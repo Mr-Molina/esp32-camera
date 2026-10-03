@@ -408,10 +408,21 @@ static int set_lenc_dsp(sensor_t *sensor, int enable)
 static int set_agc_gain(sensor_t *sensor, int gain)
 {
     int ret = 0;
-    ret = set_reg_bits(sensor, COM9, 4, 3, gain % 5);
+    ret = SCCB_Write(sensor->slv_addr, 0x00, gain & 0xFF);
     if (ret == 0) {
         ESP_LOGD(TAG, "Set gain to: %d", gain);
         sensor->status.agc_gain = gain;
+    }
+    return ret;
+}
+
+static int set_gainceiling(sensor_t *sensor, gainceiling_t level)
+{
+    int ret = 0;
+    ret = set_reg_bits(sensor, COM9, 4, 3, level % 5);
+    if (ret == 0) {
+        ESP_LOGD(TAG, "Set gainceiling to: %d", (int)level);
+        sensor->status.gainceiling = level;
     }
     return ret;
 }
@@ -468,9 +479,9 @@ static int init_status(sensor_t *sensor)
     sensor->status.ae_level = 0;
     sensor->status.special_effect = get_reg_bits(sensor, 0x64, 5, 1);
     sensor->status.wb_mode = get_reg_bits(sensor, 0x6B, 7, 1);
-    sensor->status.agc_gain = get_reg_bits(sensor, COM9, 4, 3);
+    sensor->status.agc_gain = SCCB_Read(sensor->slv_addr, 0x00);
     sensor->status.aec_value = SCCB_Read(sensor->slv_addr, AEC) | (SCCB_Read(sensor->slv_addr, AECH) << 8);
-    sensor->status.gainceiling = SCCB_Read(sensor->slv_addr, 0x00);
+    sensor->status.gainceiling = (gainceiling_t)get_reg_bits(sensor, COM9, 4, 3);
     sensor->status.awb = get_reg_bits(sensor, COM8, 1, 1);
     sensor->status.awb_gain = get_reg_bits(sensor, 0x63, 7, 1);
     sensor->status.aec = get_reg_bits(sensor, COM8, 0, 1);
@@ -490,7 +501,6 @@ static int init_status(sensor_t *sensor)
 }
 
 static int set_dummy(sensor_t *sensor, int val){ return -1; }
-static int set_gainceiling_dummy(sensor_t *sensor, gainceiling_t val){ return -1; }
 static int set_res_raw(sensor_t *sensor, int startX, int startY, int endX, int endY, int offsetX, int offsetY, int totalX, int totalY, int outputX, int outputY, bool scale, bool binning){return -1;}
 static int _set_pll(sensor_t *sensor, int bypass, int multiplier, int sys_div, int root_2x, int pre_div, int seld5, int pclk_manual, int pclk_div){return -1;}
 
@@ -554,7 +564,7 @@ int esp32_camera_ov7725_init(sensor_t *sensor)
     sensor->set_special_effect = set_dummy;
     sensor->set_wb_mode = set_dummy;
     sensor->set_ae_level = set_dummy;
-    sensor->set_gainceiling = set_gainceiling_dummy;
+    sensor->set_gainceiling = set_gainceiling;
 
 
     sensor->get_reg = get_reg;
