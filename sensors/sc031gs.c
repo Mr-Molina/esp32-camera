@@ -217,11 +217,14 @@ static int set_output_window(sensor_t *sensor, int offset_x, int offset_y, int w
 {
     int ret = 0;
     //sc:H_start={0x3212[1:0],0x3213},H_length={0x3208[1:0],0x3209},
-
+    WRITE_REG_OR_RETURN(SC031GS_OUTPUT_WINDOW_START_X_H_REG, ((offset_x >> 8) & 0x03));
+    WRITE_REG_OR_RETURN(SC031GS_OUTPUT_WINDOW_START_X_L_REG, offset_x & 0xff);
     WRITE_REG_OR_RETURN(SC031GS_OUTPUT_WINDOW_WIDTH_H_REG, ((w>>8) & 0x03));
     WRITE_REG_OR_RETURN(SC031GS_OUTPUT_WINDOW_WIDTH_L_REG, w & 0xff);
 
     //sc:V_start={0x3210[1:0],0x3211},V_length={0x320a[1:0],0x320b},
+    WRITE_REG_OR_RETURN(SC031GS_OUTPUT_WINDOW_START_Y_H_REG, ((offset_y >> 8) & 0x03));
+    WRITE_REG_OR_RETURN(SC031GS_OUTPUT_WINDOW_START_Y_L_REG, offset_y & 0xff);
     WRITE_REG_OR_RETURN(SC031GS_OUTPUT_WINDOW_HIGH_H_REG, ((h>>8) & 0x03));
     WRITE_REG_OR_RETURN(SC031GS_OUTPUT_WINDOW_HIGH_L_REG, h & 0xff);
 
