@@ -277,10 +277,8 @@ static int set_framesize(sensor_t *sensor, framesize_t framesize)
 
     // Write LSBs
     ret |= SCCB_Write(sensor->slv_addr, 0x03, 0);
-    printf("%s %d\r\n", __func__, __LINE__);
     if((w<=320)&&(h<=240))
     {
-        printf("%s %d\r\n", __func__, __LINE__);
         // Enable auto-scaling/zooming factors
         //ret |= SCCB_Write(sensor->slv_addr, 0x12, 0x50);
         set_reg_bits(sensor, 0x12, 4, 1, 1);
