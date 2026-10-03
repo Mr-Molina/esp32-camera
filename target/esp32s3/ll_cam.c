@@ -220,14 +220,14 @@ static esp_err_t ll_cam_dma_init(cam_obj_t *cam)
     esp_err_t ret = gdma_new_ahb_channel(&rx_alloc_config, NULL, &cam->dma_channel_handle);
 #endif
     if (ret != ESP_OK) {
-        cam_deinit();
         ESP_LOGE(TAG, "Can't find available GDMA channel");
         return ESP_FAIL;
     }
     int chan_id = -1;
     ret = gdma_get_channel_id(cam->dma_channel_handle, &chan_id);
     if (ret != ESP_OK) {
-        cam_deinit();
+        gdma_del_channel(cam->dma_channel_handle);
+        cam->dma_channel_handle = NULL;
         ESP_LOGE(TAG, "Can't get GDMA channel number");
         return ESP_FAIL;
     }
@@ -330,7 +330,9 @@ esp_err_t ll_cam_config(cam_obj_t *cam, const camera_config_t *config)
 
     LCD_CAM.cam_ctrl.cam_clkm_div_b = 0;
     LCD_CAM.cam_ctrl.cam_clkm_div_a = 0;
-    LCD_CAM.cam_ctrl.cam_clkm_div_num = 160000000 / config->xclk_freq_hz;
+    if (config->xclk_freq_hz > 0) {
+        LCD_CAM.cam_ctrl.cam_clkm_div_num = 160000000 / config->xclk_freq_hz;
+    }
     LCD_CAM.cam_ctrl.cam_clk_sel = 3;//Select Camera module source clock. 0: no clock. 1: APLL. 2: CLK160. 3: no clock.
 
     LCD_CAM.cam_ctrl.cam_stop_en = 0;
@@ -616,7 +618,9 @@ esp_err_t xclk_timer_conf(int ledc_timer, int xclk_freq_hz)
 {
     LCD_CAM.cam_ctrl.cam_clkm_div_b = 0;
     LCD_CAM.cam_ctrl.cam_clkm_div_a = 0;
-    LCD_CAM.cam_ctrl.cam_clkm_div_num = 160000000 / xclk_freq_hz;
+    if (xclk_freq_hz > 0) {
+        LCD_CAM.cam_ctrl.cam_clkm_div_num = 160000000 / xclk_freq_hz;
+    }
     LCD_CAM.cam_ctrl.cam_clk_sel = 3;//Select Camera module source clock. 0: no clock. 1: APLL. 2: CLK160. 3: no clock.
     LCD_CAM.cam_ctrl.cam_update = 1;
     return ESP_OK;

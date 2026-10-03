@@ -137,9 +137,11 @@ bool ll_cam_start(cam_obj_t *cam, int frame_pos)
 
 esp_err_t ll_cam_config(cam_obj_t *cam, const camera_config_t *config)
 {
-    esp_err_t err = camera_enable_out_clock(config);
-    if(err != ESP_OK) {
-        return err;
+    if (config->pin_xclk >= 0) {
+        esp_err_t err = camera_enable_out_clock(config);
+        if(err != ESP_OK) {
+            return err;
+        }
     }
 #if ESP_IDF_VERSION_MAJOR > 5
     DPORT_SET_PERI_REG_MASK(DPORT_PERIP_CLK_EN_REG, DPORT_I2S0_CLK_EN);
