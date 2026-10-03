@@ -440,9 +440,11 @@ esp_err_t esp_camera_save_to_nvs(const char *key)
                 uint8_t pf = s->pixformat;
                 ret = nvs_set_u8(handle, CAMERA_PIXFORMAT_NVS_KEY, pf);
             }
-            return ret;
+            if (ret == ESP_OK) {
+                ret = nvs_commit(handle);
+            }
         } else {
-            return ESP_ERR_CAMERA_NOT_DETECTED;
+            ret = ESP_ERR_CAMERA_NOT_DETECTED;
         }
         nvs_close(handle);
         return ret;
@@ -464,7 +466,7 @@ esp_err_t esp_camera_load_from_nvs(const char *key)
 
     if (ret == ESP_OK) {
         sensor_t *s = esp_camera_sensor_get();
-        camera_status_t st;
+        camera_status_t st = {0};
         if (s != NULL) {
             size_t size = sizeof(camera_status_t);
             ret = nvs_get_blob(handle, CAMERA_SENSOR_NVS_KEY, &st, &size);
@@ -501,7 +503,7 @@ esp_err_t esp_camera_load_from_nvs(const char *key)
                 s->set_pixformat(s, pf);
             }
         } else {
-            return ESP_ERR_CAMERA_NOT_DETECTED;
+            ret = ESP_ERR_CAMERA_NOT_DETECTED;
         }
         nvs_close(handle);
         return ret;
