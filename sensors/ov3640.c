@@ -258,18 +258,23 @@ static int ov3640_apply_vendor_power_save(sensor_t *sensor)
         return ret;
     }
 
+    int first_err = 0;
     for (size_t i = 0; i < sizeof(mcu_regs) / sizeof(mcu_regs[0]); i++) {
         ret = write_reg(sensor->slv_addr, mcu_regs[i].reg, mcu_regs[i].val);
         if (ret) {
             ESP_LOGE(TAG, "Vendor reg 0x%04x write failed", mcu_regs[i].reg);
-            return ret;
+            first_err = ret;
+            break;
         }
     }
 
     ret = write_reg(sensor->slv_addr, OV3640_BANK_SEL, OV3640_BANK_DEFAULT);
     if (ret) {
         ESP_LOGE(TAG, "Leave JPEG/MCU bank failed");
-        return ret;
+        return first_err ? first_err : ret;
+    }
+    if (first_err) {
+        return first_err;
     }
 
     ESP_LOGI(TAG, "Vendor power save applied (MCU sleep, EIS off)");
