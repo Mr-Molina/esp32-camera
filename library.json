@@ -1,6 +1,6 @@
 {
   "name": "esp32-camera",
-  "version": "2.0.0",
+  "version": "2.1.8",
   "keywords": "esp32, camera, espressif, esp32-cam",
   "description": "ESP32 compatible driver for OV2640, OV3660, OV5640, OV7670 and OV7725 image sensors.",
   "repository": {
@@ -8,7 +8,10 @@
     "url": "https://github.com/espressif/esp32-camera"
   },
   "frameworks": "espidf",
-  "platforms": "*",
+  "platforms": "espressif32",
+  "dependencies": {
+    "espressif/esp_jpeg": "^1.3.1"
+  },
   "build": {
     "flags": [
       "-Idriver/include",
@@ -21,6 +24,6 @@
     ],
     "includeDir": ".",
     "srcDir": ".",
-    "srcFilter": ["-<*>", "+<driver>", "+<conversions>", "+<sensors>"]
+    "srcFilter": ["-<*>", "+<driver>", "+<conversions>", "+<sensors>", "+<target/*>"]
   }
 }
