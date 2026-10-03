@@ -72,7 +72,7 @@ static bool jpg2rgb(const uint8_t *src, size_t src_len, uint8_t * out, size_t ou
         .outbuf_size = out_size,
         .out_format = format,
         .out_scale = scale,
-        .flags.swap_color_bytes = 0,
+        .flags.swap_color_bytes = (format == JPEG_IMAGE_FORMAT_RGB888) ? 1 : 0,
         .advanced.working_buffer = work,
         .advanced.working_buffer_size = sizeof(work),
     };
@@ -102,7 +102,7 @@ bool jpg2bmp(const uint8_t *src, size_t src_len, uint8_t ** out, size_t * out_le
         .indata_size = src_len,
         .out_format = JPEG_IMAGE_FORMAT_RGB888,
         .out_scale = JPEG_IMAGE_SCALE_0,
-        .flags.swap_color_bytes = 0,
+        .flags.swap_color_bytes = 1,
         .advanced.working_buffer = work,
         .advanced.working_buffer_size = sizeof(work),
     };
