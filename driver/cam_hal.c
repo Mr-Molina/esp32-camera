@@ -271,7 +271,7 @@ void IRAM_ATTR ll_cam_send_event(cam_obj_t *cam, cam_event_t cam_event, BaseType
 #else
         static uint16_t ovf_cnt = 0;
         CAM_WARN_THROTTLE(ovf_cnt,
-                          cam_event==CAM_IN_SUC_EOF_EVENT ? "EV-EOF-OVF" : "EV-VSYNC-OVF");
+                          cam_event==CAM_IN_SUC_EOF_EVENT ? DRAM_STR("EV-EOF-OVF") : DRAM_STR("EV-VSYNC-OVF"));
 #endif
     }
 }
