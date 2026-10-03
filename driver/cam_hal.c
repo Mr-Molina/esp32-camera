@@ -32,6 +32,9 @@
 #ifndef ESP_CACHE_MSYNC_FLAG_DIR_M2C
 #define ESP_CACHE_MSYNC_FLAG_DIR_M2C 0
 #endif
+#ifndef ESP_CACHE_MSYNC_FLAG_DIR_C2M
+#define ESP_CACHE_MSYNC_FLAG_DIR_C2M 0
+#endif
 #if CONFIG_IDF_TARGET_ESP32
 #include "esp32/rom/ets_sys.h"  // will be removed in idf v5.0
 #elif CONFIG_IDF_TARGET_ESP32S2
@@ -108,6 +111,17 @@ static inline void cam_drop_psram_cache(void *addr, size_t len)
     size_t sync_len = (len + ((uintptr_t)addr - start) + line - 1) & ~(line - 1);
     esp_cache_msync((void *)start, sync_len,
                     ESP_CACHE_MSYNC_FLAG_DIR_M2C | ESP_CACHE_MSYNC_FLAG_INVALIDATE);
+}
+
+static inline void cam_writeback_psram_cache(void *addr, size_t len)
+{
+    size_t line = dcache_line_size();
+    if (line == 0) {
+        line = 32; /* sane fallback */
+    }
+    uintptr_t start = (uintptr_t)addr & ~(line - 1);
+    size_t sync_len = (len + ((uintptr_t)addr - start) + line - 1) & ~(line - 1);
+    esp_cache_msync((void *)start, sync_len, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
 }
 
 /* Throttle repeated warnings printed from tight loops / ISRs.
@@ -774,15 +788,15 @@ skip_eoi_check:
                               "NO-EOI - JPEG end marker missing");
             cam_give(dma_buffer);
             continue; /* wait for another frame */
-        } else if (cam_obj->psram_mode &&
-                   cam_obj->in_bytes_per_pixel != cam_obj->fb_bytes_per_pixel) {
-            /* currently used only for YUV to GRAYSCALE */
-            dma_buffer->len = ll_cam_memcpy(cam_obj, dma_buffer->buf, dma_buffer->buf, dma_buffer->len);
-        }
-
-        if (cam_obj->psram_mode) {
-            /* DMA may bypass cache, ensure full frame is visible to the app */
+        } else if (cam_obj->psram_mode) {
+            /* DMA may bypass cache, invalidate so CPU reads fresh PSRAM data */
             cam_drop_psram_cache(dma_buffer->buf, dma_buffer->len);
+            if (cam_obj->in_bytes_per_pixel != cam_obj->fb_bytes_per_pixel) {
+                /* currently used only for YUV to GRAYSCALE */
+                dma_buffer->len = ll_cam_memcpy(cam_obj, dma_buffer->buf, dma_buffer->buf, dma_buffer->len);
+                /* Write back modified cache lines to PSRAM so external memory has fresh data */
+                cam_writeback_psram_cache(dma_buffer->buf, dma_buffer->len);
+            }
         }
 
         return dma_buffer;
