@@ -107,13 +107,29 @@ static IRAM_ATTR void convert_line_format(uint8_t * src, pixformat_t format, uin
     }
 }
 
-bool convert_image(uint8_t *src, uint16_t width, uint16_t height, pixformat_t format, uint8_t quality, jpge::output_stream *dst_stream)
+static inline size_t bytes_pp(pixformat_t format)
+{
+    switch (format) {
+    case PIXFORMAT_GRAYSCALE: return 1;
+    case PIXFORMAT_RGB565:    return 2;
+    case PIXFORMAT_YUV422:    return 2;
+    case PIXFORMAT_RGB888:    return 3;
+    default:                  return 0;
+    }
+}
+
+bool convert_image(uint8_t *src, size_t src_len, uint16_t width, uint16_t height, pixformat_t format, uint8_t quality, jpge::output_stream *dst_stream)
 {
     if(format != PIXFORMAT_GRAYSCALE &&
        format != PIXFORMAT_RGB888 &&
        format != PIXFORMAT_RGB565 &&
        format != PIXFORMAT_YUV422) {
         ESP_LOGE(TAG, "Format %d not supported", format);
+        return false;
+    }
+
+    if ((uint64_t)width * height * bytes_pp(format) > (uint64_t)src_len) {
+        ESP_LOGE(TAG, "Source buffer too small");
         return false;
     }
 
@@ -177,8 +193,9 @@ public:
     virtual ~callback_stream() { }
     virtual bool put_buf(const void* data, int len)
     {
-        index += ocb(oarg, index, data, len);
-        return true;
+        size_t written = ocb(oarg, index, data, len);
+        index += written;
+        return written == (size_t)len;
     }
     virtual size_t get_size() const
     {
@@ -189,7 +206,7 @@ public:
 bool fmt2jpg_cb(uint8_t *src, size_t src_len, uint16_t width, uint16_t height, pixformat_t format, uint8_t quality, jpg_out_cb cb, void * arg)
 {
     callback_stream dst_stream(cb, arg);
-    return convert_image(src, width, height, format, quality, &dst_stream);
+    return convert_image(src, src_len, width, height, format, quality, &dst_stream);
 }
 
 bool frame2jpg_cb(camera_fb_t * fb, uint8_t quality, jpg_out_cb cb, void * arg)
@@ -264,7 +281,7 @@ bool fmt2jpg(uint8_t *src, size_t src_len, uint16_t width, uint16_t height, pixf
     }
     memory_stream dst_stream(jpg_buf, jpg_buf_len);
 
-    if(!convert_image(src, width, height, format, quality, &dst_stream)) {
+    if(!convert_image(src, src_len, width, height, format, quality, &dst_stream)) {
         free(jpg_buf);
         return false;
     }

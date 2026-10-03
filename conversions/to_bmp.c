@@ -263,6 +263,12 @@ bool fmt2bmp(uint8_t *src, size_t src_len, uint16_t width, uint16_t height, pixf
         return false;
     }
 
+    size_t in_bpp = (format == PIXFORMAT_GRAYSCALE) ? 1 : ((format == PIXFORMAT_RGB888) ? 3 : 2);
+    if ((uint64_t)width * height * in_bpp > (uint64_t)src_len) {
+        ESP_LOGE(TAG, "Source buffer too small for format %d", format);
+        return false;
+    }
+
     int pix_count = width*height;
 
     // With BMP, 8-bit greyscale requires a palette.
