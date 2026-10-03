@@ -273,7 +273,7 @@ static int set_framesize(sensor_t *sensor, framesize_t framesize)
     if (ret == 0) {
         ESP_LOGD(TAG, "Set framesize to: %ux%u", w, h);
     }
-    return 0;
+    return ret;
 }
 
 static int set_contrast(sensor_t *sensor, int level)
