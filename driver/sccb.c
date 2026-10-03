@@ -77,7 +77,7 @@ int SCCB_Use_Port(int i2c_num) { // sccb use an already initialized I2C port
     if (sccb_owns_i2c_port) {
         SCCB_Deinit();
     }
-    if (i2c_num < 0 || i2c_num > I2C_NUM_MAX) {
+    if (i2c_num < 0 || i2c_num >= I2C_NUM_MAX) {
         return ESP_ERR_INVALID_ARG;
     }
     sccb_i2c_port = i2c_num;

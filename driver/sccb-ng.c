@@ -43,7 +43,7 @@ const int SCCB_I2C_PORT_DEFAULT = 1;
 const int SCCB_I2C_PORT_DEFAULT = 0;
 #endif
 
-#define MAX_DEVICES UINT8_MAX-1
+#define MAX_DEVICES (8)
 
 /*
  The legacy I2C driver used addresses to differentiate between devices, whereas the new driver uses
@@ -150,7 +150,7 @@ int SCCB_Use_Port(int i2c_num)
     {
         SCCB_Deinit();
     }
-    if (i2c_num < 0 || i2c_num > I2C_NUM_MAX)
+    if (i2c_num < 0 || i2c_num >= I2C_NUM_MAX)
     {
         return ESP_ERR_INVALID_ARG;
     }
@@ -302,7 +302,7 @@ uint8_t SCCB_Read16(uint8_t slv_addr, uint16_t reg)
     }
     i2c_master_dev_handle_t dev_handle = *dev_handle_ptr;
 
-    uint8_t rx_buffer[1];
+    uint8_t rx_buffer[1] = {0};
 
     uint16_t reg_htons = LITTLETOBIG(reg);
     uint8_t *reg_u8 = (uint8_t *)&reg_htons;
@@ -311,7 +311,8 @@ uint8_t SCCB_Read16(uint8_t slv_addr, uint16_t reg)
 
     if (ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "W [%04x]=%02x fail\n", reg, rx_buffer[0]);
+        ESP_LOGE(TAG, "R [%04x]=%02x fail\n", reg, rx_buffer[0]);
+        return 0;
     }
 
     return rx_buffer[0];
@@ -349,7 +350,7 @@ uint16_t SCCB_Read_Addr16_Val16(uint8_t slv_addr, uint16_t reg)
     }
     i2c_master_dev_handle_t dev_handle = *dev_handle_ptr;
 
-    uint8_t rx_buffer[2];
+    uint8_t rx_buffer[2] = {0};
 
     uint16_t reg_htons = LITTLETOBIG(reg);
     uint8_t *reg_u8 = (uint8_t *)&reg_htons;
@@ -359,7 +360,8 @@ uint16_t SCCB_Read_Addr16_Val16(uint8_t slv_addr, uint16_t reg)
 
     if (ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "W [%04x]=%02x fail\n", reg, data);
+        ESP_LOGE(TAG, "R [%04x]=%02x fail\n", reg, data);
+        return 0;
     }
 
     return data;
