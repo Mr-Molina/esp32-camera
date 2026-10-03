@@ -258,22 +258,18 @@ err:
 
 static int set_pixformat(sensor_t *sensor, pixformat_t pixformat)
 {
-    int ret=0;
-    sensor->pixformat = pixformat;
-
     switch (pixformat) {
     case PIXFORMAT_RGB565:
     case PIXFORMAT_RAW:
     case PIXFORMAT_GRAYSCALE:
         ESP_LOGE(TAG, "Not support");
-        break;
+        return -1;
     case PIXFORMAT_YUV422: // For now, sc101 sensor only support YUV422.
-        break;
+        sensor->pixformat = pixformat;
+        return 0;
     default:
-        ret = -1;
+        return -1;
     }
-
-    return ret;
 }
 
 static int init_status(sensor_t *sensor)
