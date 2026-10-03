@@ -141,7 +141,8 @@ esp_err_t esp_camera_af_wait(sensor_t *sensor, uint32_t timeout_ms, esp_camera_a
             return ESP_ERR_TIMEOUT;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(5));
+        TickType_t delay_ticks = pdMS_TO_TICKS(5);
+        vTaskDelay(delay_ticks ? delay_ticks : 1);
     }
 }
 
