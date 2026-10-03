@@ -170,18 +170,24 @@ static int get_reg_bits(sensor_t *sensor, uint8_t reg, uint8_t offset, uint8_t l
 
 static int reset(sensor_t *sensor)
 {
-    int i=0;
+    int i = 0, ret = 0;
     const uint8_t (*regs)[2];
 
     // Reset all registers
-    SCCB_Write(sensor->slv_addr, COM7, COM7_RESET);
+    ret = SCCB_Write(sensor->slv_addr, COM7, COM7_RESET);
+    if (ret) {
+        return ret;
+    }
 
     // Delay 10 ms
     vTaskDelay(10 / portTICK_PERIOD_MS);
 
     // Write default registers
-    for (i=0, regs = default_regs; regs[i][0]; i++) {
-        SCCB_Write(sensor->slv_addr, regs[i][0], regs[i][1]);
+    for (i = 0, regs = default_regs; regs[i][0]; i++) {
+        ret = SCCB_Write(sensor->slv_addr, regs[i][0], regs[i][1]);
+        if (ret) {
+            return ret;
+        }
     }
 
     // Delay
