@@ -270,10 +270,12 @@ bool fmt2bmp(uint8_t *src, size_t src_len, uint16_t width, uint16_t height, pixf
     // over going RGB-24.
     int bpp = (format == PIXFORMAT_GRAYSCALE) ? 1 : 3;
     int palette_size = (format == PIXFORMAT_GRAYSCALE) ? 4 * 256 : 0;
-    size_t out_size = (pix_count * bpp) + BMP_HEADER_LEN + palette_size;
+    size_t row_stride = ((width * bpp) + 3) & ~3;
+    size_t image_size = row_stride * height;
+    size_t out_size = image_size + BMP_HEADER_LEN + palette_size;
     uint8_t * out_buf = (uint8_t *)_malloc(out_size);
     if(!out_buf) {
-        ESP_LOGE(TAG, "_malloc failed! %u", out_size);
+        ESP_LOGE(TAG, "_malloc failed! %u", (unsigned)out_size);
         return false;
     }
 
@@ -289,7 +291,7 @@ bool fmt2bmp(uint8_t *src, size_t src_len, uint16_t width, uint16_t height, pixf
     bitmap->planes = 1;
     bitmap->bitsperpixel = bpp * 8;
     bitmap->compression = 0;
-    bitmap->imagesize = pix_count * bpp;
+    bitmap->imagesize = image_size;
     bitmap->ypixelpermeter = 0x0B13 ; //2835 , 72 DPI
     bitmap->xpixelpermeter = 0x0B13 ; //2835 , 72 DPI
     bitmap->numcolorspallette = 0;
@@ -312,40 +314,111 @@ bool fmt2bmp(uint8_t *src, size_t src_len, uint16_t width, uint16_t height, pixf
         }
     }
 
-    //convert data to RGB888
-    if(format == PIXFORMAT_RGB888) {
-        memcpy(pix_buf, src_buf, pix_count*3);
-    } else if(format == PIXFORMAT_RGB565) {
-        int i;
-        uint8_t hb, lb;
-        for(i=0; i<pix_count; i++) {
-            hb = *src_buf++;
-            lb = *src_buf++;
-            *pix_buf++ = (lb & 0x1F) << 3;
-            *pix_buf++ = (hb & 0x07) << 5 | (lb & 0xE0) >> 3;
-            *pix_buf++ = hb & 0xF8;
+    size_t row_bytes = width * bpp;
+    size_t padding = row_stride - row_bytes;
+
+    if (row_stride == row_bytes) {
+        //convert data to RGB888
+        if(format == PIXFORMAT_RGB888) {
+            memcpy(pix_buf, src_buf, pix_count*3);
+        } else if(format == PIXFORMAT_RGB565) {
+            int i;
+            uint8_t hb, lb;
+            for(i=0; i<pix_count; i++) {
+                hb = *src_buf++;
+                lb = *src_buf++;
+                *pix_buf++ = (lb & 0x1F) << 3;
+                *pix_buf++ = (hb & 0x07) << 5 | (lb & 0xE0) >> 3;
+                *pix_buf++ = hb & 0xF8;
+            }
+        } else if(format == PIXFORMAT_GRAYSCALE) {
+            memcpy(pix_buf, src_buf, pix_count);
+        } else if(format == PIXFORMAT_YUV422) {
+            int i, maxi = pix_count / 2;
+            uint8_t y0, y1, u, v;
+            uint8_t r, g, b;
+            for(i=0; i<maxi; i++) {
+                y0 = *src_buf++;
+                u = *src_buf++;
+                y1 = *src_buf++;
+                v = *src_buf++;
+
+                yuv2rgb(y0, u, v, &r, &g, &b);
+                *pix_buf++ = b;
+                *pix_buf++ = g;
+                *pix_buf++ = r;
+
+                yuv2rgb(y1, u, v, &r, &g, &b);
+                *pix_buf++ = b;
+                *pix_buf++ = g;
+                *pix_buf++ = r;
+            }
         }
-    } else if(format == PIXFORMAT_GRAYSCALE) {
-        memcpy(pix_buf, src_buf, pix_count);
-    } else if(format == PIXFORMAT_YUV422) {
-        int i, maxi = pix_count / 2;
-        uint8_t y0, y1, u, v;
-        uint8_t r, g, b;
-        for(i=0; i<maxi; i++) {
-            y0 = *src_buf++;
-            u = *src_buf++;
-            y1 = *src_buf++;
-            v = *src_buf++;
+    } else {
+        if(format == PIXFORMAT_RGB888) {
+            for(int y = 0; y < height; y++) {
+                memcpy(pix_buf, src_buf, width * 3);
+                pix_buf += width * 3;
+                src_buf += width * 3;
+                for(size_t p = 0; p < padding; p++) {
+                    *pix_buf++ = 0;
+                }
+            }
+        } else if(format == PIXFORMAT_RGB565) {
+            uint8_t hb, lb;
+            for(int y = 0; y < height; y++) {
+                for(int x = 0; x < width; x++) {
+                    hb = *src_buf++;
+                    lb = *src_buf++;
+                    *pix_buf++ = (lb & 0x1F) << 3;
+                    *pix_buf++ = (hb & 0x07) << 5 | (lb & 0xE0) >> 3;
+                    *pix_buf++ = hb & 0xF8;
+                }
+                for(size_t p = 0; p < padding; p++) {
+                    *pix_buf++ = 0;
+                }
+            }
+        } else if(format == PIXFORMAT_GRAYSCALE) {
+            for(int y = 0; y < height; y++) {
+                memcpy(pix_buf, src_buf, width);
+                pix_buf += width;
+                src_buf += width;
+                for(size_t p = 0; p < padding; p++) {
+                    *pix_buf++ = 0;
+                }
+            }
+        } else if(format == PIXFORMAT_YUV422) {
+            uint8_t y0, y1, u, v;
+            uint8_t r, g, b;
+            for(int y = 0; y < height; y++) {
+                for(int x = 0; x < width / 2; x++) {
+                    y0 = *src_buf++;
+                    u = *src_buf++;
+                    y1 = *src_buf++;
+                    v = *src_buf++;
 
-            yuv2rgb(y0, u, v, &r, &g, &b);
-            *pix_buf++ = b;
-            *pix_buf++ = g;
-            *pix_buf++ = r;
+                    yuv2rgb(y0, u, v, &r, &g, &b);
+                    *pix_buf++ = b;
+                    *pix_buf++ = g;
+                    *pix_buf++ = r;
 
-            yuv2rgb(y1, u, v, &r, &g, &b);
-            *pix_buf++ = b;
-            *pix_buf++ = g;
-            *pix_buf++ = r;
+                    yuv2rgb(y1, u, v, &r, &g, &b);
+                    *pix_buf++ = b;
+                    *pix_buf++ = g;
+                    *pix_buf++ = r;
+                }
+                if(width & 1) {
+                    y0 = *src_buf++;
+                    u = *src_buf++;
+                    yuv2rgb(y0, u, 128, &r, &g, &b);
+                    *pix_buf++ = b;
+                    *pix_buf++ = g;
+                    *pix_buf++ = r;
+                }
+                for(size_t p = 0; p < padding; p++) {
+                    *pix_buf++ = 0;
+                }
+            }
         }
     }
     *out = out_buf;
