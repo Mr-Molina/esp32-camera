@@ -407,10 +407,15 @@ static int set_hmirror_sensor(sensor_t *sensor, int enable)
 
 static int set_vflip_sensor(sensor_t *sensor, int enable)
 {
-    int ret = 0;
-    sensor->status.vflip = enable;
-    ret = write_reg_bits(sensor, BANK_SENSOR, REG04, REG04_VREF_EN, enable?1:0);
-    return ret & write_reg_bits(sensor, BANK_SENSOR, REG04, REG04_VFLIP_IMG, enable?1:0);
+    int ret = write_reg_bits(sensor, BANK_SENSOR, REG04, REG04_VREF_EN, enable?1:0);
+    if (ret) {
+        return ret;
+    }
+    ret = write_reg_bits(sensor, BANK_SENSOR, REG04, REG04_VFLIP_IMG, enable?1:0);
+    if (ret == 0) {
+        sensor->status.vflip = enable;
+    }
+    return ret;
 }
 
 static int set_raw_gma_dsp(sensor_t *sensor, int enable)
