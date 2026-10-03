@@ -335,35 +335,39 @@ static int set_whitebal(sensor_t *sensor, int enable)
 
 static int set_gain_ctrl(sensor_t *sensor, int enable)
 {
-    if(set_reg_bits(sensor, 0x13, 2, 1, enable) >= 0){
+    int ret = set_reg_bits(sensor, 0x13, 2, 1, enable);
+    if (ret == 0) {
         sensor->status.agc = !!enable;
     }
-    return sensor->status.agc;
+    return ret;
 }
 
 
 static int set_exposure_ctrl(sensor_t *sensor, int enable)
 {
-    if(set_reg_bits(sensor, 0x13, 0, 1, enable) >= 0){
+    int ret = set_reg_bits(sensor, 0x13, 0, 1, enable);
+    if (ret == 0) {
         sensor->status.aec = !!enable;
     }
-    return sensor->status.aec;
+    return ret;
 }
 
 static int set_hmirror(sensor_t *sensor, int enable)
 {
-    if(set_reg_bits(sensor, 0x1e, 5, 1, enable) >= 0){
+    int ret = set_reg_bits(sensor, 0x1e, 5, 1, enable);
+    if (ret == 0) {
         sensor->status.hmirror = !!enable;
     }
-    return sensor->status.hmirror;
+    return ret;
 }
 
 static int set_vflip(sensor_t *sensor, int enable)
 {
-    if(set_reg_bits(sensor, 0x1e, 4, 1, enable) >= 0){
+    int ret = set_reg_bits(sensor, 0x1e, 4, 1, enable);
+    if (ret == 0) {
         sensor->status.vflip = !!enable;
     }
-    return sensor->status.vflip;
+    return ret;
 }
 
 static int set_raw_gma_dsp(sensor_t *sensor, int enable)
