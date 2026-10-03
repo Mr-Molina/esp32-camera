@@ -207,8 +207,8 @@ public:
             return true;
         }
         if ((size_t)len > (max_len - index)) {
-            //ESP_LOGW(TAG, "JPG output overflow: %d bytes (%d,%d,%d)", len - (max_len - index), len, index, max_len);
-            len = max_len - index;
+            ESP_LOGE(TAG, "JPG output overflow");
+            return false;
         }
         if (len) {
             memcpy(out_buf + index, pBuf, len);
