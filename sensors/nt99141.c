@@ -542,8 +542,8 @@ static int set_ae_level(sensor_t *sensor, int level)
 
     if (level < 0) {
         level = 0;
-    } else if (level > 9) {
-        level = 9;
+    } else if (level > 8) {
+        level = 8;
     }
 
     for (int i = 0; i < 5; i++) {
