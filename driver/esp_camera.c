@@ -304,6 +304,14 @@ static pixformat_t get_output_data_format(camera_conv_mode_t conv_mode)
 
 esp_err_t esp_camera_init(const camera_config_t *config)
 {
+    if (config == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_state != NULL) {
+        ESP_LOGE(TAG, "Camera already initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
+
     esp_err_t err;
     s_saved_config = *config;
     err = cam_init(config);
