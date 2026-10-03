@@ -191,6 +191,7 @@ static int set_pixformat(sensor_t *sensor, pixformat_t pixformat)
         ret = write_reg(sensor->slv_addr, PORTCTRL, 0x60);
         break;
     default:
+        ret = -1;
         break;
     }
 
