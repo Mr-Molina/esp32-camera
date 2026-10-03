@@ -356,7 +356,11 @@ esp_err_t esp_camera_init(const camera_config_t *config)
         err = ESP_ERR_CAMERA_FAILED_TO_SET_FRAME_SIZE;
         goto fail;
     }
-    s_state->sensor.set_pixformat(&s_state->sensor, pix_format);
+    if (s_state->sensor.set_pixformat(&s_state->sensor, pix_format) != 0) {
+        ESP_LOGE(TAG, "Failed to set pixel format");
+        err = ESP_ERR_CAMERA_FAILED_TO_SET_OUT_FORMAT;
+        goto fail;
+    }
 #if CONFIG_CAMERA_CONVERTER_ENABLED
     if(config->conv_mode) {
         s_state->sensor.pixformat = get_output_data_format(config->conv_mode); // If conversion enabled, change the out data format by conversion mode
@@ -408,8 +412,10 @@ camera_fb_t *esp_camera_fb_get()
     camera_fb_t *fb = cam_take(FB_GET_TIMEOUT);
     //set the frame properties
     if (fb) {
-        fb->width = resolution[s_state->sensor.status.framesize].width;
-        fb->height = resolution[s_state->sensor.status.framesize].height;
+        if (s_state->sensor.status.framesize < FRAMESIZE_INVALID) {
+            fb->width = resolution[s_state->sensor.status.framesize].width;
+            fb->height = resolution[s_state->sensor.status.framesize].height;
+        }
         fb->format = s_state->sensor.pixformat;
     }
     return fb;
