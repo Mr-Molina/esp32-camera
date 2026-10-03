@@ -29,8 +29,10 @@ static int set_bank(sensor_t *sensor, ov2640_bank_t bank)
 {
     int res = 0;
     if (bank != reg_bank) {
-        reg_bank = bank;
         res = SCCB_Write(sensor->slv_addr, BANK_SEL, bank);
+        if (res == 0) {
+            reg_bank = bank;
+        }
     }
     return res;
 }
