@@ -196,8 +196,8 @@ static int set_aec_value(sensor_t *sensor, int value)
 {
     // For now, HDR is disabled, the sensor work in normal mode.
     int ret = 0;
-    WRITE_REG_OR_RETURN(0x3e01, value & 0xFF); // AE target high
-    WRITE_REG_OR_RETURN(0x3e02, (value >> 8) & 0xFF); // AE target low
+    WRITE_REG_OR_RETURN(0x3e01, (value >> 8) & 0xFF); // AE target high
+    WRITE_REG_OR_RETURN(0x3e02, value & 0xFF); // AE target low
 
     return ret;
 }
