@@ -10,7 +10,6 @@
 // #define BOARD_ESP32S3_WROOM
 // #define BOARD_ESP32S3_XIAO
 // #define BOARD_ESP32S3_GOOUUU
-// #define BOARD_ESP32S3_XIAO
 
 /**
  * 2. Kconfig setup
@@ -55,7 +54,13 @@
 #include "esp_camera_af.h"
 #endif
 
+#if !defined(BOARD_WROVER_KIT) && \
+    !defined(BOARD_ESP32CAM_AITHINKER) && \
+    !defined(BOARD_ESP32S3_WROOM) && \
+    !defined(BOARD_ESP32S3_GOOUUU) && \
+    !defined(BOARD_ESP32S3_XIAO)
 #define BOARD_WROVER_KIT 1
+#endif
 
 #include "camera_pinout.h"
 
@@ -156,6 +161,11 @@ void app_main(void)
     {
         ESP_LOGI(TAG, "Taking picture...");
         camera_fb_t *pic = esp_camera_fb_get();
+        if (!pic) {
+            ESP_LOGE(TAG, "Camera capture failed");
+            vTaskDelay(5000 / portTICK_RATE_MS);
+            continue;
+        }
 
         // use pic->buf to access the image
         ESP_LOGI(TAG, "Picture taken! Its size was: %zu bytes", pic->len);
