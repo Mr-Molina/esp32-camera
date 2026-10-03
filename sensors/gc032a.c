@@ -192,21 +192,21 @@ static int set_framesize(sensor_t *sensor, framesize_t framesize)
     uint16_t row_s = (resolution[FRAMESIZE_VGA].height - h) / 2;
     uint16_t col_s = (resolution[FRAMESIZE_VGA].width - w) / 2;
 
-    write_reg(sensor->slv_addr, 0xfe, 0x00);
-    write_reg(sensor->slv_addr, P0_ROW_START_HIGH, H8(row_s)); // Row_start[8]
-    write_reg(sensor->slv_addr, P0_ROW_START_LOW, L8(row_s)); // Row_start[7:0]
-    write_reg(sensor->slv_addr, P0_COLUMN_START_HIGH, H8(col_s)); // Column_start[9:8]
-    write_reg(sensor->slv_addr, P0_COLUMN_START_LOW, L8(col_s)); // Column_start[7:0]
-    write_reg(sensor->slv_addr, P0_WINDOW_HEIGHT_HIGH, H8(h + 8)); //window_height [8]
-    write_reg(sensor->slv_addr, P0_WINDOW_HEIGHT_LOW, L8(h + 8)); //window_height [7:0]
-    write_reg(sensor->slv_addr, P0_WINDOW_WIDTH_HIGH, H8(w + 8)); //window_width [9:8]
-    write_reg(sensor->slv_addr, P0_WINDOW_WIDTH_LOW, L8(w + 8)); //window_width [7:0]
+    ret |= write_reg(sensor->slv_addr, 0xfe, 0x00);
+    ret |= write_reg(sensor->slv_addr, P0_ROW_START_HIGH, H8(row_s)); // Row_start[8]
+    ret |= write_reg(sensor->slv_addr, P0_ROW_START_LOW, L8(row_s)); // Row_start[7:0]
+    ret |= write_reg(sensor->slv_addr, P0_COLUMN_START_HIGH, H8(col_s)); // Column_start[9:8]
+    ret |= write_reg(sensor->slv_addr, P0_COLUMN_START_LOW, L8(col_s)); // Column_start[7:0]
+    ret |= write_reg(sensor->slv_addr, P0_WINDOW_HEIGHT_HIGH, H8(h + 8)); //window_height [8]
+    ret |= write_reg(sensor->slv_addr, P0_WINDOW_HEIGHT_LOW, L8(h + 8)); //window_height [7:0]
+    ret |= write_reg(sensor->slv_addr, P0_WINDOW_WIDTH_HIGH, H8(w + 8)); //window_width [9:8]
+    ret |= write_reg(sensor->slv_addr, P0_WINDOW_WIDTH_LOW, L8(w + 8)); //window_width [7:0]
 
-    write_reg(sensor->slv_addr, P0_WIN_MODE, 0x01);
-    write_reg(sensor->slv_addr, P0_OUT_WIN_HEIGHT_HIGH, H8(h));
-    write_reg(sensor->slv_addr, P0_OUT_WIN_HEIGHT_LOW, L8(h));
-    write_reg(sensor->slv_addr, P0_OUT_WIN_WIDTH_HIGH, H8(w));
-    write_reg(sensor->slv_addr, P0_OUT_WIN_WIDTH_LOW, L8(w));
+    ret |= write_reg(sensor->slv_addr, P0_WIN_MODE, 0x01);
+    ret |= write_reg(sensor->slv_addr, P0_OUT_WIN_HEIGHT_HIGH, H8(h));
+    ret |= write_reg(sensor->slv_addr, P0_OUT_WIN_HEIGHT_LOW, L8(h));
+    ret |= write_reg(sensor->slv_addr, P0_OUT_WIN_WIDTH_HIGH, H8(w));
+    ret |= write_reg(sensor->slv_addr, P0_OUT_WIN_WIDTH_LOW, L8(w));
 
     if (ret == 0) {
         ESP_LOGD(TAG, "Set framesize to: %ux%u", w, h);

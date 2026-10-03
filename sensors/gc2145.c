@@ -240,55 +240,55 @@ static int set_framesize(sensor_t *sensor, framesize_t framesize)
         }
     }
 
-    write_reg(sensor->slv_addr, 0xfe, 0x00);
-    write_reg(sensor->slv_addr, P0_CROP_ENABLE, 0x01);
-    write_reg(sensor->slv_addr, 0x09, H8(row_s));
-    write_reg(sensor->slv_addr, 0x0a, L8(row_s));
-    write_reg(sensor->slv_addr, 0x0b, H8(col_s));
-    write_reg(sensor->slv_addr, 0x0c, L8(col_s));
-    write_reg(sensor->slv_addr, 0x0d, H8(win_h + 8));
-    write_reg(sensor->slv_addr, 0x0e, L8(win_h + 8));
-    write_reg(sensor->slv_addr, 0x0f, H8(win_w + 16));
-    write_reg(sensor->slv_addr, 0x10, L8(win_w + 16));
+    ret |= write_reg(sensor->slv_addr, 0xfe, 0x00);
+    ret |= write_reg(sensor->slv_addr, P0_CROP_ENABLE, 0x01);
+    ret |= write_reg(sensor->slv_addr, 0x09, H8(row_s));
+    ret |= write_reg(sensor->slv_addr, 0x0a, L8(row_s));
+    ret |= write_reg(sensor->slv_addr, 0x0b, H8(col_s));
+    ret |= write_reg(sensor->slv_addr, 0x0c, L8(col_s));
+    ret |= write_reg(sensor->slv_addr, 0x0d, H8(win_h + 8));
+    ret |= write_reg(sensor->slv_addr, 0x0e, L8(win_h + 8));
+    ret |= write_reg(sensor->slv_addr, 0x0f, H8(win_w + 16));
+    ret |= write_reg(sensor->slv_addr, 0x10, L8(win_w + 16));
 
-    write_reg(sensor->slv_addr, 0x99, cfg->reg0x99);
-    write_reg(sensor->slv_addr, 0x9b, cfg->reg0x9b);
-    write_reg(sensor->slv_addr, 0x9c, cfg->reg0x9c);
-    write_reg(sensor->slv_addr, 0x9d, cfg->reg0x9d);
-    write_reg(sensor->slv_addr, 0x9e, cfg->reg0x9e);
-    write_reg(sensor->slv_addr, 0x9f, cfg->reg0x9f);
-    write_reg(sensor->slv_addr, 0xa0, cfg->reg0xa0);
-    write_reg(sensor->slv_addr, 0xa1, cfg->reg0xa1);
-    write_reg(sensor->slv_addr, 0xa2, cfg->reg0xa2);
+    ret |= write_reg(sensor->slv_addr, 0x99, cfg->reg0x99);
+    ret |= write_reg(sensor->slv_addr, 0x9b, cfg->reg0x9b);
+    ret |= write_reg(sensor->slv_addr, 0x9c, cfg->reg0x9c);
+    ret |= write_reg(sensor->slv_addr, 0x9d, cfg->reg0x9d);
+    ret |= write_reg(sensor->slv_addr, 0x9e, cfg->reg0x9e);
+    ret |= write_reg(sensor->slv_addr, 0x9f, cfg->reg0x9f);
+    ret |= write_reg(sensor->slv_addr, 0xa0, cfg->reg0xa0);
+    ret |= write_reg(sensor->slv_addr, 0xa1, cfg->reg0xa1);
+    ret |= write_reg(sensor->slv_addr, 0xa2, cfg->reg0xa2);
 
-    write_reg(sensor->slv_addr, 0x95, H8(h));
-    write_reg(sensor->slv_addr, 0x96, L8(h));
-    write_reg(sensor->slv_addr, 0x97, H8(w));
-    write_reg(sensor->slv_addr, 0x98, L8(w));
+    ret |= write_reg(sensor->slv_addr, 0x95, H8(h));
+    ret |= write_reg(sensor->slv_addr, 0x96, L8(h));
+    ret |= write_reg(sensor->slv_addr, 0x97, H8(w));
+    ret |= write_reg(sensor->slv_addr, 0x98, L8(w));
 
 
 #elif CONFIG_GC_SENSOR_WINDOWING_MODE
-    write_reg(sensor->slv_addr, 0xfe, 0x00);
+    ret |= write_reg(sensor->slv_addr, 0xfe, 0x00);
 
-    write_reg(sensor->slv_addr, P0_CROP_ENABLE, 0x01);
+    ret |= write_reg(sensor->slv_addr, P0_CROP_ENABLE, 0x01);
     // write_reg(sensor->slv_addr, 0xec, col_s / 8); //measure window
     // write_reg(sensor->slv_addr, 0xed, row_s / 8);
     // write_reg(sensor->slv_addr, 0xee, (col_s + h) / 8);
     // write_reg(sensor->slv_addr, 0xef, (row_s + w) / 8);
 
-    write_reg(sensor->slv_addr, 0x09, H8(row_s));
-    write_reg(sensor->slv_addr, 0x0a, L8(row_s));
-    write_reg(sensor->slv_addr, 0x0b, H8(col_s));
-    write_reg(sensor->slv_addr, 0x0c, L8(col_s));
-    write_reg(sensor->slv_addr, 0x0d, H8(h + 8));
-    write_reg(sensor->slv_addr, 0x0e, L8(h + 8));
-    write_reg(sensor->slv_addr, 0x0f, H8(w + 8));
-    write_reg(sensor->slv_addr, 0x10, L8(w + 8));
+    ret |= write_reg(sensor->slv_addr, 0x09, H8(row_s));
+    ret |= write_reg(sensor->slv_addr, 0x0a, L8(row_s));
+    ret |= write_reg(sensor->slv_addr, 0x0b, H8(col_s));
+    ret |= write_reg(sensor->slv_addr, 0x0c, L8(col_s));
+    ret |= write_reg(sensor->slv_addr, 0x0d, H8(h + 8));
+    ret |= write_reg(sensor->slv_addr, 0x0e, L8(h + 8));
+    ret |= write_reg(sensor->slv_addr, 0x0f, H8(w + 8));
+    ret |= write_reg(sensor->slv_addr, 0x10, L8(w + 8));
 
-    write_reg(sensor->slv_addr, 0x95, H8(h));
-    write_reg(sensor->slv_addr, 0x96, L8(h));
-    write_reg(sensor->slv_addr, 0x97, H8(w));
-    write_reg(sensor->slv_addr, 0x98, L8(w));
+    ret |= write_reg(sensor->slv_addr, 0x95, H8(h));
+    ret |= write_reg(sensor->slv_addr, 0x96, L8(h));
+    ret |= write_reg(sensor->slv_addr, 0x97, H8(w));
+    ret |= write_reg(sensor->slv_addr, 0x98, L8(w));
 
 #endif
 
