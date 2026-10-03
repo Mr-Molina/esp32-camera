@@ -191,7 +191,7 @@ static int ov7670_frame_control(sensor_t *sensor, int hstart, int hstop, int vst
     frame[4].value = (vstop >> 2);
 
     frame[5].reg_num = VREF;
-    frame[5].value = (((vstop & 0x02) << 2) | (vstart & 0x02));
+    frame[5].value = (((vstop & 0x03) << 2) | (vstart & 0x03));
 
     /* End mark */
     frame[6].reg_num = 0xFF;
