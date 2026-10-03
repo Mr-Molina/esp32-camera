@@ -842,14 +842,18 @@ static int set_sharpness(sensor_t *sensor, int level)
 
 static int set_gainceiling(sensor_t *sensor, gainceiling_t level)
 {
-    int ret = 0, l = (int)level;
+    int ret = 0;
+    uint16_t reg_val = 16 << ((int)level + 1);
+    if (reg_val > 0x3FF) {
+        reg_val = 0x3FF;
+    }
 
-    ret = write_reg(sensor->slv_addr, 0x3A18, (l >> 8) & 3)
-       || write_reg(sensor->slv_addr, 0x3A19, l & 0xFF);
+    ret = write_reg(sensor->slv_addr, 0x3A18, (reg_val >> 8) & 3)
+       || write_reg(sensor->slv_addr, 0x3A19, reg_val & 0xFF);
 
     if (ret == 0) {
-        ESP_LOGD(TAG, "Set gainceiling to: %d", l);
-        sensor->status.gainceiling = l;
+        ESP_LOGD(TAG, "Set gainceiling to: %d", (int)level);
+        sensor->status.gainceiling = level;
     }
     return ret;
 }
@@ -974,7 +978,14 @@ static int init_status(sensor_t *sensor)
     sensor->status.sharpness = (read_reg(sensor->slv_addr, 0x5303) / 8) - 3;
     sensor->status.denoise = get_denoise(sensor);
     sensor->status.ae_level = 0;
-    sensor->status.gainceiling = read_reg16(sensor->slv_addr, 0x3A18) & 0x3FF;
+    {
+        uint16_t reg_val = read_reg16(sensor->slv_addr, 0x3A18) & 0x3FF;
+        gainceiling_t level = GAINCEILING_2X;
+        while (level < GAINCEILING_128X && (16 << ((int)level + 1)) < reg_val) {
+            level++;
+        }
+        sensor->status.gainceiling = level;
+    }
     sensor->status.awb = check_reg_mask(sensor->slv_addr, ISP_CONTROL_01, 0x01);
     sensor->status.dcw = !check_reg_mask(sensor->slv_addr, 0x5183, 0x80);
     sensor->status.agc = !check_reg_mask(sensor->slv_addr, AEC_PK_MANUAL, AEC_PK_MANUAL_AGC_MANUALEN);
