@@ -79,7 +79,7 @@ static IRAM_ATTR void convert_line_format(uint8_t * src, pixformat_t format, uin
         uint8_t r, g, b;
         l = width * 2;
         src += l * line;
-        for(i=0; i<l; i+=4) {
+        for(i=0; i+3<l; i+=4) {
             y0 = src[i];
             u = src[i+1];
             y1 = src[i+2];
@@ -91,6 +91,15 @@ static IRAM_ATTR void convert_line_format(uint8_t * src, pixformat_t format, uin
             dst[o++] = b;
 
             yuv2rgb(y1, u, v, &r, &g, &b);
+            dst[o++] = r;
+            dst[o++] = g;
+            dst[o++] = b;
+        }
+        if(i < l) {
+            y0 = src[i];
+            u = (i + 1 < l) ? src[i+1] : 128;
+            v = 128;
+            yuv2rgb(y0, u, v, &r, &g, &b);
             dst[o++] = r;
             dst[o++] = g;
             dst[o++] = b;
