@@ -635,12 +635,13 @@ esp_err_t cam_config(const camera_config_t *config, framesize_t frame_size, uint
 
 
 #if CONFIG_CAMERA_CORE0
-    xTaskCreatePinnedToCore(cam_task, "cam_task", CAM_TASK_STACK, NULL, configMAX_PRIORITIES - 2, &cam_obj->task_handle, 0);
+    BaseType_t task_ret = xTaskCreatePinnedToCore(cam_task, "cam_task", CAM_TASK_STACK, NULL, configMAX_PRIORITIES - 2, &cam_obj->task_handle, 0);
 #elif CONFIG_CAMERA_CORE1
-    xTaskCreatePinnedToCore(cam_task, "cam_task", CAM_TASK_STACK, NULL, configMAX_PRIORITIES - 2, &cam_obj->task_handle, 1);
+    BaseType_t task_ret = xTaskCreatePinnedToCore(cam_task, "cam_task", CAM_TASK_STACK, NULL, configMAX_PRIORITIES - 2, &cam_obj->task_handle, 1);
 #else
-    xTaskCreate(cam_task, "cam_task", CAM_TASK_STACK, NULL, configMAX_PRIORITIES - 2, &cam_obj->task_handle);
+    BaseType_t task_ret = xTaskCreate(cam_task, "cam_task", CAM_TASK_STACK, NULL, configMAX_PRIORITIES - 2, &cam_obj->task_handle);
 #endif
+    CAM_CHECK_GOTO(task_ret == pdPASS, "cam_task create failed", err);
 
     ESP_LOGI(TAG, "cam config ok");
     return ESP_OK;
@@ -657,17 +658,20 @@ esp_err_t cam_deinit(void)
     }
 
     cam_stop();
+    ll_cam_deinit(cam_obj);
+
     if (cam_obj->task_handle) {
         vTaskDelete(cam_obj->task_handle);
+        cam_obj->task_handle = NULL;
     }
     if (cam_obj->event_queue) {
         vQueueDelete(cam_obj->event_queue);
+        cam_obj->event_queue = NULL;
     }
     if (cam_obj->frame_buffer_queue) {
         vQueueDelete(cam_obj->frame_buffer_queue);
+        cam_obj->frame_buffer_queue = NULL;
     }
-
-    ll_cam_deinit(cam_obj);
 
     if (cam_obj->dma) {
         free(cam_obj->dma);
@@ -814,6 +818,9 @@ void cam_give(camera_fb_t *dma_buffer)
 }
 
 void cam_give_all(void) {
+    if (cam_obj->frame_buffer_queue) {
+        xQueueReset(cam_obj->frame_buffer_queue);
+    }
     for (int x = 0; x < cam_obj->frame_cnt; x++) {
         cam_obj->frames[x].en = 1;
     }
