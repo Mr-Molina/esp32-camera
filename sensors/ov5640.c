@@ -677,13 +677,20 @@ static int set_aec_value(sensor_t *sensor, int value)
         ESP_LOGE(TAG, "Could not read max aec_value");
         return -1;
     }
+    if (value < 0) {
+        value = 0;
+    }
     if (value > max_val) {
-        value =max_val;
+        value = max_val;
     }
 
-    ret =  write_reg(sensor->slv_addr, 0x3500, (value >> 12) & 0x0F)
-        || write_reg(sensor->slv_addr, 0x3501, (value >> 4) & 0xFF)
-        || write_reg(sensor->slv_addr, 0x3502, (value << 4) & 0xF0);
+    ret = write_reg(sensor->slv_addr, 0x3500, (value >> 12) & 0x0F);
+    if (ret == 0) {
+        ret = write_reg(sensor->slv_addr, 0x3501, (value >> 4) & 0xFF);
+    }
+    if (ret == 0) {
+        ret = write_reg(sensor->slv_addr, 0x3502, (value << 4) & 0xF0);
+    }
 
     if (ret == 0) {
         ESP_LOGD(TAG, "Set aec_value to: %d / %d", value, max_val);
