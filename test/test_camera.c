@@ -12,7 +12,9 @@
 #include "esp_camera.h"
 
 #ifdef CONFIG_IDF_TARGET_ESP32
+#if !defined(BOARD_WROVER_KIT) && !defined(BOARD_ESP32CAM_AITHINKER)
 #define BOARD_WROVER_KIT 1
+#endif
 #elif defined CONFIG_IDF_TARGET_ESP32S2
 #define BOARD_CAMERA_MODEL_ESP32S2 1
 #elif defined CONFIG_IDF_TARGET_ESP32S3
@@ -109,8 +111,8 @@
 
 #endif
 
-#define I2C_MASTER_SCL_IO           4      /*!< GPIO number used for I2C master clock */
-#define I2C_MASTER_SDA_IO           5      /*!< GPIO number used for I2C master data  */
+#define I2C_MASTER_SCL_IO           SIOC_GPIO_NUM /*!< GPIO number used for I2C master clock */
+#define I2C_MASTER_SDA_IO           SIOD_GPIO_NUM /*!< GPIO number used for I2C master data  */
 #define I2C_MASTER_NUM              0      /*!< I2C master i2c port number, the number of i2c peripheral interfaces available will depend on the chip */
 #define I2C_MASTER_FREQ_HZ          100000 /*!< I2C master clock frequency */
 
@@ -211,7 +213,11 @@ static void printf_img_base64(const camera_fb_t *pic)
     uint8_t *outbuffer = NULL;
     size_t outsize = 0;
     if (PIXFORMAT_JPEG != pic->format) {
-        fmt2jpg(pic->buf, pic->width * pic->height * 2, pic->width, pic->height, pic->format, 50, &outbuffer, &outsize);
+        bool ok = fmt2jpg(pic->buf, pic->width * pic->height * 2, pic->width, pic->height, pic->format, 50, &outbuffer, &outsize);
+        if (!ok || !outbuffer) {
+            ESP_LOGE(TAG, "fmt2jpg failed");
+            return;
+        }
     } else {
         outbuffer = pic->buf;
         outsize = pic->len;
@@ -220,14 +226,19 @@ static void printf_img_base64(const camera_fb_t *pic)
     uint8_t *base64_buf = calloc(1, outsize * 4);
     if (NULL != base64_buf) {
         size_t out_len = 0;
-        mbedtls_base64_encode(base64_buf, outsize * 4, &out_len, outbuffer, outsize);
-        printf("%s\n", base64_buf);
-        free(base64_buf);
-        if (PIXFORMAT_JPEG != pic->format) {
-            free(outbuffer);
+        int ret = mbedtls_base64_encode(base64_buf, outsize * 4, &out_len, outbuffer, outsize);
+        if (ret == 0) {
+            printf("%s\n", base64_buf);
+        } else {
+            ESP_LOGE(TAG, "mbedtls_base64_encode failed");
         }
+        free(base64_buf);
     } else {
         ESP_LOGE(TAG, "malloc for base64 buffer failed");
+    }
+
+    if (PIXFORMAT_JPEG != pic->format && outbuffer != NULL) {
+        free(outbuffer);
     }
 }
 
@@ -405,7 +416,9 @@ static const decode_func_t g_decode_func[2][2] = {
 
 static float jpg_decode_test(uint8_t decoder_index, decode_type_t type, const uint8_t *jpg, uint32_t length, uint32_t img_w, uint32_t img_h, uint32_t times)
 {
+    TEST_ASSERT_NOT_NULL(jpg);
     uint8_t *jpg_buf = malloc(length);
+    TEST_ASSERT_NOT_NULL(jpg_buf);
     if (NULL == jpg_buf) {
         ESP_LOGE(TAG, "malloc for jpg buffer failed");
         return 0;
@@ -413,6 +426,7 @@ static float jpg_decode_test(uint8_t decoder_index, decode_type_t type, const ui
     memcpy(jpg_buf, jpg, length);
 
     uint8_t *rgb_buf = heap_caps_malloc(img_w * img_h * 3, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    TEST_ASSERT_NOT_NULL(rgb_buf);
     if (NULL == rgb_buf) {
         free(jpg_buf);
         ESP_LOGE(TAG, "malloc for rgb buffer failed");
