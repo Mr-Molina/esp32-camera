@@ -212,6 +212,9 @@ static int set_window(sensor_t *sensor, ov2640_sensor_mode_t mode, int offset_x,
 
 static int set_framesize(sensor_t *sensor, framesize_t framesize)
 {
+    if (framesize > FRAMESIZE_UXGA) {
+        return -1;
+    }
     int ret = 0;
     uint16_t w = resolution[framesize].width;
     uint16_t h = resolution[framesize].height;
