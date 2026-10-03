@@ -113,16 +113,25 @@ static esp_err_t ov5640_af_firmware_load(sensor_t *sensor, uint32_t timeout_ms)
         addr++;
     }
 
-    (void)ov5640_reg_write(sensor, OV5640_CMD_MAIN, 0x00);
-    (void)ov5640_reg_write(sensor, OV5640_CMD_ACK, 0x00);
-    (void)ov5640_reg_write(sensor, OV5640_CMD_PARA0, 0x00);
-    (void)ov5640_reg_write(sensor, OV5640_CMD_PARA1, 0x00);
-    (void)ov5640_reg_write(sensor, OV5640_CMD_PARA2, 0x00);
-    (void)ov5640_reg_write(sensor, OV5640_CMD_PARA3, 0x00);
-    (void)ov5640_reg_write(sensor, OV5640_CMD_PARA4, 0x00);
+    ret = ov5640_reg_write(sensor, OV5640_CMD_MAIN, 0x00);
+    if (ret != ESP_OK) return ret;
+    ret = ov5640_reg_write(sensor, OV5640_CMD_ACK, 0x00);
+    if (ret != ESP_OK) return ret;
+    ret = ov5640_reg_write(sensor, OV5640_CMD_PARA0, 0x00);
+    if (ret != ESP_OK) return ret;
+    ret = ov5640_reg_write(sensor, OV5640_CMD_PARA1, 0x00);
+    if (ret != ESP_OK) return ret;
+    ret = ov5640_reg_write(sensor, OV5640_CMD_PARA2, 0x00);
+    if (ret != ESP_OK) return ret;
+    ret = ov5640_reg_write(sensor, OV5640_CMD_PARA3, 0x00);
+    if (ret != ESP_OK) return ret;
+    ret = ov5640_reg_write(sensor, OV5640_CMD_PARA4, 0x00);
+    if (ret != ESP_OK) return ret;
 
-    (void)ov5640_reg_write(sensor, OV5640_CMD_FW_STATUS, 0x7f);
-    (void)ov5640_reg_write(sensor, 0x3000, 0x00); // start MCU
+    ret = ov5640_reg_write(sensor, OV5640_CMD_FW_STATUS, 0x7f);
+    if (ret != ESP_OK) return ret;
+    ret = ov5640_reg_write(sensor, 0x3000, 0x00); // start MCU
+    if (ret != ESP_OK) return ret;
 
     return ov5640_af_wait_fw_idle(sensor, timeout_ms);
 }

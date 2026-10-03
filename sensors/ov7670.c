@@ -315,8 +315,8 @@ static int set_colorbar(sensor_t *sensor, int enable)
     // Write pattern to SCALING_YSC
     ret = ret | SCCB_Write(sensor->slv_addr, SCALING_YSC, reg);
 
-    // return 0 or 0xFF
-    return ret;
+    // return 0 or -1
+    return ret ? -1 : 0;
 }
 
 static int set_whitebal(sensor_t *sensor, int enable)
