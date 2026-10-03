@@ -292,9 +292,9 @@ static int analog_gain (sensor_t *sensor, int val)
 static int exposure_line (sensor_t *sensor, int val)
 {
 
-     int ret = 0;
+    int ret = 0;
     ret = write_reg(sensor->slv_addr, MANUAL_EXP_H_REG, val>>8);
-    ret += write_reg(sensor->slv_addr, MANUAL_EXP_L_REG, val>>8);
+    ret += write_reg(sensor->slv_addr, MANUAL_EXP_L_REG, val & 0xFF);
     if (ret == 0) {
         ESP_LOGD(TAG, "Set exposure_line to: %d", val);
     }
