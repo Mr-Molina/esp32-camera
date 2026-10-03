@@ -100,6 +100,14 @@ static IRAM_ATTR void convert_line_format(uint8_t * src, pixformat_t format, uin
 
 bool convert_image(uint8_t *src, uint16_t width, uint16_t height, pixformat_t format, uint8_t quality, jpge::output_stream *dst_stream)
 {
+    if(format != PIXFORMAT_GRAYSCALE &&
+       format != PIXFORMAT_RGB888 &&
+       format != PIXFORMAT_RGB565 &&
+       format != PIXFORMAT_YUV422) {
+        ESP_LOGE(TAG, "Format %d not supported", format);
+        return false;
+    }
+
     int num_channels = 3;
     jpge::subsampling_t subsampling = default_subsampling;
 
@@ -217,6 +225,24 @@ public:
 
 bool fmt2jpg(uint8_t *src, size_t src_len, uint16_t width, uint16_t height, pixformat_t format, uint8_t quality, uint8_t ** out, size_t * out_len)
 {
+    *out = NULL;
+    *out_len = 0;
+
+    if(format == PIXFORMAT_JPEG) {
+        if(!src || !src_len) {
+            return false;
+        }
+        uint8_t * jpg_buf = (uint8_t *)_malloc(src_len);
+        if(jpg_buf == NULL) {
+            ESP_LOGE(TAG, "JPG buffer malloc failed");
+            return false;
+        }
+        memcpy(jpg_buf, src, src_len);
+        *out = jpg_buf;
+        *out_len = src_len;
+        return true;
+    }
+
     //todo: allocate proper buffer for holding JPEG data
     //this should be enough for CIF frame size
     int jpg_buf_len = 128*1024;

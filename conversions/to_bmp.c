@@ -234,6 +234,8 @@ bool fmt2rgb888_bounded(const uint8_t *src_buf, size_t src_len, pixformat_t form
             *rgb_buf++ = g;
             *rgb_buf++ = r;
         }
+    } else {
+        return false;
     }
     return true;
 }
@@ -252,6 +254,14 @@ bool fmt2bmp(uint8_t *src, size_t src_len, uint16_t width, uint16_t height, pixf
 
     *out = NULL;
     *out_len = 0;
+
+    if(format != PIXFORMAT_RGB888 &&
+       format != PIXFORMAT_RGB565 &&
+       format != PIXFORMAT_GRAYSCALE &&
+       format != PIXFORMAT_YUV422) {
+        ESP_LOGE(TAG, "Unsupported format %d", format);
+        return false;
+    }
 
     int pix_count = width*height;
 
