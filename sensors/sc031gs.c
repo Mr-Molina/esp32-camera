@@ -152,6 +152,10 @@ static int set_agc_gain(sensor_t *sensor, int gain)
     int ret = 0;
     uint32_t coarse_gain, fine_gain, fine_again_reg_v, coarse_gain_reg_v;
 
+    if (gain < 16) {
+        gain = 16;
+    }
+
     if (gain < 0x20) {
         WRITE_REG_OR_RETURN(0x3314, 0x3a);
         WRITE_REG_OR_RETURN(0x3317, 0x20);
@@ -235,6 +239,10 @@ static int set_output_window(sensor_t *sensor, int offset_x, int offset_y, int w
 
 static int set_framesize(sensor_t *sensor, framesize_t framesize)
 {
+    if (framesize >= FRAMESIZE_INVALID) {
+        goto err;
+    }
+
     uint16_t w = resolution[framesize].width;
     uint16_t h = resolution[framesize].height;
 

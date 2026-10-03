@@ -236,6 +236,10 @@ static int set_window(sensor_t *sensor, int offset_x, int offset_y, int w, int h
 
 static int set_framesize(sensor_t *sensor, framesize_t framesize)
 {
+    if (framesize >= FRAMESIZE_INVALID) {
+        goto err;
+    }
+
     uint16_t w = resolution[framesize].width;
     uint16_t h = resolution[framesize].height;
     if(w>SC101_MAX_FRAME_WIDTH || h > SC101_MAX_FRAME_HIGH) {
