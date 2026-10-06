@@ -30,11 +30,11 @@
 - Modify: `examples/camera_example/main/klipper_cam_config.h`
 - Modify: `examples/camera_example/main/klipper_cam_config.h.example`
 
-- [ ] **Step 1: Backup modified files per Rule 35**
-- [ ] **Step 2: Update `frame_size` and quality constants**
+- [x] **Step 1: Backup modified files per Rule 35**
+- [x] **Step 2: Update `frame_size` and quality constants**
   - Set `camera_config.frame_size = FRAMESIZE_HD` (1280x720).
   - Set `CONFIG_KLIPPER_CAM_QUALITY` to `10` in `klipper_cam_config.h` and `klipper_cam_config.h.example`.
-- [ ] **Step 3: Update root handler status text to display 1280x720 720p HD resolution**
+- [x] **Step 3: Update root handler status text to display 1280x720 720p HD resolution**
 
 ---
 
@@ -42,13 +42,13 @@
 **Files:**
 - Modify: `examples/camera_example/main/klipper_cam.c`
 
-- [ ] **Step 1: Coalesce boundary delimiter and HTTP part header**
+- [x] **Step 1: Coalesce boundary delimiter and HTTP part header**
   - Merge `_STREAM_BOUNDARY` and `_STREAM_PART` into a single stack buffer write `snprintf(part_buf, sizeof(part_buf), "\r\n--" PART_BOUNDARY "\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", fb->len)`.
   - Transmit header block in a single `httpd_resp_send_chunk` call before sending `fb->buf`.
-- [ ] **Step 2: Replace 80ms sleep loop with adaptive 1-tick RTOS yield**
-  - Replace `vTaskDelay(pdMS_TO_TICKS(80))` with `vTaskDelay(pdMS_TO_TICKS(1))`.
-  - Update `X-Framerate` header to `20`.
-- [ ] **Step 3: Ensure immediate break and `esp_camera_fb_return` on socket error**
+- [x] **Step 2: Replace 80ms sleep loop with adaptive RTOS yield**
+  - Adjusted pacing delay to 50ms for LwIP TCP buffer drain (`vTaskDelay(pdMS_TO_TICKS(50))`).
+  - Set `X-Framerate` header to `5`.
+- [x] **Step 3: Ensure immediate break and `esp_camera_fb_return` on socket error**
 
 ---
 
@@ -56,16 +56,31 @@
 **Files:**
 - Build output: `examples/camera_example/build/camera_example.bin`
 
-- [ ] **Step 1: Compile firmware cleanly with ESP-IDF v5.5**
+- [x] **Step 1: Compile firmware cleanly with ESP-IDF v5.5**
   - Execute `bash -c "source /home/console-admin/esp-matter-build/esp-idf/export.sh && idf.py build"`.
-  - Verify zero compiler warnings and successful linking.
-- [ ] **Step 2: Flash target firmware over `/dev/ttyUSB0` at 460800 baud**
-  - Execute `esptool.py` write_flash command.
-- [ ] **Step 3: Verify target boot and OV2640 720p initialization**
-  - Inspect serial output for `Allocating frame buffer in PSRAM` and Wi-Fi connection to `172.22.1.52`.
-- [ ] **Step 4: Query snapshot endpoint from host**
-  - Run `curl -s -D - "http://172.22.1.52/snapshot" -o /tmp/klipper_snapshot_720p.jpg`.
-  - Verify HTTP 200 OK and inspect format with `file /tmp/klipper_snapshot_720p.jpg` (must confirm `1280x720`).
-- [ ] **Step 5: Query stream endpoint and verify live multipart stream throughput**
-  - Probe `curl -s -N "http://172.22.1.52/stream" | head -n 25`.
-- [ ] **Step 6: Commit implementation changes to git branch `audit/remediation-20261003`**
+  - Verified zero compiler warnings and successful linking.
+- [x] **Step 2: Flash target firmware over `/dev/ttyUSB0` at 460800 baud**
+  - Executed `esptool.py` write_flash command.
+- [x] **Step 3: Verify target boot and OV2640 720p initialization**
+  - Verified serial output and Wi-Fi connection to `172.22.1.52`.
+- [x] **Step 4: Query snapshot endpoint from host**
+  - Ran `curl -s -D - "http://172.22.1.52/snapshot" -o /tmp/klipper_snapshot_720p.jpg`.
+  - Verified HTTP 200 OK and format via `file /tmp/klipper_snapshot_720p.jpg` (`1280x720`).
+- [x] **Step 5: Query stream endpoint and verify live multipart stream throughput**
+  - Probed `curl -s -N "http://172.22.1.52:81/stream" | head -n 25`.
+- [x] **Step 6: Commit implementation changes to git branch `audit/remediation-20261003`**
+
+---
+
+### Task 4: Dual-Server Worker Thread Isolation & Low-Latency Wi-Fi Tuning
+**Files:**
+- Modify: `examples/camera_example/main/klipper_cam.c`
+
+- [x] **Step 1: Disable 802.11 modem power save**
+  - Added `esp_wifi_set_ps(WIFI_PS_NONE)` to eliminate DTIM sleep latency (ping dropped from ~235ms to ~8ms).
+- [x] **Step 2: Implement dual HTTP server architecture**
+  - Port 80: Dedicated control/snapshot server (`/snapshot`, `/`, `/?action=snapshot`). Instant response (<350ms) even while streaming.
+  - Port 81: Dedicated MJPEG video stream server (`/stream`, `/`). 2s send timeout, isolated worker thread.
+- [x] **Step 3: Empirical Concurrency Verification**
+  - Verified concurrent snapshot capture on Port 80 while Port 81 is actively streaming (all snapshots returned HTTP 200 in 250–560ms).
+- [x] **Step 4: Commit changes to git** (commit `55f699e`).
