@@ -5,3 +5,4 @@
 **/sdkconfig.old
 **/dependencies.lock
 **/managed_components/**
+examples/camera_example/main/klipper_cam_config.h
