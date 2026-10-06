@@ -21,6 +21,7 @@
 
 static const char *TAG = "klipper_cam";
 
+static httpd_handle_t s_camera_httpd = NULL;
 static httpd_handle_t s_stream_httpd = NULL;
 
 /* -------------------------------------------------------------------------- */
@@ -97,7 +98,7 @@ static esp_err_t stream_handler(httpd_req_t *req)
     }
 
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    httpd_resp_set_hdr(req, "X-Framerate", "20");
+    httpd_resp_set_hdr(req, "X-Framerate", "5");
 
     ESP_LOGI(TAG, "MJPEG stream client connected");
 
@@ -124,7 +125,7 @@ static esp_err_t stream_handler(httpd_req_t *req)
             break;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(1)); /* Minimal RTOS yield for maximum framerate */
+        vTaskDelay(pdMS_TO_TICKS(50)); /* 50ms socket pacing for LwIP TCP buffer drain */
     }
 
     ESP_LOGI(TAG, "MJPEG stream client disconnected");
@@ -164,17 +165,18 @@ static esp_err_t root_handler(httpd_req_t *req)
     const char *status_page = 
         "Klipper 3D Printer Camera (ESP32-WROVER-DEV)\n"
         "Resolution: 1280x720 HD 16:9 (OV2640 Hardware JPEG)\n"
-        "Framerate:  18-22 FPS (Optimized Non-Blocking MJPEG)\n"
+        "Framerate:  4-5 FPS (OV2640 Hardware HD Limit with LwIP Pacing)\n"
         "\n"
         "Endpoints:\n"
-        "  - Stream:   /stream   (or /?action=stream)\n"
-        "  - Snapshot: /snapshot (or /?action=snapshot)\n"
+        "  - Dedicated Stream: http://<this-ip>:81/stream (Isolated Worker Task)\n"
+        "  - Snapshot:         http://<this-ip>/snapshot  (Instantaneous, Zero-Block)\n"
+        "  - Stream Alias:     http://<this-ip>/stream\n"
         "\n"
         "Moonraker Configuration:\n"
         "  [webcam printer_cam]\n"
         "  location: printer\n"
         "  service: mjpegstreamer-adaptive\n"
-        "  stream_url: http://<this-ip>/stream\n"
+        "  stream_url: http://<this-ip>:81/stream\n"
         "  snapshot_url: http://<this-ip>/snapshot\n";
 
     httpd_resp_set_type(req, "text/plain");
@@ -182,20 +184,14 @@ static esp_err_t root_handler(httpd_req_t *req)
     return httpd_resp_send(req, status_page, strlen(status_page));
 }
 
-static httpd_handle_t start_webserver(void)
+static void start_webservers(void)
 {
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.server_port = 80;
-    config.ctrl_port = 32768;
-    config.max_open_sockets = 4;
-    config.lru_purge_enable = true;
-
-    httpd_uri_t uri_stream = {
-        .uri       = "/stream",
-        .method    = HTTP_GET,
-        .handler   = stream_handler,
-        .user_ctx  = NULL
-    };
+    /* 1. Main HTTP Server on Port 80: Handles snapshots, status, and control */
+    httpd_config_t config_p80 = HTTPD_DEFAULT_CONFIG();
+    config_p80.server_port = 80;
+    config_p80.ctrl_port = 32768;
+    config_p80.max_open_sockets = 4;
+    config_p80.lru_purge_enable = true;
 
     httpd_uri_t uri_snapshot = {
         .uri       = "/snapshot",
@@ -211,18 +207,54 @@ static httpd_handle_t start_webserver(void)
         .user_ctx  = NULL
     };
 
-    ESP_LOGI(TAG, "Starting HTTP server on port %d...", config.server_port);
-    httpd_handle_t server = NULL;
-    if (httpd_start(&server, &config) == ESP_OK) {
-        httpd_register_uri_handler(server, &uri_stream);
-        httpd_register_uri_handler(server, &uri_snapshot);
-        httpd_register_uri_handler(server, &uri_root);
-        ESP_LOGI(TAG, "HTTP Server started successfully. Endpoints: /stream, /snapshot");
-        return server;
+    httpd_uri_t uri_stream_p80 = {
+        .uri       = "/stream",
+        .method    = HTTP_GET,
+        .handler   = stream_handler,
+        .user_ctx  = NULL
+    };
+
+    ESP_LOGI(TAG, "Starting main HTTP server on port %d...", config_p80.server_port);
+    if (httpd_start(&s_camera_httpd, &config_p80) == ESP_OK) {
+        httpd_register_uri_handler(s_camera_httpd, &uri_snapshot);
+        httpd_register_uri_handler(s_camera_httpd, &uri_root);
+        httpd_register_uri_handler(s_camera_httpd, &uri_stream_p80);
+        ESP_LOGI(TAG, "Main HTTP server active on port 80 (/snapshot, /)");
+    } else {
+        ESP_LOGE(TAG, "Error starting main HTTP server on port 80!");
     }
 
-    ESP_LOGE(TAG, "Error starting HTTP server!");
-    return NULL;
+    /* 2. Dedicated Video Stream Server on Port 81: Isolated FreeRTOS task */
+    httpd_config_t config_p81 = HTTPD_DEFAULT_CONFIG();
+    config_p81.server_port = 81;
+    config_p81.ctrl_port = 32769;
+    config_p81.max_open_sockets = 2;
+    config_p81.send_wait_timeout = 2;
+    config_p81.recv_wait_timeout = 2;
+    config_p81.lru_purge_enable = true;
+
+    httpd_uri_t uri_stream_p81 = {
+        .uri       = "/stream",
+        .method    = HTTP_GET,
+        .handler   = stream_handler,
+        .user_ctx  = NULL
+    };
+
+    httpd_uri_t uri_root_p81 = {
+        .uri       = "/",
+        .method    = HTTP_GET,
+        .handler   = stream_handler,
+        .user_ctx  = NULL
+    };
+
+    ESP_LOGI(TAG, "Starting dedicated MJPEG stream server on port %d...", config_p81.server_port);
+    if (httpd_start(&s_stream_httpd, &config_p81) == ESP_OK) {
+        httpd_register_uri_handler(s_stream_httpd, &uri_stream_p81);
+        httpd_register_uri_handler(s_stream_httpd, &uri_root_p81);
+        ESP_LOGI(TAG, "Dedicated MJPEG stream server active on port 81 (/stream, /)");
+    } else {
+        ESP_LOGE(TAG, "Error starting dedicated stream server on port 81!");
+    }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -243,12 +275,12 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(TAG, "==========================================================");
         ESP_LOGI(TAG, "Wi-Fi Connected! IP Address: " IPSTR, IP2STR(&event->ip_info.ip));
-        ESP_LOGI(TAG, "Stream URL:   http://" IPSTR "/stream", IP2STR(&event->ip_info.ip));
-        ESP_LOGI(TAG, "Snapshot URL: http://" IPSTR "/snapshot", IP2STR(&event->ip_info.ip));
+        ESP_LOGI(TAG, "Dedicated Stream URL: http://" IPSTR ":81/stream", IP2STR(&event->ip_info.ip));
+        ESP_LOGI(TAG, "Control/Snapshot URL: http://" IPSTR "/snapshot", IP2STR(&event->ip_info.ip));
         ESP_LOGI(TAG, "==========================================================");
 
-        if (s_stream_httpd == NULL) {
-            s_stream_httpd = start_webserver();
+        if (s_camera_httpd == NULL && s_stream_httpd == NULL) {
+            start_webservers();
         }
     }
 }
@@ -306,6 +338,8 @@ static void wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+    ESP_LOGI(TAG, "Wi-Fi modem sleep disabled (WIFI_PS_NONE active for line-rate video throughput)");
 }
 
 /* -------------------------------------------------------------------------- */
