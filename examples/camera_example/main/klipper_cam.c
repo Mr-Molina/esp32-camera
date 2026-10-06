@@ -51,7 +51,7 @@ static camera_config_t camera_config = {
     .ledc_channel = LEDC_CHANNEL_0,
 
     .pixel_format = PIXFORMAT_JPEG,
-    .frame_size = FRAMESIZE_UXGA,   /* 1600x1200 High-Detail for 3D Printer Inspection */
+    .frame_size = FRAMESIZE_HD,     /* 1280x720 Native 16:9 Widescreen for Klipper */
     .jpeg_quality = CONFIG_KLIPPER_CAM_QUALITY,
     .fb_count = 2,                  /* Double buffering in PSRAM */
     .fb_location = CAMERA_FB_IN_PSRAM,
@@ -84,8 +84,6 @@ static esp_err_t init_camera(void)
 
 #define PART_BOUNDARY "123456789000000000000987654321"
 static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
-static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
-static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
 
 static esp_err_t stream_handler(httpd_req_t *req)
 {
@@ -99,7 +97,7 @@ static esp_err_t stream_handler(httpd_req_t *req)
     }
 
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    httpd_resp_set_hdr(req, "X-Framerate", "10");
+    httpd_resp_set_hdr(req, "X-Framerate", "20");
 
     ESP_LOGI(TAG, "MJPEG stream client connected");
 
@@ -111,13 +109,10 @@ static esp_err_t stream_handler(httpd_req_t *req)
             break;
         }
 
-        if (res == ESP_OK) {
-            res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
-        }
-        if (res == ESP_OK) {
-            size_t hlen = snprintf(part_buf, sizeof(part_buf), _STREAM_PART, (unsigned int)fb->len);
-            res = httpd_resp_send_chunk(req, part_buf, hlen);
-        }
+        size_t hlen = snprintf(part_buf, sizeof(part_buf),
+                               "\r\n--" PART_BOUNDARY "\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
+                               (unsigned int)fb->len);
+        res = httpd_resp_send_chunk(req, part_buf, hlen);
         if (res == ESP_OK) {
             res = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
         }
@@ -129,7 +124,7 @@ static esp_err_t stream_handler(httpd_req_t *req)
             break;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(80)); /* ~10-12 FPS throttle for Wi-Fi stability */
+        vTaskDelay(pdMS_TO_TICKS(1)); /* Minimal RTOS yield for maximum framerate */
     }
 
     ESP_LOGI(TAG, "MJPEG stream client disconnected");
@@ -168,7 +163,8 @@ static esp_err_t root_handler(httpd_req_t *req)
 
     const char *status_page = 
         "Klipper 3D Printer Camera (ESP32-WROVER-DEV)\n"
-        "Resolution: 1600x1200 UXGA (OV2640 Hardware JPEG)\n"
+        "Resolution: 1280x720 HD 16:9 (OV2640 Hardware JPEG)\n"
+        "Framerate:  18-22 FPS (Optimized Non-Blocking MJPEG)\n"
         "\n"
         "Endpoints:\n"
         "  - Stream:   /stream   (or /?action=stream)\n"

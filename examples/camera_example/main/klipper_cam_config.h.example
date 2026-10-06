@@ -32,7 +32,7 @@ extern "C" {
  */
 #define CONFIG_KLIPPER_CAM_VFLIP    0   /* 1 = Invert vertical (for upside-down bed/gantry mounts) */
 #define CONFIG_KLIPPER_CAM_HMIRROR  0   /* 1 = Invert horizontal */
-#define CONFIG_KLIPPER_CAM_QUALITY  12  /* JPEG quality (0-63, lower is higher quality) */
+#define CONFIG_KLIPPER_CAM_QUALITY  10  /* JPEG quality (0-63, lower is higher quality) */
 
 #ifdef __cplusplus
 }
