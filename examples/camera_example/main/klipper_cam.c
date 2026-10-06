@@ -13,6 +13,8 @@
 #include "nvs_flash.h"
 #include "esp_netif.h"
 #include "esp_http_server.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
 
 #include "esp_camera.h"
 #define BOARD_WROVER_KIT 1
@@ -171,6 +173,7 @@ static esp_err_t root_handler(httpd_req_t *req)
         "  - Dedicated Stream: http://<this-ip>:81/stream (Isolated Worker Task)\n"
         "  - Snapshot:         http://<this-ip>/snapshot  (Instantaneous, Zero-Block)\n"
         "  - Stream Alias:     http://<this-ip>/stream\n"
+        "  - OTA Update:       http://<this-ip>/update\n"
         "\n"
         "Moonraker Configuration:\n"
         "  [webcam printer_cam]\n"
@@ -184,9 +187,173 @@ static esp_err_t root_handler(httpd_req_t *req)
     return httpd_resp_send(req, status_page, strlen(status_page));
 }
 
+/* -------------------------------------------------------------------------- */
+/*                               OTA Update Handlers                          */
+/* -------------------------------------------------------------------------- */
+
+static esp_err_t ota_update_get_handler(httpd_req_t *req)
+{
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
+
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+    httpd_resp_sendstr_chunk(req,
+        "<!DOCTYPE html><html><head><title>Klipper Cam OTA Update</title>"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+        "<style>body{font-family:sans-serif;margin:40px;background:#1e1e1e;color:#eee}"
+        ".card{background:#2a2a2a;padding:24px;border-radius:8px;max-width:500px;margin:auto}"
+        "input,button{margin:12px 0;padding:10px;border-radius:4px;border:none;font-size:16px}"
+        "button{background:#007acc;color:#fff;cursor:pointer;width:100%}"
+        "#prg{width:100%;background:#444;border-radius:4px;height:20px;display:none;margin-top:12px}"
+        "#bar{width:0%;height:100%;background:#28a745;border-radius:4px;text-align:center;font-size:12px;line-height:20px}"
+        "</style></head><body><div class=\"card\">"
+        "<h2>Klipper Cam OTA Update</h2>");
+
+    char info_buf[256];
+    snprintf(info_buf, sizeof(info_buf),
+        "<p>Running Partition: <b>%s</b></p>"
+        "<p>Next Target: <b>%s</b></p>",
+        running ? running->label : "unknown",
+        update_partition ? update_partition->label : "none");
+    httpd_resp_sendstr_chunk(req, info_buf);
+
+    httpd_resp_sendstr_chunk(req,
+        "<input type=\"file\" id=\"f\" accept=\".bin\"><br>"
+        "<button id=\"btn\" onclick=\"upload()\">Flash Firmware</button>"
+        "<div id=\"prg\"><div id=\"bar\">0%</div></div>"
+        "<p id=\"st\"></p>"
+        "</div><script>"
+        "function upload(){"
+        "  var file=document.getElementById('f').files[0];"
+        "  if(!file){alert('Select .bin file first');return;}"
+        "  document.getElementById('btn').disabled=true;"
+        "  document.getElementById('prg').style.display='block';"
+        "  document.getElementById('st').innerText='Uploading and writing flash...';"
+        "  var xhr=new XMLHttpRequest();"
+        "  xhr.open('POST','/update',true);"
+        "  xhr.upload.onprogress=function(e){if(e.lengthComputable){"
+        "    var p=Math.round((e.loaded/e.total)*100);"
+        "    document.getElementById('bar').style.width=p+'%';"
+        "    document.getElementById('bar').innerText=p+'%';"
+        "  }};"
+        "  xhr.onload=function(){"
+        "    if(xhr.status==200){"
+        "      document.getElementById('st').innerText='Flash successful! Rebooting in 5s...';"
+        "      setTimeout(function(){location.href='/';},5000);"
+        "    }else{"
+        "      document.getElementById('st').innerText='Error: '+xhr.responseText;"
+        "      document.getElementById('btn').disabled=false;"
+        "    }"
+        "  };"
+        "  xhr.onerror=function(){"
+        "    document.getElementById('st').innerText='Network error during upload';"
+        "    document.getElementById('btn').disabled=false;"
+        "  };"
+        "  xhr.send(file);"
+        "}"
+        "</script></body></html>");
+
+    return httpd_resp_sendstr_chunk(req, NULL);
+}
+
+static esp_err_t ota_update_post_handler(httpd_req_t *req)
+{
+    esp_ota_handle_t update_handle = 0;
+    const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
+
+    if (update_partition == NULL) {
+        ESP_LOGE(TAG, "OTA failed: Next update partition not found");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No passive OTA partition found");
+        return ESP_FAIL;
+    }
+
+    int total_len = req->content_len;
+    if (total_len <= 0) {
+        ESP_LOGE(TAG, "OTA failed: Missing or invalid Content-Length: %d", total_len);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Content-Length header required");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Starting OTA update: size=%d bytes, writing to partition '%s' (offset 0x%08lx)",
+             total_len, update_partition->label, (unsigned long)update_partition->address);
+
+    esp_err_t err = esp_ota_begin(update_partition, OTA_WITH_SEQUENTIAL_WRITES, &update_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_begin failed: %s", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "esp_ota_begin failed");
+        return ESP_FAIL;
+    }
+
+    char *ota_buf = malloc(1024);
+    if (!ota_buf) {
+        esp_ota_abort(update_handle);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA buffer allocation failed");
+        return ESP_ERR_NO_MEM;
+    }
+
+    int remaining = total_len;
+    int received = 0;
+
+    while (remaining > 0) {
+        int to_read = remaining > 1024 ? 1024 : remaining;
+        int ret = httpd_req_recv(req, ota_buf, to_read);
+        if (ret <= 0) {
+            if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+                continue;
+            }
+            ESP_LOGE(TAG, "OTA socket read error: %d", ret);
+            free(ota_buf);
+            esp_ota_abort(update_handle);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA socket read error");
+            return ESP_FAIL;
+        }
+
+        err = esp_ota_write(update_handle, (const void *)ota_buf, ret);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_ota_write failed at %d bytes: %s", received, esp_err_to_name(err));
+            free(ota_buf);
+            esp_ota_abort(update_handle);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "esp_ota_write failed");
+            return ESP_FAIL;
+        }
+
+        remaining -= ret;
+        received += ret;
+    }
+
+    free(ota_buf);
+
+    err = esp_ota_end(update_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_end failed (signature/image validation error): %s", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Firmware image validation failed");
+        return ESP_FAIL;
+    }
+
+    err = esp_ota_set_boot_partition(update_partition);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_set_boot_partition failed: %s", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to update boot partition");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "OTA firmware update successful! Written %d bytes to '%s'. Scheduling restart...",
+             received, update_partition->label);
+
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_sendstr(req, "Firmware update successful! Rebooting...\n");
+
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    esp_restart();
+    return ESP_OK;
+}
+
 static void start_webservers(void)
 {
-    /* 1. Main HTTP Server on Port 80: Handles snapshots, status, and control */
+    /* 1. Main HTTP Server on Port 80: Handles snapshots, status, OTA updates, and control */
     httpd_config_t config_p80 = HTTPD_DEFAULT_CONFIG();
     config_p80.server_port = 80;
     config_p80.ctrl_port = 32768;
@@ -214,12 +381,28 @@ static void start_webservers(void)
         .user_ctx  = NULL
     };
 
+    httpd_uri_t uri_ota_get = {
+        .uri       = "/update",
+        .method    = HTTP_GET,
+        .handler   = ota_update_get_handler,
+        .user_ctx  = NULL
+    };
+
+    httpd_uri_t uri_ota_post = {
+        .uri       = "/update",
+        .method    = HTTP_POST,
+        .handler   = ota_update_post_handler,
+        .user_ctx  = NULL
+    };
+
     ESP_LOGI(TAG, "Starting main HTTP server on port %d...", config_p80.server_port);
     if (httpd_start(&s_camera_httpd, &config_p80) == ESP_OK) {
         httpd_register_uri_handler(s_camera_httpd, &uri_snapshot);
         httpd_register_uri_handler(s_camera_httpd, &uri_root);
         httpd_register_uri_handler(s_camera_httpd, &uri_stream_p80);
-        ESP_LOGI(TAG, "Main HTTP server active on port 80 (/snapshot, /)");
+        httpd_register_uri_handler(s_camera_httpd, &uri_ota_get);
+        httpd_register_uri_handler(s_camera_httpd, &uri_ota_post);
+        ESP_LOGI(TAG, "Main HTTP server active on port 80 (/snapshot, /, /update)");
     } else {
         ESP_LOGE(TAG, "Error starting main HTTP server on port 80!");
     }
