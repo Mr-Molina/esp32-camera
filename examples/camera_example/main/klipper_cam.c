@@ -15,9 +15,10 @@
 #include "esp_http_server.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
+#include "driver/gpio.h"
 
 #include "esp_camera.h"
-#define BOARD_WROVER_KIT 1
+#define BOARD_ESP32CAM_AITHINKER 1
 #include "camera_pinout.h"
 #include "klipper_cam_config.h"
 
@@ -537,6 +538,11 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    /* Ensure AI-Thinker flash LED (GPIO 4) is held OFF */
+    gpio_reset_pin(GPIO_NUM_4);
+    gpio_set_direction(GPIO_NUM_4, GPIO_MODE_OUTPUT);
+    gpio_set_level(GPIO_NUM_4, 0);
 
     /* Initialize camera hardware first */
     if (init_camera() != ESP_OK) {
