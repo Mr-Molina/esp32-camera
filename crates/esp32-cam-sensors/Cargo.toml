@@ -1,0 +1,13 @@
+[package]
+name = "esp32-cam-sensors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Safe no_std CameraSensor trait and 18 sensor drivers for esp32-camera"
+
+[dependencies]
+esp32-cam-types.workspace = true
+esp32-cam-sccb.workspace = true
+
+[lints]
+workspace = true

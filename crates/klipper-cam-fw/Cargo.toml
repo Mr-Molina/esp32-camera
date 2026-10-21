@@ -1,0 +1,17 @@
+[package]
+name = "klipper-cam-fw"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Bare-metal no_std Klipper camera HTTP/MJPEG streaming and constant-time OTA firmware"
+
+[dependencies]
+esp32-cam-types.workspace = true
+esp32-cam-sccb.workspace = true
+esp32-cam-sensors.workspace = true
+esp32-cam-conversions.workspace = true
+esp32-cam-ll.workspace = true
+esp32-cam-hal.workspace = true
+
+[lints]
+workspace = true

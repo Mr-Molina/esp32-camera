@@ -1,0 +1,19 @@
+[package]
+name = "esp32-cam-hal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Type-state CameraDriver HAL, board pinout validation, and RAII FramePool"
+
+[dependencies]
+esp32-cam-types.workspace = true
+esp32-cam-sccb.workspace = true
+esp32-cam-ll.workspace = true
+esp32-cam-sensors = { workspace = true, optional = true }
+
+[features]
+default = []
+sensors = ["dep:esp32-cam-sensors"]
+
+[lints]
+workspace = true

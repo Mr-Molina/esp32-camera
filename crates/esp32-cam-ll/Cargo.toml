@@ -1,0 +1,12 @@
+[package]
+name = "esp32-cam-ll"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Low-level DMA descriptor ring, I2S0/LCD_CAM peripheral interface, and XCLK LEDC generator"
+
+[dependencies]
+esp32-cam-types.workspace = true
+
+[lints]
+workspace = true
