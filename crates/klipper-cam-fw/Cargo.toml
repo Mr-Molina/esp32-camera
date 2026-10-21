@@ -13,5 +13,11 @@ esp32-cam-conversions.workspace = true
 esp32-cam-ll.workspace = true
 esp32-cam-hal.workspace = true
 
+[target.'cfg(target_arch = "xtensa")'.dependencies]
+esp-hal = { version = "1.2.2", features = ["esp32", "unstable"] }
+esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32"] }
+esp-backtrace = { version = "0.20.0", features = ["esp32", "println", "panic-handler"] }
+esp-println = { version = "0.18.0", features = ["esp32"] }
+
 [lints]
 workspace = true
