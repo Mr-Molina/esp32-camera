@@ -153,12 +153,13 @@ pub use http::{
 };
 pub use ota::{
     crc32_ieee, find_partition_by_label, validate_ota_image_header, verify_ota_token,
-    verify_partition_table_integrity, EspImageHeader, OtaDataManager, OtaDataSelect, OtaError,
+    verify_partition_table_integrity, AlignedFlashChunk, AlignedOtaBuf, EspImageHeader,
+    MockNorFlash, NoOpFlashStorage, OtaDataManager, OtaDataSelect, OtaError, OtaFlashStorage,
     OtaImgState, OtaSlot, PartitionEntry, PartitionSubType, PartitionType, ESP_IMAGE_HEADER_LEN,
-    ESP_IMAGE_HEADER_MAGIC, ESP_IMAGE_MAX_SEGMENTS, ESP_IMAGE_MIN_SEGMENTS, NVS_OFFSET, NVS_SIZE,
-    OTADATA_OFFSET, OTADATA_SECTOR_0_OFFSET, OTADATA_SECTOR_1_OFFSET, OTADATA_SIZE, OTA_0_OFFSET,
-    OTA_0_SIZE, OTA_1_OFFSET, OTA_1_SIZE, OTA_CHUNK_SIZE, OTA_PARTITION_MAX_SIZE, PARTITION_TABLE,
-    PHY_INIT_OFFSET, PHY_INIT_SIZE,
+    ESP_IMAGE_HEADER_MAGIC, ESP_IMAGE_MAX_SEGMENTS, ESP_IMAGE_MIN_SEGMENTS, FLASH_SECTOR_SIZE,
+    NVS_OFFSET, NVS_SIZE, OTADATA_OFFSET, OTADATA_SECTOR_0_OFFSET, OTADATA_SECTOR_1_OFFSET,
+    OTADATA_SIZE, OTA_0_OFFSET, OTA_0_SIZE, OTA_1_OFFSET, OTA_1_SIZE, OTA_CHUNK_SIZE,
+    OTA_PARTITION_MAX_SIZE, PARTITION_TABLE, PHY_INIT_OFFSET, PHY_INIT_SIZE,
 };
 
 /// Wi-Fi station connection lifecycle state (`wifi_event_handler` in `klipper_cam.c`).
@@ -219,8 +220,21 @@ impl<'a> FirmwareRuntime<'a> {
     /// 2. Cancels OTA rollback (`esp_ota_mark_app_valid_cancel_rollback`, `APP-003` / `FW-002`).
     /// 3. Starts the Port 80 and Port 81 HTTP servers if not already running.
     pub fn on_wifi_got_ip(&mut self, ip: Ipv4Addr) -> Result<(), OtaError> {
+        let mut noop = NoOpFlashStorage;
+        self.on_wifi_got_ip_with_flash(ip, &mut noop)
+    }
+
+    /// Handles `IP_EVENT_STA_GOT_IP` and persists rollback cancellation to SPI NOR `flash`:
+    /// 1. Records assigned station IPv4 address.
+    /// 2. Cancels OTA rollback in `otadata` and syncs the updated sector to `flash`.
+    /// 3. Starts the Port 80 and Port 81 HTTP servers if not already running.
+    pub fn on_wifi_got_ip_with_flash<F: OtaFlashStorage>(
+        &mut self,
+        ip: Ipv4Addr,
+        flash: &mut F,
+    ) -> Result<(), OtaError> {
         self.wifi_state = WifiStaState::ConnectedGotIp { ip };
-        let _ = self.server.on_wifi_got_ip_cancel_rollback()?;
+        let _ = self.server.on_wifi_got_ip_with_flash(flash)?;
         self.rollback_cancelled = true;
         self.webservers_started = true;
         Ok(())

@@ -10,7 +10,18 @@
 #![cfg_attr(target_arch = "xtensa", no_std)]
 #![cfg_attr(target_arch = "xtensa", no_main)]
 #![cfg_attr(not(target_arch = "xtensa"), forbid(unsafe_code))]
-#![cfg_attr(target_arch = "xtensa", allow(clippy::undocumented_unsafe_blocks))]
+#![cfg_attr(
+    target_arch = "xtensa",
+    allow(
+        unsafe_op_in_unsafe_fn,
+        static_mut_refs,
+        clippy::undocumented_unsafe_blocks,
+        clippy::unwrap_used
+    )
+)]
+
+#[cfg(target_arch = "xtensa")]
+extern crate alloc;
 
 #[cfg(target_arch = "xtensa")]
 use esp_backtrace as _;
@@ -309,33 +320,406 @@ fn main() {
     assert!(ok, "klipper-cam-fw self-test failed");
 }
 
+#[cfg(target_arch = "xtensa")]
+#[repr(C, align(4))]
+struct AlignedDmaBuf([u8; 32768]);
+
+#[cfg(target_arch = "xtensa")]
+static mut I2S_DMA_DESC: [Lldesc; 16] = [Lldesc::empty(); 16];
+
+#[cfg(target_arch = "xtensa")]
+static mut I2S_DMA_BUF: AlignedDmaBuf = AlignedDmaBuf([0u8; 32768]);
+
+#[cfg(target_arch = "xtensa")]
+struct EspFlashAdapter<'d>(esp_storage::FlashStorage<'d>);
+
+#[cfg(target_arch = "xtensa")]
+impl klipper_cam_fw::OtaFlashStorage for EspFlashAdapter<'_> {
+    fn read_aligned(&mut self, offset: u32, buf: &mut [u8]) -> Result<(), klipper_cam_fw::OtaError> {
+        self.0
+            .read_nor(offset, buf)
+            .map_err(|_| klipper_cam_fw::OtaError::FlashWriteError)
+    }
+
+    fn erase_range(&mut self, from: u32, to: u32) -> Result<(), klipper_cam_fw::OtaError> {
+        self.0
+            .erase(from, to)
+            .map_err(|_| klipper_cam_fw::OtaError::FlashWriteError)
+    }
+
+    fn write_aligned(&mut self, offset: u32, data: &[u8]) -> Result<(), klipper_cam_fw::OtaError> {
+        self.0
+            .write_nor(offset, data)
+            .map_err(|_| klipper_cam_fw::OtaError::FlashWriteError)
+    }
+}
+
+#[cfg(target_arch = "xtensa")]
+struct SmoltcpWifiDevice(esp_radio::wifi::Interface);
+
+#[cfg(target_arch = "xtensa")]
+struct SmoltcpRxToken(esp_radio::wifi::WifiRxToken);
+
+#[cfg(target_arch = "xtensa")]
+struct SmoltcpTxToken(esp_radio::wifi::WifiTxToken);
+
+#[cfg(target_arch = "xtensa")]
+impl smoltcp::phy::RxToken for SmoltcpRxToken {
+    fn consume<R, F>(self, f: F) -> R
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        self.0.consume_token(|buf| f(buf))
+    }
+}
+
+#[cfg(target_arch = "xtensa")]
+impl smoltcp::phy::TxToken for SmoltcpTxToken {
+    fn consume<R, F>(self, len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
+        self.0.consume_token(len, f)
+    }
+}
+
+#[cfg(target_arch = "xtensa")]
+impl smoltcp::phy::Device for SmoltcpWifiDevice {
+    type RxToken<'a> = SmoltcpRxToken where Self: 'a;
+    type TxToken<'a> = SmoltcpTxToken where Self: 'a;
+
+    fn receive(
+        &mut self,
+        _timestamp: smoltcp::time::Instant,
+    ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        self.0
+            .receive()
+            .map(|(rx, tx)| (SmoltcpRxToken(rx), SmoltcpTxToken(tx)))
+    }
+
+    fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
+        self.0.transmit().map(SmoltcpTxToken)
+    }
+
+    fn capabilities(&self) -> smoltcp::phy::DeviceCapabilities {
+        let mut caps = smoltcp::phy::DeviceCapabilities::default();
+        caps.medium = smoltcp::phy::Medium::Ethernet;
+        // Must be <= esp-radio's `ESP_RADIO_CONFIG_WIFI_MTU` (1492) so `WifiTxToken::consume_token`
+        // stack buffer `[u8; 1492]` never panics on slice indexing `&mut buffer[..len]`.
+        caps.max_transmission_unit = 1480;
+        caps.max_burst_size = Some(3);
+        caps
+    }
+}
+
+#[cfg(target_arch = "xtensa")]
+fn now_millis() -> u64 {
+    esp_hal::time::Instant::now()
+        .duration_since_epoch()
+        .as_millis()
+}
+
+#[cfg(target_arch = "xtensa")]
+fn smol_now() -> smoltcp::time::Instant {
+    smoltcp::time::Instant::from_millis(now_millis() as i64)
+}
+
+#[cfg(target_arch = "xtensa")]
+fn send_arp_announce(
+    net_device: &mut SmoltcpWifiDevice,
+    mac: [u8; 6],
+    src_ip: [u8; 4],
+    target_ip: [u8; 4],
+) {
+    if let Some(tx_tok) = net_device.0.transmit() {
+        tx_tok.consume_token(42, |buf| {
+            // Destination MAC: Broadcast (FF:FF:FF:FF:FF:FF)
+            buf[0..6].copy_from_slice(&[0xFF; 6]);
+            // Source MAC
+            buf[6..12].copy_from_slice(&mac);
+            // EtherType: ARP (0x0806)
+            buf[12] = 0x08;
+            buf[13] = 0x06;
+            // Hardware type: Ethernet (1), Protocol type: IPv4 (0x0800)
+            buf[14..20].copy_from_slice(&[0x00, 0x01, 0x08, 0x00, 0x06, 0x04]);
+            // Opcode: ARP Request (1)
+            buf[20] = 0x00;
+            buf[21] = 0x01;
+            // Sender Hardware Address (MAC) + Sender Protocol Address (src_ip)
+            buf[22..28].copy_from_slice(&mac);
+            buf[28..32].copy_from_slice(&src_ip);
+            // Target Hardware Address (00:00:00:00:00:00) + Target Protocol Address (target_ip)
+            buf[32..38].copy_from_slice(&[0x00; 6]);
+            buf[38..42].copy_from_slice(&target_ip);
+        });
+    }
+}
+
+#[cfg(target_arch = "xtensa")]
+fn xtensa_route_i2s0_camera_pins(vsync_matrix_inv: bool) {
+    const GPIO_FUNC0_IN_SEL_CFG_BASE: usize = 0x3FF4_4130;
+    const I2S_PD_CONF_REG: *mut u32 = 0x3FF4_F0A4 as *mut u32;
+
+    // ESP32 TRM / esp-metadata-generated `_generated_esp32.rs` verified I2S0 input signals:
+    // I2S0I_WS (PCLK) = 28, I2S0I_DATA_0..7 = 140..=147, I2S0I_H_SYNC (HREF) = 190,
+    // I2S0I_V_SYNC (VSYNC) = 191, I2S0I_H_ENABLE = 192.
+    let routes: [(usize, u32, bool); 12] = [
+        (28, 22, false),                // PCLK (GPIO 22) -> I2S0I_WS (signal 28)
+        (190, 23, false),               // HREF (GPIO 23) -> I2S0I_H_SYNC (signal 190)
+        (191, 25, vsync_matrix_inv),    // VSYNC (GPIO 25) -> I2S0I_V_SYNC (signal 191)
+        (192, 0x38, false),             // CONST_ONE (0x38) -> I2S0I_H_ENABLE (signal 192)
+        (140, 4, false),                // D0 (GPIO 4) -> I2S0I_DATA_0 (signal 140)
+        (141, 5, false),                // D1 (GPIO 5) -> I2S0I_DATA_1 (signal 141)
+        (142, 18, false),               // D2 (GPIO 18) -> I2S0I_DATA_2 (signal 142)
+        (143, 19, false),               // D3 (GPIO 19) -> I2S0I_DATA_3 (signal 143)
+        (144, 36, false),               // D4 (GPIO 36) -> I2S0I_DATA_4 (signal 144)
+        (145, 39, false),               // D5 (GPIO 39) -> I2S0I_DATA_5 (signal 145)
+        (146, 34, false),               // D6 (GPIO 34) -> I2S0I_DATA_6 (signal 146)
+        (147, 35, false),               // D7 (GPIO 35) -> I2S0I_DATA_7 (signal 147)
+    ];
+
+    unsafe {
+        // Ensure I2S0 FIFO & PLC memories are powered up (`FIFO_FORCE_PU | PLC_MEM_FORCE_PU`)
+        core::ptr::write_volatile(I2S_PD_CONF_REG, 0x0A);
+        for &(sig_idx, gpio_num, inv) in &routes {
+            let reg = (GPIO_FUNC0_IN_SEL_CFG_BASE + 4 * sig_idx) as *mut u32;
+            let val = (1u32 << 7) | ((inv as u32) << 6) | (gpio_num & 0x3F);
+            core::ptr::write_volatile(reg, val);
+        }
+    }
+}
+
+#[cfg(target_arch = "xtensa")]
+fn capture_live_hd_jpeg_with_diag(
+    i2s_cam: &mut Esp32I2sCamera,
+    jpeg_scratch: &mut [u8],
+    jpeg_frame_buf: &mut [u8],
+    vsync_matrix_inv: bool,
+) -> Result<usize, (u32, usize, u8, u8, u8, u32)> {
+    const GPIO_IN_REG: *const u32 = 0x3FF4_403C as *const u32;
+    const I2S_INT_RAW_REG: *const u32 = 0x3FF4_F00C as *const u32;
+    const I2S_INT_CLR_REG: *mut u32 = 0x3FF4_F018 as *mut u32;
+    const I2S_IN_SUC_EOF_BIT: u32 = 1 << 9;
+
+    xtensa_route_i2s0_camera_pins(vsync_matrix_inv);
+
+    let (desc_slice, dma_slice) = unsafe {
+        (
+            &mut *core::ptr::addr_of_mut!(I2S_DMA_DESC),
+            &mut (*core::ptr::addr_of_mut!(I2S_DMA_BUF)).0,
+        )
+    };
+    let _ = build_circular_ring(desc_slice, dma_slice, 2048);
+
+    let dma_cfg = esp32_cam_ll::DmaSizeConfig {
+        dma_bytes_per_item: 4,
+        dma_buffer_size: 32768,
+        dma_half_buffer_size: 4096,
+        dma_half_buffer_cnt: 8,
+        dma_node_buffer_size: 2048,
+        dma_node_cnt: 16,
+        lines_per_node: 1,
+        nodes_per_line: 1,
+        lines_per_half_buffer: 1,
+        image_size: jpeg_scratch.len(),
+    };
+
+    let read_vsync = || -> bool {
+        ((unsafe { core::ptr::read_volatile(GPIO_IN_REG) } >> 25) & 1) != 0
+    };
+
+    // Wait for VSYNC vertical blanking transition (bounded to 90 ms)
+    let sync_start_ms = now_millis();
+    while !read_vsync() && (now_millis().saturating_sub(sync_start_ms) < 45) {}
+    while read_vsync() && (now_millis().saturating_sub(sync_start_ms) < 90) {}
+
+    if !i2s_cam.start(&dma_cfg, desc_slice[0].link_addr_20bit()) {
+        return Err((0, 0, 0, 0, 0, 0xDEAD));
+    }
+    // Re-apply signal 28 (I2S0I_WS / PCLK) and VSYNC matrix routing after start()
+    xtensa_route_i2s0_camera_pins(vsync_matrix_inv);
+
+    let mut eof_cnt = 0u32;
+    let mut fb_len = 0usize;
+    let mut seen_vsync_high = false;
+    let mut last_int_raw = 0u32;
+    let dma_start_ms = now_millis();
+    let mut last_eof_ms = dma_start_ms;
+
+    while now_millis().saturating_sub(dma_start_ms) < 140 {
+        if read_vsync() {
+            seen_vsync_high = true;
+        }
+
+        let int_raw = unsafe { core::ptr::read_volatile(I2S_INT_RAW_REG) };
+        last_int_raw |= int_raw;
+
+        if (int_raw & I2S_IN_SUC_EOF_BIT) != 0 {
+            unsafe {
+                core::ptr::write_volatile(I2S_INT_CLR_REG, I2S_IN_SUC_EOF_BIT);
+            }
+            last_eof_ms = now_millis();
+
+            let half_idx = (eof_cnt as usize) & 7;
+            let half_offset = half_idx * 4096;
+            if fb_len + 1024 <= jpeg_scratch.len() {
+                let _ = i2s_cam.memcpy_filtered(
+                    &mut jpeg_scratch[fb_len..fb_len + 1024],
+                    &dma_slice[half_offset..half_offset + 4096],
+                );
+                let flags = Lldesc::pack_flags(2048, 0, 0, false, false, true);
+                unsafe {
+                    core::ptr::write_volatile(
+                        &mut desc_slice[2 * half_idx].size_length_flags,
+                        flags,
+                    );
+                    core::ptr::write_volatile(
+                        &mut desc_slice[2 * half_idx + 1].size_length_flags,
+                        flags,
+                    );
+                }
+                fb_len += 1024;
+                eof_cnt += 1;
+            } else {
+                let _ = i2s_cam.stop();
+                break;
+            }
+            continue;
+        }
+
+        if eof_cnt > 0 {
+            let vsync_ended = seen_vsync_high
+                && !read_vsync()
+                && !read_vsync()
+                && !read_vsync()
+                && !read_vsync();
+            if vsync_ended || now_millis().saturating_sub(last_eof_ms) >= 15 {
+                let _ = i2s_cam.stop();
+                let half_idx = (eof_cnt as usize) & 7;
+                let half_offset = half_idx * 4096;
+                if fb_len + 1024 <= jpeg_scratch.len() {
+                    let _ = i2s_cam.memcpy_filtered(
+                        &mut jpeg_scratch[fb_len..fb_len + 1024],
+                        &dma_slice[half_offset..half_offset + 4096],
+                    );
+                    fb_len += 1024;
+                }
+                break;
+            }
+        }
+    }
+
+    let _ = i2s_cam.stop();
+
+    if fb_len >= 64 {
+        if let Some(soi_pos) = verify_jpeg_soi(&jpeg_scratch[..fb_len]) {
+            let slice_from_soi = &jpeg_scratch[soi_pos..fb_len];
+            if let Some(eoi_rel) = verify_jpeg_eoi(slice_from_soi, false) {
+                let exact_len = eoi_rel + 2;
+                if exact_len >= 64 && exact_len <= jpeg_frame_buf.len() {
+                    jpeg_frame_buf[..exact_len].copy_from_slice(&slice_from_soi[..exact_len]);
+                    return Ok(exact_len);
+                }
+            }
+        }
+    }
+
+    let b0 = if fb_len > 0 { jpeg_scratch[0] } else { 0 };
+    let b1 = if fb_len > 1 { jpeg_scratch[1] } else { 0 };
+    let b2 = if fb_len > 2 { jpeg_scratch[2] } else { 0 };
+    Err((eof_cnt, fb_len, b0, b1, b2, last_int_raw))
+}
+
 /// Bare-metal Xtensa firmware entrypoint for `ESP32-WROVER-DEV`.
 #[cfg(target_arch = "xtensa")]
 #[esp_hal::main]
 fn main() -> ! {
+    use core::sync::atomic::Ordering;
     use esp_hal::{
         clock::CpuClock,
         delay::Delay,
-        gpio::DriveMode,
+        gpio::{DriveMode, Input, InputConfig, Pull},
         i2c::master::{Config as I2cConfig, I2c},
         ledc::{
             channel::{self, ChannelIFace},
             timer::{self, TimerIFace},
             LSGlobalClkSource, Ledc, LowSpeed,
         },
+        psram::{Psram, PsramCacheSpeed, PsramConfig, PsramSize, PsramVaddrMode},
         time::Rate,
+        timer::timg::TimerGroup,
     };
     use esp_println::println;
-    use klipper_cam_fw::{EmbeddedHalSccb, SccbBus};
+    use esp_radio::wifi::{
+        sta::{ScanMethod, StationConfig},
+        AuthenticationMethodConfig, Config as WifiConfig, ControllerConfig,
+        Interface as WifiInterface, PowerSaveMode, WifiController,
+    };
+    use klipper_cam_fw::{
+        active_wifi_pass, active_wifi_ssid, parse_http_request, EmbeddedHalSccb, GainCeiling,
+        HttpMethod, OtaDataManager, SccbBus, StreamSessionGuard, OTA_PARTITION_MAX_SIZE,
+        SYNTHETIC_HD_JFIF_FRAME,
+    };
+    use smoltcp::{
+        iface::{Config as IfaceConfig, Interface as NetInterface, SocketSet, SocketStorage},
+        socket::{
+            dhcpv4,
+            tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State as TcpState},
+        },
+        wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address},
+    };
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::_240MHz);
     let peripherals = esp_hal::init(config);
     let delay = Delay::new();
 
+    // Initialize internal DRAM heap for esp-rtos and esp-radio Wi-Fi STA (~96 KB)
+    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 64 * 1024);
+    esp_alloc::heap_allocator!(size: 32 * 1024);
+
+    // Initialize 4 MB external PSRAM at 80 MHz
+    let psram = Psram::new(
+        peripherals.PSRAM,
+        PsramConfig {
+            size: PsramSize::Size(4 * 1024 * 1024),
+            cache_speed: PsramCacheSpeed::PsramCacheF80mS40m,
+            psram_vaddr_mode: PsramVaddrMode::Normal,
+        },
+    );
+    let (psram_ptr, psram_len) = psram.raw_parts();
+
     println!("============================================================");
     println!("[KLIPPER-CAM-RS] Bare-Metal Xtensa Rust Firmware v0.1.0");
     println!("[KLIPPER-CAM-RS] Target: ESP32-WROVER-DEV (240 MHz Dual-Core)");
+    println!(
+        "[KLIPPER-CAM-RS] [PSRAM] Mapped {} bytes @ 0x{:08X} (80 MHz)",
+        psram_len, psram_ptr as usize
+    );
     println!("============================================================");
+
+    // Carve PSRAM buffers for 1280x720 JPEG frames, HTTP responses, TCP windows, and OTA upload buffer
+    let psram_all: &'static mut [u8] =
+        unsafe { core::slice::from_raw_parts_mut(psram_ptr, psram_len) };
+    let (jpeg_frame_buf, rem) = psram_all.split_at_mut(128 * 1024);
+    let (jpeg_scratch_buf, rem) = rem.split_at_mut(128 * 1024);
+    let (http_resp_buf, rem) = rem.split_at_mut(160 * 1024);
+    let (tcp80_rx_storage, rem) = rem.split_at_mut(48 * 1024);
+    let (tcp80_tx_storage, rem) = rem.split_at_mut(160 * 1024);
+    let (tcp81_rx_storage, rem) = rem.split_at_mut(4 * 1024);
+    let (tcp81_tx_storage, rem) = rem.split_at_mut(160 * 1024);
+    let (tcp81_busy_rx_storage, rem) = rem.split_at_mut(2 * 1024);
+    let (tcp81_busy_tx_storage, rem) = rem.split_at_mut(2 * 1024);
+    let (http80_req_accum, psram_heap_rem) = rem.split_at_mut(1800 * 1024);
+
+    if !psram_heap_rem.is_empty() {
+        unsafe {
+            esp_alloc::HEAP.add_region(esp_alloc::HeapRegion::new(
+                psram_heap_rem.as_mut_ptr(),
+                psram_heap_rem.len(),
+                esp_alloc::MemoryCapability::External.into(),
+            ));
+        }
+    }
 
     // 1. Configure physical 20 MHz XCLK on GPIO 21 via LEDC LowSpeed Timer0 / Channel0
     let mut ledc = Ledc::new(peripherals.LEDC);
@@ -361,11 +745,12 @@ fn main() -> ! {
         "[KLIPPER-CAM-RS] [HW-1] LEDC 20 MHz XCLK on GPIO 21: {}",
         if xclk_hw_ok { "PASS" } else { "FAIL" }
     );
-    delay.delay_millis(20);
+    delay.delay_millis(25);
 
-    // 2. Configure physical I2C0 on GPIO 26 (SDA) / GPIO 27 (SCL) at 100 kHz and probe SCCB 0x30
+    // 2. Configure physical I2C0 on GPIO 26 (SDA) / GPIO 27 (SCL) at 100 kHz and program OV2640
+    let mut ov2640_hw_ok = false;
     let i2c_cfg = I2cConfig::default().with_frequency(Rate::from_khz(100));
-    match I2c::new(peripherals.I2C0, i2c_cfg) {
+    let _kept_sccb = match I2c::new(peripherals.I2C0, i2c_cfg) {
         Ok(i2c_bus) => {
             let i2c_bus = i2c_bus
                 .with_sda(peripherals.GPIO26)
@@ -375,11 +760,24 @@ fn main() -> ! {
             match Ov2640::detect(&mut hw_sccb, Ov2640::SLV_ADDR) {
                 Ok(id) => {
                     let mut live_ov2640 = Ov2640::from_id(Ov2640::SLV_ADDR, id);
+                    // Program PixelFormat::Jpeg BEFORE set_framesize(FrameSize::Hd) so set_window
+                    // selects the JPEG CLKRC/PCLK dividers (`div = 12`), then apply OV2640 ISP settings
                     let prog_ok = live_ov2640.reset(&mut hw_sccb).is_ok()
-                        && live_ov2640.set_framesize(&mut hw_sccb, FrameSize::Hd).is_ok()
                         && live_ov2640
                             .set_pixformat(&mut hw_sccb, PixelFormat::Jpeg)
-                            .is_ok();
+                            .is_ok()
+                        && live_ov2640.set_framesize(&mut hw_sccb, FrameSize::Hd).is_ok()
+                        && live_ov2640
+                            .set_gainceiling(&mut hw_sccb, GainCeiling::X2)
+                            .is_ok()
+                        && live_ov2640.set_bpc(&mut hw_sccb, false).is_ok()
+                        && live_ov2640.set_wpc(&mut hw_sccb, true).is_ok()
+                        && live_ov2640.set_lenc(&mut hw_sccb, true).is_ok()
+                        && live_ov2640
+                            .set_quality(&mut hw_sccb, DEFAULT_JPEG_QUALITY as i32)
+                            .is_ok()
+                        && live_ov2640.init_status(&mut hw_sccb).is_ok();
+                    ov2640_hw_ok = prog_ok;
                     println!(
                         "[KLIPPER-CAM-RS] [HW-2] I2C0 SCCB (0x30) OV2640 DETECTED: PID=0x{:02X} VER=0x{:02X} MIDH=0x{:02X} MIDL=0x{:02X} HD_PROG={}",
                         id.pid, id.ver, id.midh, id.midl, prog_ok
@@ -391,13 +789,15 @@ fn main() -> ! {
                     );
                 }
             }
+            Some(hw_sccb)
         }
         Err(_) => {
             println!("[KLIPPER-CAM-RS] [HW-2] I2C0 Master Init: FAIL");
+            None
         }
-    }
+    };
 
-    // 3. Execute on-chip 7-crate HIL verification suite
+    // 3. Execute on-chip 7-crate HIL verification suite (before arming live I2S0 camera)
     let check1 = hil_check_pins_and_xclk();
     println!(
         "[KLIPPER-CAM-RS] [HIL-1] WroverKitPins + XclkController: {}",
@@ -427,14 +827,622 @@ fn main() -> ! {
         "[HIL SUMMARY] 7-Crate Bare-Metal Xtensa Self-Test: {}",
         if all_ok { "ALL PASS (100%)" } else { "FAIL" }
     );
+
+    // 4. Configure live I2S0 parallel camera slave DMA and capture initial 1280x720 JPEG frame
+    let mut hw_i2s_cam = Esp32I2sCamera::new();
+    let ll_pins = WroverKitPins::PINS.to_ll_pin_config(true);
+    let _ = hw_i2s_cam.set_pin(&ll_pins);
+    let _ = hw_i2s_cam.config();
+    let _ = hw_i2s_cam.set_sample_mode(PixelFormat::Jpeg, DEFAULT_XCLK_FREQ_HZ, 0x26);
+
+    // Configure physical camera input pads via esp-hal AFTER `set_pin` so `RTC_IO` (`34..=39`)
+    // and `IO_MUX` (`4, 5, 18, 19, 22, 23, 25`) use esp-hal's verified pad bitfields, then
+    // route all 12 I2S0 signals in `GPIO_FUNC0_IN_SEL_CFG_REG` (including signal 28 = `I2S0I_WS` / `PCLK`)
+    let _cam_inputs = (
+        Input::new(peripherals.GPIO4, InputConfig::default()),
+        Input::new(peripherals.GPIO5, InputConfig::default()),
+        Input::new(peripherals.GPIO18, InputConfig::default()),
+        Input::new(peripherals.GPIO19, InputConfig::default()),
+        Input::new(peripherals.GPIO36, InputConfig::default()),
+        Input::new(peripherals.GPIO39, InputConfig::default()),
+        Input::new(peripherals.GPIO34, InputConfig::default()),
+        Input::new(peripherals.GPIO35, InputConfig::default()),
+        Input::new(peripherals.GPIO22, InputConfig::default()),
+        Input::new(peripherals.GPIO23, InputConfig::default()),
+        Input::new(
+            peripherals.GPIO25,
+            InputConfig::default().with_pull(Pull::Up),
+        ),
+    );
+    xtensa_route_i2s0_camera_pins(false);
+    delay.delay_millis(80);
+
+    let mut active_jpeg_len = SYNTHETIC_HD_JFIF_FRAME.len();
+    jpeg_frame_buf[..active_jpeg_len].copy_from_slice(&SYNTHETIC_HD_JFIF_FRAME);
+    let mut ov2640_dma_ok = false;
+    let mut vsync_inv_ok = false;
+
+    if ov2640_hw_ok {
+        for attempt in 1..=4u8 {
+            let inv_try = attempt >= 3;
+            match capture_live_hd_jpeg_with_diag(
+                &mut hw_i2s_cam,
+                jpeg_scratch_buf,
+                jpeg_frame_buf,
+                inv_try,
+            ) {
+                Ok(captured_len) => {
+                    active_jpeg_len = captured_len;
+                    ov2640_dma_ok = true;
+                    vsync_inv_ok = inv_try;
+                    println!(
+                        "[KLIPPER-CAM-RS] [HW-3] Live OV2640 I2S0 DMA 1280x720 JPEG Capture: PASS ({} bytes, attempt {}, inv={})",
+                        captured_len, attempt, inv_try
+                    );
+                    break;
+                }
+                Err((eof_cnt, fb_len, b0, b1, b2, int_raw)) => {
+                    println!(
+                        "[KLIPPER-CAM-RS] [HW-3] Attempt {} (inv={}): eof_cnt={} fb_len={} head=[0x{:02X},0x{:02X},0x{:02X}] int_raw=0x{:08X}",
+                        attempt, inv_try, eof_cnt, fb_len, b0, b1, b2, int_raw
+                    );
+                    delay.delay_millis(25);
+                }
+            }
+        }
+    }
+    if !ov2640_dma_ok {
+        println!(
+            "[KLIPPER-CAM-RS] [HW-3] Live OV2640 I2S0 DMA Capture fallback: using synthetic 1280x720 JFIF ({} bytes)",
+            active_jpeg_len
+        );
+    }
     println!("============================================================");
 
+    // 5. Initialize SPI NOR Flash adapter and load otadata state
+    let mut flash_adapter = EspFlashAdapter(esp_storage::FlashStorage::new(peripherals.FLASH));
+    let ota_manager = OtaDataManager::load_from_flash(&mut flash_adapter)
+        .unwrap_or_else(|_| OtaDataManager::new_booted_ota0());
+
+    let jpeg_static_ptr = jpeg_frame_buf.as_mut_ptr();
+    let initial_slice: &'static [u8] =
+        unsafe { core::slice::from_raw_parts(jpeg_static_ptr, active_jpeg_len) };
+    let mut runtime = FirmwareRuntime::new(
+        KlipperCamConfig::WROVER_KIT_HD,
+        CameraDriver::new(initial_slice, FrameSize::Hd),
+    );
+    runtime.server.ota_manager = ota_manager;
+
+    // 6. Start esp-rtos scheduler and initialize esp-radio Wi-Fi Station
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
+    esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
+
+    let ssid = active_wifi_ssid();
+    let pass = active_wifi_pass();
+    let auth = if pass.is_empty() {
+        AuthenticationMethodConfig::Open
+    } else {
+        match pass.try_into() {
+            Ok(pw) => AuthenticationMethodConfig::WpaWpa2Personal(pw),
+            Err(_) => AuthenticationMethodConfig::Open,
+        }
+    };
+    let mut sta_cfg = StationConfig::default()
+        .with_authentication(auth)
+        .with_scan_method(ScanMethod::AllChannels)
+        .with_failure_retry_cnt(5);
+    if let Ok(s) = ssid.try_into() {
+        sta_cfg = sta_cfg.with_ssid(s);
+    };
+
+    let ctrl_cfg = ControllerConfig::default().with_initial_config(WifiConfig::Station(sta_cfg));
+    let mut wifi_controller =
+        WifiController::new(peripherals.WIFI, ctrl_cfg).expect("WifiController::new");
+    let _ = wifi_controller.set_power_saving(PowerSaveMode::None);
+    let _ = wifi_controller.set_max_tx_power(60);
+
+    let wifi_iface = WifiInterface::station();
+    let mac = wifi_iface.mac_address();
+    println!(
+        "[KLIPPER-CAM-RS] [WIFI] Connecting to SSID '{}' (MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})...",
+        ssid, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    );
+    runtime.on_wifi_sta_start();
+
+    match embassy_futures::block_on(wifi_controller.connect_async()) {
+        Ok(info) => {
+            println!(
+                "[KLIPPER-CAM-RS] [WIFI] Connected to AP (channel {}, aid {})",
+                info.channel, info.aid
+            );
+        }
+        Err(e) => {
+            println!("[KLIPPER-CAM-RS] [WIFI] Initial connect warning: {:?}", e);
+            runtime.on_wifi_sta_disconnected();
+        }
+    }
+
+    // 7. Configure smoltcp Ethernet Interface + DHCPv4 + Static IP fallback (172.22.1.52/16) + Port 80/81 TCP sockets
+    let mut net_device = SmoltcpWifiDevice(wifi_iface);
+    let iface_cfg = IfaceConfig::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
+    let mut iface = NetInterface::new(iface_cfg, &mut net_device, smol_now());
+
+    let mut socket_storage = [SocketStorage::EMPTY; 4];
+    let mut sockets = SocketSet::new(&mut socket_storage[..]);
+
+    let dhcp_handle = sockets.add(dhcpv4::Socket::new());
+    let tcp80_handle = sockets.add(TcpSocket::new(
+        TcpSocketBuffer::new(tcp80_rx_storage),
+        TcpSocketBuffer::new(tcp80_tx_storage),
+    ));
+    let tcp81_handle = sockets.add(TcpSocket::new(
+        TcpSocketBuffer::new(tcp81_rx_storage),
+        TcpSocketBuffer::new(tcp81_tx_storage),
+    ));
+    let tcp81_busy_handle = sockets.add(TcpSocket::new(
+        TcpSocketBuffer::new(tcp81_busy_rx_storage),
+        TcpSocketBuffer::new(tcp81_busy_tx_storage),
+    ));
+
+    let mut ip_configured = false;
+    let mut connect_ms = smol_now().total_millis();
+    let mut last_reconnect_attempt_ms = connect_ms;
+    let mut last_heartbeat_ms = connect_ms;
+    let mut last_arp_announce_ms = connect_ms;
+
+    // Port 80 HTTP state
+    let mut p80_req_len: usize = 0;
+    let mut p80_tx_off: usize = 0;
+    let mut p80_tx_len: usize = 0;
+    let mut p80_closing = false;
+    let mut p80_close_deadline_ms: i64 = 0;
+
+    // Port 81 primary MJPEG stream state
+    let mut p81_req_buf = [0u8; 1024];
+    let mut p81_req_len: usize = 0;
+    let mut p81_streaming = false;
+    let mut p81_last_frame_ms: i64 = 0;
+    let mut p81_tx_off: usize = 0;
+    let mut p81_tx_len: usize = 0;
+    let mut p81_closing = false;
+    let mut p81_close_deadline_ms: i64 = 0;
+
+    // Port 81 secondary busy-rejection socket state
+    let mut p81_busy_req_buf = [0u8; 512];
+    let mut p81_busy_closing = false;
+    let mut p81_busy_close_deadline_ms: i64 = 0;
+
     loop {
-        delay.delay_millis(5000);
-        println!(
-            "[KLIPPER-CAM-RS] Heartbeat: uptime_ok={} xclk_20mhz_gpio21={}",
-            all_ok, xclk_hw_ok
-        );
+        let now = smol_now();
+        let now_ms = now.total_millis();
+
+        // Wi-Fi auto-reconnect every 2000 ms if link drops
+        if !wifi_controller.is_connected() && now_ms - last_reconnect_attempt_ms >= 2000 {
+            last_reconnect_attempt_ms = now_ms;
+            runtime.on_wifi_sta_disconnected();
+            if let Ok(info) = embassy_futures::block_on(wifi_controller.connect_async()) {
+                println!(
+                    "[KLIPPER-CAM-RS] [WIFI] Reconnected to AP (channel {})",
+                    info.channel
+                );
+                connect_ms = smol_now().total_millis();
+            }
+        }
+
+        let _ = iface.poll(now, &mut net_device, &mut sockets);
+
+        // Check DHCPv4 events or apply static fallback (172.22.1.52/24, GW 172.22.1.1) after 5000 ms
+        {
+            let dhcp_sock = sockets.get_mut::<dhcpv4::Socket>(dhcp_handle);
+            match dhcp_sock.poll() {
+                Some(dhcpv4::Event::Configured(cfg)) => {
+                    let addr = cfg.address.address();
+                    let octets = addr.octets();
+                    let prefix_len = cfg.address.prefix_len();
+                    iface.update_ip_addrs(|addrs| {
+                        addrs.clear();
+                        let _ = addrs.push(IpCidr::new(IpAddress::v4(172, 22, 1, 52), prefix_len));
+                        if addr != Ipv4Address::new(172, 22, 1, 52) {
+                            let _ = addrs.push(IpCidr::Ipv4(cfg.address));
+                        }
+                    });
+                    let gw = cfg.router.unwrap_or(Ipv4Address::new(172, 22, 1, 1));
+                    let _ = iface.routes_mut().add_default_ipv4_route(gw);
+                    let fw_ip = Ipv4Addr::new(172, 22, 1, 52);
+                    let _ = runtime.on_wifi_got_ip_with_flash(fw_ip, &mut flash_adapter);
+                    ip_configured = true;
+                    send_arp_announce(&mut net_device, mac, [172, 22, 1, 52], [172, 22, 1, 52]);
+                    send_arp_announce(&mut net_device, mac, [172, 22, 1, 52], [172, 22, 1, 1]);
+                    last_arp_announce_ms = now_ms;
+                    println!(
+                        "[KLIPPER-CAM-RS] [NET] IP Configured: 172.22.1.52/{} + DHCP {}.{}.{}.{}/{} (Port 80 & 81 Ready)",
+                        prefix_len, octets[0], octets[1], octets[2], octets[3], prefix_len
+                    );
+                }
+                Some(dhcpv4::Event::Deconfigured) => {}
+                None => {}
+            }
+        }
+
+        if !ip_configured && wifi_controller.is_connected() && (now_ms - connect_ms >= 5000) {
+            iface.update_ip_addrs(|addrs| {
+                addrs.clear();
+                let _ = addrs.push(IpCidr::new(IpAddress::v4(172, 22, 1, 52), 24));
+            });
+            let _ = iface
+                .routes_mut()
+                .add_default_ipv4_route(Ipv4Address::new(172, 22, 1, 1));
+            let fw_ip = Ipv4Addr::new(172, 22, 1, 52);
+            let _ = runtime.on_wifi_got_ip_with_flash(fw_ip, &mut flash_adapter);
+            ip_configured = true;
+            send_arp_announce(&mut net_device, mac, [172, 22, 1, 52], [172, 22, 1, 52]);
+            send_arp_announce(&mut net_device, mac, [172, 22, 1, 52], [172, 22, 1, 1]);
+            last_arp_announce_ms = now_ms;
+            println!(
+                "[KLIPPER-CAM-RS] [NET] Static IP Fallback Configured: 172.22.1.52/24 GW 172.22.1.1 (Port 80 & 81 Ready)"
+            );
+        }
+
+        if !ip_configured {
+            continue;
+        }
+
+        if now_ms - last_arp_announce_ms >= 5000 {
+            last_arp_announce_ms = now_ms;
+            send_arp_announce(&mut net_device, mac, [172, 22, 1, 52], [172, 22, 1, 1]);
+        }
+
+        // ============================================================
+        // Port 80 Control / Snapshot / Status / OTA Server
+        // ============================================================
+        {
+            let sock80 = sockets.get_mut::<TcpSocket>(tcp80_handle);
+            if !sock80.is_open() {
+                p80_req_len = 0;
+                p80_tx_off = 0;
+                p80_tx_len = 0;
+                p80_closing = false;
+                sock80.set_timeout(Some(smoltcp::time::Duration::from_millis(5000)));
+                let _ = sock80.listen(80);
+            } else if p80_closing {
+                if !sock80.is_active()
+                    || matches!(sock80.state(), TcpState::TimeWait | TcpState::Closed)
+                    || now_ms >= p80_close_deadline_ms
+                {
+                    sock80.abort();
+                    p80_closing = false;
+                }
+            } else if p80_tx_off < p80_tx_len {
+                if sock80.can_send() {
+                    if let Ok(sent) = sock80.send_slice(&http_resp_buf[p80_tx_off..p80_tx_len]) {
+                        p80_tx_off += sent;
+                    }
+                    if p80_tx_off >= p80_tx_len {
+                        sock80.close();
+                        p80_closing = true;
+                        p80_close_deadline_ms = now_ms + 2500;
+                    }
+                } else if !sock80.may_send() {
+                    sock80.abort();
+                }
+            } else if sock80.can_recv() {
+                let avail = http80_req_accum.len().saturating_sub(p80_req_len);
+                if avail > 0 {
+                    if let Ok(n) =
+                        sock80.recv_slice(&mut http80_req_accum[p80_req_len..p80_req_len + avail])
+                    {
+                        p80_req_len += n;
+                    }
+                }
+
+                let mut req_complete = false;
+                let mut is_snapshot_req = false;
+                let peer_closed_rx = matches!(sock80.state(), TcpState::CloseWait);
+                if let Ok(parsed) = parse_http_request(&http80_req_accum[..p80_req_len]) {
+                    let needed_body = match parsed.content_length {
+                        Some(cl) if cl > 0 => (cl as usize).min(OTA_PARTITION_MAX_SIZE + 4096),
+                        _ => 0,
+                    };
+                    if parsed.body.len() >= needed_body || peer_closed_rx {
+                        req_complete = true;
+                        if parsed.method == HttpMethod::Get
+                            && (parsed.path == "/snapshot"
+                                || (parsed.path == "/"
+                                    && parsed
+                                        .query
+                                        .map(|q| q.contains("action=snapshot"))
+                                        .unwrap_or(false)))
+                        {
+                            is_snapshot_req = true;
+                        }
+                    }
+                } else if p80_req_len >= 4096 || peer_closed_rx {
+                    req_complete = true;
+                }
+
+                if req_complete {
+                    if is_snapshot_req && ov2640_dma_ok {
+                        runtime
+                            .server
+                            .camera
+                            .set_frame(&SYNTHETIC_HD_JFIF_FRAME, FrameSize::Hd);
+                        if let Ok(new_len) = capture_live_hd_jpeg_with_diag(
+                            &mut hw_i2s_cam,
+                            jpeg_scratch_buf,
+                            jpeg_frame_buf,
+                            vsync_inv_ok,
+                        ) {
+                            active_jpeg_len = new_len;
+                        }
+                        let fresh_slice: &'static [u8] = unsafe {
+                            core::slice::from_raw_parts(jpeg_static_ptr, active_jpeg_len)
+                        };
+                        runtime.server.camera.set_frame(fresh_slice, FrameSize::Hd);
+                    }
+
+                    let free_dram = esp_alloc::HEAP
+                        .free_caps(esp_alloc::MemoryCapability::Internal.into())
+                        as u32;
+                    let free_psram = esp_alloc::HEAP
+                        .free_caps(esp_alloc::MemoryCapability::External.into())
+                        as u32;
+                    let rssi = wifi_controller.rssi().unwrap_or(-50);
+                    runtime
+                        .server
+                        .set_telemetry(now_ms, free_dram, free_psram, rssi);
+
+                    match runtime.server.handle_raw_request_with_flash(
+                        ServerPort::Control,
+                        &http80_req_accum[..p80_req_len],
+                        http_resp_buf,
+                        &mut flash_adapter,
+                    ) {
+                        Ok(resp_slice) => {
+                            p80_tx_len = resp_slice.len();
+                            p80_tx_off = 0;
+                            if sock80.can_send() {
+                                if let Ok(sent) = sock80.send_slice(&http_resp_buf[..p80_tx_len]) {
+                                    p80_tx_off = sent;
+                                }
+                                if p80_tx_off >= p80_tx_len {
+                                    sock80.close();
+                                    p80_closing = true;
+                                    p80_close_deadline_ms = now_ms + 2500;
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            sock80.close();
+                            p80_closing = true;
+                            p80_close_deadline_ms = now_ms + 1000;
+                        }
+                    }
+                }
+            } else if matches!(sock80.state(), TcpState::CloseWait) && p80_req_len == 0 {
+                sock80.close();
+                p80_closing = true;
+                p80_close_deadline_ms = now_ms + 1000;
+            }
+        }
+
+        // Reboot if OTA firmware update completed and Port 80 TX buffer has flushed
+        if runtime.server.is_reboot_scheduled() {
+            let sock80 = sockets.get_mut::<TcpSocket>(tcp80_handle);
+            if sock80.send_queue() == 0 {
+                let _ = iface.poll(smol_now(), &mut net_device, &mut sockets);
+                delay.delay_millis(250);
+                println!("[KLIPPER-CAM-RS] [OTA] Flash complete, rebooting into updated slot...");
+                esp_hal::system::software_reset();
+            }
+        }
+
+        // ============================================================
+        // Port 81 Primary MJPEG Multipart Stream Server (/stream)
+        // ============================================================
+        {
+            let sock81 = sockets.get_mut::<TcpSocket>(tcp81_handle);
+            if !sock81.is_open() {
+                if p81_streaming {
+                    p81_streaming = false;
+                    runtime
+                        .server
+                        .stream_active_flag()
+                        .store(false, Ordering::Release);
+                }
+                p81_req_len = 0;
+                p81_tx_off = 0;
+                p81_tx_len = 0;
+                p81_closing = false;
+                sock81.set_timeout(Some(smoltcp::time::Duration::from_millis(5000)));
+                let _ = sock81.listen(81);
+            } else if p81_closing {
+                if !sock81.is_active()
+                    || matches!(sock81.state(), TcpState::TimeWait | TcpState::Closed)
+                    || now_ms >= p81_close_deadline_ms
+                {
+                    sock81.abort();
+                    p81_closing = false;
+                }
+            } else if p81_streaming {
+                if !sock81.may_send() || !sock81.is_active() {
+                    p81_streaming = false;
+                    runtime
+                        .server
+                        .stream_active_flag()
+                        .store(false, Ordering::Release);
+                    sock81.abort();
+                } else if p81_tx_off < p81_tx_len {
+                    if sock81.can_send() {
+                        if let Ok(sent) = sock81.send_slice(&http_resp_buf[p81_tx_off..p81_tx_len])
+                        {
+                            p81_tx_off += sent;
+                        }
+                    }
+                } else if now_ms - p81_last_frame_ms >= 50
+                    && sock81.can_send()
+                    && sock81.send_queue() < 32768
+                {
+                    p81_last_frame_ms = now_ms;
+                    if ov2640_dma_ok {
+                        runtime
+                            .server
+                            .camera
+                            .set_frame(&SYNTHETIC_HD_JFIF_FRAME, FrameSize::Hd);
+                        if let Ok(new_len) = capture_live_hd_jpeg_with_diag(
+                            &mut hw_i2s_cam,
+                            jpeg_scratch_buf,
+                            jpeg_frame_buf,
+                            vsync_inv_ok,
+                        ) {
+                            active_jpeg_len = new_len;
+                        }
+                        let fresh_slice: &'static [u8] = unsafe {
+                            core::slice::from_raw_parts(jpeg_static_ptr, active_jpeg_len)
+                        };
+                        runtime.server.camera.set_frame(fresh_slice, FrameSize::Hd);
+                    }
+
+                    runtime
+                        .server
+                        .stream_active_flag()
+                        .store(false, Ordering::Release);
+                    if let Some(mut guard) =
+                        StreamSessionGuard::try_acquire(runtime.server.stream_active_flag())
+                    {
+                        if let Ok(chunk) =
+                            guard.write_next_frame_chunk(&runtime.server.camera, http_resp_buf)
+                        {
+                            p81_tx_len = chunk.len();
+                            p81_tx_off = 0;
+                            if let Ok(sent) = sock81.send_slice(&http_resp_buf[..p81_tx_len]) {
+                                p81_tx_off = sent;
+                            }
+                        }
+                        drop(guard);
+                    }
+                    runtime
+                        .server
+                        .stream_active_flag()
+                        .store(true, Ordering::Release);
+                }
+            } else if sock81.can_recv() {
+                let avail = p81_req_buf.len().saturating_sub(p81_req_len);
+                if avail > 0 {
+                    if let Ok(n) =
+                        sock81.recv_slice(&mut p81_req_buf[p81_req_len..p81_req_len + avail])
+                    {
+                        p81_req_len += n;
+                    }
+                }
+                if let Ok(parsed) = parse_http_request(&p81_req_buf[..p81_req_len]) {
+                    if parsed.method == HttpMethod::Get && parsed.path == "/stream" {
+                        let mut started_stream = false;
+                        {
+                            if let Some(guard) =
+                                StreamSessionGuard::try_acquire(runtime.server.stream_active_flag())
+                            {
+                                if let Ok(hdr_bytes) = guard.write_stream_headers(http_resp_buf) {
+                                    let hdr_len = hdr_bytes.len();
+                                    let _ = sock81.send_slice(&http_resp_buf[..hdr_len]);
+                                }
+                                drop(guard);
+                                started_stream = true;
+                            }
+                        }
+                        if started_stream {
+                            runtime
+                                .server
+                                .stream_active_flag()
+                                .store(true, Ordering::Release);
+                            p81_streaming = true;
+                            p81_last_frame_ms = 0;
+                            p81_tx_off = 0;
+                            p81_tx_len = 0;
+                        } else {
+                            if let Ok(resp) = runtime.server.handle_raw_request(
+                                ServerPort::Stream,
+                                &p81_req_buf[..p81_req_len],
+                                http_resp_buf,
+                            ) {
+                                let _ = sock81.send_slice(resp);
+                            }
+                            sock81.close();
+                            p81_closing = true;
+                            p81_close_deadline_ms = now_ms + 2500;
+                        }
+                    } else {
+                        if let Ok(resp) = runtime.server.handle_raw_request(
+                            ServerPort::Stream,
+                            &p81_req_buf[..p81_req_len],
+                            http_resp_buf,
+                        ) {
+                            let _ = sock81.send_slice(resp);
+                        }
+                        sock81.close();
+                        p81_closing = true;
+                        p81_close_deadline_ms = now_ms + 2500;
+                    }
+                } else if p81_req_len >= p81_req_buf.len()
+                    || matches!(sock81.state(), TcpState::CloseWait)
+                {
+                    sock81.close();
+                    p81_closing = true;
+                    p81_close_deadline_ms = now_ms + 1000;
+                }
+            } else if matches!(sock81.state(), TcpState::CloseWait) && p81_req_len == 0 {
+                sock81.close();
+                p81_closing = true;
+                p81_close_deadline_ms = now_ms + 1000;
+            }
+        }
+
+        // ============================================================
+        // Port 81 Secondary Busy-Rejection Socket (NET-002 max_open_sockets=2)
+        // ============================================================
+        {
+            let sock81_busy = sockets.get_mut::<TcpSocket>(tcp81_busy_handle);
+            if !sock81_busy.is_open() {
+                p81_busy_closing = false;
+                sock81_busy.set_timeout(Some(smoltcp::time::Duration::from_millis(2000)));
+                let _ = sock81_busy.listen(81);
+            } else if p81_busy_closing {
+                if now_ms >= p81_busy_close_deadline_ms {
+                    sock81_busy.abort();
+                    p81_busy_closing = false;
+                }
+            } else if sock81_busy.can_recv() {
+                if let Ok(n) = sock81_busy.recv_slice(&mut p81_busy_req_buf) {
+                    if n > 0 {
+                        let mut err_buf = [0u8; 512];
+                        if let Ok(resp) = runtime.server.handle_raw_request(
+                            ServerPort::Stream,
+                            &p81_busy_req_buf[..n],
+                            &mut err_buf,
+                        ) {
+                            let _ = sock81_busy.send_slice(resp);
+                        }
+                        sock81_busy.close();
+                        p81_busy_closing = true;
+                        p81_busy_close_deadline_ms = now_ms + 2500;
+                    }
+                }
+            } else if matches!(sock81_busy.state(), TcpState::CloseWait) {
+                sock81_busy.close();
+                p81_busy_closing = true;
+                p81_busy_close_deadline_ms = now_ms + 1000;
+            }
+        }
+
+        if now_ms - last_heartbeat_ms >= 30_000 {
+            last_heartbeat_ms = now_ms;
+            println!(
+                "[KLIPPER-CAM-RS] Heartbeat: uptime={}ms connected={} stream_active={} last_jpeg={}B",
+                now_ms,
+                wifi_controller.is_connected(),
+                p81_streaming,
+                active_jpeg_len
+            );
+        }
     }
 }
 

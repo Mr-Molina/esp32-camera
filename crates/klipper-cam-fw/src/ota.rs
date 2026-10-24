@@ -478,6 +478,183 @@ impl Default for OtaDataSelect {
     }
 }
 
+/// 4-byte-aligned 32-byte buffer for `otadata` NOR flash reads and writes (`esp-storage` alignment requirement).
+#[repr(C, align(4))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlignedOtaBuf(pub [u8; 32]);
+
+impl Default for AlignedOtaBuf {
+    #[inline]
+    fn default() -> Self {
+        Self([0xFF; 32])
+    }
+}
+
+/// 4-byte-aligned 1024-byte chunk buffer for OTA application partition flash writes (`esp-storage` alignment requirement).
+#[repr(C, align(4))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlignedFlashChunk(pub [u8; OTA_CHUNK_SIZE]);
+
+impl Default for AlignedFlashChunk {
+    #[inline]
+    fn default() -> Self {
+        Self([0xFF; OTA_CHUNK_SIZE])
+    }
+}
+
+/// Hardware abstraction trait for SPI NOR flash `otadata` and OTA partition reads, erases, and writes.
+///
+/// Designed to wrap `esp_storage::FlashStorage` on Xtensa targets while enabling
+/// deterministic `#![no_std]` mock NOR flash verification on the host.
+pub trait OtaFlashStorage {
+    /// Reads `buf.len()` bytes starting at `offset` (`offset` and `buf.len()` must be 4-byte aligned).
+    fn read_aligned(&mut self, offset: u32, buf: &mut [u8]) -> Result<(), OtaError>;
+
+    /// Erases the flash range `[from, to)` (`from` and `to` must be 4096-byte sector aligned).
+    fn erase_range(&mut self, from: u32, to: u32) -> Result<(), OtaError>;
+
+    /// Writes `data` starting at `offset` (`offset` and `data.len()` must be 4-byte aligned).
+    fn write_aligned(&mut self, offset: u32, data: &[u8]) -> Result<(), OtaError>;
+}
+
+/// No-op [`OtaFlashStorage`] implementation for in-memory HTTP/OTA state machine operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NoOpFlashStorage;
+
+impl OtaFlashStorage for NoOpFlashStorage {
+    #[inline]
+    fn read_aligned(&mut self, _offset: u32, _buf: &mut [u8]) -> Result<(), OtaError> {
+        Ok(())
+    }
+
+    #[inline]
+    fn erase_range(&mut self, _from: u32, _to: u32) -> Result<(), OtaError> {
+        Ok(())
+    }
+
+    #[inline]
+    fn write_aligned(&mut self, _offset: u32, _data: &[u8]) -> Result<(), OtaError> {
+        Ok(())
+    }
+}
+
+/// Deterministic `#![no_std]` SPI NOR flash simulator covering `otadata` (`0x17000..0x19000`)
+/// and the leading `APP_WINDOW` bytes of `ota_0` (`0x20000`) and `ota_1` (`0x1D0000`).
+///
+/// Enforces hardware NOR flash invariants:
+/// - `read_aligned` and `write_aligned` require 4-byte aligned `offset` and buffer length.
+/// - `erase_range` requires 4096-byte (`0x1000`) sector-aligned `from` and `to` with `from < to`.
+/// - `erase_range` resets bytes to `0xFF`, and `write_aligned` programs bits via `dst &= src`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MockNorFlash<const APP_WINDOW: usize = 8192> {
+    pub otadata_s0: [u8; FLASH_SECTOR_SIZE as usize],
+    pub otadata_s1: [u8; FLASH_SECTOR_SIZE as usize],
+    pub ota_0: [u8; APP_WINDOW],
+    pub ota_1: [u8; APP_WINDOW],
+    pub erase_count: u32,
+    pub write_count: u32,
+    pub last_erased_range: Option<(u32, u32)>,
+    pub fail_writes: bool,
+}
+
+impl<const APP_WINDOW: usize> MockNorFlash<APP_WINDOW> {
+    /// Creates a blank (`0xFF`-erased) [`MockNorFlash`] instance.
+    pub const fn new() -> Self {
+        Self {
+            otadata_s0: [0xFF; FLASH_SECTOR_SIZE as usize],
+            otadata_s1: [0xFF; FLASH_SECTOR_SIZE as usize],
+            ota_0: [0xFF; APP_WINDOW],
+            ota_1: [0xFF; APP_WINDOW],
+            erase_count: 0,
+            write_count: 0,
+            last_erased_range: None,
+            fail_writes: false,
+        }
+    }
+
+    /// Creates a [`MockNorFlash`] initialized with `ota_0` active (`ota_seq = 1`, `Valid`) in `otadata` sector 0.
+    pub const fn new_booted_ota0() -> Self {
+        let mut flash = Self::new();
+        let bytes = OtaDataSelect::new(1, OtaImgState::Valid).to_bytes();
+        let mut i = 0;
+        while i < 32 {
+            flash.otadata_s0[i] = bytes[i];
+            i += 1;
+        }
+        flash
+    }
+
+    fn region_mut(&mut self, offset: u32, len: usize) -> Result<&mut [u8], OtaError> {
+        let end = offset
+            .checked_add(len as u32)
+            .ok_or(OtaError::FlashWriteError)?;
+        if offset >= OTADATA_SECTOR_0_OFFSET && end <= OTADATA_SECTOR_0_OFFSET + FLASH_SECTOR_SIZE {
+            let start = (offset - OTADATA_SECTOR_0_OFFSET) as usize;
+            Ok(&mut self.otadata_s0[start..start + len])
+        } else if offset >= OTADATA_SECTOR_1_OFFSET
+            && end <= OTADATA_SECTOR_1_OFFSET + FLASH_SECTOR_SIZE
+        {
+            let start = (offset - OTADATA_SECTOR_1_OFFSET) as usize;
+            Ok(&mut self.otadata_s1[start..start + len])
+        } else if offset >= OTA_0_OFFSET && end <= OTA_0_OFFSET + (APP_WINDOW as u32) {
+            let start = (offset - OTA_0_OFFSET) as usize;
+            Ok(&mut self.ota_0[start..start + len])
+        } else if offset >= OTA_1_OFFSET && end <= OTA_1_OFFSET + (APP_WINDOW as u32) {
+            let start = (offset - OTA_1_OFFSET) as usize;
+            Ok(&mut self.ota_1[start..start + len])
+        } else {
+            Err(OtaError::FlashWriteError)
+        }
+    }
+}
+
+impl<const APP_WINDOW: usize> Default for MockNorFlash<APP_WINDOW> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const APP_WINDOW: usize> OtaFlashStorage for MockNorFlash<APP_WINDOW> {
+    fn read_aligned(&mut self, offset: u32, buf: &mut [u8]) -> Result<(), OtaError> {
+        if (offset & 3) != 0 || (buf.len() & 3) != 0 {
+            return Err(OtaError::FlashWriteError);
+        }
+        let len = buf.len();
+        let slice = self.region_mut(offset, len)?;
+        buf.copy_from_slice(slice);
+        Ok(())
+    }
+
+    fn erase_range(&mut self, from: u32, to: u32) -> Result<(), OtaError> {
+        if self.fail_writes
+            || (from & (FLASH_SECTOR_SIZE - 1)) != 0
+            || (to & (FLASH_SECTOR_SIZE - 1)) != 0
+            || from >= to
+        {
+            return Err(OtaError::FlashWriteError);
+        }
+        let len = (to - from) as usize;
+        let slice = self.region_mut(from, len)?;
+        slice.fill(0xFF);
+        self.erase_count = self.erase_count.saturating_add(1);
+        self.last_erased_range = Some((from, to));
+        Ok(())
+    }
+
+    fn write_aligned(&mut self, offset: u32, data: &[u8]) -> Result<(), OtaError> {
+        if self.fail_writes || (offset & 3) != 0 || (data.len() & 3) != 0 {
+            return Err(OtaError::FlashWriteError);
+        }
+        let slice = self.region_mut(offset, data.len())?;
+        for (dst, &src) in slice.iter_mut().zip(data.iter()) {
+            *dst &= src;
+        }
+        self.write_count = self.write_count.saturating_add(1);
+        Ok(())
+    }
+}
+
 /// Dual-sector `otadata` state machine (`0x17000` and `0x18000`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OtaDataManager {
@@ -499,6 +676,119 @@ impl OtaDataManager {
     #[inline]
     pub const fn from_sectors(sector_0: OtaDataSelect, sector_1: OtaDataSelect) -> Self {
         Self { sector_0, sector_1 }
+    }
+
+    /// Reads both `otadata` sectors (`0x17000` and `0x18000`) from `flash` using 4-byte-aligned
+    /// [`AlignedOtaBuf`] buffers.
+    ///
+    /// If neither sector in flash contains a valid CRC-32 (e.g. blank factory flash),
+    /// initializes to [`Self::new_booted_ota0`].
+    pub fn load_from_flash<F: OtaFlashStorage>(flash: &mut F) -> Result<Self, OtaError> {
+        let mut buf0 = AlignedOtaBuf::default();
+        let mut buf1 = AlignedOtaBuf::default();
+        flash.read_aligned(OTADATA_SECTOR_0_OFFSET, &mut buf0.0)?;
+        flash.read_aligned(OTADATA_SECTOR_1_OFFSET, &mut buf1.0)?;
+        let sector_0 = OtaDataSelect::from_bytes(&buf0.0);
+        let sector_1 = OtaDataSelect::from_bytes(&buf1.0);
+        if !sector_0.is_crc_valid() && !sector_1.is_crc_valid() {
+            Ok(Self::new_booted_ota0())
+        } else {
+            Ok(Self::from_sectors(sector_0, sector_1))
+        }
+    }
+
+    /// Erases the 4KB `otadata` sector corresponding to `slot` (`0x17000` for `Ota0`,
+    /// `0x18000` for `Ota1`) and writes its 32-byte [`OtaDataSelect`] entry to `flash`.
+    pub fn sync_slot_to_flash<F: OtaFlashStorage>(
+        &self,
+        flash: &mut F,
+        slot: OtaSlot,
+    ) -> Result<(), OtaError> {
+        let (sector_offset, entry) = match slot {
+            OtaSlot::Ota0 => (OTADATA_SECTOR_0_OFFSET, &self.sector_0),
+            OtaSlot::Ota1 => (OTADATA_SECTOR_1_OFFSET, &self.sector_1),
+        };
+        flash.erase_range(sector_offset, sector_offset + FLASH_SECTOR_SIZE)?;
+        let aligned = AlignedOtaBuf(entry.to_bytes());
+        flash.write_aligned(sector_offset, &aligned.0)
+    }
+
+    /// Alias for [`Self::sync_slot_to_flash`].
+    #[inline]
+    pub fn sync_sector_to_flash<F: OtaFlashStorage>(
+        &self,
+        flash: &mut F,
+        slot: OtaSlot,
+    ) -> Result<(), OtaError> {
+        self.sync_slot_to_flash(flash, slot)
+    }
+
+    /// Marks the currently active OTA slot as [`OtaImgState::Valid`] (`EMB-003`) and,
+    /// if the state transitioned from `PendingVerify`/`New`, persists the updated `otadata`
+    /// sector to `flash`.
+    pub fn cancel_rollback_in_flash<F: OtaFlashStorage>(
+        &mut self,
+        flash: &mut F,
+    ) -> Result<bool, OtaError> {
+        let active = self.active_slot();
+        let changed = self.mark_app_valid_cancel_rollback()?;
+        if changed {
+            self.sync_slot_to_flash(flash, active)?;
+        }
+        Ok(changed)
+    }
+
+    /// Validates an ESP32 OTA firmware `payload`, erases the 4KB-rounded range in the passive
+    /// [`OtaSlot`] partition, writes the image in 1024-byte 4-byte-aligned chunks (padding any
+    /// trailing `1..=3` bytes with `0xFF`), updates `otadata` to [`OtaImgState::PendingVerify`],
+    /// and syncs the updated `otadata` sector to `flash`.
+    pub fn write_ota_image_to_flash<F: OtaFlashStorage>(
+        &mut self,
+        flash: &mut F,
+        payload: &[u8],
+    ) -> Result<OtaSlot, OtaError> {
+        let target_slot = self.next_update_slot();
+        let partition = target_slot.partition();
+        let max_size = if (partition.size as usize) < OTA_PARTITION_MAX_SIZE {
+            partition.size as usize
+        } else {
+            OTA_PARTITION_MAX_SIZE
+        };
+
+        validate_ota_image_header(payload, payload.len(), max_size)?;
+
+        let erase_len = ((payload.len() as u32) + 0xFFF) & !0xFFF;
+        flash.erase_range(
+            partition.offset,
+            partition.offset.saturating_add(erase_len),
+        )?;
+
+        let mut chunk = AlignedFlashChunk::default();
+        let mut received = 0usize;
+        while received < payload.len() {
+            let remaining = payload.len() - received;
+            let step = if remaining > OTA_CHUNK_SIZE {
+                OTA_CHUNK_SIZE
+            } else {
+                remaining
+            };
+            chunk.0[..step].copy_from_slice(&payload[received..received + step]);
+            let aligned_step = (step + 3) & !3;
+            let mut pad = step;
+            while pad < aligned_step {
+                chunk.0[pad] = 0xFF;
+                pad += 1;
+            }
+            flash.write_aligned(
+                partition.offset.saturating_add(received as u32),
+                &chunk.0[..aligned_step],
+            )?;
+            received += step;
+        }
+
+        self.set_boot_slot(target_slot)?;
+        self.sync_slot_to_flash(flash, target_slot)?;
+        Ok(target_slot)
     }
 
     /// Returns the currently active [`OtaSlot`] according to ESP-IDF bootloader selection rules.
@@ -919,5 +1209,62 @@ mod tests {
             validate_ota_image_header(&valid_hdr, 0, OTA_PARTITION_MAX_SIZE),
             Err(OtaError::MissingContentLength)
         );
+    }
+
+    #[test]
+    fn test_ota_flash_storage_load_write_and_cancel_rollback() {
+        let mut flash: MockNorFlash<8192> = MockNorFlash::new();
+        assert_eq!(core::mem::align_of::<AlignedOtaBuf>(), 4);
+        assert_eq!(core::mem::align_of::<AlignedFlashChunk>(), 4);
+
+        // 1. Blank factory flash initializes to ota_0 (ota_seq = 1, Valid)
+        let mut mgr = OtaDataManager::load_from_flash(&mut flash).expect("load blank flash");
+        assert_eq!(mgr.active_slot(), OtaSlot::Ota0);
+        assert_eq!(mgr.next_update_slot(), OtaSlot::Ota1);
+        mgr.sync_slot_to_flash(&mut flash, OtaSlot::Ota0)
+            .expect("sync initial ota_0 sector");
+
+        // 2. Build a 1029-byte firmware image (1024 + 5 bytes -> tests multi-chunk + 3-byte 0xFF alignment padding)
+        let mut image = [0x5Au8; 1029];
+        let hdr = EspImageHeader::minimal_valid_header_bytes(4, 0x4008_0400);
+        image[..24].copy_from_slice(&hdr);
+
+        let slot = mgr
+            .write_ota_image_to_flash(&mut flash, &image)
+            .expect("write OTA image to ota_1");
+        assert_eq!(slot, OtaSlot::Ota1);
+        assert_eq!(mgr.active_slot(), OtaSlot::Ota1);
+        assert_eq!(mgr.sector_1.state(), OtaImgState::PendingVerify);
+
+        // Verify ota_1 flash contents and 0xFF trailing padding up to 1032-byte 4-byte boundary
+        assert_eq!(&flash.ota_1[..1029], &image[..]);
+        assert_eq!(&flash.ota_1[1029..1032], &[0xFF, 0xFF, 0xFF]);
+
+        // 3. Simulate reboot: reload OtaDataManager from flash and verify PendingVerify state on ota_1
+        let mut booted_mgr =
+            OtaDataManager::load_from_flash(&mut flash).expect("reload otadata after reboot");
+        assert_eq!(booted_mgr.active_slot(), OtaSlot::Ota1);
+        assert_eq!(booted_mgr.sector_1.ota_seq, 2);
+        assert_eq!(booted_mgr.sector_1.state(), OtaImgState::PendingVerify);
+
+        // 4. Wi-Fi GOT_IP cancels rollback and persists Valid state to flash
+        let changed = booted_mgr
+            .cancel_rollback_in_flash(&mut flash)
+            .expect("cancel rollback in flash");
+        assert!(changed);
+        assert_eq!(booted_mgr.sector_1.state(), OtaImgState::Valid);
+
+        // Second call is idempotent and does not rewrite flash
+        let writes_before = flash.write_count;
+        let changed_again = booted_mgr
+            .cancel_rollback_in_flash(&mut flash)
+            .expect("idempotent cancel rollback");
+        assert!(!changed_again);
+        assert_eq!(flash.write_count, writes_before);
+
+        // Reload again from flash to confirm Valid state was persisted to sector 1 (0x18000)
+        let reloaded = OtaDataManager::load_from_flash(&mut flash).expect("reload after Valid");
+        assert_eq!(reloaded.active_slot(), OtaSlot::Ota1);
+        assert_eq!(reloaded.sector_1.state(), OtaImgState::Valid);
     }
 }

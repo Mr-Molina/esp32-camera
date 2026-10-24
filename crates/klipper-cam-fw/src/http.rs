@@ -13,8 +13,8 @@ use esp32_cam_types::{CameraError, FrameSize};
 
 use crate::config::KlipperCamConfig;
 use crate::ota::{
-    validate_ota_image_header, verify_ota_token, OtaDataManager, OtaError, OtaSlot,
-    OTA_CHUNK_SIZE, OTA_PARTITION_MAX_SIZE,
+    validate_ota_image_header, verify_ota_token, NoOpFlashStorage, OtaDataManager, OtaError,
+    OtaFlashStorage, OtaSlot, OTA_PARTITION_MAX_SIZE,
 };
 
 /// Multipart boundary string used by the Port 81 MJPEG stream (`PART_BOUNDARY` in `klipper_cam.c`).
@@ -535,6 +535,19 @@ impl<'a> CameraDriver<'a> {
         CameraDriver::new(&SYNTHETIC_HD_JFIF_FRAME, FrameSize::Hd)
     }
 
+    /// Replaces the active JPEG frame slice and resolution served by [`CameraDriver::acquire_frame`].
+    #[inline]
+    pub fn set_frame(&mut self, frame_data: &'a [u8], frame_size: FrameSize) {
+        self.frame_data = frame_data;
+        self.frame_size = frame_size;
+    }
+
+    /// Returns the underlying JPEG frame slice currently configured in the driver.
+    #[inline]
+    pub const fn frame_data(&self) -> &'a [u8] {
+        self.frame_data
+    }
+
     /// Acquires the frame-buffer mutex and returns an RAII [`FrameGuard`].
     ///
     /// Returns [`CameraError::InvalidState`] if the mutex is already locked (`Camera busy`),
@@ -765,7 +778,17 @@ impl<'a> KlipperCamServer<'a> {
 
     /// Cancels rollback on successful Wi-Fi IP acquisition (`IP_EVENT_STA_GOT_IP`, `APP-003` / `FW-002`).
     pub fn on_wifi_got_ip_cancel_rollback(&mut self) -> Result<bool, OtaError> {
-        self.ota_manager.mark_app_valid_cancel_rollback()
+        let mut noop = NoOpFlashStorage;
+        self.on_wifi_got_ip_with_flash(&mut noop)
+    }
+
+    /// Cancels rollback on successful Wi-Fi IP acquisition and persists the updated `otadata`
+    /// sector to `flash` (`IP_EVENT_STA_GOT_IP`, `APP-003` / `FW-002`).
+    pub fn on_wifi_got_ip_with_flash<F: OtaFlashStorage>(
+        &mut self,
+        flash: &mut F,
+    ) -> Result<bool, OtaError> {
+        self.ota_manager.cancel_rollback_in_flash(flash)
     }
 
     /// Handles a raw HTTP/1.1 request received on `port` (`ServerPort::Control` = 80 or
@@ -776,8 +799,21 @@ impl<'a> KlipperCamServer<'a> {
         raw_req: &[u8],
         out_buf: &'b mut [u8],
     ) -> Result<&'b [u8], HttpError> {
+        let mut noop = NoOpFlashStorage;
+        self.handle_raw_request_with_flash(port, raw_req, out_buf, &mut noop)
+    }
+
+    /// Handles a raw HTTP/1.1 request received on `port` with an [`OtaFlashStorage`] backend
+    /// for persisting `POST /update` firmware images and `otadata` state transitions.
+    pub fn handle_raw_request_with_flash<'b, F: OtaFlashStorage>(
+        &mut self,
+        port: ServerPort,
+        raw_req: &[u8],
+        out_buf: &'b mut [u8],
+        flash: &mut F,
+    ) -> Result<&'b [u8], HttpError> {
         let req = parse_http_request(raw_req)?;
-        self.handle_request(port, &req, out_buf)
+        self.handle_request_with_flash(port, &req, out_buf, flash)
     }
 
     /// Routes a parsed [`HttpRequest`] on `port` (`Control` = 80, `Stream` = 81).
@@ -787,24 +823,38 @@ impl<'a> KlipperCamServer<'a> {
         req: &HttpRequest<'_>,
         out_buf: &'b mut [u8],
     ) -> Result<&'b [u8], HttpError> {
+        let mut noop = NoOpFlashStorage;
+        self.handle_request_with_flash(port, req, out_buf, &mut noop)
+    }
+
+    /// Routes a parsed [`HttpRequest`] on `port` (`Control` = 80, `Stream` = 81) with an
+    /// [`OtaFlashStorage`] backend.
+    pub fn handle_request_with_flash<'b, F: OtaFlashStorage>(
+        &mut self,
+        port: ServerPort,
+        req: &HttpRequest<'_>,
+        out_buf: &'b mut [u8],
+        flash: &mut F,
+    ) -> Result<&'b [u8], HttpError> {
         match port {
-            ServerPort::Control => self.handle_port80(req, out_buf),
+            ServerPort::Control => self.handle_port80(req, out_buf, flash),
             ServerPort::Stream => self.handle_port81(req, out_buf),
         }
     }
 
     /// Handles requests arriving on Port 80 (`s_camera_httpd` in `klipper_cam.c`).
-    fn handle_port80<'b>(
+    fn handle_port80<'b, F: OtaFlashStorage>(
         &mut self,
         req: &HttpRequest<'_>,
         out_buf: &'b mut [u8],
+        flash: &mut F,
     ) -> Result<&'b [u8], HttpError> {
         match (req.method, req.path) {
             (HttpMethod::Get, "/") => self.handle_root_p80(req, out_buf),
             (HttpMethod::Get, "/snapshot") => self.handle_snapshot(out_buf),
             (HttpMethod::Get, "/status") => self.handle_status(out_buf),
             (HttpMethod::Get, "/update") => self.handle_ota_get(out_buf),
-            (HttpMethod::Post, "/update") => self.handle_ota_post(req, out_buf),
+            (HttpMethod::Post, "/update") => self.handle_ota_post(req, out_buf, flash),
             // Port 80 explicitly does NOT serve /stream (NET-001 / APP-005 -> 404 Not Found)
             _ => write_http_error(out_buf, 404, "Not Found", "404 Not Found\n", false),
         }
@@ -979,10 +1029,11 @@ xhr.send(file);}</script></body></html>";
     /// 2. `Content-Length` validation (`> 0` and `<= 0x1B0000`).
     /// 3. ESP32 `0xE9` image magic and segment count validation (`1..=16`).
     /// 4. 1024-byte chunked write loop to passive OTA slot + `otadata` CRC32 update + reboot flag.
-    fn handle_ota_post<'b>(
+    fn handle_ota_post<'b, F: OtaFlashStorage>(
         &mut self,
         req: &HttpRequest<'_>,
         out_buf: &'b mut [u8],
+        flash: &mut F,
     ) -> Result<&'b [u8], HttpError> {
         let expected_token = self.config.ota_token.as_bytes();
         let provided_token = req.ota_token.unwrap_or(b"");
@@ -1052,31 +1103,21 @@ xhr.send(file);}</script></body></html>";
             );
         }
 
-        // Process payload in bounded 1024-byte chunks matching klipper_cam.c
-        let mut received = 0usize;
-        while received < content_len {
-            let remaining = content_len - received;
-            let step = if remaining > OTA_CHUNK_SIZE {
-                OTA_CHUNK_SIZE
-            } else {
-                remaining
-            };
-            let _chunk = &payload[received..received + step];
-            received += step;
-        }
+        let written_slot = match self.ota_manager.write_ota_image_to_flash(flash, payload) {
+            Ok(slot) => slot,
+            Err(_) => {
+                return write_http_error(
+                    out_buf,
+                    500,
+                    "Internal Server Error",
+                    "Failed to update boot partition",
+                    false,
+                );
+            }
+        };
 
-        if self.ota_manager.set_boot_slot(target_slot).is_err() {
-            return write_http_error(
-                out_buf,
-                500,
-                "Internal Server Error",
-                "Failed to update boot partition",
-                false,
-            );
-        }
-
-        self.last_ota_bytes_written = received;
-        self.last_ota_target_slot = Some(target_slot);
+        self.last_ota_bytes_written = content_len;
+        self.last_ota_target_slot = Some(written_slot);
         self.reboot_scheduled = true;
 
         let ok_body = "Firmware update successful! Rebooting...\n";
@@ -1555,5 +1596,78 @@ mod tests {
         // 6. Simulate reboot + Wi-Fi IP acquisition cancelling rollback
         assert_eq!(server.on_wifi_got_ip_cancel_rollback(), Ok(true));
         assert_eq!(server.ota_manager.sector_1.state(), OtaImgState::Valid);
+    }
+
+    #[test]
+    fn test_camera_driver_set_frame_and_handle_raw_request_with_flash() {
+        use crate::ota::MockNorFlash;
+
+        let mut flash: MockNorFlash<8192> = MockNorFlash::new_booted_ota0();
+        let initial_frame: [u8; 6] = [0xFF, 0xD8, 0x11, 0x22, 0xFF, 0xD9];
+        let updated_frame: [u8; 8] = [0xFF, 0xD8, 0xAA, 0xBB, 0xCC, 0xDD, 0xFF, 0xD9];
+
+        let mut server = KlipperCamServer::new(
+            KlipperCamConfig::WROVER_KIT_HD,
+            CameraDriver::new(&initial_frame, FrameSize::Vga),
+        );
+        assert_eq!(server.camera.frame_data(), &initial_frame);
+
+        // Update live frame via set_frame and verify GET /snapshot returns updated frame
+        server.camera.set_frame(&updated_frame, FrameSize::Hd);
+        assert_eq!(server.camera.frame_data(), &updated_frame);
+
+        let mut resp_buf = [0u8; 1024];
+        let snap_resp = server
+            .handle_raw_request_with_flash(
+                ServerPort::Control,
+                b"GET /snapshot HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n",
+                &mut resp_buf,
+                &mut flash,
+            )
+            .expect("snapshot with flash");
+        let snap_view = HttpResponseView::parse(snap_resp).expect("parse snapshot");
+        assert_eq!(snap_view.status_code, 200);
+        assert_eq!(snap_view.body, &updated_frame);
+
+        // POST /update with flash persists 27-byte firmware (24-byte header + 3 trailing bytes) to ota_1
+        let mut fw_img = [0xA5u8; 27];
+        let hdr = EspImageHeader::minimal_valid_header_bytes(2, 0x4008_0400);
+        fw_img[..24].copy_from_slice(&hdr);
+
+        let mut ota_req = [0u8; 256];
+        let ota_req_bytes = {
+            let mut w = SliceWriter::new(&mut ota_req);
+            write!(
+                w,
+                "POST /update HTTP/1.1\r\nHost: 172.22.1.52\r\nX-OTA-Token: {}\r\nContent-Length: 27\r\n\r\n",
+                server.config.ota_token
+            )
+            .expect("hdr");
+            w.write_bytes(&fw_img).expect("body");
+            w.into_bytes()
+        };
+
+        let ota_resp = server
+            .handle_raw_request_with_flash(
+                ServerPort::Control,
+                ota_req_bytes,
+                &mut resp_buf,
+                &mut flash,
+            )
+            .expect("OTA POST with flash");
+        let ota_view = HttpResponseView::parse(ota_resp).expect("parse 200");
+        assert_eq!(ota_view.status_code, 200);
+        assert_eq!(&flash.ota_1[..27], &fw_img[..]);
+        assert_eq!(flash.ota_1[27], 0xFF);
+
+        // Confirm otadata sector 1 in flash has PendingVerify, then cancel rollback with flash
+        let loaded = OtaDataManager::load_from_flash(&mut flash).expect("load from flash");
+        assert_eq!(loaded.active_slot(), OtaSlot::Ota1);
+        assert_eq!(loaded.sector_1.state(), OtaImgState::PendingVerify);
+
+        assert_eq!(server.on_wifi_got_ip_with_flash(&mut flash), Ok(true));
+        let loaded_after =
+            OtaDataManager::load_from_flash(&mut flash).expect("load after rollback cancel");
+        assert_eq!(loaded_after.sector_1.state(), OtaImgState::Valid);
     }
 }
