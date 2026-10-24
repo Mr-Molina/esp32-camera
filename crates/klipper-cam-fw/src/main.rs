@@ -506,10 +506,13 @@ const PORT80_SOCKET_COUNT: usize = 4;
 const PORT81_SOCKET_COUNT: usize = 2;
 
 #[cfg(target_arch = "xtensa")]
-const TCP_MAX_INFLIGHT_BYTES: usize = 4 * 1420;
+const TCP_MSS_BYTES: usize = 1426;
 
 #[cfg(target_arch = "xtensa")]
-const TCP_LOW_WATER_BYTES: usize = 2 * 1420;
+const TCP_BATCH_SEGMENTS: usize = 8;
+
+#[cfg(target_arch = "xtensa")]
+const TCP_MAX_INFLIGHT_BYTES: usize = TCP_BATCH_SEGMENTS * TCP_MSS_BYTES;
 
 #[cfg(target_arch = "xtensa")]
 fn enqueue_tcp_sliding_window(
@@ -521,14 +524,114 @@ fn enqueue_tcp_sliding_window(
     if *tx_off >= tx_len || !sock.can_send() {
         return;
     }
-    let queued = sock.send_queue();
-    if queued <= TCP_LOW_WATER_BYTES {
-        let budget = TCP_MAX_INFLIGHT_BYTES.saturating_sub(queued);
-        let chunk_end = (*tx_off + budget).min(tx_len);
+    if sock.send_queue() == 0 {
+        let chunk_end = (*tx_off + TCP_MAX_INFLIGHT_BYTES).min(tx_len);
         if chunk_end > *tx_off {
             if let Ok(sent) = sock.send_slice(&buf[*tx_off..chunk_end]) {
                 *tx_off += sent;
             }
+        }
+    }
+}
+
+#[cfg(target_arch = "xtensa")]
+fn poll_net_burst(
+    iface: &mut smoltcp::iface::Interface,
+    net_device: &mut SmoltcpWifiDevice,
+    sockets: &mut smoltcp::iface::SocketSet<'_>,
+) {
+    for _ in 0..3u8 {
+        let now = smol_now();
+        let _ = iface.poll(now, net_device, sockets);
+        if iface.poll_delay(now, sockets) != Some(smoltcp::time::Duration::ZERO) {
+            break;
+        }
+    }
+}
+
+#[cfg(target_arch = "xtensa")]
+fn connect_strongest_ap(
+    wifi_controller: &mut esp_radio::wifi::WifiController<'_>,
+    base_sta_cfg: &esp_radio::wifi::sta::StationConfig,
+    ssid_str: &str,
+    timeout_ms: u64,
+) -> Option<esp_radio::wifi::sta::ConnectedInfo> {
+    use esp_hal::time::Duration;
+    use esp_println::println;
+    use esp_radio::wifi::{
+        scan::{ScanConfig, ScanTypeConfig},
+        Config as WifiConfig, PowerSaveMode,
+    };
+
+    let _ = wifi_controller.set_max_tx_power(78);
+    let _ = wifi_controller.set_power_saving(PowerSaveMode::None);
+
+    let mut scan_cfg = ScanConfig::default()
+        .with_max(8)
+        .with_scan_type(ScanTypeConfig::Active {
+            min: Duration::from_millis(20),
+            max: Duration::from_millis(45),
+        });
+    if let Ok(s) = ssid_str.try_into() {
+        scan_cfg = scan_cfg.with_ssid(s);
+    }
+
+    let best_ap = match block_on_with_timeout(wifi_controller.scan_async(&scan_cfg), 2500) {
+        Some(Ok(aps)) => aps
+            .into_iter()
+            .filter(|ap| ap.ssid.as_str() == ssid_str)
+            .max_by_key(|ap| ap.signal_strength),
+        _ => None,
+    };
+
+    if let Some(ap) = best_ap {
+        println!(
+            "[KLIPPER-CAM-RS] [WIFI] Strongest '{}' AP: ch={} rssi={}dBm bssid={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            ssid_str,
+            ap.channel,
+            ap.signal_strength,
+            ap.bssid[0],
+            ap.bssid[1],
+            ap.bssid[2],
+            ap.bssid[3],
+            ap.bssid[4],
+            ap.bssid[5]
+        );
+        let locked_cfg = base_sta_cfg
+            .clone()
+            .with_bssid(ap.bssid)
+            .with_channel(ap.channel);
+        if wifi_controller
+            .set_config(&WifiConfig::Station(locked_cfg))
+            .is_ok()
+        {
+            let _ = wifi_controller.set_max_tx_power(78);
+            match block_on_with_timeout(wifi_controller.connect_async(), timeout_ms) {
+                Some(Ok(info)) => {
+                    let _ = wifi_controller.set_power_saving(PowerSaveMode::None);
+                    let _ = wifi_controller.set_max_tx_power(78);
+                    return Some(info);
+                }
+                Some(Err(_)) => {}
+                None => {
+                    let _ = block_on_with_timeout(wifi_controller.disconnect_async(), 500);
+                }
+            }
+        }
+    }
+
+    let _ = wifi_controller.set_config(&WifiConfig::Station(base_sta_cfg.clone()));
+    let _ = wifi_controller.set_max_tx_power(78);
+    match block_on_with_timeout(wifi_controller.connect_async(), timeout_ms) {
+        Some(Ok(info)) => {
+            let _ = wifi_controller.set_power_saving(PowerSaveMode::None);
+            let _ = wifi_controller.set_max_tx_power(78);
+            Some(info)
+        }
+        Some(Err(_)) => None,
+        None => {
+            let _ = block_on_with_timeout(wifi_controller.disconnect_async(), 500);
+            None
         }
     }
 }
@@ -557,6 +660,7 @@ fn capture_live_hd_jpeg_with_diag(
     i2s_cam: &mut Esp32I2sCamera,
     jpeg_scratch: &mut [u8],
     ping_pong: &mut PingPongFrameBuffer<'_>,
+    poll_net: &mut dyn FnMut(),
 ) -> Result<usize, (u32, usize, u8, u8, u8, u32)> {
     const GPIO_IN_REG: *const u32 = 0x3FF4_403C as *const u32;
     const I2S_INT_RAW_REG: *const u32 = 0x3FF4_F00C as *const u32;
@@ -588,10 +692,24 @@ fn capture_live_hd_jpeg_with_diag(
         ((unsafe { core::ptr::read_volatile(GPIO_IN_REG) } >> 25) & 1) != 0
     };
 
-    // Wait for VSYNC vertical blanking transition (bounded to 90 ms)
+    // Wait for VSYNC vertical blanking transition (bounded to 90 ms) while servicing smoltcp
     let sync_start_ms = now_millis();
-    while !read_vsync() && (now_millis().saturating_sub(sync_start_ms) < 45) {}
-    while read_vsync() && (now_millis().saturating_sub(sync_start_ms) < 90) {}
+    let mut spin = 0u32;
+    while !read_vsync() && (now_millis().saturating_sub(sync_start_ms) < 45) {
+        spin = spin.wrapping_add(1);
+        if (spin & 0x7F) == 0 {
+            poll_net();
+        }
+    }
+    let vsync_high_ms = now_millis();
+    while read_vsync() && (now_millis().saturating_sub(sync_start_ms) < 90) {
+        if now_millis().saturating_sub(vsync_high_ms) >= 2 {
+            spin = spin.wrapping_add(1);
+            if (spin & 0x7F) == 0 {
+                poll_net();
+            }
+        }
+    }
 
     if !i2s_cam.start(&dma_cfg, desc_slice[0].link_addr_20bit()) {
         return Err((0, 0, 0, 0, 0, 0xDEAD));
@@ -958,6 +1076,7 @@ fn main() -> ! {
                 &mut hw_i2s_cam,
                 jpeg_scratch_buf,
                 &mut ping_pong,
+                &mut || {},
             ) {
                 Ok(captured_len) => {
                     ov2640_dma_ok = true;
@@ -1024,9 +1143,10 @@ fn main() -> ! {
     let ctrl_cfg = ControllerConfig::default()
         .with_rx_queue_size(16)
         .with_tx_queue_size(12)
-        .with_initial_config(WifiConfig::Station(sta_cfg));
+        .with_initial_config(WifiConfig::Station(sta_cfg.clone()));
     let mut wifi_controller =
         WifiController::new(peripherals.WIFI, ctrl_cfg).expect("WifiController::new");
+    let _ = wifi_controller.set_max_tx_power(78);
     let _ = wifi_controller.set_power_saving(PowerSaveMode::None);
 
     let wifi_iface = WifiInterface::station();
@@ -1037,21 +1157,17 @@ fn main() -> ! {
     );
     runtime.on_wifi_sta_start();
 
-    match block_on_with_timeout(wifi_controller.connect_async(), 8000) {
-        Some(Ok(info)) => {
-            let _ = wifi_controller.set_power_saving(PowerSaveMode::None);
+    match connect_strongest_ap(&mut wifi_controller, &sta_cfg, ssid, 8000) {
+        Some(info) => {
             println!(
                 "[KLIPPER-CAM-RS] [WIFI] Connected to AP (channel {}, aid {})",
                 info.channel, info.aid
             );
         }
-        Some(Err(e)) => {
-            println!("[KLIPPER-CAM-RS] [WIFI] Initial connect warning: {:?}", e);
-            runtime.on_wifi_sta_disconnected();
-        }
         None => {
-            println!("[KLIPPER-CAM-RS] [WIFI] Initial connect timed out (8000 ms); will retry in loop");
-            let _ = block_on_with_timeout(wifi_controller.disconnect_async(), 500);
+            println!(
+                "[KLIPPER-CAM-RS] [WIFI] Initial connect warning/timeout; will retry in loop"
+            );
             runtime.on_wifi_sta_disconnected();
         }
     }
@@ -1141,6 +1257,8 @@ fn main() -> ! {
     let mut last_capture_ms = connect_ms;
     let mut post_snapshot_refresh_at_ms: Option<i64> = None;
     let mut last_applied_ctrl = klipper_cam_fw::CameraControlState::new_default();
+    let mut weak_rssi_since_ms: Option<i64> = None;
+    let mut last_roam_attempt_ms: i64 = connect_ms;
 
     loop {
         let now = smol_now();
@@ -1150,27 +1268,21 @@ fn main() -> ! {
         if !wifi_controller.is_connected() && now_ms - last_reconnect_attempt_ms >= 2000 {
             last_reconnect_attempt_ms = now_ms;
             runtime.on_wifi_sta_disconnected();
-            match block_on_with_timeout(wifi_controller.connect_async(), 4000) {
-                Some(Ok(info)) => {
-                    let _ = wifi_controller.set_power_saving(PowerSaveMode::None);
-                    println!(
-                        "[KLIPPER-CAM-RS] [WIFI] Reconnected to AP (channel {})",
-                        info.channel
+            if let Some(info) = connect_strongest_ap(&mut wifi_controller, &sta_cfg, ssid, 4000) {
+                println!(
+                    "[KLIPPER-CAM-RS] [WIFI] Reconnected to AP (channel {})",
+                    info.channel
+                );
+                connect_ms = smol_now().total_millis();
+                weak_rssi_since_ms = None;
+                if ip_configured {
+                    send_arp_announce(
+                        &mut net_device,
+                        mac,
+                        [172, 22, 1, 52],
+                        [172, 22, 1, 1],
                     );
-                    connect_ms = smol_now().total_millis();
-                    if ip_configured {
-                        send_arp_announce(
-                            &mut net_device,
-                            mac,
-                            [172, 22, 1, 52],
-                            [172, 22, 1, 1],
-                        );
-                        last_arp_announce_ms = connect_ms;
-                    }
-                }
-                Some(Err(_)) => {}
-                None => {
-                    let _ = block_on_with_timeout(wifi_controller.disconnect_async(), 500);
+                    last_arp_announce_ms = connect_ms;
                 }
             }
         }
@@ -1287,22 +1399,52 @@ fn main() -> ! {
         {
             post_snapshot_refresh_at_ms = None;
             last_capture_ms = now_ms;
-            for _ in 0..2u8 {
-                if capture_live_hd_jpeg_with_diag(
-                    &mut hw_i2s_cam,
-                    jpeg_scratch_buf,
-                    &mut ping_pong,
-                )
-                .is_ok()
-                {
-                    let fresh_slice = active_ping_pong_static_slice(&ping_pong);
-                    runtime.server.camera.set_frame(
-                        fresh_slice,
-                        runtime.server.control_state.framesize,
-                    );
-                    last_capture_ms = smol_now().total_millis();
-                    break;
+            if capture_live_hd_jpeg_with_diag(
+                &mut hw_i2s_cam,
+                jpeg_scratch_buf,
+                &mut ping_pong,
+                &mut || {
+                    let _ = iface.poll(smol_now(), &mut net_device, &mut sockets);
+                },
+            )
+            .is_ok()
+            {
+                let fresh_slice = active_ping_pong_static_slice(&ping_pong);
+                runtime.server.camera.set_frame(
+                    fresh_slice,
+                    runtime.server.control_state.framesize,
+                );
+                last_capture_ms = smol_now().total_millis();
+            }
+        }
+
+        // Idle weak-RSSI roam check: if idle and RSSI stays worse than -68 dBm for > 15s, re-scan for strongest AP
+        if wifi_controller.is_connected()
+            && p81_stream_owner.is_none()
+            && !p80_busy
+            && ota_accum_owner.is_none()
+            && !runtime.server.is_reboot_scheduled()
+        {
+            let cur_rssi = wifi_controller.rssi().unwrap_or(-50);
+            if cur_rssi < -68 {
+                let since = *weak_rssi_since_ms.get_or_insert(now_ms);
+                if now_ms - since >= 15_000 && now_ms - last_roam_attempt_ms >= 180_000 {
+                    last_roam_attempt_ms = now_ms;
+                    weak_rssi_since_ms = None;
+                    let _ = block_on_with_timeout(wifi_controller.disconnect_async(), 500);
+                    if let Some(info) =
+                        connect_strongest_ap(&mut wifi_controller, &sta_cfg, ssid, 5000)
+                    {
+                        println!(
+                            "[KLIPPER-CAM-RS] [WIFI] Roamed from weak RSSI ({} dBm) to strongest AP (channel {})",
+                            cur_rssi, info.channel
+                        );
+                        send_arp_announce(&mut net_device, mac, [172, 22, 1, 52], [172, 22, 1, 1]);
+                        last_arp_announce_ms = smol_now().total_millis();
+                    }
                 }
+            } else {
+                weak_rssi_since_ms = None;
             }
         }
 
@@ -1502,49 +1644,49 @@ fn main() -> ! {
         // Apply any pending live camera control updates from GET /control?var=...&val=...
         // only after all active Port 80 HTTP responses have finished flushing.
         let p80_tx_active = p80_states.iter().any(|s| s.tx_len > 0 && !s.closing);
-        if !p80_tx_active {
-            if let Some(ctrl) = runtime.server.take_pending_control_update() {
-                if let (Some(ref mut sccb), Some(ref mut ov)) = (&mut kept_sccb, &mut live_ov2640) {
-                    if ctrl.framesize != last_applied_ctrl.framesize {
-                        let _ = ov.set_framesize(sccb, ctrl.framesize);
-                    }
-                    if ctrl.quality != last_applied_ctrl.quality {
-                        let _ = ov.set_quality(sccb, ctrl.quality);
-                    }
-                    if ctrl.brightness != last_applied_ctrl.brightness {
-                        let _ = ov.set_brightness(sccb, ctrl.brightness);
-                    }
-                    if ctrl.contrast != last_applied_ctrl.contrast {
-                        let _ = ov.set_contrast(sccb, ctrl.contrast);
-                    }
-                    if ctrl.saturation != last_applied_ctrl.saturation {
-                        let _ = ov.set_saturation(sccb, ctrl.saturation);
-                    }
-                    if ctrl.special_effect != last_applied_ctrl.special_effect {
-                        let _ = ov.set_special_effect(sccb, ctrl.special_effect);
-                    }
-                    if ctrl.hmirror != last_applied_ctrl.hmirror {
-                        let _ = ov.set_hmirror(sccb, ctrl.hmirror);
-                    }
-                    if ctrl.vflip != last_applied_ctrl.vflip {
-                        let _ = ov.set_vflip(sccb, ctrl.vflip);
-                    }
-                    if ctrl.awb != last_applied_ctrl.awb {
-                        let _ = ov.set_whitebal(sccb, ctrl.awb);
-                    }
-                    if ctrl.agc != last_applied_ctrl.agc {
-                        let _ = ov.set_gain_ctrl(sccb, ctrl.agc);
-                    }
-                    if ctrl.aec != last_applied_ctrl.aec {
-                        let _ = ov.set_exposure_ctrl(sccb, ctrl.aec);
-                    }
-                    if ctrl.ae_level != last_applied_ctrl.ae_level {
-                        let _ = ov.set_ae_level(sccb, ctrl.ae_level);
-                    }
+        if p80_tx_active {
+            poll_net_burst(&mut iface, &mut net_device, &mut sockets);
+        } else if let Some(ctrl) = runtime.server.take_pending_control_update() {
+            if let (Some(ref mut sccb), Some(ref mut ov)) = (&mut kept_sccb, &mut live_ov2640) {
+                if ctrl.framesize != last_applied_ctrl.framesize {
+                    let _ = ov.set_framesize(sccb, ctrl.framesize);
                 }
-                last_applied_ctrl = ctrl;
-                post_snapshot_refresh_at_ms = Some(now_ms + 150);
+                if ctrl.quality != last_applied_ctrl.quality {
+                    let _ = ov.set_quality(sccb, ctrl.quality);
+                }
+                if ctrl.brightness != last_applied_ctrl.brightness {
+                    let _ = ov.set_brightness(sccb, ctrl.brightness);
+                }
+                if ctrl.contrast != last_applied_ctrl.contrast {
+                    let _ = ov.set_contrast(sccb, ctrl.contrast);
+                }
+                if ctrl.saturation != last_applied_ctrl.saturation {
+                    let _ = ov.set_saturation(sccb, ctrl.saturation);
+                }
+                if ctrl.special_effect != last_applied_ctrl.special_effect {
+                    let _ = ov.set_special_effect(sccb, ctrl.special_effect);
+                }
+                if ctrl.hmirror != last_applied_ctrl.hmirror {
+                    let _ = ov.set_hmirror(sccb, ctrl.hmirror);
+                }
+                if ctrl.vflip != last_applied_ctrl.vflip {
+                    let _ = ov.set_vflip(sccb, ctrl.vflip);
+                }
+                if ctrl.awb != last_applied_ctrl.awb {
+                    let _ = ov.set_whitebal(sccb, ctrl.awb);
+                }
+                if ctrl.agc != last_applied_ctrl.agc {
+                    let _ = ov.set_gain_ctrl(sccb, ctrl.agc);
+                }
+                if ctrl.aec != last_applied_ctrl.aec {
+                    let _ = ov.set_exposure_ctrl(sccb, ctrl.aec);
+                }
+                if ctrl.ae_level != last_applied_ctrl.ae_level {
+                    let _ = ov.set_ae_level(sccb, ctrl.ae_level);
+                }
             }
+            last_applied_ctrl = ctrl;
+            post_snapshot_refresh_at_ms = Some(now_ms + 150);
         }
 
         // Reboot if OTA firmware update completed and all Port 80 TX buffers have flushed
@@ -1608,7 +1750,7 @@ fn main() -> ! {
                             &mut p81_tx_off,
                             p81_tx_len,
                         );
-                    } else if now_ms - p81_last_frame_ms >= 150
+                    } else if now_ms - p81_last_frame_ms >= 60
                         && sock81.can_send()
                         && sock81.send_queue() == 0
                     {
@@ -1617,29 +1759,29 @@ fn main() -> ! {
                 }
                 if ready_for_next_frame {
                     p81_last_frame_ms = now_ms;
-                    if now_ms - last_capture_ms >= 140
+                    if now_ms - last_capture_ms >= 50
                         && ov2640_dma_ok
                         && ota_accum_owner.is_none()
                         && !runtime.server.is_reboot_scheduled()
                         && !p80_busy
                     {
                         last_capture_ms = now_ms;
-                        for _ in 0..2u8 {
-                            if capture_live_hd_jpeg_with_diag(
-                                &mut hw_i2s_cam,
-                                jpeg_scratch_buf,
-                                &mut ping_pong,
-                            )
-                            .is_ok()
-                            {
-                                let fresh_slice = active_ping_pong_static_slice(&ping_pong);
-                                runtime.server.camera.set_frame(
-                                    fresh_slice,
-                                    runtime.server.control_state.framesize,
-                                );
-                                last_capture_ms = smol_now().total_millis();
-                                break;
-                            }
+                        if capture_live_hd_jpeg_with_diag(
+                            &mut hw_i2s_cam,
+                            jpeg_scratch_buf,
+                            &mut ping_pong,
+                            &mut || {
+                                let _ = iface.poll(smol_now(), &mut net_device, &mut sockets);
+                            },
+                        )
+                        .is_ok()
+                        {
+                            let fresh_slice = active_ping_pong_static_slice(&ping_pong);
+                            runtime.server.camera.set_frame(
+                                fresh_slice,
+                                runtime.server.control_state.framesize,
+                            );
+                            last_capture_ms = smol_now().total_millis();
                         }
                     }
                     let sock81 = sockets.get_mut::<TcpSocket>(tcp81_handles[idx]);
@@ -1796,6 +1938,8 @@ fn main() -> ! {
                 }
             }
         }
+
+        poll_net_burst(&mut iface, &mut net_device, &mut sockets);
 
         if now_ms - last_heartbeat_ms >= 30_000 {
             last_heartbeat_ms = now_ms;
