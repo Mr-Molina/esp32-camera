@@ -440,6 +440,35 @@ fn smol_now() -> smoltcp::time::Instant {
 }
 
 #[cfg(target_arch = "xtensa")]
+fn block_on_with_timeout<F: core::future::Future>(
+    mut fut: F,
+    timeout_ms: u64,
+) -> Option<F::Output> {
+    use core::{
+        pin::Pin,
+        task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
+    };
+    const VTABLE: RawWakerVTable = RawWakerVTable::new(
+        |p| RawWaker::new(p, &VTABLE),
+        |_| {},
+        |_| {},
+        |_| {},
+    );
+    let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
+    let start_ms = now_millis();
+    loop {
+        if let Poll::Ready(res) = fut.as_mut().poll(&mut cx) {
+            return Some(res);
+        }
+        if now_millis().saturating_sub(start_ms) >= timeout_ms {
+            return None;
+        }
+    }
+}
+
+#[cfg(target_arch = "xtensa")]
 fn send_arp_announce(
     net_device: &mut SmoltcpWifiDevice,
     mac: [u8; 6],
@@ -471,14 +500,38 @@ fn send_arp_announce(
 }
 
 #[cfg(target_arch = "xtensa")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DmaCapturePhase {
-    Idle { last_done_ms: i64 },
-    WaitVsyncHigh { start_ms: i64 },
-}
+const PORT80_SOCKET_COUNT: usize = 4;
 
 #[cfg(target_arch = "xtensa")]
-const PORT80_SOCKET_COUNT: usize = 4;
+const PORT81_SOCKET_COUNT: usize = 2;
+
+#[cfg(target_arch = "xtensa")]
+const TCP_MAX_INFLIGHT_BYTES: usize = 4 * 1420;
+
+#[cfg(target_arch = "xtensa")]
+const TCP_LOW_WATER_BYTES: usize = 2 * 1420;
+
+#[cfg(target_arch = "xtensa")]
+fn enqueue_tcp_sliding_window(
+    sock: &mut smoltcp::socket::tcp::Socket<'_>,
+    buf: &[u8],
+    tx_off: &mut usize,
+    tx_len: usize,
+) {
+    if *tx_off >= tx_len || !sock.can_send() {
+        return;
+    }
+    let queued = sock.send_queue();
+    if queued <= TCP_LOW_WATER_BYTES {
+        let budget = TCP_MAX_INFLIGHT_BYTES.saturating_sub(queued);
+        let chunk_end = (*tx_off + budget).min(tx_len);
+        if chunk_end > *tx_off {
+            if let Ok(sent) = sock.send_slice(&buf[*tx_off..chunk_end]) {
+                *tx_off += sent;
+            }
+        }
+    }
+}
 
 #[cfg(target_arch = "xtensa")]
 #[derive(Debug, Clone, Copy, Default)]
@@ -489,6 +542,14 @@ struct Port80WorkerState {
     closing: bool,
     close_deadline_ms: i64,
     using_ota_accum: bool,
+}
+
+#[cfg(target_arch = "xtensa")]
+#[derive(Debug, Clone, Copy, Default)]
+struct Port81WorkerState {
+    req_len: usize,
+    closing: bool,
+    close_deadline_ms: i64,
 }
 
 #[cfg(target_arch = "xtensa")]
@@ -680,9 +741,9 @@ fn main() -> ! {
     let peripherals = esp_hal::init(config);
     let delay = Delay::new();
 
-    // Initialize internal DRAM heap for esp-rtos and esp-radio Wi-Fi STA (~96 KB)
+    // Initialize internal DRAM heap for esp-rtos and esp-radio Wi-Fi STA (~112 KB strictly internal)
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 64 * 1024);
-    esp_alloc::heap_allocator!(size: 32 * 1024);
+    esp_alloc::heap_allocator!(size: 48 * 1024);
 
     // Initialize 4 MB external PSRAM at 80 MHz
     let psram = Psram::new(
@@ -704,7 +765,7 @@ fn main() -> ! {
     );
     println!("============================================================");
 
-    // Carve PSRAM buffers for Ping-Pong 1280x720 JPEG slots, 4-socket Port 80 pool, Port 81 stream, and OTA buffer
+    // Carve PSRAM buffers for Ping-Pong 1280x720 JPEG slots, 4-socket Port 80 pool, 2-socket Port 81 pool, and OTA buffer
     let psram_all: &'static mut [u8] =
         unsafe { core::slice::from_raw_parts_mut(psram_ptr, psram_len) };
     let (jpeg_slot_a, rem) = psram_all.split_at_mut(128 * 1024);
@@ -729,25 +790,17 @@ fn main() -> ! {
     let (p80_resp2, rem) = rem.split_at_mut(128 * 1024);
     let (p80_resp3, rem) = rem.split_at_mut(128 * 1024);
 
-    // Port 81 primary + busy buffers
-    let (tcp81_rx_storage, rem) = rem.split_at_mut(4 * 1024);
-    let (tcp81_tx_storage, rem) = rem.split_at_mut(160 * 1024);
+    // 2-socket Port 81 pool buffers + shared 128 KB MJPEG frame chunk buffer
+    let (tcp81_rx0, rem) = rem.split_at_mut(4 * 1024);
+    let (tcp81_tx0, rem) = rem.split_at_mut(128 * 1024);
+    let (tcp81_rx1, rem) = rem.split_at_mut(4 * 1024);
+    let (tcp81_tx1, rem) = rem.split_at_mut(128 * 1024);
     let (p81_resp_buf, rem) = rem.split_at_mut(128 * 1024);
-    let (tcp81_busy_rx_storage, rem) = rem.split_at_mut(2 * 1024);
-    let (tcp81_busy_tx_storage, rem) = rem.split_at_mut(2 * 1024);
 
-    // Shared 1800 KB OTA upload accumulator
+    // Shared 1800 KB OTA upload accumulator; remaining PSRAM stays unmapped from esp_alloc::HEAP
+    // so esp-radio / esp-rtos malloc() can NEVER spill internal DMA/Wi-Fi allocations into external PSRAM.
     let (http80_ota_accum, psram_heap_rem) = rem.split_at_mut(1800 * 1024);
-
-    if !psram_heap_rem.is_empty() {
-        unsafe {
-            esp_alloc::HEAP.add_region(esp_alloc::HeapRegion::new(
-                psram_heap_rem.as_mut_ptr(),
-                psram_heap_rem.len(),
-                esp_alloc::MemoryCapability::External.into(),
-            ));
-        }
-    }
+    let free_psram_bytes = psram_heap_rem.len() as u32;
 
     let mut ping_pong = PingPongFrameBuffer::new(
         jpeg_slot_a,
@@ -932,10 +985,12 @@ fn main() -> ! {
     }
     println!("============================================================");
 
-    // 5. Initialize SPI NOR Flash adapter and load otadata state
+    // 5. Initialize SPI NOR Flash adapter, load otadata state, and cancel rollback
+    //    BEFORE starting esp-rtos / Wi-Fi so SPI NOR Flash sector erase never runs while Wi-Fi interrupts are active.
     let mut flash_adapter = EspFlashAdapter(esp_storage::FlashStorage::new(peripherals.FLASH));
-    let ota_manager = OtaDataManager::load_from_flash(&mut flash_adapter)
+    let mut ota_manager = OtaDataManager::load_from_flash(&mut flash_adapter)
         .unwrap_or_else(|_| OtaDataManager::new_booted_ota0());
+    let _ = ota_manager.cancel_rollback_in_flash(&mut flash_adapter);
 
     let initial_slice = active_ping_pong_static_slice(&ping_pong);
     let mut runtime = FirmwareRuntime::new(
@@ -966,11 +1021,13 @@ fn main() -> ! {
         sta_cfg = sta_cfg.with_ssid(s);
     };
 
-    let ctrl_cfg = ControllerConfig::default().with_initial_config(WifiConfig::Station(sta_cfg));
+    let ctrl_cfg = ControllerConfig::default()
+        .with_rx_queue_size(16)
+        .with_tx_queue_size(12)
+        .with_initial_config(WifiConfig::Station(sta_cfg));
     let mut wifi_controller =
         WifiController::new(peripherals.WIFI, ctrl_cfg).expect("WifiController::new");
     let _ = wifi_controller.set_power_saving(PowerSaveMode::None);
-    let _ = wifi_controller.set_max_tx_power(60);
 
     let wifi_iface = WifiInterface::station();
     let mac = wifi_iface.mac_address();
@@ -980,24 +1037,43 @@ fn main() -> ! {
     );
     runtime.on_wifi_sta_start();
 
-    match embassy_futures::block_on(wifi_controller.connect_async()) {
-        Ok(info) => {
+    match block_on_with_timeout(wifi_controller.connect_async(), 8000) {
+        Some(Ok(info)) => {
+            let _ = wifi_controller.set_power_saving(PowerSaveMode::None);
             println!(
                 "[KLIPPER-CAM-RS] [WIFI] Connected to AP (channel {}, aid {})",
                 info.channel, info.aid
             );
         }
-        Err(e) => {
+        Some(Err(e)) => {
             println!("[KLIPPER-CAM-RS] [WIFI] Initial connect warning: {:?}", e);
+            runtime.on_wifi_sta_disconnected();
+        }
+        None => {
+            println!("[KLIPPER-CAM-RS] [WIFI] Initial connect timed out (8000 ms); will retry in loop");
+            let _ = block_on_with_timeout(wifi_controller.disconnect_async(), 500);
             runtime.on_wifi_sta_disconnected();
         }
     }
 
-    // 7. Configure smoltcp Ethernet Interface + DHCPv4 + Static IP fallback (172.22.1.52/24)
-    //    + 4-socket Port 80 pool + Port 81 primary & busy TCP sockets (7 sockets total)
+    // 7. Configure smoltcp Ethernet Interface + DHCPv4 + Static IP (172.22.1.52/24, GW 172.22.1.1)
+    //    + 4-socket Port 80 pool + 2-socket Port 81 pool (7 sockets total)
     let mut net_device = SmoltcpWifiDevice(wifi_iface);
-    let iface_cfg = IfaceConfig::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
+    let mut iface_cfg = IfaceConfig::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
+    const RNG_DATA_REG: *const u32 = 0x3FF7_5144 as *const u32;
+    let hw_rng_lo = unsafe { core::ptr::read_volatile(RNG_DATA_REG) } as u64;
+    let hw_rng_hi = unsafe { core::ptr::read_volatile(RNG_DATA_REG) } as u64;
+    let boot_us = esp_hal::time::Instant::now()
+        .duration_since_epoch()
+        .as_micros();
+    iface_cfg.random_seed = ((hw_rng_hi << 32) | hw_rng_lo) ^ boot_us ^ 0x9E37_79B9_7F4A_7C15;
     let mut iface = NetInterface::new(iface_cfg, &mut net_device, smol_now());
+    iface.update_ip_addrs(|addrs| {
+        let _ = addrs.push(IpCidr::new(IpAddress::v4(172, 22, 1, 52), 24));
+    });
+    let _ = iface
+        .routes_mut()
+        .add_default_ipv4_route(Ipv4Address::new(172, 22, 1, 1));
 
     let mut socket_storage = [SocketStorage::EMPTY; 7];
     let mut sockets = SocketSet::new(&mut socket_storage[..]);
@@ -1021,6 +1097,12 @@ fn main() -> ! {
             TcpSocketBuffer::new(p80_tx3),
         )),
     ];
+    for &h80 in &tcp80_handles {
+        let s80 = sockets.get_mut::<TcpSocket>(h80);
+        s80.set_nagle_enabled(false);
+        s80.set_timeout(Some(smoltcp::time::Duration::from_millis(60_000)));
+        let _ = s80.listen(80);
+    }
     let p80_hdr_bufs: [&mut [u8]; PORT80_SOCKET_COUNT] =
         [p80_hdr0, p80_hdr1, p80_hdr2, p80_hdr3];
     let p80_resp_bufs: [&mut [u8]; PORT80_SOCKET_COUNT] =
@@ -1028,63 +1110,74 @@ fn main() -> ! {
     let mut p80_states = [Port80WorkerState::default(); PORT80_SOCKET_COUNT];
     let mut ota_accum_owner: Option<usize> = None;
 
-    let tcp81_handle = sockets.add(TcpSocket::new(
-        TcpSocketBuffer::new(tcp81_rx_storage),
-        TcpSocketBuffer::new(tcp81_tx_storage),
-    ));
-    let tcp81_busy_handle = sockets.add(TcpSocket::new(
-        TcpSocketBuffer::new(tcp81_busy_rx_storage),
-        TcpSocketBuffer::new(tcp81_busy_tx_storage),
-    ));
+    let tcp81_handles: [smoltcp::iface::SocketHandle; PORT81_SOCKET_COUNT] = [
+        sockets.add(TcpSocket::new(
+            TcpSocketBuffer::new(tcp81_rx0),
+            TcpSocketBuffer::new(tcp81_tx0),
+        )),
+        sockets.add(TcpSocket::new(
+            TcpSocketBuffer::new(tcp81_rx1),
+            TcpSocketBuffer::new(tcp81_tx1),
+        )),
+    ];
+    for &h81 in &tcp81_handles {
+        let s81 = sockets.get_mut::<TcpSocket>(h81);
+        s81.set_nagle_enabled(false);
+        s81.set_timeout(Some(smoltcp::time::Duration::from_millis(10_000)));
+        let _ = s81.listen(81);
+    }
+    let mut p81_req_bufs = [[0u8; 1024]; PORT81_SOCKET_COUNT];
+    let mut p81_states = [Port81WorkerState::default(); PORT81_SOCKET_COUNT];
+    let mut p81_stream_owner: Option<usize> = None;
+    let mut p81_last_frame_ms: i64 = 0;
+    let mut p81_tx_off: usize = 0;
+    let mut p81_tx_len: usize = 0;
 
     let mut ip_configured = false;
     let mut connect_ms = smol_now().total_millis();
     let mut last_reconnect_attempt_ms = connect_ms;
     let mut last_heartbeat_ms = connect_ms;
     let mut last_arp_announce_ms = connect_ms;
-
-    // Non-blocking background I2S0 DMA capture state machine
-    let mut dma_phase = DmaCapturePhase::Idle {
-        last_done_ms: connect_ms,
-    };
-    let mut need_post_snapshot_refresh = false;
+    let mut last_capture_ms = connect_ms;
+    let mut post_snapshot_refresh_at_ms: Option<i64> = None;
     let mut last_applied_ctrl = klipper_cam_fw::CameraControlState::new_default();
-
-    // Port 81 primary MJPEG stream state
-    let mut p81_req_buf = [0u8; 1024];
-    let mut p81_req_len: usize = 0;
-    let mut p81_streaming = false;
-    let mut p81_last_frame_ms: i64 = 0;
-    let mut p81_tx_off: usize = 0;
-    let mut p81_tx_len: usize = 0;
-    let mut p81_closing = false;
-    let mut p81_close_deadline_ms: i64 = 0;
-
-    // Port 81 secondary busy-rejection socket state
-    let mut p81_busy_req_buf = [0u8; 512];
-    let mut p81_busy_closing = false;
-    let mut p81_busy_close_deadline_ms: i64 = 0;
 
     loop {
         let now = smol_now();
         let now_ms = now.total_millis();
 
-        // Wi-Fi auto-reconnect every 2000 ms if link drops
+        // Wi-Fi auto-reconnect every 2000 ms if link drops (bounded 4000 ms timeout)
         if !wifi_controller.is_connected() && now_ms - last_reconnect_attempt_ms >= 2000 {
             last_reconnect_attempt_ms = now_ms;
             runtime.on_wifi_sta_disconnected();
-            if let Ok(info) = embassy_futures::block_on(wifi_controller.connect_async()) {
-                println!(
-                    "[KLIPPER-CAM-RS] [WIFI] Reconnected to AP (channel {})",
-                    info.channel
-                );
-                connect_ms = smol_now().total_millis();
+            match block_on_with_timeout(wifi_controller.connect_async(), 4000) {
+                Some(Ok(info)) => {
+                    let _ = wifi_controller.set_power_saving(PowerSaveMode::None);
+                    println!(
+                        "[KLIPPER-CAM-RS] [WIFI] Reconnected to AP (channel {})",
+                        info.channel
+                    );
+                    connect_ms = smol_now().total_millis();
+                    if ip_configured {
+                        send_arp_announce(
+                            &mut net_device,
+                            mac,
+                            [172, 22, 1, 52],
+                            [172, 22, 1, 1],
+                        );
+                        last_arp_announce_ms = connect_ms;
+                    }
+                }
+                Some(Err(_)) => {}
+                None => {
+                    let _ = block_on_with_timeout(wifi_controller.disconnect_async(), 500);
+                }
             }
         }
 
         let _ = iface.poll(now, &mut net_device, &mut sockets);
 
-        // Check DHCPv4 events or apply static fallback (172.22.1.52/24, GW 172.22.1.1) after 5000 ms
+        // Check DHCPv4 events or configure static IP (172.22.1.52/24, GW 172.22.1.1) immediately on connect
         {
             let dhcp_sock = sockets.get_mut::<dhcpv4::Socket>(dhcp_handle);
             match dhcp_sock.poll() {
@@ -1093,46 +1186,69 @@ fn main() -> ! {
                     let octets = addr.octets();
                     let prefix_len = cfg.address.prefix_len();
                     iface.update_ip_addrs(|addrs| {
-                        addrs.clear();
-                        let _ = addrs.push(IpCidr::new(IpAddress::v4(172, 22, 1, 52), prefix_len));
-                        if addr != Ipv4Address::new(172, 22, 1, 52) {
+                        if !addrs
+                            .iter()
+                            .any(|c| c.address() == IpAddress::v4(172, 22, 1, 52))
+                        {
+                            let _ =
+                                addrs.push(IpCidr::new(IpAddress::v4(172, 22, 1, 52), prefix_len));
+                        }
+                        if addr != Ipv4Address::new(172, 22, 1, 52)
+                            && !addrs.iter().any(|c| c.address() == IpAddress::Ipv4(addr))
+                        {
                             let _ = addrs.push(IpCidr::Ipv4(cfg.address));
                         }
                     });
                     let gw = cfg.router.unwrap_or(Ipv4Address::new(172, 22, 1, 1));
                     let _ = iface.routes_mut().add_default_ipv4_route(gw);
                     let fw_ip = Ipv4Addr::new(172, 22, 1, 52);
-                    let _ = runtime.on_wifi_got_ip_with_flash(fw_ip, &mut flash_adapter);
+                    let _ = runtime.on_wifi_got_ip(fw_ip);
                     ip_configured = true;
-                    send_arp_announce(&mut net_device, mac, [172, 22, 1, 52], [172, 22, 1, 52]);
                     send_arp_announce(&mut net_device, mac, [172, 22, 1, 52], [172, 22, 1, 1]);
                     last_arp_announce_ms = now_ms;
                     println!(
-                        "[KLIPPER-CAM-RS] [NET] IP Configured: 172.22.1.52/{} + DHCP {}.{}.{}.{}/{} (Port 80 x4 & Port 81 Ready)",
+                        "[KLIPPER-CAM-RS] [NET] IP Configured: 172.22.1.52/{} + DHCP {}.{}.{}.{}/{} (Port 80 x4 & Port 81 x2 Ready)",
                         prefix_len, octets[0], octets[1], octets[2], octets[3], prefix_len
                     );
                 }
-                Some(dhcpv4::Event::Deconfigured) => {}
+                Some(dhcpv4::Event::Deconfigured) => {
+                    iface.update_ip_addrs(|addrs| {
+                        if !addrs
+                            .iter()
+                            .any(|c| c.address() == IpAddress::v4(172, 22, 1, 52))
+                        {
+                            let _ = addrs.push(IpCidr::new(IpAddress::v4(172, 22, 1, 52), 24));
+                        }
+                    });
+                    let _ = iface
+                        .routes_mut()
+                        .add_default_ipv4_route(Ipv4Address::new(172, 22, 1, 1));
+                    ip_configured = true;
+                    send_arp_announce(&mut net_device, mac, [172, 22, 1, 52], [172, 22, 1, 1]);
+                }
                 None => {}
             }
         }
 
-        if !ip_configured && wifi_controller.is_connected() && (now_ms - connect_ms >= 5000) {
+        if !ip_configured && wifi_controller.is_connected() {
             iface.update_ip_addrs(|addrs| {
-                addrs.clear();
-                let _ = addrs.push(IpCidr::new(IpAddress::v4(172, 22, 1, 52), 24));
+                if !addrs
+                    .iter()
+                    .any(|c| c.address() == IpAddress::v4(172, 22, 1, 52))
+                {
+                    let _ = addrs.push(IpCidr::new(IpAddress::v4(172, 22, 1, 52), 24));
+                }
             });
             let _ = iface
                 .routes_mut()
                 .add_default_ipv4_route(Ipv4Address::new(172, 22, 1, 1));
             let fw_ip = Ipv4Addr::new(172, 22, 1, 52);
-            let _ = runtime.on_wifi_got_ip_with_flash(fw_ip, &mut flash_adapter);
+            let _ = runtime.on_wifi_got_ip(fw_ip);
             ip_configured = true;
-            send_arp_announce(&mut net_device, mac, [172, 22, 1, 52], [172, 22, 1, 52]);
             send_arp_announce(&mut net_device, mac, [172, 22, 1, 52], [172, 22, 1, 1]);
             last_arp_announce_ms = now_ms;
             println!(
-                "[KLIPPER-CAM-RS] [NET] Static IP Fallback Configured: 172.22.1.52/24 GW 172.22.1.1 (Port 80 x4 & Port 81 Ready)"
+                "[KLIPPER-CAM-RS] [NET] Static IP Configured: 172.22.1.52/24 GW 172.22.1.1 (Port 80 x4 & Port 81 x2 Ready)"
             );
         }
 
@@ -1146,194 +1262,46 @@ fn main() -> ! {
         }
 
         // ============================================================
-        // Non-Blocking I2S0 Background Capture State Machine (Ping-Pong)
+        // On-Demand Post-Snapshot I2S0 Capture (Ping-Pong Double Buffer)
         // ============================================================
-        if ov2640_dma_ok && ota_accum_owner.is_none() && !runtime.server.is_reboot_scheduled() {
-            const GPIO_IN_REG: *const u32 = 0x3FF4_403C as *const u32;
-            const I2S_INT_RAW_REG: *const u32 = 0x3FF4_F00C as *const u32;
-            const I2S_INT_CLR_REG: *mut u32 = 0x3FF4_F018 as *mut u32;
-            const I2S_IN_SUC_EOF_BIT: u32 = 1 << 9;
-
-            let read_vsync = || -> bool {
-                ((unsafe { core::ptr::read_volatile(GPIO_IN_REG) } >> 25) & 1) != 0
-            };
-
-            let p80_busy = tcp80_handles
-                .iter()
-                .any(|&h| sockets.get_mut::<TcpSocket>(h).is_active());
-
-            match dma_phase {
-                DmaCapturePhase::Idle { last_done_ms } => {
-                    let should_capture = !p80_busy
-                        && ((p81_streaming && now_ms - last_done_ms >= 35)
-                            || need_post_snapshot_refresh);
-                    if should_capture {
-                        need_post_snapshot_refresh = false;
-                        dma_phase = DmaCapturePhase::WaitVsyncHigh { start_ms: now_ms };
-                    }
-                }
-                DmaCapturePhase::WaitVsyncHigh { start_ms } => {
-                    if p80_busy {
-                        dma_phase = DmaCapturePhase::Idle {
-                            last_done_ms: now_ms,
-                        };
-                    } else if !read_vsync() {
-                        if now_ms - start_ms >= 200 {
-                            dma_phase = DmaCapturePhase::Idle {
-                                last_done_ms: now_ms,
-                            };
-                        }
-                    } else {
-                        let (desc_slice, dma_slice) = unsafe {
-                            (
-                                &mut *core::ptr::addr_of_mut!(I2S_DMA_DESC),
-                                &mut (*core::ptr::addr_of_mut!(I2S_DMA_BUF)).0,
-                            )
-                        };
-                        let _ = build_circular_ring(desc_slice, dma_slice, 2048);
-
-                        let dma_cfg = esp32_cam_ll::DmaSizeConfig {
-                            dma_bytes_per_item: 4,
-                            dma_buffer_size: 32768,
-                            dma_half_buffer_size: 4096,
-                            dma_half_buffer_cnt: 8,
-                            dma_node_buffer_size: 2048,
-                            dma_node_cnt: 16,
-                            lines_per_node: 1,
-                            nodes_per_line: 1,
-                            lines_per_half_buffer: 1,
-                            image_size: jpeg_scratch_buf.len(),
-                        };
-
-                        // VSYNC is currently HIGH; wait for exact falling edge (<= 10 ms) so SOI is at offset 0
-                        let edge_start_ms = now_millis();
-                        while read_vsync() && (now_millis().saturating_sub(edge_start_ms) < 10) {}
-
-                        if hw_i2s_cam.start(&dma_cfg, desc_slice[0].link_addr_20bit()) {
-                            let mut eof_cnt = 0u32;
-                            let mut fb_len = 0usize;
-                            let mut seen_vsync_high = false;
-                            let mut spin_ticks = 0u32;
-                            let dma_start_ms = now_millis();
-                            let mut last_eof_ms = dma_start_ms;
-
-                            while now_millis().saturating_sub(dma_start_ms) < 85 {
-                                if read_vsync() {
-                                    seen_vsync_high = true;
-                                }
-
-                                let int_raw = unsafe { core::ptr::read_volatile(I2S_INT_RAW_REG) };
-                                if (int_raw & I2S_IN_SUC_EOF_BIT) != 0 {
-                                    unsafe {
-                                        core::ptr::write_volatile(
-                                            I2S_INT_CLR_REG,
-                                            I2S_IN_SUC_EOF_BIT,
-                                        );
-                                    }
-                                    last_eof_ms = now_millis();
-
-                                    let half_idx = (eof_cnt as usize) & 7;
-                                    let half_offset = half_idx * 4096;
-                                    if fb_len + 1024 <= jpeg_scratch_buf.len() {
-                                        let _ = hw_i2s_cam.memcpy_filtered(
-                                            &mut jpeg_scratch_buf[fb_len..fb_len + 1024],
-                                            &dma_slice[half_offset..half_offset + 4096],
-                                        );
-                                        let flags =
-                                            Lldesc::pack_flags(2048, 0, 0, false, false, true);
-                                        unsafe {
-                                            core::ptr::write_volatile(
-                                                &mut desc_slice[2 * half_idx].size_length_flags,
-                                                flags,
-                                            );
-                                            core::ptr::write_volatile(
-                                                &mut desc_slice[2 * half_idx + 1].size_length_flags,
-                                                flags,
-                                            );
-                                        }
-                                        fb_len += 1024;
-                                        eof_cnt += 1;
-
-                                        // Service smoltcp TCP SYN/ACK packets every 2 half-buffers (~2 ms)
-                                        if (eof_cnt & 1) == 0 {
-                                            let _ = iface.poll(
-                                                smol_now(),
-                                                &mut net_device,
-                                                &mut sockets,
-                                            );
-                                        }
-                                    } else {
-                                        let _ = hw_i2s_cam.stop();
-                                        break;
-                                    }
-                                    continue;
-                                }
-
-                                spin_ticks = spin_ticks.wrapping_add(1);
-                                if (spin_ticks & 0x7FF) == 0 {
-                                    let _ = iface.poll(smol_now(), &mut net_device, &mut sockets);
-                                }
-
-                                if eof_cnt == 0 {
-                                    if now_millis().saturating_sub(dma_start_ms) >= 18 {
-                                        let _ = hw_i2s_cam.stop();
-                                        break;
-                                    }
-                                } else {
-                                    let vsync_ended = seen_vsync_high
-                                        && !read_vsync()
-                                        && !read_vsync()
-                                        && !read_vsync()
-                                        && !read_vsync();
-                                    if vsync_ended
-                                        || now_millis().saturating_sub(last_eof_ms) >= 15
-                                    {
-                                        let _ = hw_i2s_cam.stop();
-                                        let half_idx = (eof_cnt as usize) & 7;
-                                        let half_offset = half_idx * 4096;
-                                        if fb_len + 1024 <= jpeg_scratch_buf.len() {
-                                            let _ = hw_i2s_cam.memcpy_filtered(
-                                                &mut jpeg_scratch_buf[fb_len..fb_len + 1024],
-                                                &dma_slice[half_offset..half_offset + 4096],
-                                            );
-                                            fb_len += 1024;
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-
-                            let _ = hw_i2s_cam.stop();
-
-                            if fb_len >= 64 {
-                                if let Some(soi_pos) = verify_jpeg_soi(&jpeg_scratch_buf[..fb_len])
-                                {
-                                    let slice_from_soi = &jpeg_scratch_buf[soi_pos..fb_len];
-                                    if let Some(eoi_rel) = verify_jpeg_eoi(slice_from_soi, false) {
-                                        let exact_len = eoi_rel + 2;
-                                        if exact_len >= 64
-                                            && ping_pong
-                                                .write_and_commit_inactive(
-                                                    &slice_from_soi[..exact_len],
-                                                )
-                                                .is_ok()
-                                        {
-                                            let fresh_slice =
-                                                active_ping_pong_static_slice(&ping_pong);
-                                            runtime.server.camera.set_frame(
-                                                fresh_slice,
-                                                runtime.server.control_state.framesize,
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        dma_phase = DmaCapturePhase::Idle {
-                            last_done_ms: smol_now().total_millis(),
-                        };
-                    }
+        let p80_busy = (0..PORT80_SOCKET_COUNT).any(|i| {
+            (p80_states[i].req_len > 0 || p80_states[i].tx_len > 0) && !p80_states[i].closing
+        });
+        let p81_frame_inflight = p81_stream_owner
+            .map(|owner| {
+                p81_tx_off < p81_tx_len
+                    || sockets.get_mut::<TcpSocket>(tcp81_handles[owner]).send_queue() > 0
+            })
+            .unwrap_or(false);
+        let post_snap_due = post_snapshot_refresh_at_ms
+            .map(|deadline| now_ms >= deadline)
+            .unwrap_or(false);
+        let idle_refresh_due =
+            p81_stream_owner.is_none() && (now_ms - last_capture_ms >= 30_000);
+        if ov2640_dma_ok
+            && ota_accum_owner.is_none()
+            && !runtime.server.is_reboot_scheduled()
+            && !p80_busy
+            && !p81_frame_inflight
+            && (post_snap_due || idle_refresh_due)
+        {
+            post_snapshot_refresh_at_ms = None;
+            last_capture_ms = now_ms;
+            for _ in 0..2u8 {
+                if capture_live_hd_jpeg_with_diag(
+                    &mut hw_i2s_cam,
+                    jpeg_scratch_buf,
+                    &mut ping_pong,
+                )
+                .is_ok()
+                {
+                    let fresh_slice = active_ping_pong_static_slice(&ping_pong);
+                    runtime.server.camera.set_frame(
+                        fresh_slice,
+                        runtime.server.control_state.framesize,
+                    );
+                    last_capture_ms = smol_now().total_millis();
+                    break;
                 }
             }
         }
@@ -1368,13 +1336,13 @@ fn main() -> ! {
                 }
             } else if st.tx_len > 0 {
                 if st.tx_off < st.tx_len {
-                    if sock80.can_send() && sock80.send_queue() == 0 {
-                        let step = (st.tx_len - st.tx_off).min(2800);
-                        if let Ok(sent) = sock80
-                            .send_slice(&p80_resp_bufs[idx][st.tx_off..st.tx_off + step])
-                        {
-                            st.tx_off += sent;
-                        }
+                    if sock80.can_send() {
+                        enqueue_tcp_sliding_window(
+                            sock80,
+                            p80_resp_bufs[idx],
+                            &mut st.tx_off,
+                            st.tx_len,
+                        );
                     } else if !sock80.may_send() {
                         sock80.abort();
                         if ota_accum_owner == Some(idx) {
@@ -1429,6 +1397,7 @@ fn main() -> ! {
 
                 let mut req_complete = false;
                 let mut is_ota_post = false;
+                let mut is_snapshot_req = false;
                 let peer_closed_rx = matches!(sock80.state(), TcpState::CloseWait);
                 {
                     let req_slice: &[u8] = if st.using_ota_accum {
@@ -1454,7 +1423,7 @@ fn main() -> ! {
                                             .map(|q| q.contains("action=snapshot"))
                                             .unwrap_or(false)))
                             {
-                                need_post_snapshot_refresh = true;
+                                is_snapshot_req = true;
                             }
                         }
                     } else if (!st.using_ota_accum && st.req_len >= p80_hdr_bufs[idx].len())
@@ -1467,21 +1436,18 @@ fn main() -> ! {
                 if req_complete {
                     if is_ota_post {
                         let _ = hw_i2s_cam.stop();
-                        dma_phase = DmaCapturePhase::Idle {
-                            last_done_ms: now_ms,
-                        };
+                    }
+                    if is_snapshot_req {
+                        post_snapshot_refresh_at_ms = Some(now_ms + 150);
                     }
 
                     let free_dram = esp_alloc::HEAP
                         .free_caps(esp_alloc::MemoryCapability::Internal.into())
                         as u32;
-                    let free_psram = esp_alloc::HEAP
-                        .free_caps(esp_alloc::MemoryCapability::External.into())
-                        as u32;
                     let rssi = wifi_controller.rssi().unwrap_or(-50);
                     runtime
                         .server
-                        .set_telemetry(now_ms, free_dram, free_psram, rssi);
+                        .set_telemetry(now_ms, free_dram, free_psram_bytes, rssi);
 
                     let req_slice: &[u8] = if st.using_ota_accum {
                         &http80_ota_accum[..st.req_len]
@@ -1512,14 +1478,12 @@ fn main() -> ! {
                         Ok(resp_len) => {
                             st.tx_len = resp_len;
                             st.tx_off = 0;
-                            if sock80.can_send() {
-                                let step = st.tx_len.min(2800);
-                                if let Ok(sent) =
-                                    sock80.send_slice(&p80_resp_bufs[idx][..step])
-                                {
-                                    st.tx_off = sent;
-                                }
-                            }
+                            enqueue_tcp_sliding_window(
+                                sock80,
+                                p80_resp_bufs[idx],
+                                &mut st.tx_off,
+                                st.tx_len,
+                            );
                         }
                         Err(_) => {
                             sock80.close();
@@ -1579,7 +1543,7 @@ fn main() -> ! {
                     }
                 }
                 last_applied_ctrl = ctrl;
-                need_post_snapshot_refresh = true;
+                post_snapshot_refresh_at_ms = Some(now_ms + 150);
             }
         }
 
@@ -1597,51 +1561,88 @@ fn main() -> ! {
         }
 
         // ============================================================
-        // Port 81 Primary MJPEG Multipart Stream Server (/stream)
+        // Port 81 2-Socket Symmetric MJPEG Stream Pool (/stream & /)
         // ============================================================
-        {
-            let sock81 = sockets.get_mut::<TcpSocket>(tcp81_handle);
-            if !sock81.is_open() {
-                if p81_streaming {
-                    p81_streaming = false;
-                    runtime
-                        .server
-                        .stream_active_flag()
-                        .store(false, Ordering::Release);
-                }
-                p81_req_len = 0;
+        if let Some(owner) = p81_stream_owner {
+            let sock = sockets.get_mut::<TcpSocket>(tcp81_handles[owner]);
+            let peer_disconnected = !sock.is_open()
+                || !sock.is_active()
+                || !sock.may_send()
+                || !sock.may_recv()
+                || matches!(
+                    sock.state(),
+                    TcpState::CloseWait
+                        | TcpState::TimeWait
+                        | TcpState::Closed
+                        | TcpState::Closing
+                        | TcpState::LastAck
+                );
+            if peer_disconnected {
+                sock.abort();
+                p81_states[owner] = Port81WorkerState::default();
+                sock.set_timeout(Some(smoltcp::time::Duration::from_millis(10_000)));
+                let _ = sock.listen(81);
+                p81_stream_owner = None;
                 p81_tx_off = 0;
                 p81_tx_len = 0;
-                p81_closing = false;
-                sock81.set_timeout(Some(smoltcp::time::Duration::from_millis(5000)));
-                let _ = sock81.listen(81);
-            } else if p81_closing {
-                if !sock81.is_active()
-                    || matches!(sock81.state(), TcpState::TimeWait | TcpState::Closed)
-                    || now_ms >= p81_close_deadline_ms
+                runtime
+                    .server
+                    .stream_active_flag()
+                    .store(false, Ordering::Release);
+            }
+        }
+
+        for idx in 0..PORT81_SOCKET_COUNT {
+            if p81_stream_owner == Some(idx) {
+                let mut ready_for_next_frame = false;
                 {
-                    sock81.abort();
-                    p81_closing = false;
+                    let sock81 = sockets.get_mut::<TcpSocket>(tcp81_handles[idx]);
+                    if sock81.can_recv() {
+                        let mut drain = [0u8; 128];
+                        let _ = sock81.recv_slice(&mut drain);
+                    }
+                    if p81_tx_off < p81_tx_len {
+                        enqueue_tcp_sliding_window(
+                            sock81,
+                            p81_resp_buf,
+                            &mut p81_tx_off,
+                            p81_tx_len,
+                        );
+                    } else if now_ms - p81_last_frame_ms >= 150
+                        && sock81.can_send()
+                        && sock81.send_queue() == 0
+                    {
+                        ready_for_next_frame = true;
+                    }
                 }
-            } else if p81_streaming {
-                if !sock81.may_send() || !sock81.is_active() {
-                    p81_streaming = false;
-                    runtime
-                        .server
-                        .stream_active_flag()
-                        .store(false, Ordering::Release);
-                    sock81.abort();
-                } else if p81_tx_off < p81_tx_len {
-                    if sock81.can_send() {
-                        if let Ok(sent) = sock81.send_slice(&p81_resp_buf[p81_tx_off..p81_tx_len]) {
-                            p81_tx_off += sent;
+                if ready_for_next_frame {
+                    p81_last_frame_ms = now_ms;
+                    if now_ms - last_capture_ms >= 140
+                        && ov2640_dma_ok
+                        && ota_accum_owner.is_none()
+                        && !runtime.server.is_reboot_scheduled()
+                        && !p80_busy
+                    {
+                        last_capture_ms = now_ms;
+                        for _ in 0..2u8 {
+                            if capture_live_hd_jpeg_with_diag(
+                                &mut hw_i2s_cam,
+                                jpeg_scratch_buf,
+                                &mut ping_pong,
+                            )
+                            .is_ok()
+                            {
+                                let fresh_slice = active_ping_pong_static_slice(&ping_pong);
+                                runtime.server.camera.set_frame(
+                                    fresh_slice,
+                                    runtime.server.control_state.framesize,
+                                );
+                                last_capture_ms = smol_now().total_millis();
+                                break;
+                            }
                         }
                     }
-                } else if now_ms - p81_last_frame_ms >= 50
-                    && sock81.can_send()
-                    && sock81.send_queue() < 32768
-                {
-                    p81_last_frame_ms = now_ms;
+                    let sock81 = sockets.get_mut::<TcpSocket>(tcp81_handles[idx]);
                     runtime
                         .server
                         .stream_active_flag()
@@ -1654,9 +1655,12 @@ fn main() -> ! {
                         {
                             p81_tx_len = chunk.len();
                             p81_tx_off = 0;
-                            if let Ok(sent) = sock81.send_slice(&p81_resp_buf[..p81_tx_len]) {
-                                p81_tx_off = sent;
-                            }
+                            enqueue_tcp_sliding_window(
+                                sock81,
+                                p81_resp_buf,
+                                &mut p81_tx_off,
+                                p81_tx_len,
+                            );
                         }
                         drop(guard);
                     }
@@ -1665,120 +1669,131 @@ fn main() -> ! {
                         .stream_active_flag()
                         .store(true, Ordering::Release);
                 }
-            } else if sock81.can_recv() {
-                let avail = p81_req_buf.len().saturating_sub(p81_req_len);
-                if avail > 0 {
-                    if let Ok(n) =
-                        sock81.recv_slice(&mut p81_req_buf[p81_req_len..p81_req_len + avail])
-                    {
-                        p81_req_len += n;
-                    }
-                }
-                if let Ok(parsed) = parse_http_request(&p81_req_buf[..p81_req_len]) {
-                    if parsed.method == HttpMethod::Get && parsed.path == "/stream" {
-                        let mut started_stream = false;
-                        {
-                            if let Some(guard) =
-                                StreamSessionGuard::try_acquire(runtime.server.stream_active_flag())
-                            {
-                                if let Ok(hdr_bytes) = guard.write_stream_headers(p81_resp_buf) {
-                                    let hdr_len = hdr_bytes.len();
-                                    let _ = sock81.send_slice(&p81_resp_buf[..hdr_len]);
-                                }
-                                drop(guard);
-                                started_stream = true;
-                            }
-                        }
-                        if started_stream {
-                            runtime
-                                .server
-                                .stream_active_flag()
-                                .store(true, Ordering::Release);
-                            p81_streaming = true;
-                            p81_last_frame_ms = 0;
-                            p81_tx_off = 0;
-                            p81_tx_len = 0;
-                        } else {
-                            if let Ok(resp) = runtime.server.handle_raw_request(
-                                ServerPort::Stream,
-                                &p81_req_buf[..p81_req_len],
-                                p81_resp_buf,
-                            ) {
-                                let _ = sock81.send_slice(resp);
-                            }
-                            sock81.close();
-                            p81_closing = true;
-                            p81_close_deadline_ms = now_ms + 2500;
-                        }
-                    } else {
-                        if let Ok(resp) = runtime.server.handle_raw_request(
-                            ServerPort::Stream,
-                            &p81_req_buf[..p81_req_len],
-                            p81_resp_buf,
-                        ) {
-                            let _ = sock81.send_slice(resp);
-                        }
-                        sock81.close();
-                        p81_closing = true;
-                        p81_close_deadline_ms = now_ms + 2500;
-                    }
-                } else if p81_req_len >= p81_req_buf.len()
-                    || matches!(sock81.state(), TcpState::CloseWait)
+            } else {
+                let mut preempt_and_start = false;
                 {
-                    sock81.close();
-                    p81_closing = true;
-                    p81_close_deadline_ms = now_ms + 1000;
-                }
-            } else if matches!(sock81.state(), TcpState::CloseWait) && p81_req_len == 0 {
-                sock81.close();
-                p81_closing = true;
-                p81_close_deadline_ms = now_ms + 1000;
-            }
-        }
+                    let sock81 = sockets.get_mut::<TcpSocket>(tcp81_handles[idx]);
+                    let st = &mut p81_states[idx];
 
-        // ============================================================
-        // Port 81 Secondary Busy-Rejection Socket (NET-002 max_open_sockets=2)
-        // ============================================================
-        {
-            let sock81_busy = sockets.get_mut::<TcpSocket>(tcp81_busy_handle);
-            if !sock81_busy.is_open() {
-                p81_busy_closing = false;
-                sock81_busy.set_timeout(Some(smoltcp::time::Duration::from_millis(2000)));
-                let _ = sock81_busy.listen(81);
-            } else if p81_busy_closing {
-                let finished_cleanly = matches!(
-                    sock81_busy.state(),
-                    TcpState::TimeWait | TcpState::Closed
-                );
-                if !sock81_busy.is_active()
-                    || finished_cleanly
-                    || now_ms >= p81_busy_close_deadline_ms
-                {
-                    sock81_busy.abort();
-                    p81_busy_closing = false;
-                    sock81_busy.set_timeout(Some(smoltcp::time::Duration::from_millis(2000)));
-                    let _ = sock81_busy.listen(81);
-                }
-            } else if sock81_busy.can_recv() {
-                if let Ok(n) = sock81_busy.recv_slice(&mut p81_busy_req_buf) {
-                    if n > 0 {
-                        let mut err_buf = [0u8; 512];
-                        if let Ok(resp) = runtime.server.handle_raw_request(
-                            ServerPort::Stream,
-                            &p81_busy_req_buf[..n],
-                            &mut err_buf,
-                        ) {
-                            let _ = sock81_busy.send_slice(resp);
+                    if !sock81.is_open() {
+                        *st = Port81WorkerState::default();
+                        sock81.set_timeout(Some(smoltcp::time::Duration::from_millis(10_000)));
+                        let _ = sock81.listen(81);
+                    } else if st.closing {
+                        let finished_cleanly = matches!(
+                            sock81.state(),
+                            TcpState::TimeWait | TcpState::Closed
+                        );
+                        if !sock81.is_active()
+                            || finished_cleanly
+                            || now_ms >= st.close_deadline_ms
+                        {
+                            sock81.abort();
+                            *st = Port81WorkerState::default();
+                            sock81.set_timeout(Some(smoltcp::time::Duration::from_millis(10_000)));
+                            let _ = sock81.listen(81);
                         }
-                        sock81_busy.close();
-                        p81_busy_closing = true;
-                        p81_busy_close_deadline_ms = now_ms + 2500;
+                    } else if sock81.can_recv() {
+                        let avail = p81_req_bufs[idx].len().saturating_sub(st.req_len);
+                        if avail > 0 {
+                            if let Ok(n) = sock81.recv_slice(
+                                &mut p81_req_bufs[idx][st.req_len..st.req_len + avail],
+                            ) {
+                                st.req_len += n;
+                            }
+                        }
+                        if let Ok(parsed) = parse_http_request(&p81_req_bufs[idx][..st.req_len]) {
+                            let is_stream_get = parsed.method == HttpMethod::Get
+                                && (parsed.path == "/stream" || parsed.path == "/");
+                            if is_stream_get {
+                                preempt_and_start = true;
+                            } else {
+                                let mut err_buf = [0u8; 512];
+                                if let Ok(resp) = runtime.server.handle_raw_request(
+                                    ServerPort::Stream,
+                                    &p81_req_bufs[idx][..st.req_len],
+                                    &mut err_buf,
+                                ) {
+                                    let _ = sock81.send_slice(resp);
+                                }
+                                sock81.close();
+                                st.closing = true;
+                                st.close_deadline_ms = now_ms + 1000;
+                            }
+                        } else if st.req_len >= p81_req_bufs[idx].len()
+                            || matches!(sock81.state(), TcpState::CloseWait)
+                        {
+                            sock81.close();
+                            st.closing = true;
+                            st.close_deadline_ms = now_ms + 1000;
+                        }
+                    } else if matches!(sock81.state(), TcpState::CloseWait) && st.req_len == 0 {
+                        sock81.close();
+                        st.closing = true;
+                        st.close_deadline_ms = now_ms + 1000;
                     }
                 }
-            } else if matches!(sock81_busy.state(), TcpState::CloseWait) {
-                sock81_busy.close();
-                p81_busy_closing = true;
-                p81_busy_close_deadline_ms = now_ms + 1000;
+
+                if preempt_and_start {
+                    // Cleanly preempt any prior/stale Port 81 stream so browser Reloads or
+                    // immediate reconnects succeed 100% of the time with zero stale locks.
+                    if let Some(prev_owner) = p81_stream_owner {
+                        if prev_owner != idx {
+                            let prev_sock = sockets.get_mut::<TcpSocket>(tcp81_handles[prev_owner]);
+                            prev_sock.abort();
+                            p81_states[prev_owner] = Port81WorkerState::default();
+                            prev_sock
+                                .set_timeout(Some(smoltcp::time::Duration::from_millis(10_000)));
+                            let _ = prev_sock.listen(81);
+                        }
+                    }
+                    p81_stream_owner = None;
+                    runtime
+                        .server
+                        .stream_active_flag()
+                        .store(false, Ordering::Release);
+
+                    let mut total_written = 0usize;
+                    if let Some(mut guard) =
+                        StreamSessionGuard::try_acquire(runtime.server.stream_active_flag())
+                    {
+                        if let Ok(hdr_bytes) = guard.write_stream_headers(p81_resp_buf) {
+                            let hdr_len = hdr_bytes.len();
+                            if let Ok(frame_bytes) = guard.write_next_frame_chunk(
+                                &runtime.server.camera,
+                                &mut p81_resp_buf[hdr_len..],
+                            ) {
+                                total_written = hdr_len + frame_bytes.len();
+                            } else {
+                                total_written = hdr_len;
+                            }
+                        }
+                        drop(guard);
+                    }
+
+                    let sock81 = sockets.get_mut::<TcpSocket>(tcp81_handles[idx]);
+                    if total_written > 0 {
+                        runtime
+                            .server
+                            .stream_active_flag()
+                            .store(true, Ordering::Release);
+                        p81_stream_owner = Some(idx);
+                        p81_states[idx] = Port81WorkerState::default();
+                        p81_last_frame_ms = now_ms;
+                        p81_tx_len = total_written;
+                        p81_tx_off = 0;
+                        enqueue_tcp_sliding_window(
+                            sock81,
+                            p81_resp_buf,
+                            &mut p81_tx_off,
+                            p81_tx_len,
+                        );
+                    } else {
+                        sock81.close();
+                        p81_states[idx].closing = true;
+                        p81_states[idx].close_deadline_ms = now_ms + 1000;
+                    }
+                }
             }
         }
 
@@ -1788,7 +1803,7 @@ fn main() -> ! {
                 "[KLIPPER-CAM-RS] Heartbeat: uptime={}ms connected={} stream_active={} frame_seq={} last_jpeg={}B",
                 now_ms,
                 wifi_controller.is_connected(),
-                p81_streaming,
+                p81_stream_owner.is_some(),
                 ping_pong.frame_seq(),
                 ping_pong.active_len()
             );
