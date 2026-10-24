@@ -295,6 +295,28 @@ pub const fn crc32_ieee(data: &[u8]) -> u32 {
     !crc
 }
 
+/// Computes the ESP-IDF / ESP32 ROM `esp_rom_crc32_le(u32::MAX, data)` checksum used by
+/// `bootloader_common_ota_select_crc` (`init = 0x0000_0000`, reflected polynomial `0xEDB8_8320`,
+/// final XOR `0xFFFF_FFFF`).
+pub const fn crc32_esp_ota(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0x0000_0000;
+    let mut i: usize = 0;
+    while i < data.len() {
+        crc ^= data[i] as u32;
+        let mut bit: u8 = 0;
+        while bit < 8 {
+            if (crc & 1) != 0 {
+                crc = (crc >> 1) ^ 0xEDB8_8320;
+            } else {
+                crc >>= 1;
+            }
+            bit += 1;
+        }
+        i += 1;
+    }
+    !crc
+}
+
 /// OTA image lifecycle states stored in `otadata` (`esp_ota_img_states_t`).
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -357,10 +379,10 @@ impl OtaDataSelect {
         }
     }
 
-    /// Creates a new [`OtaDataSelect`] with `ota_seq`, `state`, and valid IEEE 802.3 CRC-32.
+    /// Creates a new [`OtaDataSelect`] with `ota_seq`, `state`, and valid ESP-IDF `otadata` CRC-32.
     #[inline]
     pub const fn new(ota_seq: u32, state: OtaImgState) -> Self {
-        let crc = crc32_ieee(&ota_seq.to_le_bytes());
+        let crc = crc32_esp_ota(&ota_seq.to_le_bytes());
         Self {
             ota_seq,
             seq_label: [0xFF; 20],
@@ -369,10 +391,10 @@ impl OtaDataSelect {
         }
     }
 
-    /// Calculates the IEEE 802.3 CRC-32 over the little-endian representation of `ota_seq`.
+    /// Calculates the ESP-IDF `bootloader_common_ota_select_crc` over the little-endian representation of `ota_seq`.
     #[inline]
     pub const fn calculate_crc(&self) -> u32 {
-        crc32_ieee(&self.ota_seq.to_le_bytes())
+        crc32_esp_ota(&self.ota_seq.to_le_bytes())
     }
 
     /// Returns `true` if `ota_seq` is initialized (`!= 0` and `!= u32::MAX`) and `crc` matches.
@@ -437,7 +459,12 @@ impl OtaDataSelect {
             i += 1;
         }
 
-        let st_b = self.ota_state.to_le_bytes();
+        let flash_state = if self.ota_state == OtaImgState::PendingVerify as u32 {
+            OtaImgState::New as u32
+        } else {
+            self.ota_state
+        };
+        let st_b = flash_state.to_le_bytes();
         out[24] = st_b[0];
         out[25] = st_b[1];
         out[26] = st_b[2];
@@ -460,7 +487,12 @@ impl OtaDataSelect {
             seq_label[i] = bytes[4 + i];
             i += 1;
         }
-        let ota_state = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]);
+        let raw_state = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]);
+        let ota_state = if ota_seq != u32::MAX && raw_state == OtaImgState::New as u32 {
+            OtaImgState::PendingVerify as u32
+        } else {
+            raw_state
+        };
         let crc = u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]);
         Self {
             ota_seq,
@@ -1125,8 +1157,12 @@ mod tests {
         assert_eq!(s0.slot(), Some(OtaSlot::Ota0));
         assert_eq!(s0.state(), OtaImgState::PendingVerify);
 
-        // Round-trip serialization
+        // Round-trip serialization and ESP-IDF bootloader_common_ota_select_crc parity
         let raw = s0.to_bytes();
+        assert_eq!(&raw[24..28], &[0, 0, 0, 0]);
+        assert_eq!(&raw[28..32], &[154, 152, 67, 71]);
+        let s1_raw = OtaDataSelect::new(2, OtaImgState::PendingVerify).to_bytes();
+        assert_eq!(&s1_raw[24..32], &[0, 0, 0, 0, 116, 55, 246, 85]);
         let decoded = OtaDataSelect::from_bytes(&raw);
         assert_eq!(decoded, s0);
 

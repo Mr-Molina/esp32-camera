@@ -784,8 +784,9 @@ fn main() -> ! {
 
     // 2. Configure physical I2C0 on GPIO 26 (SDA) / GPIO 27 (SCL) at 100 kHz and program OV2640
     let mut ov2640_hw_ok = false;
+    let mut live_ov2640: Option<Ov2640> = None;
     let i2c_cfg = I2cConfig::default().with_frequency(Rate::from_khz(100));
-    let _kept_sccb = match I2c::new(peripherals.I2C0, i2c_cfg) {
+    let mut kept_sccb = match I2c::new(peripherals.I2C0, i2c_cfg) {
         Ok(i2c_bus) => {
             let i2c_bus = i2c_bus
                 .with_sda(peripherals.GPIO26)
@@ -794,29 +795,30 @@ fn main() -> ! {
             let _ = hw_sccb.write_reg8(Ov2640::SLV_ADDR, 0xFF, 0x01);
             match Ov2640::detect(&mut hw_sccb, Ov2640::SLV_ADDR) {
                 Ok(id) => {
-                    let mut live_ov2640 = Ov2640::from_id(Ov2640::SLV_ADDR, id);
+                    let mut ov = Ov2640::from_id(Ov2640::SLV_ADDR, id);
                     // Program PixelFormat::Jpeg BEFORE set_framesize(FrameSize::Hd) so set_window
                     // selects the JPEG CLKRC/PCLK dividers (`div = 12`), then apply OV2640 ISP settings
-                    let prog_ok = live_ov2640.reset(&mut hw_sccb).is_ok()
-                        && live_ov2640
+                    let prog_ok = ov.reset(&mut hw_sccb).is_ok()
+                        && ov
                             .set_pixformat(&mut hw_sccb, PixelFormat::Jpeg)
                             .is_ok()
-                        && live_ov2640.set_framesize(&mut hw_sccb, FrameSize::Hd).is_ok()
-                        && live_ov2640
+                        && ov.set_framesize(&mut hw_sccb, FrameSize::Hd).is_ok()
+                        && ov
                             .set_gainceiling(&mut hw_sccb, GainCeiling::X2)
                             .is_ok()
-                        && live_ov2640.set_bpc(&mut hw_sccb, false).is_ok()
-                        && live_ov2640.set_wpc(&mut hw_sccb, true).is_ok()
-                        && live_ov2640.set_lenc(&mut hw_sccb, true).is_ok()
-                        && live_ov2640
+                        && ov.set_bpc(&mut hw_sccb, false).is_ok()
+                        && ov.set_wpc(&mut hw_sccb, true).is_ok()
+                        && ov.set_lenc(&mut hw_sccb, true).is_ok()
+                        && ov
                             .set_quality(&mut hw_sccb, DEFAULT_JPEG_QUALITY as i32)
                             .is_ok()
-                        && live_ov2640.init_status(&mut hw_sccb).is_ok();
+                        && ov.init_status(&mut hw_sccb).is_ok();
                     ov2640_hw_ok = prog_ok;
                     println!(
                         "[KLIPPER-CAM-RS] [HW-2] I2C0 SCCB (0x30) OV2640 DETECTED: PID=0x{:02X} VER=0x{:02X} MIDH=0x{:02X} MIDL=0x{:02X} HD_PROG={}",
                         id.pid, id.ver, id.midh, id.midl, prog_ok
                     );
+                    live_ov2640 = Some(ov);
                 }
                 Err(_) => {
                     println!(
@@ -1046,6 +1048,7 @@ fn main() -> ! {
         last_done_ms: connect_ms,
     };
     let mut need_post_snapshot_refresh = false;
+    let mut last_applied_ctrl = klipper_cam_fw::CameraControlState::new_default();
 
     // Port 81 primary MJPEG stream state
     let mut p81_req_buf = [0u8; 1024];
@@ -1317,10 +1320,10 @@ fn main() -> ! {
                                         {
                                             let fresh_slice =
                                                 active_ping_pong_static_slice(&ping_pong);
-                                            runtime
-                                                .server
-                                                .camera
-                                                .set_frame(fresh_slice, FrameSize::Hd);
+                                            runtime.server.camera.set_frame(
+                                                fresh_slice,
+                                                runtime.server.control_state.framesize,
+                                            );
                                         }
                                     }
                                 }
@@ -1347,7 +1350,7 @@ fn main() -> ! {
                     ota_accum_owner = None;
                 }
                 *st = Port80WorkerState::default();
-                sock80.set_timeout(Some(smoltcp::time::Duration::from_millis(5000)));
+                sock80.set_timeout(Some(smoltcp::time::Duration::from_millis(60_000)));
                 let _ = sock80.listen(80);
             } else if st.closing {
                 let finished_cleanly = matches!(
@@ -1360,29 +1363,31 @@ fn main() -> ! {
                         ota_accum_owner = None;
                     }
                     *st = Port80WorkerState::default();
-                    sock80.set_timeout(Some(smoltcp::time::Duration::from_millis(5000)));
+                    sock80.set_timeout(Some(smoltcp::time::Duration::from_millis(60_000)));
                     let _ = sock80.listen(80);
                 }
-            } else if st.tx_off < st.tx_len {
-                if sock80.can_send() {
-                    if let Ok(sent) =
-                        sock80.send_slice(&p80_resp_bufs[idx][st.tx_off..st.tx_len])
-                    {
-                        st.tx_off += sent;
+            } else if st.tx_len > 0 {
+                if st.tx_off < st.tx_len {
+                    if sock80.can_send() && sock80.send_queue() == 0 {
+                        let step = (st.tx_len - st.tx_off).min(2800);
+                        if let Ok(sent) = sock80
+                            .send_slice(&p80_resp_bufs[idx][st.tx_off..st.tx_off + step])
+                        {
+                            st.tx_off += sent;
+                        }
+                    } else if !sock80.may_send() {
+                        sock80.abort();
+                        if ota_accum_owner == Some(idx) {
+                            ota_accum_owner = None;
+                        }
+                        *st = Port80WorkerState::default();
+                        sock80.set_timeout(Some(smoltcp::time::Duration::from_millis(60_000)));
+                        let _ = sock80.listen(80);
                     }
-                    if st.tx_off >= st.tx_len {
-                        sock80.close();
-                        st.closing = true;
-                        st.close_deadline_ms = now_ms + 2500;
-                    }
-                } else if !sock80.may_send() {
-                    sock80.abort();
-                    if ota_accum_owner == Some(idx) {
-                        ota_accum_owner = None;
-                    }
-                    *st = Port80WorkerState::default();
-                    sock80.set_timeout(Some(smoltcp::time::Duration::from_millis(5000)));
-                    let _ = sock80.listen(80);
+                } else if sock80.send_queue() == 0 || !sock80.may_send() {
+                    sock80.close();
+                    st.closing = true;
+                    st.close_deadline_ms = now_ms + 1500;
                 }
             } else if sock80.can_recv() {
                 if !st.using_ota_accum {
@@ -1423,6 +1428,7 @@ fn main() -> ! {
                 }
 
                 let mut req_complete = false;
+                let mut is_ota_post = false;
                 let peer_closed_rx = matches!(sock80.state(), TcpState::CloseWait);
                 {
                     let req_slice: &[u8] = if st.using_ota_accum {
@@ -1437,6 +1443,9 @@ fn main() -> ! {
                         };
                         if parsed.body.len() >= needed_body || peer_closed_rx {
                             req_complete = true;
+                            if parsed.method == HttpMethod::Post && parsed.path == "/update" {
+                                is_ota_post = true;
+                            }
                             if parsed.method == HttpMethod::Get
                                 && (parsed.path == "/snapshot"
                                     || (parsed.path == "/"
@@ -1456,6 +1465,13 @@ fn main() -> ! {
                 }
 
                 if req_complete {
+                    if is_ota_post {
+                        let _ = hw_i2s_cam.stop();
+                        dma_phase = DmaCapturePhase::Idle {
+                            last_done_ms: now_ms,
+                        };
+                    }
+
                     let free_dram = esp_alloc::HEAP
                         .free_caps(esp_alloc::MemoryCapability::Internal.into())
                         as u32;
@@ -1497,15 +1513,11 @@ fn main() -> ! {
                             st.tx_len = resp_len;
                             st.tx_off = 0;
                             if sock80.can_send() {
+                                let step = st.tx_len.min(2800);
                                 if let Ok(sent) =
-                                    sock80.send_slice(&p80_resp_bufs[idx][..st.tx_len])
+                                    sock80.send_slice(&p80_resp_bufs[idx][..step])
                                 {
                                     st.tx_off = sent;
-                                }
-                                if st.tx_off >= st.tx_len {
-                                    sock80.close();
-                                    st.closing = true;
-                                    st.close_deadline_ms = now_ms + 2500;
                                 }
                             }
                         }
@@ -1520,6 +1532,54 @@ fn main() -> ! {
                 sock80.close();
                 st.closing = true;
                 st.close_deadline_ms = now_ms + 1000;
+            }
+        }
+
+        // Apply any pending live camera control updates from GET /control?var=...&val=...
+        // only after all active Port 80 HTTP responses have finished flushing.
+        let p80_tx_active = p80_states.iter().any(|s| s.tx_len > 0 && !s.closing);
+        if !p80_tx_active {
+            if let Some(ctrl) = runtime.server.take_pending_control_update() {
+                if let (Some(ref mut sccb), Some(ref mut ov)) = (&mut kept_sccb, &mut live_ov2640) {
+                    if ctrl.framesize != last_applied_ctrl.framesize {
+                        let _ = ov.set_framesize(sccb, ctrl.framesize);
+                    }
+                    if ctrl.quality != last_applied_ctrl.quality {
+                        let _ = ov.set_quality(sccb, ctrl.quality);
+                    }
+                    if ctrl.brightness != last_applied_ctrl.brightness {
+                        let _ = ov.set_brightness(sccb, ctrl.brightness);
+                    }
+                    if ctrl.contrast != last_applied_ctrl.contrast {
+                        let _ = ov.set_contrast(sccb, ctrl.contrast);
+                    }
+                    if ctrl.saturation != last_applied_ctrl.saturation {
+                        let _ = ov.set_saturation(sccb, ctrl.saturation);
+                    }
+                    if ctrl.special_effect != last_applied_ctrl.special_effect {
+                        let _ = ov.set_special_effect(sccb, ctrl.special_effect);
+                    }
+                    if ctrl.hmirror != last_applied_ctrl.hmirror {
+                        let _ = ov.set_hmirror(sccb, ctrl.hmirror);
+                    }
+                    if ctrl.vflip != last_applied_ctrl.vflip {
+                        let _ = ov.set_vflip(sccb, ctrl.vflip);
+                    }
+                    if ctrl.awb != last_applied_ctrl.awb {
+                        let _ = ov.set_whitebal(sccb, ctrl.awb);
+                    }
+                    if ctrl.agc != last_applied_ctrl.agc {
+                        let _ = ov.set_gain_ctrl(sccb, ctrl.agc);
+                    }
+                    if ctrl.aec != last_applied_ctrl.aec {
+                        let _ = ov.set_exposure_ctrl(sccb, ctrl.aec);
+                    }
+                    if ctrl.ae_level != last_applied_ctrl.ae_level {
+                        let _ = ov.set_ae_level(sccb, ctrl.ae_level);
+                    }
+                }
+                last_applied_ctrl = ctrl;
+                need_post_snapshot_refresh = true;
             }
         }
 

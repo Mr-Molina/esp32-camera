@@ -30,6 +30,9 @@ pub const MAX_URL_QUERY_LEN: usize = 256;
 /// Stack buffer size for `GET /status` JSON serialization (`384` bytes, `klipper_cam.c`).
 pub const STATUS_JSON_BUF_LEN: usize = 384;
 
+/// Stack buffer size for `GET /control` JSON serialization (`384` bytes).
+pub const CONTROL_JSON_BUF_LEN: usize = 384;
+
 /// Stack buffer size for each MJPEG multipart boundary header (`128` bytes, `klipper_cam.c`).
 pub const MJPEG_PART_HDR_BUF_LEN: usize = 128;
 
@@ -445,6 +448,176 @@ pub fn format_status_json<'a>(
     core::str::from_utf8(&stack_buf[..len]).map_err(|_| HttpError::InvalidUtf8)
 }
 
+/// Live camera sensor tuning state exposed by `GET /control` and `GET /panel` on Port 80.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CameraControlState {
+    pub framesize: FrameSize,
+    pub quality: i32,
+    pub brightness: i32,
+    pub contrast: i32,
+    pub saturation: i32,
+    pub special_effect: i32,
+    pub hmirror: bool,
+    pub vflip: bool,
+    pub awb: bool,
+    pub agc: bool,
+    pub aec: bool,
+    pub ae_level: i32,
+    pub dirty: bool,
+}
+
+impl CameraControlState {
+    /// Creates the default 1280x720 HD camera control state.
+    pub const fn new_default() -> Self {
+        Self {
+            framesize: FrameSize::Hd,
+            quality: 12,
+            brightness: 0,
+            contrast: 0,
+            saturation: 0,
+            special_effect: 0,
+            hmirror: false,
+            vflip: false,
+            awb: true,
+            agc: true,
+            aec: true,
+            ae_level: 0,
+            dirty: false,
+        }
+    }
+}
+
+impl Default for CameraControlState {
+    #[inline]
+    fn default() -> Self {
+        Self::new_default()
+    }
+}
+
+/// Returns the canonical `"WxH"` resolution label for `fs`.
+#[inline]
+pub const fn framesize_label(fs: FrameSize) -> &'static str {
+    match fs {
+        FrameSize::Qvga => "320x240",
+        FrameSize::Cif => "400x296",
+        FrameSize::Hvga => "480x320",
+        FrameSize::Vga => "640x480",
+        FrameSize::Svga => "800x600",
+        FrameSize::Xga => "1024x768",
+        FrameSize::Hd => "1280x720",
+        FrameSize::Sxga => "1280x1024",
+        FrameSize::Uxga => "1600x1200",
+        _ => "1280x720",
+    }
+}
+
+/// Returns the integer control index (`5..=13`) serialized in `GET /control` for `fs`.
+#[inline]
+pub const fn framesize_control_code(fs: FrameSize) -> u8 {
+    match fs {
+        FrameSize::Qvga => 5,
+        FrameSize::Cif => 6,
+        FrameSize::Hvga => 7,
+        FrameSize::Vga => 8,
+        FrameSize::Svga => 9,
+        FrameSize::Xga => 10,
+        FrameSize::Hd => 11,
+        FrameSize::Sxga => 12,
+        FrameSize::Uxga => 13,
+        _ => 11,
+    }
+}
+
+/// Parses a `framesize` query parameter (`5..=13` or horizontal width `320..=1600`) into a [`FrameSize`].
+#[inline]
+pub const fn parse_framesize_val(val: isize) -> Option<FrameSize> {
+    match val {
+        5 | 320 => Some(FrameSize::Qvga),
+        6 | 400 => Some(FrameSize::Cif),
+        7 | 480 => Some(FrameSize::Hvga),
+        8 | 640 => Some(FrameSize::Vga),
+        9 | 800 => Some(FrameSize::Svga),
+        10 | 1024 => Some(FrameSize::Xga),
+        11 | 1280 => Some(FrameSize::Hd),
+        12 => Some(FrameSize::Sxga),
+        13 | 1600 => Some(FrameSize::Uxga),
+        _ => None,
+    }
+}
+
+/// Formats a [`CameraControlState`] as JSON into a 384-byte stack buffer.
+pub fn format_control_json<'a>(
+    ctrl: &CameraControlState,
+    stack_buf: &'a mut [u8; CONTROL_JSON_BUF_LEN],
+) -> Result<&'a str, HttpError> {
+    let mut writer = SliceWriter::new(stack_buf);
+    write!(
+        writer,
+        "{{\"framesize\":{},\"framesize_label\":\"{}\",\"quality\":{},\"brightness\":{},\"contrast\":{},\"saturation\":{},\"special_effect\":{},\"hmirror\":{},\"vflip\":{},\"awb\":{},\"agc\":{},\"aec\":{},\"ae_level\":{}}}",
+        framesize_control_code(ctrl.framesize),
+        framesize_label(ctrl.framesize),
+        ctrl.quality,
+        ctrl.brightness,
+        ctrl.contrast,
+        ctrl.saturation,
+        ctrl.special_effect,
+        u8::from(ctrl.hmirror),
+        u8::from(ctrl.vflip),
+        u8::from(ctrl.awb),
+        u8::from(ctrl.agc),
+        u8::from(ctrl.aec),
+        ctrl.ae_level
+    )
+    .map_err(|_| HttpError::BufferTooSmall)?;
+
+    let len = writer.written_len();
+    core::str::from_utf8(&stack_buf[..len]).map_err(|_| HttpError::InvalidUtf8)
+}
+
+/// Self-contained dark-mode Camera Control & Live Preview dashboard served by `GET /panel` on Port 80.
+pub const KLIPPER_CONTROL_PANEL_HTML: &str = "\
+<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Klipper Cam Control Panel</title>\
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+<style>\
+body{font-family:sans-serif;margin:0;padding:16px;background:#121212;color:#e0e0e0}\
+.wrap{max-width:920px;margin:auto;display:grid;grid-template-columns:1fr 300px;gap:16px}\
+@media(max-width:768px){.wrap{grid-template-columns:1fr}}\
+.card{background:#1e1e1e;padding:16px;border-radius:8px;border:1px solid #333}\
+h2{margin:0 0 12px;font-size:18px;color:#fff}\
+#view{width:100%;background:#000;border-radius:6px;min-height:200px;display:block}\
+.r{display:flex;justify-content:space-between;align-items:center;margin:7px 0;font-size:13px}\
+button{background:#007acc;color:#fff;border:none;padding:7px 12px;border-radius:4px;cursor:pointer;margin-right:6px}\
+#st{font-family:monospace;font-size:12px;color:#9cdcfe;margin-top:10px}\
+</style></head><body><div class=\"wrap\">\
+<div class=\"card\"><h2>Klipper Camera Live Preview</h2>\
+<img id=\"view\" src=\"/snapshot\" alt=\"Preview\">\
+<div style=\"margin-top:10px\">\
+<button onclick=\"startStream()\">Live Stream (:81)</button>\
+<button onclick=\"snap()\">Snapshot</button>\
+<a href=\"/update\" style=\"color:#569cd6;font-size:13px\">OTA Update</a>\
+</div><div id=\"st\">Loading...</div></div>\
+<div class=\"card\"><h2>OV2640 Controls</h2>\
+<div class=\"r\"><label>Resolution</label><select id=\"framesize\" onchange=\"setCtrl('framesize',this.value)\">\
+<option value=\"5\">320x240</option><option value=\"6\">400x296</option><option value=\"7\">480x320</option>\
+<option value=\"8\">640x480</option><option value=\"9\">800x600</option><option value=\"10\">1024x768</option>\
+<option value=\"11\" selected>1280x720</option><option value=\"12\">1280x1024</option><option value=\"13\">1600x1200</option>\
+</select></div><div id=\"sl\"></div></div></div><script>\
+var S=[['quality','Quality',4,63,12],['brightness','Brightness',-2,2,0],['contrast','Contrast',-2,2,0],\
+['saturation','Saturation',-2,2,0],['ae_level','AE Level',-2,2,0],['special_effect','Effect',0,6,0]];\
+var B=[['hmirror','H-Mirror',0],['vflip','V-Flip',0],['awb','Auto WB',1],['agc','Auto Gain',1],['aec','Auto Exp',1]];\
+var h='';S.forEach(function(x){h+='<div class=\"r\"><label>'+x[1]+'</label><input id=\"'+x[0]+'\" type=\"range\" min=\"'+x[2]+'\" max=\"'+x[3]+'\" value=\"'+x[4]+'\" onchange=\"setCtrl(\\''+x[0]+'\\',this.value)\"></div>';});\
+B.forEach(function(x){h+='<div class=\"r\"><label>'+x[1]+'</label><input id=\"'+x[0]+'\" type=\"checkbox\"'+(x[2]?' checked':'')+' onchange=\"setCtrl(\\''+x[0]+'\\',this.checked?1:0)\"></div>';});\
+document.getElementById('sl').innerHTML=h;\
+function startStream(){document.getElementById('view').src='http://'+location.hostname+':81/stream';}\
+function snap(){document.getElementById('view').src='/snapshot?t='+Date.now();}\
+function applyUi(c){['framesize','quality','brightness','contrast','saturation','ae_level','special_effect'].forEach(function(k){if(c[k]!==undefined)document.getElementById(k).value=c[k];});\
+['hmirror','vflip','awb','agc','aec'].forEach(function(k){if(c[k]!==undefined)document.getElementById(k).checked=!!c[k];});}\
+function setCtrl(k,v){fetch('/control?var='+k+'&val='+v).then(function(r){return r.json();}).then(applyUi);}\
+function poll(){fetch('/status').then(function(r){return r.json();}).then(function(s){\
+document.getElementById('st').innerText='Res: '+s.framesize+' | RSSI: '+s.wifi_rssi+' dBm | PSRAM: '+s.free_psram+' B | Part: '+s.active_partition+' | Stream: '+s.stream_active;});}\
+fetch('/control').then(function(r){return r.json();}).then(applyUi);poll();setInterval(poll,3000);\
+</script></body></html>";
+
 /// Formats an MJPEG multipart frame boundary header into a 128-byte stack buffer (`klipper_cam.c`).
 pub fn format_mjpeg_part_header(
     jpeg_len: usize,
@@ -699,6 +872,7 @@ pub struct KlipperCamServer<'a> {
     pub config: KlipperCamConfig,
     pub camera: CameraDriver<'a>,
     pub ota_manager: OtaDataManager,
+    pub control_state: CameraControlState,
     stream_active: AtomicBool,
     uptime_ms: i64,
     free_heap: u32,
@@ -716,6 +890,7 @@ impl<'a> KlipperCamServer<'a> {
             config,
             camera,
             ota_manager: OtaDataManager::new_booted_ota0(),
+            control_state: CameraControlState::new_default(),
             stream_active: AtomicBool::new(false),
             uptime_ms: 15_000,
             free_heap: 184_320,
@@ -730,6 +905,17 @@ impl<'a> KlipperCamServer<'a> {
     /// Creates a default [`KlipperCamServer`] with `WroverKit` 1280x720 HD configuration.
     pub const fn new_default() -> KlipperCamServer<'static> {
         KlipperCamServer::new(KlipperCamConfig::WROVER_KIT_HD, CameraDriver::new_hd_default())
+    }
+
+    /// Returns `Some(CameraControlState)` and clears `dirty` if a camera control setting
+    /// was modified via `GET /control?var=<param>&val=<int>`.
+    pub fn take_pending_control_update(&mut self) -> Option<CameraControlState> {
+        if self.control_state.dirty {
+            self.control_state.dirty = false;
+            Some(self.control_state)
+        } else {
+            None
+        }
     }
 
     /// Updates the live system telemetry metrics reported by `GET /status`.
@@ -853,6 +1039,8 @@ impl<'a> KlipperCamServer<'a> {
             (HttpMethod::Get, "/") => self.handle_root_p80(req, out_buf),
             (HttpMethod::Get, "/snapshot") => self.handle_snapshot(out_buf),
             (HttpMethod::Get, "/status") => self.handle_status(out_buf),
+            (HttpMethod::Get, "/control") => self.handle_control(req, out_buf),
+            (HttpMethod::Get, "/panel") => self.handle_panel_get(out_buf),
             (HttpMethod::Get, "/update") => self.handle_ota_get(out_buf),
             (HttpMethod::Post, "/update") => self.handle_ota_post(req, out_buf, flash),
             // Port 80 explicitly does NOT serve /stream (NET-001 / APP-005 -> 404 Not Found)
@@ -939,7 +1127,7 @@ impl<'a> KlipperCamServer<'a> {
             free_psram: self.free_psram,
             wifi_rssi: self.wifi_rssi,
             active_partition: active_label,
-            framesize: "1280x720",
+            framesize: framesize_label(self.control_state.framesize),
             stream_active: self.is_stream_active(),
         };
 
@@ -952,6 +1140,251 @@ impl<'a> KlipperCamServer<'a> {
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
             json_str.len(),
             json_str
+        )
+        .map_err(|_| HttpError::BufferTooSmall)?;
+        Ok(writer.into_bytes())
+    }
+
+    /// Handles `GET /control` and `GET /control?var=<param>&val=<int>` on Port 80.
+    fn handle_control<'b>(
+        &mut self,
+        req: &HttpRequest<'_>,
+        out_buf: &'b mut [u8],
+    ) -> Result<&'b [u8], HttpError> {
+        if let Some(q) = req.query {
+            if !q.is_empty() {
+                if q.len() > MAX_URL_QUERY_LEN {
+                    return write_http_error(
+                        out_buf,
+                        400,
+                        "Bad Request",
+                        "Query string exceeds maximum length\n",
+                        true,
+                    );
+                }
+
+                let mut var_opt: Option<&str> = None;
+                let mut val_str_opt: Option<&str> = None;
+                for pair in q.split('&') {
+                    if let Some(eq_idx) = pair.find('=') {
+                        let k = &pair[..eq_idx];
+                        let v = &pair[eq_idx + 1..];
+                        if k == "var" {
+                            var_opt = Some(v);
+                        } else if k == "val" {
+                            val_str_opt = Some(v);
+                        }
+                    }
+                }
+
+                let var_name = match var_opt {
+                    Some(v) if !v.is_empty() => v,
+                    _ => {
+                        return write_http_error(
+                            out_buf,
+                            400,
+                            "Bad Request",
+                            "Missing 'var' parameter\n",
+                            true,
+                        );
+                    }
+                };
+
+                let val = match val_str_opt.and_then(parse_isize_ascii) {
+                    Some(v) => v,
+                    None => {
+                        return write_http_error(
+                            out_buf,
+                            400,
+                            "Bad Request",
+                            "Missing or invalid integer 'val' parameter\n",
+                            true,
+                        );
+                    }
+                };
+
+                match var_name {
+                    "framesize" => match parse_framesize_val(val) {
+                        Some(fs) => self.control_state.framesize = fs,
+                        None => {
+                            return write_http_error(
+                                out_buf,
+                                400,
+                                "Bad Request",
+                                "Invalid framesize value\n",
+                                true,
+                            );
+                        }
+                    },
+                    "quality" => {
+                        if !(4..=63).contains(&val) {
+                            return write_http_error(
+                                out_buf,
+                                400,
+                                "Bad Request",
+                                "Quality must be in 4..=63\n",
+                                true,
+                            );
+                        }
+                        self.control_state.quality = val as i32;
+                    }
+                    "brightness" => {
+                        if !(-2..=2).contains(&val) {
+                            return write_http_error(
+                                out_buf,
+                                400,
+                                "Bad Request",
+                                "Brightness must be in -2..=2\n",
+                                true,
+                            );
+                        }
+                        self.control_state.brightness = val as i32;
+                    }
+                    "contrast" => {
+                        if !(-2..=2).contains(&val) {
+                            return write_http_error(
+                                out_buf,
+                                400,
+                                "Bad Request",
+                                "Contrast must be in -2..=2\n",
+                                true,
+                            );
+                        }
+                        self.control_state.contrast = val as i32;
+                    }
+                    "saturation" => {
+                        if !(-2..=2).contains(&val) {
+                            return write_http_error(
+                                out_buf,
+                                400,
+                                "Bad Request",
+                                "Saturation must be in -2..=2\n",
+                                true,
+                            );
+                        }
+                        self.control_state.saturation = val as i32;
+                    }
+                    "special_effect" => {
+                        if !(0..=6).contains(&val) {
+                            return write_http_error(
+                                out_buf,
+                                400,
+                                "Bad Request",
+                                "Special effect must be in 0..=6\n",
+                                true,
+                            );
+                        }
+                        self.control_state.special_effect = val as i32;
+                    }
+                    "hmirror" => {
+                        if val != 0 && val != 1 {
+                            return write_http_error(
+                                out_buf,
+                                400,
+                                "Bad Request",
+                                "Boolean parameter must be 0 or 1\n",
+                                true,
+                            );
+                        }
+                        self.control_state.hmirror = val != 0;
+                    }
+                    "vflip" => {
+                        if val != 0 && val != 1 {
+                            return write_http_error(
+                                out_buf,
+                                400,
+                                "Bad Request",
+                                "Boolean parameter must be 0 or 1\n",
+                                true,
+                            );
+                        }
+                        self.control_state.vflip = val != 0;
+                    }
+                    "awb" => {
+                        if val != 0 && val != 1 {
+                            return write_http_error(
+                                out_buf,
+                                400,
+                                "Bad Request",
+                                "Boolean parameter must be 0 or 1\n",
+                                true,
+                            );
+                        }
+                        self.control_state.awb = val != 0;
+                    }
+                    "agc" => {
+                        if val != 0 && val != 1 {
+                            return write_http_error(
+                                out_buf,
+                                400,
+                                "Bad Request",
+                                "Boolean parameter must be 0 or 1\n",
+                                true,
+                            );
+                        }
+                        self.control_state.agc = val != 0;
+                    }
+                    "aec" => {
+                        if val != 0 && val != 1 {
+                            return write_http_error(
+                                out_buf,
+                                400,
+                                "Bad Request",
+                                "Boolean parameter must be 0 or 1\n",
+                                true,
+                            );
+                        }
+                        self.control_state.aec = val != 0;
+                    }
+                    "ae_level" => {
+                        if !(-2..=2).contains(&val) {
+                            return write_http_error(
+                                out_buf,
+                                400,
+                                "Bad Request",
+                                "AE level must be in -2..=2\n",
+                                true,
+                            );
+                        }
+                        self.control_state.ae_level = val as i32;
+                    }
+                    _ => {
+                        return write_http_error(
+                            out_buf,
+                            400,
+                            "Bad Request",
+                            "Unknown camera control variable\n",
+                            true,
+                        );
+                    }
+                }
+
+                self.control_state.dirty = true;
+            }
+        }
+
+        let mut json_stack = [0u8; CONTROL_JSON_BUF_LEN];
+        let json_str = format_control_json(&self.control_state, &mut json_stack)?;
+
+        let mut writer = SliceWriter::new(out_buf);
+        write!(
+            writer,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
+            json_str.len(),
+            json_str
+        )
+        .map_err(|_| HttpError::BufferTooSmall)?;
+        Ok(writer.into_bytes())
+    }
+
+    /// Handles `GET /panel` on Port 80, serving the dark-mode Camera Control & Live Preview dashboard.
+    fn handle_panel_get<'b>(&self, out_buf: &'b mut [u8]) -> Result<&'b [u8], HttpError> {
+        let mut writer = SliceWriter::new(out_buf);
+        write!(
+            writer,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
+            KLIPPER_CONTROL_PANEL_HTML.len(),
+            KLIPPER_CONTROL_PANEL_HTML
         )
         .map_err(|_| HttpError::BufferTooSmall)?;
         Ok(writer.into_bytes())
@@ -1669,5 +2102,210 @@ mod tests {
         let loaded_after =
             OtaDataManager::load_from_flash(&mut flash).expect("load after rollback cancel");
         assert_eq!(loaded_after.sector_1.state(), OtaImgState::Valid);
+    }
+
+    #[test]
+    fn test_port80_control_get_and_parameter_updates() {
+        let mut server = KlipperCamServer::new_default();
+        let mut resp_buf = [0u8; 2048];
+
+        // 1. Initially no pending control update; GET /control returns default HD JSON
+        assert_eq!(server.take_pending_control_update(), None);
+        let r0 = server
+            .handle_raw_request(
+                ServerPort::Control,
+                b"GET /control HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n",
+                &mut resp_buf,
+            )
+            .expect("GET /control");
+        let v0 = HttpResponseView::parse(r0).expect("parse GET /control");
+        assert_eq!(v0.status_code, 200);
+        assert_eq!(v0.content_type, Some("application/json"));
+        assert_eq!(v0.access_control_allow_origin, Some("*"));
+        let json0 = core::str::from_utf8(v0.body).expect("utf8 json");
+        assert_eq!(
+            json0,
+            "{\"framesize\":11,\"framesize_label\":\"1280x720\",\"quality\":12,\"brightness\":0,\"contrast\":0,\"saturation\":0,\"special_effect\":0,\"hmirror\":0,\"vflip\":0,\"awb\":1,\"agc\":1,\"aec\":1,\"ae_level\":0}"
+        );
+        assert_eq!(server.take_pending_control_update(), None);
+
+        // 2. GET /control?var=hmirror&val=1 -> 200 OK, sets hmirror=true and dirty=true
+        let r_hm = server
+            .handle_raw_request(
+                ServerPort::Control,
+                b"GET /control?var=hmirror&val=1 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n",
+                &mut resp_buf,
+            )
+            .expect("GET /control?var=hmirror&val=1");
+        let v_hm = HttpResponseView::parse(r_hm).expect("parse hmirror response");
+        assert_eq!(v_hm.status_code, 200);
+        let json_hm = core::str::from_utf8(v_hm.body).expect("utf8");
+        assert!(json_hm.contains("\"hmirror\":1"));
+        let upd1 = server
+            .take_pending_control_update()
+            .expect("pending control update after hmirror=1");
+        assert!(upd1.hmirror);
+        assert!(!upd1.dirty);
+        assert_eq!(server.take_pending_control_update(), None);
+
+        // 3. GET /control?var=quality&val=10 -> 200 OK
+        let r_q = server
+            .handle_raw_request(
+                ServerPort::Control,
+                b"GET /control?var=quality&val=10 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n",
+                &mut resp_buf,
+            )
+            .expect("GET /control?var=quality&val=10");
+        let v_q = HttpResponseView::parse(r_q).expect("parse quality response");
+        assert_eq!(v_q.status_code, 200);
+        let json_q = core::str::from_utf8(v_q.body).expect("utf8");
+        assert!(json_q.contains("\"quality\":10"));
+
+        // 4. GET /control?var=brightness&val=-1 -> 200 OK
+        let r_b = server
+            .handle_raw_request(
+                ServerPort::Control,
+                b"GET /control?var=brightness&val=-1 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n",
+                &mut resp_buf,
+            )
+            .expect("GET /control?var=brightness&val=-1");
+        let v_b = HttpResponseView::parse(r_b).expect("parse brightness response");
+        assert_eq!(v_b.status_code, 200);
+        let json_b = core::str::from_utf8(v_b.body).expect("utf8");
+        assert!(json_b.contains("\"brightness\":-1"));
+
+        // 5. Additional valid controls: contrast, saturation, special_effect, vflip, awb, agc, aec, ae_level, framesize
+        for (req_raw, expected_substr) in [
+            (
+                b"GET /control?var=contrast&val=2 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+                "\"contrast\":2",
+            ),
+            (
+                b"GET /control?var=saturation&val=-2 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+                "\"saturation\":-2",
+            ),
+            (
+                b"GET /control?var=special_effect&val=3 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+                "\"special_effect\":3",
+            ),
+            (
+                b"GET /control?var=vflip&val=1 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+                "\"vflip\":1",
+            ),
+            (
+                b"GET /control?var=awb&val=0 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+                "\"awb\":0",
+            ),
+            (
+                b"GET /control?var=agc&val=0 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+                "\"agc\":0",
+            ),
+            (
+                b"GET /control?var=aec&val=0 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+                "\"aec\":0",
+            ),
+            (
+                b"GET /control?var=ae_level&val=1 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+                "\"ae_level\":1",
+            ),
+            (
+                b"GET /control?var=framesize&val=800 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+                "\"framesize\":9,\"framesize_label\":\"800x600\"",
+            ),
+        ] {
+            let r = server
+                .handle_raw_request(ServerPort::Control, req_raw, &mut resp_buf)
+                .expect("control update");
+            let v = HttpResponseView::parse(r).expect("parse response");
+            assert_eq!(v.status_code, 200);
+            let s = core::str::from_utf8(v.body).expect("utf8");
+            assert!(s.contains(expected_substr), "expected {} in {}", expected_substr, s);
+        }
+
+        // Verify /status reflects updated framesize ("800x600")
+        let r_stat = server
+            .handle_raw_request(
+                ServerPort::Control,
+                b"GET /status HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n",
+                &mut resp_buf,
+            )
+            .expect("GET /status");
+        let v_stat = HttpResponseView::parse(r_stat).expect("parse status");
+        let s_stat = core::str::from_utf8(v_stat.body).expect("utf8");
+        assert!(s_stat.contains("\"framesize\":\"800x600\""));
+
+        let upd_final = server
+            .take_pending_control_update()
+            .expect("pending control update");
+        assert_eq!(upd_final.framesize, FrameSize::Svga);
+        assert_eq!(upd_final.quality, 10);
+        assert_eq!(upd_final.brightness, -1);
+        assert_eq!(upd_final.contrast, 2);
+        assert_eq!(upd_final.saturation, -2);
+        assert_eq!(upd_final.special_effect, 3);
+        assert!(upd_final.hmirror);
+        assert!(upd_final.vflip);
+        assert!(!upd_final.awb);
+        assert!(!upd_final.agc);
+        assert!(!upd_final.aec);
+        assert_eq!(upd_final.ae_level, 1);
+    }
+
+    #[test]
+    fn test_port80_control_invalid_parameters_return_400_bad_request() {
+        let mut server = KlipperCamServer::new_default();
+        let mut resp_buf = [0u8; 1024];
+
+        for bad_req in [
+            b"GET /control?var=unknown&val=1 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+            b"GET /control?var=quality&val=3 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+            b"GET /control?var=quality&val=64 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+            b"GET /control?var=brightness&val=3 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+            b"GET /control?var=contrast&val=-3 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+            b"GET /control?var=saturation&val=9 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+            b"GET /control?var=special_effect&val=7 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+            b"GET /control?var=hmirror&val=2 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+            b"GET /control?var=vflip&val=-1 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+            b"GET /control?var=ae_level&val=-5 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+            b"GET /control?var=framesize&val=999 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+            b"GET /control?var=quality HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+            b"GET /control?val=10 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+            b"GET /control?var=quality&val=abc HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+        ] {
+            let resp = server
+                .handle_raw_request(ServerPort::Control, bad_req, &mut resp_buf)
+                .expect("400 response written");
+            let view = HttpResponseView::parse(resp).expect("parse 400 response");
+            assert_eq!(view.status_code, 400);
+            assert_eq!(view.access_control_allow_origin, Some("*"));
+        }
+
+        // State must remain clean and unmodified after rejected requests
+        assert_eq!(server.take_pending_control_update(), None);
+        assert_eq!(server.control_state, CameraControlState::new_default());
+    }
+
+    #[test]
+    fn test_port80_panel_get_html_dashboard() {
+        let mut server = KlipperCamServer::new_default();
+        let mut resp_buf = [0u8; 4096];
+
+        let resp = server
+            .handle_raw_request(
+                ServerPort::Control,
+                b"GET /panel HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n",
+                &mut resp_buf,
+            )
+            .expect("GET /panel");
+        let view = HttpResponseView::parse(resp).expect("parse /panel response");
+        assert_eq!(view.status_code, 200);
+        assert_eq!(view.content_type, Some("text/html"));
+        assert_eq!(view.access_control_allow_origin, Some("*"));
+        let html = core::str::from_utf8(view.body).expect("utf8 html");
+        assert!(html.contains("Klipper Cam Control Panel"));
+        assert!(html.contains(":81/stream"));
+        assert!(html.contains("/snapshot"));
+        assert!(html.contains("fetch('/control?var='+k+'&val='+v)"));
+        assert!(html.contains("fetch('/status')"));
     }
 }
