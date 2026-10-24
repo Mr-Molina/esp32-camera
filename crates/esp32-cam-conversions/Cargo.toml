@@ -1,0 +1,12 @@
+[package]
+name = "esp32-cam-conversions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Safe no_std JPEG SOI/EOI SWAR scanner, YUV/RGB color conversion, BMP serializer, and baseline JPEG codec"
+
+[dependencies]
+esp32-cam-types.workspace = true
+
+[lints]
+workspace = true

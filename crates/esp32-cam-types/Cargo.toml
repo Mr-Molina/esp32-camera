@@ -1,0 +1,9 @@
+[package]
+name = "esp32-cam-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core no_std types, sensor metadata, resolution tables, and error definitions for esp32-camera"
+
+[lints]
+workspace = true

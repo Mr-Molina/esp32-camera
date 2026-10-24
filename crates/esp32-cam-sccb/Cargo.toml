@@ -1,0 +1,13 @@
+[package]
+name = "esp32-cam-sccb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Safe no_std SCCB/I2C register bus trait, embedded-hal 1.0 adapter, and deterministic MockSccbBus"
+
+[dependencies]
+esp32-cam-types.workspace = true
+embedded-hal.workspace = true
+
+[lints]
+workspace = true
