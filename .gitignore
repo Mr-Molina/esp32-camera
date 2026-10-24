@@ -4,5 +4,7 @@
 .env.local
 .env*.local
 *.bin
+__pycache__/
+*.pyc
 handoff.md
 .agents/
