@@ -93,8 +93,8 @@ pub const I2S0I_DATA_IN6_IDX: u8 = 146;
 /// GPIO matrix input signal index for `I2S0I_DATA_IN7_IDX` (`147`).
 pub const I2S0I_DATA_IN7_IDX: u8 = 147;
 
-/// GPIO matrix input signal index for `I2S0I_WS_IN_IDX` (`PCLK`, `158`).
-pub const I2S0I_WS_IN_IDX: u8 = 158;
+/// GPIO matrix input signal index for `I2S0I_WS_IN_IDX` (`PCLK`, `28`, ESP32 TRM Table 4-2).
+pub const I2S0I_WS_IN_IDX: u8 = 28;
 
 /// GPIO matrix input signal index for `I2S0I_H_SYNC_IDX` (`HREF`, `190`).
 pub const I2S0I_H_SYNC_IDX: u8 = 190;
@@ -141,7 +141,9 @@ pub const I2S_LC_IN_RST_BIT: u32 = 1 << 0;
 pub const I2S_LC_AHBM_FIFO_RST_BIT: u32 = 1 << 2;
 pub const I2S_LC_AHBM_RST_BIT: u32 = 1 << 3;
 
-/// `I2S0.conf2` (`0xA8`), `I2S0.clkm_conf` (`0xAC`), and `I2S0.sample_rate_conf` (`0xB0`) offsets.
+/// `I2S0.pd_conf` (`0xA4`), `I2S0.conf2` (`0xA8`), `I2S0.clkm_conf` (`0xAC`), and `I2S0.sample_rate_conf` (`0xB0`) offsets.
+pub const I2S_PD_CONF_REG_OFFSET: usize = 0xA4;
+pub const I2S_PD_FIFO_MEM_FORCE_PU: u32 = 0x0A;
 pub const I2S_CONF2_REG_OFFSET: usize = 0xA8;
 pub const I2S_CLKM_CONF_REG_OFFSET: usize = 0xAC;
 pub const I2S_SAMPLE_RATE_CONF_REG_OFFSET: usize = 0xB0;
@@ -241,6 +243,7 @@ pub struct I2s0RegisterBlock {
     pub lc_conf: u32,
     pub clkm_conf: u32,
     pub sample_rate_conf: u32,
+    pub pd_conf: u32,
     pub conf2: u32,
     pub conf_chan: u32,
 }
@@ -312,7 +315,7 @@ fn xtensa_configure_input_pad(gpio_num: u8, enable_pullup: bool) {
     match gpio_num {
         36..=39 => {
             let v = xtensa_mmio_read(RTC_IO_SENSOR_PADS_REG)
-                & !((1 << 27) | (1 << 26) | (1 << 25) | (1 << 24));
+                & !((1 << 30) | (1 << 29) | (1 << 28) | (1 << 27));
             xtensa_mmio_write(RTC_IO_SENSOR_PADS_REG, v);
         }
         34 | 35 => {
@@ -531,6 +534,7 @@ impl Esp32I2sCamera {
                 lc_conf: 0,
                 clkm_conf: 0,
                 sample_rate_conf: 0,
+                pd_conf: 0,
                 conf2: 0,
                 conf_chan: 0,
             },
@@ -700,6 +704,9 @@ impl Esp32I2sCamera {
         volatile_write_u32(&mut self.regs.conf, I2S_RX_SLAVE_MOD_BIT);
         volatile_write_u32(&mut self.regs.lc_conf, 0);
 
+        // Force I2S0 FIFO and PLC memory power-up (`FIFO_FORCE_PU | PLC_MEM_FORCE_PU`)
+        volatile_write_u32(&mut self.regs.pd_conf, I2S_PD_FIFO_MEM_FORCE_PU);
+
         // Enable LCD + Camera mode (`I2S0.conf2.lcd_en = 1; I2S0.conf2.camera_en = 1;`)
         volatile_write_u32(&mut self.regs.conf2, I2S_LCD_EN_BIT | I2S_CAMERA_EN_BIT);
 
@@ -738,6 +745,12 @@ impl Esp32I2sCamera {
                 I2S_LC_IN_RST_BIT | I2S_LC_AHBM_FIFO_RST_BIT | I2S_LC_AHBM_RST_BIT,
             );
             xtensa_mmio_write(I2S0_BASE_ADDR + I2S_LC_CONF_REG_OFFSET, 0);
+
+            // Force I2S0 FIFO and PLC memory power-up (`FIFO_FORCE_PU | PLC_MEM_FORCE_PU`)
+            xtensa_mmio_write(
+                I2S0_BASE_ADDR + I2S_PD_CONF_REG_OFFSET,
+                I2S_PD_FIFO_MEM_FORCE_PU,
+            );
 
             // Enable LCD + Camera slave mode (`0x21`)
             xtensa_mmio_write(
@@ -856,6 +869,27 @@ impl Esp32I2sCamera {
             xtensa_mmio_write(I2S0_BASE_ADDR + I2S_LC_CONF_REG_OFFSET, 0);
             xtensa_mmio_write(I2S0_BASE_ADDR + I2S_LC_CONF_REG_OFFSET, I2S_LC_AHBM_RST_BIT);
             xtensa_mmio_write(I2S0_BASE_ADDR + I2S_LC_CONF_REG_OFFSET, 0);
+
+            // Ensure I2S0 FIFO memory remains powered up and GPIO matrix input bindings stay latched
+            xtensa_mmio_write(
+                I2S0_BASE_ADDR + I2S_PD_CONF_REG_OFFSET,
+                I2S_PD_FIFO_MEM_FORCE_PU,
+            );
+            let mut b_idx = 0;
+            while b_idx < self.gpio_binding_count {
+                let b = self.gpio_bindings[b_idx];
+                let inv = if b.signal_idx == I2S0I_V_SYNC_IDX {
+                    self.vsync_invert
+                } else {
+                    b.inverted
+                };
+                let sel_val = (1u32 << 7) | ((inv as u32) << 6) | ((b.gpio_num as u32) & 0x3F);
+                xtensa_mmio_write(
+                    GPIO_FUNC0_IN_SEL_CFG_REG + 4 * (b.signal_idx as usize),
+                    sel_val,
+                );
+                b_idx += 1;
+            }
 
             xtensa_mmio_write(I2S0_BASE_ADDR + I2S_RXEOF_NUM_REG_OFFSET, eof_num);
             xtensa_mmio_write(I2S0_BASE_ADDR + I2S_IN_LINK_REG_OFFSET, link_val);
@@ -1262,7 +1296,9 @@ mod tests {
         };
         assert_eq!(cam.set_pin(&valid_pins), Ok(()));
         assert_eq!(cam.gpio_bindings().len(), 12);
+        assert_eq!(I2S0I_WS_IN_IDX, 28);
         assert_eq!(cam.gpio_bindings()[0].signal_idx, I2S0I_WS_IN_IDX);
+        assert_eq!(cam.gpio_bindings()[0].signal_idx, 28);
         assert_eq!(cam.gpio_bindings()[1].signal_idx, I2S0I_V_SYNC_IDX);
         assert_eq!(cam.gpio_bindings()[2].signal_idx, I2S0I_H_SYNC_IDX);
         assert_eq!(cam.gpio_bindings()[3].signal_idx, I2S0I_DATA_IN0_IDX);
@@ -1289,6 +1325,9 @@ mod tests {
         assert_eq!(cam.config(), Ok(()));
         assert_eq!(cam.regs().dport_clk_en & DPORT_I2S0_CLK_EN, DPORT_I2S0_CLK_EN);
         assert_eq!(cam.regs().dport_rst_en & DPORT_I2S0_RST, 0);
+        assert_eq!(cam.regs().pd_conf, I2S_PD_FIFO_MEM_FORCE_PU);
+        assert_eq!(I2S_PD_CONF_REG_OFFSET, 0xA4);
+        assert_eq!(I2S_PD_FIFO_MEM_FORCE_PU, 0x0A);
         assert_eq!(cam.regs().conf2, I2S_LCD_EN_BIT | I2S_CAMERA_EN_BIT);
 
         let mode = cam

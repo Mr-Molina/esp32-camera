@@ -35,8 +35,9 @@ use klipper_cam_fw::{
     verify_jpeg_eoi, verify_jpeg_soi, verify_partition_table_integrity, BoardPins, CameraDriver,
     CameraSensor, DmaElement, Esp32I2sCamera, EspImageHeader, FirmwareRuntime, FramePool,
     FrameSize, GrabMode, HttpResponseView, Ipv4Addr, KlipperCamConfig, MockSccbBus, OtaSlot,
-    Ov2640, PixelFormat, ServerPort, SliceWriter, WroverKitPins, XclkConfig, XclkController,
-    DEFAULT_JPEG_QUALITY, DEFAULT_OTA_TOKEN, DEFAULT_XCLK_FREQ_HZ, MJPEG_CONTENT_TYPE,
+    Ov2640, PingPongFrameBuffer, PixelFormat, ServerPort, SliceWriter, WroverKitPins, XclkConfig,
+    XclkController, DEFAULT_JPEG_QUALITY, DEFAULT_OTA_TOKEN, DEFAULT_XCLK_FREQ_HZ,
+    MJPEG_CONTENT_TYPE,
 };
 
 #[inline(never)]
@@ -226,6 +227,20 @@ fn hil_check_jpeg_pool_and_http_ota() -> bool {
         }
     }
     if pool.free_count() != 2 {
+        return false;
+    }
+
+    let mut pp_a = [0u8; 640];
+    let mut pp_b = [0u8; 640];
+    let mut pp = match PingPongFrameBuffer::new(&mut pp_a, &mut pp_b, &jpeg_encoded[..jpeg_len]) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    if pp.write_and_commit_inactive(&jpeg_encoded[..jpeg_len]).is_err()
+        || pp.frame_seq() != 2
+        || pp.active_slot_index() != 1
+        || pp.active_frame() != &jpeg_encoded[..jpeg_len]
+    {
         return false;
     }
 
@@ -456,52 +471,36 @@ fn send_arp_announce(
 }
 
 #[cfg(target_arch = "xtensa")]
-fn xtensa_route_i2s0_camera_pins(vsync_matrix_inv: bool) {
-    const GPIO_FUNC0_IN_SEL_CFG_BASE: usize = 0x3FF4_4130;
-    const I2S_PD_CONF_REG: *mut u32 = 0x3FF4_F0A4 as *mut u32;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DmaCapturePhase {
+    Idle { last_done_ms: i64 },
+    WaitVsyncHigh { start_ms: i64 },
+}
 
-    // ESP32 TRM / esp-metadata-generated `_generated_esp32.rs` verified I2S0 input signals:
-    // I2S0I_WS (PCLK) = 28, I2S0I_DATA_0..7 = 140..=147, I2S0I_H_SYNC (HREF) = 190,
-    // I2S0I_V_SYNC (VSYNC) = 191, I2S0I_H_ENABLE = 192.
-    let routes: [(usize, u32, bool); 12] = [
-        (28, 22, false),                // PCLK (GPIO 22) -> I2S0I_WS (signal 28)
-        (190, 23, false),               // HREF (GPIO 23) -> I2S0I_H_SYNC (signal 190)
-        (191, 25, vsync_matrix_inv),    // VSYNC (GPIO 25) -> I2S0I_V_SYNC (signal 191)
-        (192, 0x38, false),             // CONST_ONE (0x38) -> I2S0I_H_ENABLE (signal 192)
-        (140, 4, false),                // D0 (GPIO 4) -> I2S0I_DATA_0 (signal 140)
-        (141, 5, false),                // D1 (GPIO 5) -> I2S0I_DATA_1 (signal 141)
-        (142, 18, false),               // D2 (GPIO 18) -> I2S0I_DATA_2 (signal 142)
-        (143, 19, false),               // D3 (GPIO 19) -> I2S0I_DATA_3 (signal 143)
-        (144, 36, false),               // D4 (GPIO 36) -> I2S0I_DATA_4 (signal 144)
-        (145, 39, false),               // D5 (GPIO 39) -> I2S0I_DATA_5 (signal 145)
-        (146, 34, false),               // D6 (GPIO 34) -> I2S0I_DATA_6 (signal 146)
-        (147, 35, false),               // D7 (GPIO 35) -> I2S0I_DATA_7 (signal 147)
-    ];
+#[cfg(target_arch = "xtensa")]
+const PORT80_SOCKET_COUNT: usize = 4;
 
-    unsafe {
-        // Ensure I2S0 FIFO & PLC memories are powered up (`FIFO_FORCE_PU | PLC_MEM_FORCE_PU`)
-        core::ptr::write_volatile(I2S_PD_CONF_REG, 0x0A);
-        for &(sig_idx, gpio_num, inv) in &routes {
-            let reg = (GPIO_FUNC0_IN_SEL_CFG_BASE + 4 * sig_idx) as *mut u32;
-            let val = (1u32 << 7) | ((inv as u32) << 6) | (gpio_num & 0x3F);
-            core::ptr::write_volatile(reg, val);
-        }
-    }
+#[cfg(target_arch = "xtensa")]
+#[derive(Debug, Clone, Copy, Default)]
+struct Port80WorkerState {
+    req_len: usize,
+    tx_off: usize,
+    tx_len: usize,
+    closing: bool,
+    close_deadline_ms: i64,
+    using_ota_accum: bool,
 }
 
 #[cfg(target_arch = "xtensa")]
 fn capture_live_hd_jpeg_with_diag(
     i2s_cam: &mut Esp32I2sCamera,
     jpeg_scratch: &mut [u8],
-    jpeg_frame_buf: &mut [u8],
-    vsync_matrix_inv: bool,
+    ping_pong: &mut PingPongFrameBuffer<'_>,
 ) -> Result<usize, (u32, usize, u8, u8, u8, u32)> {
     const GPIO_IN_REG: *const u32 = 0x3FF4_403C as *const u32;
     const I2S_INT_RAW_REG: *const u32 = 0x3FF4_F00C as *const u32;
     const I2S_INT_CLR_REG: *mut u32 = 0x3FF4_F018 as *mut u32;
     const I2S_IN_SUC_EOF_BIT: u32 = 1 << 9;
-
-    xtensa_route_i2s0_camera_pins(vsync_matrix_inv);
 
     let (desc_slice, dma_slice) = unsafe {
         (
@@ -536,8 +535,6 @@ fn capture_live_hd_jpeg_with_diag(
     if !i2s_cam.start(&dma_cfg, desc_slice[0].link_addr_20bit()) {
         return Err((0, 0, 0, 0, 0, 0xDEAD));
     }
-    // Re-apply signal 28 (I2S0I_WS / PCLK) and VSYNC matrix routing after start()
-    xtensa_route_i2s0_camera_pins(vsync_matrix_inv);
 
     let mut eof_cnt = 0u32;
     let mut fb_len = 0usize;
@@ -616,8 +613,11 @@ fn capture_live_hd_jpeg_with_diag(
             let slice_from_soi = &jpeg_scratch[soi_pos..fb_len];
             if let Some(eoi_rel) = verify_jpeg_eoi(slice_from_soi, false) {
                 let exact_len = eoi_rel + 2;
-                if exact_len >= 64 && exact_len <= jpeg_frame_buf.len() {
-                    jpeg_frame_buf[..exact_len].copy_from_slice(&slice_from_soi[..exact_len]);
+                if exact_len >= 64
+                    && ping_pong
+                        .write_and_commit_inactive(&slice_from_soi[..exact_len])
+                        .is_ok()
+                {
                     return Ok(exact_len);
                 }
             }
@@ -628,6 +628,13 @@ fn capture_live_hd_jpeg_with_diag(
     let b1 = if fb_len > 1 { jpeg_scratch[1] } else { 0 };
     let b2 = if fb_len > 2 { jpeg_scratch[2] } else { 0 };
     Err((eof_cnt, fb_len, b0, b1, b2, last_int_raw))
+}
+
+#[cfg(target_arch = "xtensa")]
+#[inline]
+fn active_ping_pong_static_slice(pp: &PingPongFrameBuffer<'_>) -> &'static [u8] {
+    let active = pp.active_frame();
+    unsafe { core::slice::from_raw_parts(active.as_ptr(), active.len()) }
 }
 
 /// Bare-metal Xtensa firmware entrypoint for `ESP32-WROVER-DEV`.
@@ -697,19 +704,40 @@ fn main() -> ! {
     );
     println!("============================================================");
 
-    // Carve PSRAM buffers for 1280x720 JPEG frames, HTTP responses, TCP windows, and OTA upload buffer
+    // Carve PSRAM buffers for Ping-Pong 1280x720 JPEG slots, 4-socket Port 80 pool, Port 81 stream, and OTA buffer
     let psram_all: &'static mut [u8] =
         unsafe { core::slice::from_raw_parts_mut(psram_ptr, psram_len) };
-    let (jpeg_frame_buf, rem) = psram_all.split_at_mut(128 * 1024);
+    let (jpeg_slot_a, rem) = psram_all.split_at_mut(128 * 1024);
+    let (jpeg_slot_b, rem) = rem.split_at_mut(128 * 1024);
     let (jpeg_scratch_buf, rem) = rem.split_at_mut(128 * 1024);
-    let (http_resp_buf, rem) = rem.split_at_mut(160 * 1024);
-    let (tcp80_rx_storage, rem) = rem.split_at_mut(48 * 1024);
-    let (tcp80_tx_storage, rem) = rem.split_at_mut(160 * 1024);
+
+    // 4 Port 80 worker buffers: rx (8 KB x 4), tx (64 KB x 4), req_hdr (4 KB x 4), resp (128 KB x 4)
+    let (p80_rx0, rem) = rem.split_at_mut(8 * 1024);
+    let (p80_rx1, rem) = rem.split_at_mut(8 * 1024);
+    let (p80_rx2, rem) = rem.split_at_mut(8 * 1024);
+    let (p80_rx3, rem) = rem.split_at_mut(8 * 1024);
+    let (p80_tx0, rem) = rem.split_at_mut(64 * 1024);
+    let (p80_tx1, rem) = rem.split_at_mut(64 * 1024);
+    let (p80_tx2, rem) = rem.split_at_mut(64 * 1024);
+    let (p80_tx3, rem) = rem.split_at_mut(64 * 1024);
+    let (p80_hdr0, rem) = rem.split_at_mut(4 * 1024);
+    let (p80_hdr1, rem) = rem.split_at_mut(4 * 1024);
+    let (p80_hdr2, rem) = rem.split_at_mut(4 * 1024);
+    let (p80_hdr3, rem) = rem.split_at_mut(4 * 1024);
+    let (p80_resp0, rem) = rem.split_at_mut(128 * 1024);
+    let (p80_resp1, rem) = rem.split_at_mut(128 * 1024);
+    let (p80_resp2, rem) = rem.split_at_mut(128 * 1024);
+    let (p80_resp3, rem) = rem.split_at_mut(128 * 1024);
+
+    // Port 81 primary + busy buffers
     let (tcp81_rx_storage, rem) = rem.split_at_mut(4 * 1024);
     let (tcp81_tx_storage, rem) = rem.split_at_mut(160 * 1024);
+    let (p81_resp_buf, rem) = rem.split_at_mut(128 * 1024);
     let (tcp81_busy_rx_storage, rem) = rem.split_at_mut(2 * 1024);
     let (tcp81_busy_tx_storage, rem) = rem.split_at_mut(2 * 1024);
-    let (http80_req_accum, psram_heap_rem) = rem.split_at_mut(1800 * 1024);
+
+    // Shared 1800 KB OTA upload accumulator
+    let (http80_ota_accum, psram_heap_rem) = rem.split_at_mut(1800 * 1024);
 
     if !psram_heap_rem.is_empty() {
         unsafe {
@@ -720,6 +748,13 @@ fn main() -> ! {
             ));
         }
     }
+
+    let mut ping_pong = PingPongFrameBuffer::new(
+        jpeg_slot_a,
+        jpeg_slot_b,
+        &SYNTHETIC_HD_JFIF_FRAME,
+    )
+    .expect("PingPongFrameBuffer::new");
 
     // 1. Configure physical 20 MHz XCLK on GPIO 21 via LEDC LowSpeed Timer0 / Channel0
     let mut ledc = Ledc::new(peripherals.LEDC);
@@ -830,14 +865,14 @@ fn main() -> ! {
 
     // 4. Configure live I2S0 parallel camera slave DMA and capture initial 1280x720 JPEG frame
     let mut hw_i2s_cam = Esp32I2sCamera::new();
-    let ll_pins = WroverKitPins::PINS.to_ll_pin_config(true);
+    let ll_pins = WroverKitPins::PINS.to_ll_pin_config(false);
     let _ = hw_i2s_cam.set_pin(&ll_pins);
     let _ = hw_i2s_cam.config();
     let _ = hw_i2s_cam.set_sample_mode(PixelFormat::Jpeg, DEFAULT_XCLK_FREQ_HZ, 0x26);
 
     // Configure physical camera input pads via esp-hal AFTER `set_pin` so `RTC_IO` (`34..=39`)
-    // and `IO_MUX` (`4, 5, 18, 19, 22, 23, 25`) use esp-hal's verified pad bitfields, then
-    // route all 12 I2S0 signals in `GPIO_FUNC0_IN_SEL_CFG_REG` (including signal 28 = `I2S0I_WS` / `PCLK`)
+    // and `IO_MUX` (`4, 5, 18, 19, 22, 23, 25`) use esp-hal's verified pad bitfields;
+    // `hw_i2s_cam.start()` latches all 12 `GPIO_FUNC0_IN_SEL_CFG_REG` signals (`I2S0I_WS_IN_IDX = 28`).
     let _cam_inputs = (
         Input::new(peripherals.GPIO4, InputConfig::default()),
         Input::new(peripherals.GPIO5, InputConfig::default()),
@@ -854,27 +889,23 @@ fn main() -> ! {
             InputConfig::default().with_pull(Pull::Up),
         ),
     );
-    xtensa_route_i2s0_camera_pins(false);
     delay.delay_millis(80);
 
-    let mut active_jpeg_len = SYNTHETIC_HD_JFIF_FRAME.len();
-    jpeg_frame_buf[..active_jpeg_len].copy_from_slice(&SYNTHETIC_HD_JFIF_FRAME);
     let mut ov2640_dma_ok = false;
-    let mut vsync_inv_ok = false;
 
     if ov2640_hw_ok {
         for attempt in 1..=4u8 {
             let inv_try = attempt >= 3;
+            if attempt == 3 {
+                let _ = hw_i2s_cam.set_pin(&WroverKitPins::PINS.to_ll_pin_config(true));
+            }
             match capture_live_hd_jpeg_with_diag(
                 &mut hw_i2s_cam,
                 jpeg_scratch_buf,
-                jpeg_frame_buf,
-                inv_try,
+                &mut ping_pong,
             ) {
                 Ok(captured_len) => {
-                    active_jpeg_len = captured_len;
                     ov2640_dma_ok = true;
-                    vsync_inv_ok = inv_try;
                     println!(
                         "[KLIPPER-CAM-RS] [HW-3] Live OV2640 I2S0 DMA 1280x720 JPEG Capture: PASS ({} bytes, attempt {}, inv={})",
                         captured_len, attempt, inv_try
@@ -894,7 +925,7 @@ fn main() -> ! {
     if !ov2640_dma_ok {
         println!(
             "[KLIPPER-CAM-RS] [HW-3] Live OV2640 I2S0 DMA Capture fallback: using synthetic 1280x720 JFIF ({} bytes)",
-            active_jpeg_len
+            ping_pong.active_len()
         );
     }
     println!("============================================================");
@@ -904,9 +935,7 @@ fn main() -> ! {
     let ota_manager = OtaDataManager::load_from_flash(&mut flash_adapter)
         .unwrap_or_else(|_| OtaDataManager::new_booted_ota0());
 
-    let jpeg_static_ptr = jpeg_frame_buf.as_mut_ptr();
-    let initial_slice: &'static [u8] =
-        unsafe { core::slice::from_raw_parts(jpeg_static_ptr, active_jpeg_len) };
+    let initial_slice = active_ping_pong_static_slice(&ping_pong);
     let mut runtime = FirmwareRuntime::new(
         KlipperCamConfig::WROVER_KIT_HD,
         CameraDriver::new(initial_slice, FrameSize::Hd),
@@ -962,19 +991,41 @@ fn main() -> ! {
         }
     }
 
-    // 7. Configure smoltcp Ethernet Interface + DHCPv4 + Static IP fallback (172.22.1.52/16) + Port 80/81 TCP sockets
+    // 7. Configure smoltcp Ethernet Interface + DHCPv4 + Static IP fallback (172.22.1.52/24)
+    //    + 4-socket Port 80 pool + Port 81 primary & busy TCP sockets (7 sockets total)
     let mut net_device = SmoltcpWifiDevice(wifi_iface);
     let iface_cfg = IfaceConfig::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
     let mut iface = NetInterface::new(iface_cfg, &mut net_device, smol_now());
 
-    let mut socket_storage = [SocketStorage::EMPTY; 4];
+    let mut socket_storage = [SocketStorage::EMPTY; 7];
     let mut sockets = SocketSet::new(&mut socket_storage[..]);
 
     let dhcp_handle = sockets.add(dhcpv4::Socket::new());
-    let tcp80_handle = sockets.add(TcpSocket::new(
-        TcpSocketBuffer::new(tcp80_rx_storage),
-        TcpSocketBuffer::new(tcp80_tx_storage),
-    ));
+    let tcp80_handles: [smoltcp::iface::SocketHandle; PORT80_SOCKET_COUNT] = [
+        sockets.add(TcpSocket::new(
+            TcpSocketBuffer::new(p80_rx0),
+            TcpSocketBuffer::new(p80_tx0),
+        )),
+        sockets.add(TcpSocket::new(
+            TcpSocketBuffer::new(p80_rx1),
+            TcpSocketBuffer::new(p80_tx1),
+        )),
+        sockets.add(TcpSocket::new(
+            TcpSocketBuffer::new(p80_rx2),
+            TcpSocketBuffer::new(p80_tx2),
+        )),
+        sockets.add(TcpSocket::new(
+            TcpSocketBuffer::new(p80_rx3),
+            TcpSocketBuffer::new(p80_tx3),
+        )),
+    ];
+    let p80_hdr_bufs: [&mut [u8]; PORT80_SOCKET_COUNT] =
+        [p80_hdr0, p80_hdr1, p80_hdr2, p80_hdr3];
+    let p80_resp_bufs: [&mut [u8]; PORT80_SOCKET_COUNT] =
+        [p80_resp0, p80_resp1, p80_resp2, p80_resp3];
+    let mut p80_states = [Port80WorkerState::default(); PORT80_SOCKET_COUNT];
+    let mut ota_accum_owner: Option<usize> = None;
+
     let tcp81_handle = sockets.add(TcpSocket::new(
         TcpSocketBuffer::new(tcp81_rx_storage),
         TcpSocketBuffer::new(tcp81_tx_storage),
@@ -990,12 +1041,11 @@ fn main() -> ! {
     let mut last_heartbeat_ms = connect_ms;
     let mut last_arp_announce_ms = connect_ms;
 
-    // Port 80 HTTP state
-    let mut p80_req_len: usize = 0;
-    let mut p80_tx_off: usize = 0;
-    let mut p80_tx_len: usize = 0;
-    let mut p80_closing = false;
-    let mut p80_close_deadline_ms: i64 = 0;
+    // Non-blocking background I2S0 DMA capture state machine
+    let mut dma_phase = DmaCapturePhase::Idle {
+        last_done_ms: connect_ms,
+    };
+    let mut need_post_snapshot_refresh = false;
 
     // Port 81 primary MJPEG stream state
     let mut p81_req_buf = [0u8; 1024];
@@ -1055,7 +1105,7 @@ fn main() -> ! {
                     send_arp_announce(&mut net_device, mac, [172, 22, 1, 52], [172, 22, 1, 1]);
                     last_arp_announce_ms = now_ms;
                     println!(
-                        "[KLIPPER-CAM-RS] [NET] IP Configured: 172.22.1.52/{} + DHCP {}.{}.{}.{}/{} (Port 80 & 81 Ready)",
+                        "[KLIPPER-CAM-RS] [NET] IP Configured: 172.22.1.52/{} + DHCP {}.{}.{}.{}/{} (Port 80 x4 & Port 81 Ready)",
                         prefix_len, octets[0], octets[1], octets[2], octets[3], prefix_len
                     );
                 }
@@ -1079,7 +1129,7 @@ fn main() -> ! {
             send_arp_announce(&mut net_device, mac, [172, 22, 1, 52], [172, 22, 1, 1]);
             last_arp_announce_ms = now_ms;
             println!(
-                "[KLIPPER-CAM-RS] [NET] Static IP Fallback Configured: 172.22.1.52/24 GW 172.22.1.1 (Port 80 & 81 Ready)"
+                "[KLIPPER-CAM-RS] [NET] Static IP Fallback Configured: 172.22.1.52/24 GW 172.22.1.1 (Port 80 x4 & Port 81 Ready)"
             );
         }
 
@@ -1093,93 +1143,319 @@ fn main() -> ! {
         }
 
         // ============================================================
-        // Port 80 Control / Snapshot / Status / OTA Server
+        // Non-Blocking I2S0 Background Capture State Machine (Ping-Pong)
         // ============================================================
-        {
-            let sock80 = sockets.get_mut::<TcpSocket>(tcp80_handle);
+        if ov2640_dma_ok && ota_accum_owner.is_none() && !runtime.server.is_reboot_scheduled() {
+            const GPIO_IN_REG: *const u32 = 0x3FF4_403C as *const u32;
+            const I2S_INT_RAW_REG: *const u32 = 0x3FF4_F00C as *const u32;
+            const I2S_INT_CLR_REG: *mut u32 = 0x3FF4_F018 as *mut u32;
+            const I2S_IN_SUC_EOF_BIT: u32 = 1 << 9;
+
+            let read_vsync = || -> bool {
+                ((unsafe { core::ptr::read_volatile(GPIO_IN_REG) } >> 25) & 1) != 0
+            };
+
+            let p80_busy = tcp80_handles
+                .iter()
+                .any(|&h| sockets.get_mut::<TcpSocket>(h).is_active());
+
+            match dma_phase {
+                DmaCapturePhase::Idle { last_done_ms } => {
+                    let should_capture = !p80_busy
+                        && ((p81_streaming && now_ms - last_done_ms >= 35)
+                            || need_post_snapshot_refresh);
+                    if should_capture {
+                        need_post_snapshot_refresh = false;
+                        dma_phase = DmaCapturePhase::WaitVsyncHigh { start_ms: now_ms };
+                    }
+                }
+                DmaCapturePhase::WaitVsyncHigh { start_ms } => {
+                    if p80_busy {
+                        dma_phase = DmaCapturePhase::Idle {
+                            last_done_ms: now_ms,
+                        };
+                    } else if !read_vsync() {
+                        if now_ms - start_ms >= 200 {
+                            dma_phase = DmaCapturePhase::Idle {
+                                last_done_ms: now_ms,
+                            };
+                        }
+                    } else {
+                        let (desc_slice, dma_slice) = unsafe {
+                            (
+                                &mut *core::ptr::addr_of_mut!(I2S_DMA_DESC),
+                                &mut (*core::ptr::addr_of_mut!(I2S_DMA_BUF)).0,
+                            )
+                        };
+                        let _ = build_circular_ring(desc_slice, dma_slice, 2048);
+
+                        let dma_cfg = esp32_cam_ll::DmaSizeConfig {
+                            dma_bytes_per_item: 4,
+                            dma_buffer_size: 32768,
+                            dma_half_buffer_size: 4096,
+                            dma_half_buffer_cnt: 8,
+                            dma_node_buffer_size: 2048,
+                            dma_node_cnt: 16,
+                            lines_per_node: 1,
+                            nodes_per_line: 1,
+                            lines_per_half_buffer: 1,
+                            image_size: jpeg_scratch_buf.len(),
+                        };
+
+                        // VSYNC is currently HIGH; wait for exact falling edge (<= 10 ms) so SOI is at offset 0
+                        let edge_start_ms = now_millis();
+                        while read_vsync() && (now_millis().saturating_sub(edge_start_ms) < 10) {}
+
+                        if hw_i2s_cam.start(&dma_cfg, desc_slice[0].link_addr_20bit()) {
+                            let mut eof_cnt = 0u32;
+                            let mut fb_len = 0usize;
+                            let mut seen_vsync_high = false;
+                            let mut spin_ticks = 0u32;
+                            let dma_start_ms = now_millis();
+                            let mut last_eof_ms = dma_start_ms;
+
+                            while now_millis().saturating_sub(dma_start_ms) < 85 {
+                                if read_vsync() {
+                                    seen_vsync_high = true;
+                                }
+
+                                let int_raw = unsafe { core::ptr::read_volatile(I2S_INT_RAW_REG) };
+                                if (int_raw & I2S_IN_SUC_EOF_BIT) != 0 {
+                                    unsafe {
+                                        core::ptr::write_volatile(
+                                            I2S_INT_CLR_REG,
+                                            I2S_IN_SUC_EOF_BIT,
+                                        );
+                                    }
+                                    last_eof_ms = now_millis();
+
+                                    let half_idx = (eof_cnt as usize) & 7;
+                                    let half_offset = half_idx * 4096;
+                                    if fb_len + 1024 <= jpeg_scratch_buf.len() {
+                                        let _ = hw_i2s_cam.memcpy_filtered(
+                                            &mut jpeg_scratch_buf[fb_len..fb_len + 1024],
+                                            &dma_slice[half_offset..half_offset + 4096],
+                                        );
+                                        let flags =
+                                            Lldesc::pack_flags(2048, 0, 0, false, false, true);
+                                        unsafe {
+                                            core::ptr::write_volatile(
+                                                &mut desc_slice[2 * half_idx].size_length_flags,
+                                                flags,
+                                            );
+                                            core::ptr::write_volatile(
+                                                &mut desc_slice[2 * half_idx + 1].size_length_flags,
+                                                flags,
+                                            );
+                                        }
+                                        fb_len += 1024;
+                                        eof_cnt += 1;
+
+                                        // Service smoltcp TCP SYN/ACK packets every 2 half-buffers (~2 ms)
+                                        if (eof_cnt & 1) == 0 {
+                                            let _ = iface.poll(
+                                                smol_now(),
+                                                &mut net_device,
+                                                &mut sockets,
+                                            );
+                                        }
+                                    } else {
+                                        let _ = hw_i2s_cam.stop();
+                                        break;
+                                    }
+                                    continue;
+                                }
+
+                                spin_ticks = spin_ticks.wrapping_add(1);
+                                if (spin_ticks & 0x7FF) == 0 {
+                                    let _ = iface.poll(smol_now(), &mut net_device, &mut sockets);
+                                }
+
+                                if eof_cnt == 0 {
+                                    if now_millis().saturating_sub(dma_start_ms) >= 18 {
+                                        let _ = hw_i2s_cam.stop();
+                                        break;
+                                    }
+                                } else {
+                                    let vsync_ended = seen_vsync_high
+                                        && !read_vsync()
+                                        && !read_vsync()
+                                        && !read_vsync()
+                                        && !read_vsync();
+                                    if vsync_ended
+                                        || now_millis().saturating_sub(last_eof_ms) >= 15
+                                    {
+                                        let _ = hw_i2s_cam.stop();
+                                        let half_idx = (eof_cnt as usize) & 7;
+                                        let half_offset = half_idx * 4096;
+                                        if fb_len + 1024 <= jpeg_scratch_buf.len() {
+                                            let _ = hw_i2s_cam.memcpy_filtered(
+                                                &mut jpeg_scratch_buf[fb_len..fb_len + 1024],
+                                                &dma_slice[half_offset..half_offset + 4096],
+                                            );
+                                            fb_len += 1024;
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+
+                            let _ = hw_i2s_cam.stop();
+
+                            if fb_len >= 64 {
+                                if let Some(soi_pos) = verify_jpeg_soi(&jpeg_scratch_buf[..fb_len])
+                                {
+                                    let slice_from_soi = &jpeg_scratch_buf[soi_pos..fb_len];
+                                    if let Some(eoi_rel) = verify_jpeg_eoi(slice_from_soi, false) {
+                                        let exact_len = eoi_rel + 2;
+                                        if exact_len >= 64
+                                            && ping_pong
+                                                .write_and_commit_inactive(
+                                                    &slice_from_soi[..exact_len],
+                                                )
+                                                .is_ok()
+                                        {
+                                            let fresh_slice =
+                                                active_ping_pong_static_slice(&ping_pong);
+                                            runtime
+                                                .server
+                                                .camera
+                                                .set_frame(fresh_slice, FrameSize::Hd);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        dma_phase = DmaCapturePhase::Idle {
+                            last_done_ms: smol_now().total_millis(),
+                        };
+                    }
+                }
+            }
+        }
+
+        // ============================================================
+        // Port 80 4-Socket Listener Pool (Control / Snapshot / Status / OTA)
+        // ============================================================
+        for idx in 0..PORT80_SOCKET_COUNT {
+            let sock80 = sockets.get_mut::<TcpSocket>(tcp80_handles[idx]);
+            let st = &mut p80_states[idx];
+
             if !sock80.is_open() {
-                p80_req_len = 0;
-                p80_tx_off = 0;
-                p80_tx_len = 0;
-                p80_closing = false;
+                if ota_accum_owner == Some(idx) {
+                    ota_accum_owner = None;
+                }
+                *st = Port80WorkerState::default();
                 sock80.set_timeout(Some(smoltcp::time::Duration::from_millis(5000)));
                 let _ = sock80.listen(80);
-            } else if p80_closing {
-                if !sock80.is_active()
-                    || matches!(sock80.state(), TcpState::TimeWait | TcpState::Closed)
-                    || now_ms >= p80_close_deadline_ms
-                {
+            } else if st.closing {
+                let finished_cleanly = matches!(
+                    sock80.state(),
+                    TcpState::TimeWait | TcpState::Closed
+                );
+                if !sock80.is_active() || finished_cleanly || now_ms >= st.close_deadline_ms {
                     sock80.abort();
-                    p80_closing = false;
-                }
-            } else if p80_tx_off < p80_tx_len {
-                if sock80.can_send() {
-                    if let Ok(sent) = sock80.send_slice(&http_resp_buf[p80_tx_off..p80_tx_len]) {
-                        p80_tx_off += sent;
+                    if ota_accum_owner == Some(idx) {
+                        ota_accum_owner = None;
                     }
-                    if p80_tx_off >= p80_tx_len {
+                    *st = Port80WorkerState::default();
+                    sock80.set_timeout(Some(smoltcp::time::Duration::from_millis(5000)));
+                    let _ = sock80.listen(80);
+                }
+            } else if st.tx_off < st.tx_len {
+                if sock80.can_send() {
+                    if let Ok(sent) =
+                        sock80.send_slice(&p80_resp_bufs[idx][st.tx_off..st.tx_len])
+                    {
+                        st.tx_off += sent;
+                    }
+                    if st.tx_off >= st.tx_len {
                         sock80.close();
-                        p80_closing = true;
-                        p80_close_deadline_ms = now_ms + 2500;
+                        st.closing = true;
+                        st.close_deadline_ms = now_ms + 2500;
                     }
                 } else if !sock80.may_send() {
                     sock80.abort();
+                    if ota_accum_owner == Some(idx) {
+                        ota_accum_owner = None;
+                    }
+                    *st = Port80WorkerState::default();
+                    sock80.set_timeout(Some(smoltcp::time::Duration::from_millis(5000)));
+                    let _ = sock80.listen(80);
                 }
             } else if sock80.can_recv() {
-                let avail = http80_req_accum.len().saturating_sub(p80_req_len);
-                if avail > 0 {
-                    if let Ok(n) =
-                        sock80.recv_slice(&mut http80_req_accum[p80_req_len..p80_req_len + avail])
-                    {
-                        p80_req_len += n;
+                if !st.using_ota_accum {
+                    let avail = p80_hdr_bufs[idx].len().saturating_sub(st.req_len);
+                    if avail > 0 {
+                        if let Ok(n) = sock80
+                            .recv_slice(&mut p80_hdr_bufs[idx][st.req_len..st.req_len + avail])
+                        {
+                            st.req_len += n;
+                        }
+                    }
+
+                    // Promote large POST /update payloads (> 4 KB) into shared 1,800 KB http80_ota_accum
+                    if let Ok(parsed) = parse_http_request(&p80_hdr_bufs[idx][..st.req_len]) {
+                        if let Some(cl) = parsed.content_length {
+                            let hdr_bytes = st.req_len.saturating_sub(parsed.body.len());
+                            if hdr_bytes.saturating_add(cl as usize) > p80_hdr_bufs[idx].len()
+                                && ota_accum_owner.is_none()
+                            {
+                                http80_ota_accum[..st.req_len]
+                                    .copy_from_slice(&p80_hdr_bufs[idx][..st.req_len]);
+                                st.using_ota_accum = true;
+                                ota_accum_owner = Some(idx);
+                            }
+                        }
+                    }
+                }
+
+                if st.using_ota_accum && sock80.can_recv() {
+                    let avail = http80_ota_accum.len().saturating_sub(st.req_len);
+                    if avail > 0 {
+                        if let Ok(n) = sock80
+                            .recv_slice(&mut http80_ota_accum[st.req_len..st.req_len + avail])
+                        {
+                            st.req_len += n;
+                        }
                     }
                 }
 
                 let mut req_complete = false;
-                let mut is_snapshot_req = false;
                 let peer_closed_rx = matches!(sock80.state(), TcpState::CloseWait);
-                if let Ok(parsed) = parse_http_request(&http80_req_accum[..p80_req_len]) {
-                    let needed_body = match parsed.content_length {
-                        Some(cl) if cl > 0 => (cl as usize).min(OTA_PARTITION_MAX_SIZE + 4096),
-                        _ => 0,
+                {
+                    let req_slice: &[u8] = if st.using_ota_accum {
+                        &http80_ota_accum[..st.req_len]
+                    } else {
+                        &p80_hdr_bufs[idx][..st.req_len]
                     };
-                    if parsed.body.len() >= needed_body || peer_closed_rx {
-                        req_complete = true;
-                        if parsed.method == HttpMethod::Get
-                            && (parsed.path == "/snapshot"
-                                || (parsed.path == "/"
-                                    && parsed
-                                        .query
-                                        .map(|q| q.contains("action=snapshot"))
-                                        .unwrap_or(false)))
-                        {
-                            is_snapshot_req = true;
+                    if let Ok(parsed) = parse_http_request(req_slice) {
+                        let needed_body = match parsed.content_length {
+                            Some(cl) if cl > 0 => (cl as usize).min(OTA_PARTITION_MAX_SIZE + 4096),
+                            _ => 0,
+                        };
+                        if parsed.body.len() >= needed_body || peer_closed_rx {
+                            req_complete = true;
+                            if parsed.method == HttpMethod::Get
+                                && (parsed.path == "/snapshot"
+                                    || (parsed.path == "/"
+                                        && parsed
+                                            .query
+                                            .map(|q| q.contains("action=snapshot"))
+                                            .unwrap_or(false)))
+                            {
+                                need_post_snapshot_refresh = true;
+                            }
                         }
+                    } else if (!st.using_ota_accum && st.req_len >= p80_hdr_bufs[idx].len())
+                        || peer_closed_rx
+                    {
+                        req_complete = true;
                     }
-                } else if p80_req_len >= 4096 || peer_closed_rx {
-                    req_complete = true;
                 }
 
                 if req_complete {
-                    if is_snapshot_req && ov2640_dma_ok {
-                        runtime
-                            .server
-                            .camera
-                            .set_frame(&SYNTHETIC_HD_JFIF_FRAME, FrameSize::Hd);
-                        if let Ok(new_len) = capture_live_hd_jpeg_with_diag(
-                            &mut hw_i2s_cam,
-                            jpeg_scratch_buf,
-                            jpeg_frame_buf,
-                            vsync_inv_ok,
-                        ) {
-                            active_jpeg_len = new_len;
-                        }
-                        let fresh_slice: &'static [u8] = unsafe {
-                            core::slice::from_raw_parts(jpeg_static_ptr, active_jpeg_len)
-                        };
-                        runtime.server.camera.set_frame(fresh_slice, FrameSize::Hd);
-                    }
-
                     let free_dram = esp_alloc::HEAP
                         .free_caps(esp_alloc::MemoryCapability::Internal.into())
                         as u32;
@@ -1191,44 +1467,68 @@ fn main() -> ! {
                         .server
                         .set_telemetry(now_ms, free_dram, free_psram, rssi);
 
-                    match runtime.server.handle_raw_request_with_flash(
-                        ServerPort::Control,
-                        &http80_req_accum[..p80_req_len],
-                        http_resp_buf,
-                        &mut flash_adapter,
-                    ) {
-                        Ok(resp_slice) => {
-                            p80_tx_len = resp_slice.len();
-                            p80_tx_off = 0;
+                    let req_slice: &[u8] = if st.using_ota_accum {
+                        &http80_ota_accum[..st.req_len]
+                    } else {
+                        &p80_hdr_bufs[idx][..st.req_len]
+                    };
+
+                    // Note: GET /snapshot serves immediately from runtime.server.camera
+                    // (backed by the active PingPongFrameBuffer slot) with zero VSYNC wait!
+                    let handle_res = runtime
+                        .server
+                        .handle_raw_request_with_flash(
+                            ServerPort::Control,
+                            req_slice,
+                            p80_resp_bufs[idx],
+                            &mut flash_adapter,
+                        )
+                        .map(|s| s.len());
+
+                    if st.using_ota_accum {
+                        st.using_ota_accum = false;
+                        if ota_accum_owner == Some(idx) {
+                            ota_accum_owner = None;
+                        }
+                    }
+
+                    match handle_res {
+                        Ok(resp_len) => {
+                            st.tx_len = resp_len;
+                            st.tx_off = 0;
                             if sock80.can_send() {
-                                if let Ok(sent) = sock80.send_slice(&http_resp_buf[..p80_tx_len]) {
-                                    p80_tx_off = sent;
+                                if let Ok(sent) =
+                                    sock80.send_slice(&p80_resp_bufs[idx][..st.tx_len])
+                                {
+                                    st.tx_off = sent;
                                 }
-                                if p80_tx_off >= p80_tx_len {
+                                if st.tx_off >= st.tx_len {
                                     sock80.close();
-                                    p80_closing = true;
-                                    p80_close_deadline_ms = now_ms + 2500;
+                                    st.closing = true;
+                                    st.close_deadline_ms = now_ms + 2500;
                                 }
                             }
                         }
                         Err(_) => {
                             sock80.close();
-                            p80_closing = true;
-                            p80_close_deadline_ms = now_ms + 1000;
+                            st.closing = true;
+                            st.close_deadline_ms = now_ms + 1000;
                         }
                     }
                 }
-            } else if matches!(sock80.state(), TcpState::CloseWait) && p80_req_len == 0 {
+            } else if matches!(sock80.state(), TcpState::CloseWait) && st.req_len == 0 {
                 sock80.close();
-                p80_closing = true;
-                p80_close_deadline_ms = now_ms + 1000;
+                st.closing = true;
+                st.close_deadline_ms = now_ms + 1000;
             }
         }
 
-        // Reboot if OTA firmware update completed and Port 80 TX buffer has flushed
+        // Reboot if OTA firmware update completed and all Port 80 TX buffers have flushed
         if runtime.server.is_reboot_scheduled() {
-            let sock80 = sockets.get_mut::<TcpSocket>(tcp80_handle);
-            if sock80.send_queue() == 0 {
+            let all_flushed = tcp80_handles
+                .iter()
+                .all(|&h| sockets.get_mut::<TcpSocket>(h).send_queue() == 0);
+            if all_flushed {
                 let _ = iface.poll(smol_now(), &mut net_device, &mut sockets);
                 delay.delay_millis(250);
                 println!("[KLIPPER-CAM-RS] [OTA] Flash complete, rebooting into updated slot...");
@@ -1273,8 +1573,7 @@ fn main() -> ! {
                     sock81.abort();
                 } else if p81_tx_off < p81_tx_len {
                     if sock81.can_send() {
-                        if let Ok(sent) = sock81.send_slice(&http_resp_buf[p81_tx_off..p81_tx_len])
-                        {
+                        if let Ok(sent) = sock81.send_slice(&p81_resp_buf[p81_tx_off..p81_tx_len]) {
                             p81_tx_off += sent;
                         }
                     }
@@ -1283,25 +1582,6 @@ fn main() -> ! {
                     && sock81.send_queue() < 32768
                 {
                     p81_last_frame_ms = now_ms;
-                    if ov2640_dma_ok {
-                        runtime
-                            .server
-                            .camera
-                            .set_frame(&SYNTHETIC_HD_JFIF_FRAME, FrameSize::Hd);
-                        if let Ok(new_len) = capture_live_hd_jpeg_with_diag(
-                            &mut hw_i2s_cam,
-                            jpeg_scratch_buf,
-                            jpeg_frame_buf,
-                            vsync_inv_ok,
-                        ) {
-                            active_jpeg_len = new_len;
-                        }
-                        let fresh_slice: &'static [u8] = unsafe {
-                            core::slice::from_raw_parts(jpeg_static_ptr, active_jpeg_len)
-                        };
-                        runtime.server.camera.set_frame(fresh_slice, FrameSize::Hd);
-                    }
-
                     runtime
                         .server
                         .stream_active_flag()
@@ -1310,11 +1590,11 @@ fn main() -> ! {
                         StreamSessionGuard::try_acquire(runtime.server.stream_active_flag())
                     {
                         if let Ok(chunk) =
-                            guard.write_next_frame_chunk(&runtime.server.camera, http_resp_buf)
+                            guard.write_next_frame_chunk(&runtime.server.camera, p81_resp_buf)
                         {
                             p81_tx_len = chunk.len();
                             p81_tx_off = 0;
-                            if let Ok(sent) = sock81.send_slice(&http_resp_buf[..p81_tx_len]) {
+                            if let Ok(sent) = sock81.send_slice(&p81_resp_buf[..p81_tx_len]) {
                                 p81_tx_off = sent;
                             }
                         }
@@ -1341,9 +1621,9 @@ fn main() -> ! {
                             if let Some(guard) =
                                 StreamSessionGuard::try_acquire(runtime.server.stream_active_flag())
                             {
-                                if let Ok(hdr_bytes) = guard.write_stream_headers(http_resp_buf) {
+                                if let Ok(hdr_bytes) = guard.write_stream_headers(p81_resp_buf) {
                                     let hdr_len = hdr_bytes.len();
-                                    let _ = sock81.send_slice(&http_resp_buf[..hdr_len]);
+                                    let _ = sock81.send_slice(&p81_resp_buf[..hdr_len]);
                                 }
                                 drop(guard);
                                 started_stream = true;
@@ -1362,7 +1642,7 @@ fn main() -> ! {
                             if let Ok(resp) = runtime.server.handle_raw_request(
                                 ServerPort::Stream,
                                 &p81_req_buf[..p81_req_len],
-                                http_resp_buf,
+                                p81_resp_buf,
                             ) {
                                 let _ = sock81.send_slice(resp);
                             }
@@ -1374,7 +1654,7 @@ fn main() -> ! {
                         if let Ok(resp) = runtime.server.handle_raw_request(
                             ServerPort::Stream,
                             &p81_req_buf[..p81_req_len],
-                            http_resp_buf,
+                            p81_resp_buf,
                         ) {
                             let _ = sock81.send_slice(resp);
                         }
@@ -1406,9 +1686,18 @@ fn main() -> ! {
                 sock81_busy.set_timeout(Some(smoltcp::time::Duration::from_millis(2000)));
                 let _ = sock81_busy.listen(81);
             } else if p81_busy_closing {
-                if now_ms >= p81_busy_close_deadline_ms {
+                let finished_cleanly = matches!(
+                    sock81_busy.state(),
+                    TcpState::TimeWait | TcpState::Closed
+                );
+                if !sock81_busy.is_active()
+                    || finished_cleanly
+                    || now_ms >= p81_busy_close_deadline_ms
+                {
                     sock81_busy.abort();
                     p81_busy_closing = false;
+                    sock81_busy.set_timeout(Some(smoltcp::time::Duration::from_millis(2000)));
+                    let _ = sock81_busy.listen(81);
                 }
             } else if sock81_busy.can_recv() {
                 if let Ok(n) = sock81_busy.recv_slice(&mut p81_busy_req_buf) {
@@ -1436,11 +1725,12 @@ fn main() -> ! {
         if now_ms - last_heartbeat_ms >= 30_000 {
             last_heartbeat_ms = now_ms;
             println!(
-                "[KLIPPER-CAM-RS] Heartbeat: uptime={}ms connected={} stream_active={} last_jpeg={}B",
+                "[KLIPPER-CAM-RS] Heartbeat: uptime={}ms connected={} stream_active={} frame_seq={} last_jpeg={}B",
                 now_ms,
                 wifi_controller.is_connected(),
                 p81_streaming,
-                active_jpeg_len
+                ping_pong.frame_seq(),
+                ping_pong.active_len()
             );
         }
     }
