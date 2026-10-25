@@ -9,6 +9,7 @@
 
 #![cfg_attr(target_arch = "xtensa", no_std)]
 #![cfg_attr(target_arch = "xtensa", no_main)]
+#![cfg_attr(target_arch = "xtensa", feature(asm_experimental_arch))]
 #![cfg_attr(not(target_arch = "xtensa"), forbid(unsafe_code))]
 #![cfg_attr(
     target_arch = "xtensa",
@@ -509,7 +510,7 @@ const PORT81_SOCKET_COUNT: usize = 2;
 const TCP_MSS_BYTES: usize = 1426;
 
 #[cfg(target_arch = "xtensa")]
-const TCP_BATCH_SEGMENTS: usize = 8;
+const TCP_BATCH_SEGMENTS: usize = 4;
 
 #[cfg(target_arch = "xtensa")]
 const TCP_MAX_INFLIGHT_BYTES: usize = TCP_BATCH_SEGMENTS * TCP_MSS_BYTES;
@@ -550,6 +551,173 @@ fn poll_net_burst(
 }
 
 #[cfg(target_arch = "xtensa")]
+#[esp_hal::ram]
+fn release_psram_cs_and_exit_qpi() {
+    const SPI0_EXT2_REG: *const u32 = 0x3FF4_30F8 as *const u32;
+    const SPI1_EXT2_REG: *const u32 = 0x3FF4_20F8 as *const u32;
+    const GPIO_OUT_W1TS_REG: *mut u32 = 0x3FF4_4008 as *mut u32;
+    const GPIO_OUT_W1TC_REG: *mut u32 = 0x3FF4_400C as *mut u32;
+    const GPIO_ENABLE_REG: *const u32 = 0x3FF4_4020 as *const u32;
+    const GPIO_ENABLE_W1TS_REG: *mut u32 = 0x3FF4_4024 as *mut u32;
+    const GPIO_ENABLE_W1TC_REG: *mut u32 = 0x3FF4_4028 as *mut u32;
+
+    const IO_MUX_GPIO7_REG: *mut u32 = 0x3FF4_9064 as *mut u32;
+    const IO_MUX_GPIO8_REG: *mut u32 = 0x3FF4_9068 as *mut u32;
+    const IO_MUX_GPIO9_REG: *mut u32 = 0x3FF4_9054 as *mut u32;
+    const IO_MUX_GPIO10_REG: *mut u32 = 0x3FF4_9058 as *mut u32;
+    const IO_MUX_GPIO16_REG: *mut u32 = 0x3FF4_904C as *mut u32;
+    const IO_MUX_GPIO17_REG: *mut u32 = 0x3FF4_9050 as *mut u32;
+
+    const GPIO_FUNC7_OUT_SEL_CFG_REG: *mut u32 = 0x3FF4_454C as *mut u32;
+    const GPIO_FUNC8_OUT_SEL_CFG_REG: *mut u32 = 0x3FF4_4550 as *mut u32;
+    const GPIO_FUNC9_OUT_SEL_CFG_REG: *mut u32 = 0x3FF4_4554 as *mut u32;
+    const GPIO_FUNC10_OUT_SEL_CFG_REG: *mut u32 = 0x3FF4_4558 as *mut u32;
+    const GPIO_FUNC16_OUT_SEL_CFG_REG: *mut u32 = 0x3FF4_4570 as *mut u32;
+    const GPIO_FUNC17_OUT_SEL_CFG_REG: *mut u32 = 0x3FF4_4574 as *mut u32;
+
+    const SIG_GPIO_OUT_IDX: u32 = 0x100;
+    const SD_MASK: u32 = (1 << 7) | (1 << 8) | (1 << 9) | (1 << 10);
+
+    unsafe {
+        let saved_ps: u32;
+        core::arch::asm!("rsil {0}, 15", out(reg) saved_ps, options(nomem, nostack));
+
+        let mut wait_spin = 0u32;
+        while ((core::ptr::read_volatile(SPI0_EXT2_REG) & 0x7) != 0
+            || (core::ptr::read_volatile(SPI1_EXT2_REG) & 0x7) != 0)
+            && wait_spin < 10_000
+        {
+            wait_spin = wait_spin.wrapping_add(1);
+        }
+
+        let saved_iomux_7 = core::ptr::read_volatile(IO_MUX_GPIO7_REG);
+        let saved_iomux_8 = core::ptr::read_volatile(IO_MUX_GPIO8_REG);
+        let saved_iomux_9 = core::ptr::read_volatile(IO_MUX_GPIO9_REG);
+        let saved_iomux_10 = core::ptr::read_volatile(IO_MUX_GPIO10_REG);
+        let saved_iomux_16 = core::ptr::read_volatile(IO_MUX_GPIO16_REG);
+        let saved_iomux_17 = core::ptr::read_volatile(IO_MUX_GPIO17_REG);
+        let saved_outsel_7 = core::ptr::read_volatile(GPIO_FUNC7_OUT_SEL_CFG_REG);
+        let saved_outsel_8 = core::ptr::read_volatile(GPIO_FUNC8_OUT_SEL_CFG_REG);
+        let saved_outsel_9 = core::ptr::read_volatile(GPIO_FUNC9_OUT_SEL_CFG_REG);
+        let saved_outsel_10 = core::ptr::read_volatile(GPIO_FUNC10_OUT_SEL_CFG_REG);
+        let saved_outsel_17 = core::ptr::read_volatile(GPIO_FUNC17_OUT_SEL_CFG_REG);
+        let saved_enable = core::ptr::read_volatile(GPIO_ENABLE_REG);
+
+        // 1. Enable internal pull-up on GPIO 16 (PSRAM CS#) and drive HIGH (1),
+        //    and drive GPIO 17 (PSRAM CLK) LOW (0).
+        core::ptr::write_volatile(GPIO_OUT_W1TS_REG, 1 << 16);
+        core::ptr::write_volatile(GPIO_OUT_W1TC_REG, 1 << 17);
+        core::ptr::write_volatile(GPIO_FUNC16_OUT_SEL_CFG_REG, SIG_GPIO_OUT_IDX);
+        core::ptr::write_volatile(GPIO_FUNC17_OUT_SEL_CFG_REG, SIG_GPIO_OUT_IDX);
+        core::ptr::write_volatile(IO_MUX_GPIO16_REG, 0x2B00);
+        core::ptr::write_volatile(IO_MUX_GPIO17_REG, 0x2800);
+        core::ptr::write_volatile(GPIO_ENABLE_W1TS_REG, (1 << 16) | (1 << 17));
+
+        for _ in 0..32u32 {
+            core::arch::asm!("nop", options(nomem, nostack));
+        }
+
+        // 2. Temporarily mux SD0..SD3 (GPIO 7..10) to GPIO output to clock 0xF5 (Exit QPI)
+        //    to PSRAM while Flash CS0# (GPIO 11) stays deasserted HIGH.
+        core::ptr::write_volatile(GPIO_OUT_W1TS_REG, SD_MASK);
+        core::ptr::write_volatile(GPIO_FUNC7_OUT_SEL_CFG_REG, SIG_GPIO_OUT_IDX);
+        core::ptr::write_volatile(GPIO_FUNC8_OUT_SEL_CFG_REG, SIG_GPIO_OUT_IDX);
+        core::ptr::write_volatile(GPIO_FUNC9_OUT_SEL_CFG_REG, SIG_GPIO_OUT_IDX);
+        core::ptr::write_volatile(GPIO_FUNC10_OUT_SEL_CFG_REG, SIG_GPIO_OUT_IDX);
+        core::ptr::write_volatile(IO_MUX_GPIO7_REG, 0x2B00);
+        core::ptr::write_volatile(IO_MUX_GPIO8_REG, 0x2B00);
+        core::ptr::write_volatile(IO_MUX_GPIO9_REG, 0x2B00);
+        core::ptr::write_volatile(IO_MUX_GPIO10_REG, 0x2B00);
+        core::ptr::write_volatile(GPIO_ENABLE_W1TS_REG, SD_MASK);
+
+        let mut pass = 0u8;
+        while pass < 3 {
+            let nib5_set = if pass == 0 {
+                (1u32 << 8) | (1u32 << 10)
+            } else if pass == 1 {
+                (1u32 << 8) | (1u32 << 9)
+            } else {
+                (1u32 << 7) | (1u32 << 9)
+            };
+            let nib5_clr = SD_MASK & !nib5_set;
+
+            core::ptr::write_volatile(GPIO_OUT_W1TC_REG, 1 << 16);
+            for _ in 0..16u32 {
+                core::arch::asm!("nop", options(nomem, nostack));
+            }
+
+            // Cycle 1: Nibble 0xF
+            core::ptr::write_volatile(GPIO_OUT_W1TS_REG, SD_MASK);
+            for _ in 0..16u32 {
+                core::arch::asm!("nop", options(nomem, nostack));
+            }
+            core::ptr::write_volatile(GPIO_OUT_W1TS_REG, 1 << 17);
+            for _ in 0..16u32 {
+                core::arch::asm!("nop", options(nomem, nostack));
+            }
+            core::ptr::write_volatile(GPIO_OUT_W1TC_REG, 1 << 17);
+            for _ in 0..16u32 {
+                core::arch::asm!("nop", options(nomem, nostack));
+            }
+
+            // Cycle 2: Nibble 0x5
+            core::ptr::write_volatile(GPIO_OUT_W1TS_REG, nib5_set);
+            core::ptr::write_volatile(GPIO_OUT_W1TC_REG, nib5_clr);
+            for _ in 0..16u32 {
+                core::arch::asm!("nop", options(nomem, nostack));
+            }
+            core::ptr::write_volatile(GPIO_OUT_W1TS_REG, 1 << 17);
+            for _ in 0..16u32 {
+                core::arch::asm!("nop", options(nomem, nostack));
+            }
+            core::ptr::write_volatile(GPIO_OUT_W1TC_REG, 1 << 17);
+            for _ in 0..16u32 {
+                core::arch::asm!("nop", options(nomem, nostack));
+            }
+
+            core::ptr::write_volatile(GPIO_OUT_W1TS_REG, 1 << 16);
+            for _ in 0..32u32 {
+                core::arch::asm!("nop", options(nomem, nostack));
+            }
+            pass += 1;
+        }
+
+        // 3. Restore GPIO 7..10 and GPIO 17 output enable, GPIO matrix out_sel, and IO_MUX to exact saved state
+        core::ptr::write_volatile(GPIO_OUT_W1TS_REG, SD_MASK);
+        let restore_mask = SD_MASK | (1 << 17);
+        core::ptr::write_volatile(GPIO_ENABLE_W1TC_REG, restore_mask & !saved_enable);
+        core::ptr::write_volatile(GPIO_ENABLE_W1TS_REG, restore_mask & saved_enable);
+        core::ptr::write_volatile(GPIO_FUNC7_OUT_SEL_CFG_REG, saved_outsel_7);
+        core::ptr::write_volatile(GPIO_FUNC8_OUT_SEL_CFG_REG, saved_outsel_8);
+        core::ptr::write_volatile(GPIO_FUNC9_OUT_SEL_CFG_REG, saved_outsel_9);
+        core::ptr::write_volatile(GPIO_FUNC10_OUT_SEL_CFG_REG, saved_outsel_10);
+        core::ptr::write_volatile(GPIO_FUNC17_OUT_SEL_CFG_REG, saved_outsel_17);
+        core::ptr::write_volatile(IO_MUX_GPIO7_REG, saved_iomux_7);
+        core::ptr::write_volatile(IO_MUX_GPIO8_REG, saved_iomux_8);
+        core::ptr::write_volatile(IO_MUX_GPIO9_REG, saved_iomux_9);
+        core::ptr::write_volatile(IO_MUX_GPIO10_REG, saved_iomux_10);
+        core::ptr::write_volatile(IO_MUX_GPIO17_REG, saved_iomux_17);
+
+        // Keep GPIO 16 (PSRAM CS#) driven HIGH with internal pull-up enabled (FUN_WPU = 1 << 8)
+        core::ptr::write_volatile(GPIO_OUT_W1TS_REG, 1 << 16);
+        core::ptr::write_volatile(IO_MUX_GPIO16_REG, saved_iomux_16 | (1 << 8));
+        for _ in 0..32u32 {
+            core::arch::asm!("nop", options(nomem, nostack));
+        }
+
+        core::arch::asm!("wsr.ps {0}; rsync", in(reg) saved_ps, options(nomem, nostack));
+    }
+}
+
+#[cfg(target_arch = "xtensa")]
+#[esp_hal::ram]
+fn quiesce_psram_and_software_reset(hw_i2s_cam: &mut Esp32I2sCamera) -> ! {
+    let _ = hw_i2s_cam.stop();
+    release_psram_cs_and_exit_qpi();
+    esp_hal::system::software_reset()
+}
+
+#[cfg(target_arch = "xtensa")]
 fn connect_strongest_ap(
     wifi_controller: &mut esp_radio::wifi::WifiController<'_>,
     base_sta_cfg: &esp_radio::wifi::sta::StationConfig,
@@ -576,51 +744,61 @@ fn connect_strongest_ap(
         scan_cfg = scan_cfg.with_ssid(s);
     }
 
-    let best_ap = match block_on_with_timeout(wifi_controller.scan_async(&scan_cfg), 2500) {
-        Some(Ok(aps)) => aps
+    // Wait up to 5000 ms for the ~630 ms scan (14 ch * 45 ms) so scan_async is never dropped mid-scan.
+    // Only call set_config when scan_async returns Some(Ok(_)) (ScanDone event confirmed).
+    if let Some(Ok(aps)) = block_on_with_timeout(wifi_controller.scan_async(&scan_cfg), 5000) {
+        if let Some(ap) = aps
             .into_iter()
             .filter(|ap| ap.ssid.as_str() == ssid_str)
-            .max_by_key(|ap| ap.signal_strength),
-        _ => None,
-    };
-
-    if let Some(ap) = best_ap {
-        println!(
-            "[KLIPPER-CAM-RS] [WIFI] Strongest '{}' AP: ch={} rssi={}dBm bssid={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            ssid_str,
-            ap.channel,
-            ap.signal_strength,
-            ap.bssid[0],
-            ap.bssid[1],
-            ap.bssid[2],
-            ap.bssid[3],
-            ap.bssid[4],
-            ap.bssid[5]
-        );
-        let locked_cfg = base_sta_cfg
-            .clone()
-            .with_bssid(ap.bssid)
-            .with_channel(ap.channel);
-        if wifi_controller
-            .set_config(&WifiConfig::Station(locked_cfg))
-            .is_ok()
+            .max_by_key(|ap| ap.signal_strength)
         {
-            let _ = wifi_controller.set_max_tx_power(78);
-            match block_on_with_timeout(wifi_controller.connect_async(), timeout_ms) {
-                Some(Ok(info)) => {
-                    let _ = wifi_controller.set_power_saving(PowerSaveMode::None);
-                    let _ = wifi_controller.set_max_tx_power(78);
-                    return Some(info);
-                }
-                Some(Err(_)) => {}
-                None => {
-                    let _ = block_on_with_timeout(wifi_controller.disconnect_async(), 500);
+            println!(
+                "[KLIPPER-CAM-RS] [WIFI] Strongest '{}' AP: ch={} rssi={}dBm bssid={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                ssid_str,
+                ap.channel,
+                ap.signal_strength,
+                ap.bssid[0],
+                ap.bssid[1],
+                ap.bssid[2],
+                ap.bssid[3],
+                ap.bssid[4],
+                ap.bssid[5]
+            );
+            let locked_cfg = base_sta_cfg
+                .clone()
+                .with_bssid(ap.bssid)
+                .with_channel(ap.channel);
+            if wifi_controller
+                .set_config(&WifiConfig::Station(locked_cfg))
+                .is_ok()
+            {
+                let _ = wifi_controller.set_max_tx_power(78);
+                match block_on_with_timeout(wifi_controller.connect_async(), timeout_ms) {
+                    Some(Ok(info)) => {
+                        let _ = wifi_controller.set_power_saving(PowerSaveMode::None);
+                        let _ = wifi_controller.set_max_tx_power(78);
+                        return Some(info);
+                    }
+                    Some(Err(e)) => {
+                        println!(
+                            "[KLIPPER-CAM-RS] [WIFI] BSSID-locked connect_async error: {:?}",
+                            e
+                        );
+                        let _ = block_on_with_timeout(wifi_controller.disconnect_async(), 1000);
+                    }
+                    None => {
+                        println!(
+                            "[KLIPPER-CAM-RS] [WIFI] BSSID-locked connect_async timed out ({} ms)",
+                            timeout_ms
+                        );
+                        let _ = block_on_with_timeout(wifi_controller.disconnect_async(), 1000);
+                    }
                 }
             }
+            let _ = wifi_controller.set_config(&WifiConfig::Station(base_sta_cfg.clone()));
         }
     }
 
-    let _ = wifi_controller.set_config(&WifiConfig::Station(base_sta_cfg.clone()));
     let _ = wifi_controller.set_max_tx_power(78);
     match block_on_with_timeout(wifi_controller.connect_async(), timeout_ms) {
         Some(Ok(info)) => {
@@ -628,9 +806,17 @@ fn connect_strongest_ap(
             let _ = wifi_controller.set_max_tx_power(78);
             Some(info)
         }
-        Some(Err(_)) => None,
+        Some(Err(e)) => {
+            println!("[KLIPPER-CAM-RS] [WIFI] connect_async error: {:?}", e);
+            let _ = block_on_with_timeout(wifi_controller.disconnect_async(), 1000);
+            None
+        }
         None => {
-            let _ = block_on_with_timeout(wifi_controller.disconnect_async(), 500);
+            println!(
+                "[KLIPPER-CAM-RS] [WIFI] connect_async timed out ({} ms)",
+                timeout_ms
+            );
+            let _ = block_on_with_timeout(wifi_controller.disconnect_async(), 1000);
             None
         }
     }
@@ -872,6 +1058,14 @@ fn main() -> ! {
             psram_vaddr_mode: PsramVaddrMode::Normal,
         },
     );
+    // Enable internal pull-up (FUN_WPU = bit 8) on GPIO 16 (PSRAM CS#) so it cannot float low across warm resets
+    unsafe {
+        const IO_MUX_GPIO16_REG: *mut u32 = 0x3FF4_904C as *mut u32;
+        core::ptr::write_volatile(
+            IO_MUX_GPIO16_REG,
+            core::ptr::read_volatile(IO_MUX_GPIO16_REG) | (1 << 8),
+        );
+    }
     let (psram_ptr, psram_len) = psram.raw_parts();
 
     println!("============================================================");
@@ -1184,12 +1378,6 @@ fn main() -> ! {
         .as_micros();
     iface_cfg.random_seed = ((hw_rng_hi << 32) | hw_rng_lo) ^ boot_us ^ 0x9E37_79B9_7F4A_7C15;
     let mut iface = NetInterface::new(iface_cfg, &mut net_device, smol_now());
-    iface.update_ip_addrs(|addrs| {
-        let _ = addrs.push(IpCidr::new(IpAddress::v4(172, 22, 1, 52), 24));
-    });
-    let _ = iface
-        .routes_mut()
-        .add_default_ipv4_route(Ipv4Address::new(172, 22, 1, 1));
 
     let mut socket_storage = [SocketStorage::EMPTY; 7];
     let mut sockets = SocketSet::new(&mut socket_storage[..]);
@@ -1251,45 +1439,64 @@ fn main() -> ! {
 
     let mut ip_configured = false;
     let mut connect_ms = smol_now().total_millis();
+    let mut last_wifi_connected_ms = connect_ms;
     let mut last_reconnect_attempt_ms = connect_ms;
     let mut last_heartbeat_ms = connect_ms;
     let mut last_arp_announce_ms = connect_ms;
     let mut last_capture_ms = connect_ms;
     let mut post_snapshot_refresh_at_ms: Option<i64> = None;
     let mut last_applied_ctrl = klipper_cam_fw::CameraControlState::new_default();
-    let mut weak_rssi_since_ms: Option<i64> = None;
-    let mut last_roam_attempt_ms: i64 = connect_ms;
 
     loop {
         let now = smol_now();
         let now_ms = now.total_millis();
 
-        // Wi-Fi auto-reconnect every 2000 ms if link drops (bounded 4000 ms timeout)
-        if !wifi_controller.is_connected() && now_ms - last_reconnect_attempt_ms >= 2000 {
-            last_reconnect_attempt_ms = now_ms;
-            runtime.on_wifi_sta_disconnected();
-            if let Some(info) = connect_strongest_ap(&mut wifi_controller, &sta_cfg, ssid, 4000) {
+        if wifi_controller.is_connected() {
+            last_wifi_connected_ms = now_ms;
+        } else {
+            if now_ms - last_wifi_connected_ms >= 60_000
+                && ota_accum_owner.is_none()
+                && !runtime.server.is_reboot_scheduled()
+            {
                 println!(
-                    "[KLIPPER-CAM-RS] [WIFI] Reconnected to AP (channel {})",
-                    info.channel
+                    "[KLIPPER-CAM-RS] [WATCHDOG] Wi-Fi disconnected > 60s; deasserting PSRAM CS# and rebooting..."
                 );
-                connect_ms = smol_now().total_millis();
-                weak_rssi_since_ms = None;
-                if ip_configured {
-                    send_arp_announce(
-                        &mut net_device,
-                        mac,
-                        [172, 22, 1, 52],
-                        [172, 22, 1, 1],
+                quiesce_psram_and_software_reset(&mut hw_i2s_cam);
+            }
+            if now_ms - last_reconnect_attempt_ms >= 2000 {
+                last_reconnect_attempt_ms = now_ms;
+                runtime.on_wifi_sta_disconnected();
+                println!(
+                    "[KLIPPER-CAM-RS] [WIFI] Attempting reconnect to SSID '{}' (disconnected {}ms)...",
+                    ssid,
+                    now_ms - last_wifi_connected_ms
+                );
+                if let Some(info) =
+                    connect_strongest_ap(&mut wifi_controller, &sta_cfg, ssid, 4000)
+                {
+                    println!(
+                        "[KLIPPER-CAM-RS] [WIFI] Reconnected to AP (channel {}, aid {})",
+                        info.channel, info.aid
                     );
-                    last_arp_announce_ms = connect_ms;
+                    connect_ms = smol_now().total_millis();
+                    last_wifi_connected_ms = connect_ms;
+                    let _ = runtime.on_wifi_got_ip(Ipv4Addr::new(172, 22, 1, 52));
+                    if ip_configured {
+                        send_arp_announce(
+                            &mut net_device,
+                            mac,
+                            [172, 22, 1, 52],
+                            [172, 22, 1, 1],
+                        );
+                        last_arp_announce_ms = connect_ms;
+                    }
                 }
             }
         }
 
         let _ = iface.poll(now, &mut net_device, &mut sockets);
 
-        // Check DHCPv4 events or configure static IP (172.22.1.52/24, GW 172.22.1.1) immediately on connect
+        // Check DHCPv4 events or configure static IP (172.22.1.52/24, GW 172.22.1.1) unconditionally
         {
             let dhcp_sock = sockets.get_mut::<dhcpv4::Socket>(dhcp_handle);
             match dhcp_sock.poll() {
@@ -1335,14 +1542,12 @@ fn main() -> ! {
                     let _ = iface
                         .routes_mut()
                         .add_default_ipv4_route(Ipv4Address::new(172, 22, 1, 1));
-                    ip_configured = true;
-                    send_arp_announce(&mut net_device, mac, [172, 22, 1, 52], [172, 22, 1, 1]);
                 }
                 None => {}
             }
         }
 
-        if !ip_configured && wifi_controller.is_connected() {
+        if !ip_configured {
             iface.update_ip_addrs(|addrs| {
                 if !addrs
                     .iter()
@@ -1357,18 +1562,21 @@ fn main() -> ! {
             let fw_ip = Ipv4Addr::new(172, 22, 1, 52);
             let _ = runtime.on_wifi_got_ip(fw_ip);
             ip_configured = true;
-            send_arp_announce(&mut net_device, mac, [172, 22, 1, 52], [172, 22, 1, 1]);
-            last_arp_announce_ms = now_ms;
+            if wifi_controller.is_connected() {
+                send_arp_announce(&mut net_device, mac, [172, 22, 1, 52], [172, 22, 1, 1]);
+                last_arp_announce_ms = now_ms;
+            }
             println!(
                 "[KLIPPER-CAM-RS] [NET] Static IP Configured: 172.22.1.52/24 GW 172.22.1.1 (Port 80 x4 & Port 81 x2 Ready)"
             );
         }
 
-        if !ip_configured {
-            continue;
-        }
-
-        if now_ms - last_arp_announce_ms >= 5000 {
+        let arp_interval_ms = if now_ms - connect_ms < 3000 {
+            500
+        } else {
+            5000
+        };
+        if wifi_controller.is_connected() && now_ms - last_arp_announce_ms >= arp_interval_ms {
             last_arp_announce_ms = now_ms;
             send_arp_announce(&mut net_device, mac, [172, 22, 1, 52], [172, 22, 1, 1]);
         }
@@ -1418,36 +1626,6 @@ fn main() -> ! {
             }
         }
 
-        // Idle weak-RSSI roam check: if idle and RSSI stays worse than -68 dBm for > 15s, re-scan for strongest AP
-        if wifi_controller.is_connected()
-            && p81_stream_owner.is_none()
-            && !p80_busy
-            && ota_accum_owner.is_none()
-            && !runtime.server.is_reboot_scheduled()
-        {
-            let cur_rssi = wifi_controller.rssi().unwrap_or(-50);
-            if cur_rssi < -68 {
-                let since = *weak_rssi_since_ms.get_or_insert(now_ms);
-                if now_ms - since >= 15_000 && now_ms - last_roam_attempt_ms >= 180_000 {
-                    last_roam_attempt_ms = now_ms;
-                    weak_rssi_since_ms = None;
-                    let _ = block_on_with_timeout(wifi_controller.disconnect_async(), 500);
-                    if let Some(info) =
-                        connect_strongest_ap(&mut wifi_controller, &sta_cfg, ssid, 5000)
-                    {
-                        println!(
-                            "[KLIPPER-CAM-RS] [WIFI] Roamed from weak RSSI ({} dBm) to strongest AP (channel {})",
-                            cur_rssi, info.channel
-                        );
-                        send_arp_announce(&mut net_device, mac, [172, 22, 1, 52], [172, 22, 1, 1]);
-                        last_arp_announce_ms = smol_now().total_millis();
-                    }
-                }
-            } else {
-                weak_rssi_since_ms = None;
-            }
-        }
-
         // ============================================================
         // Port 80 4-Socket Listener Pool (Control / Snapshot / Status / OTA)
         // ============================================================
@@ -1477,7 +1655,26 @@ fn main() -> ! {
                     let _ = sock80.listen(80);
                 }
             } else if st.tx_len > 0 {
-                if st.tx_off < st.tx_len {
+                let peer_disconnected = !sock80.is_active()
+                    || !sock80.may_send()
+                    || matches!(
+                        sock80.state(),
+                        TcpState::Closing
+                            | TcpState::LastAck
+                            | TcpState::TimeWait
+                            | TcpState::Closed
+                    )
+                    || (matches!(sock80.state(), TcpState::CloseWait) && st.tx_off < st.tx_len)
+                    || (st.close_deadline_ms > 0 && now_ms >= st.close_deadline_ms);
+                if peer_disconnected {
+                    sock80.abort();
+                    if ota_accum_owner == Some(idx) {
+                        ota_accum_owner = None;
+                    }
+                    *st = Port80WorkerState::default();
+                    sock80.set_timeout(Some(smoltcp::time::Duration::from_millis(60_000)));
+                    let _ = sock80.listen(80);
+                } else if st.tx_off < st.tx_len {
                     if sock80.can_send() {
                         enqueue_tcp_sliding_window(
                             sock80,
@@ -1485,16 +1682,8 @@ fn main() -> ! {
                             &mut st.tx_off,
                             st.tx_len,
                         );
-                    } else if !sock80.may_send() {
-                        sock80.abort();
-                        if ota_accum_owner == Some(idx) {
-                            ota_accum_owner = None;
-                        }
-                        *st = Port80WorkerState::default();
-                        sock80.set_timeout(Some(smoltcp::time::Duration::from_millis(60_000)));
-                        let _ = sock80.listen(80);
                     }
-                } else if sock80.send_queue() == 0 || !sock80.may_send() {
+                } else if sock80.send_queue() == 0 {
                     sock80.close();
                     st.closing = true;
                     st.close_deadline_ms = now_ms + 1500;
@@ -1620,6 +1809,7 @@ fn main() -> ! {
                         Ok(resp_len) => {
                             st.tx_len = resp_len;
                             st.tx_off = 0;
+                            st.close_deadline_ms = now_ms + 5000;
                             enqueue_tcp_sliding_window(
                                 sock80,
                                 p80_resp_bufs[idx],
@@ -1697,8 +1887,10 @@ fn main() -> ! {
             if all_flushed {
                 let _ = iface.poll(smol_now(), &mut net_device, &mut sockets);
                 delay.delay_millis(250);
-                println!("[KLIPPER-CAM-RS] [OTA] Flash complete, rebooting into updated slot...");
-                esp_hal::system::software_reset();
+                println!(
+                    "[KLIPPER-CAM-RS] [OTA] Flash complete, deasserting PSRAM CS# and rebooting into updated slot..."
+                );
+                quiesce_psram_and_software_reset(&mut hw_i2s_cam);
             }
         }
 
