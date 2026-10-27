@@ -151,6 +151,24 @@ impl Esp32S3LcdCam {
         self.dma_num = dma_num;
     }
 
+    /// Enables or disables PSRAM direct-DMA mode.
+    #[inline]
+    pub fn set_psram_mode(&mut self, psram_mode: bool) {
+        self.psram_mode = psram_mode;
+    }
+
+    /// Returns `true` if PSRAM direct-DMA mode is enabled.
+    #[inline]
+    pub const fn psram_mode(&self) -> bool {
+        self.psram_mode
+    }
+
+    /// Returns the configured GPIO matrix bindings.
+    #[inline]
+    pub fn gpio_bindings(&self) -> &[GpioMatrixBinding] {
+        &self.gpio_bindings[..self.gpio_binding_count]
+    }
+
     /// Returns `true` if byte swapping (`cam_byte_order`) is enabled.
     #[inline]
     pub const fn swap_data(&self) -> bool {
@@ -222,7 +240,7 @@ impl Esp32S3LcdCam {
         };
         self.gpio_bindings[2] = GpioMatrixBinding {
             gpio_num: cfg.pin_href as u8,
-            signal_idx: CAM_H_ENABLE_IDX,
+            signal_idx: CAM_H_SYNC_IDX,
             inverted: false,
         };
 
@@ -258,7 +276,14 @@ impl Esp32S3LcdCam {
         pixel_format: PixelFormat,
         conv_mode: CameraConvMode,
     ) -> Result<(), CameraError> {
-        let div_num = 160_000_000u32.checked_div(xclk_freq_hz).unwrap_or(0) & 0xFF;
+        if xclk_freq_hz == 0 {
+            return Err(CameraError::InvalidArg);
+        }
+        let raw_div = 160_000_000u32 / xclk_freq_hz;
+        if !(1..=0xFF).contains(&raw_div) {
+            return Err(CameraError::InvalidArg);
+        }
+        let div_num = raw_div;
         let swap_bit = u32::from(self.swap_data) << 15;
         // `cam_clkm_div_num` (bits 0..7), `cam_clk_sel = 3` (bits 21..22), `cam_vsync_filter_thres = 4` (bits 11..13), `cam_update = 1` (bit 14)
         let ctrl_val = div_num | (4 << 11) | (1 << 14) | swap_bit | (3 << 21);
@@ -418,6 +443,8 @@ impl Esp32S3LcdCam {
         }
         let link = (volatile_read_u32(&self.regs.gdma_in_link) & !(1 << 29)) | (1 << 28);
         volatile_write_u32(&mut self.regs.gdma_in_link, link);
+        let ctrl1 = volatile_read_u32(&self.regs.cam_ctrl1) & !(1 << 29);
+        volatile_write_u32(&mut self.regs.cam_ctrl1, ctrl1);
         self.running = false;
         true
     }
@@ -448,6 +475,26 @@ mod tests {
         };
         assert_eq!(s3.set_pin(&pins), Ok(()));
         assert_eq!(s3.dma_align(), 16);
+        assert_eq!(s3.gpio_bindings()[2].signal_idx, CAM_H_SYNC_IDX);
+
+        // PSRAM mode getter and setter (LL-010)
+        assert!(!s3.psram_mode());
+        s3.set_psram_mode(true);
+        assert!(s3.psram_mode());
+
+        // Validate xclk frequency division boundaries (LL-010)
+        assert_eq!(
+            s3.config(0, PixelFormat::Yuv422, CameraConvMode::Disable),
+            Err(CameraError::InvalidArg)
+        );
+        assert_eq!(
+            s3.config(200_000_000, PixelFormat::Yuv422, CameraConvMode::Disable),
+            Err(CameraError::InvalidArg)
+        );
+        assert_eq!(
+            s3.config(500_000, PixelFormat::Yuv422, CameraConvMode::Disable),
+            Err(CameraError::InvalidArg)
+        );
 
         assert_eq!(
             s3.config(20_000_000, PixelFormat::Yuv422, CameraConvMode::Yuv422ToRgb565),
@@ -476,7 +523,9 @@ mod tests {
         assert_eq!(s3.regs().lc_dma_int_ena, 1);
 
         assert!(s3.start(&dma_cfg, 0x3FC8_9ABC));
+        assert_ne!(s3.regs().cam_ctrl1 & (1 << 29), 0);
         assert!(s3.stop());
+        assert_eq!(s3.regs().cam_ctrl1 & (1 << 29), 0);
         assert_eq!(s3.deinit(), Ok(()));
     }
 }

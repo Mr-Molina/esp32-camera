@@ -106,11 +106,8 @@ pub fn parse_jpeg_dimensions(buf: &[u8]) -> Option<(u16, u16)> {
         return None;
     }
 
-    // Start at SOI if present, otherwise scan from start of buffer.
-    let mut i = match verify_jpeg_soi(buf) {
-        Some(soi_idx) => soi_idx + 2,
-        None => 0,
-    };
+    let soi_idx = verify_jpeg_soi(buf)?;
+    let mut i = soi_idx + 2;
 
     while i + 1 < buf.len() {
         if buf[i] != 0xFF {
@@ -140,7 +137,7 @@ pub fn parse_jpeg_dimensions(buf: &[u8]) -> Option<(u16, u16)> {
                     return None;
                 }
                 let seg_len = u16::from_be_bytes([buf[i], buf[i + 1]]) as usize;
-                if seg_len < 8 {
+                if seg_len < 8 || i.checked_add(seg_len)? > buf.len() {
                     return None;
                 }
                 let height = u16::from_be_bytes([buf[i + 3], buf[i + 4]]);
@@ -264,5 +261,18 @@ mod tests {
         ];
         assert_eq!(parse_jpeg_dimensions(&zero_dim), None);
         assert_eq!(parse_jpeg_dimensions(&[0xFF, 0xD8, 0xFF, 0xD9]), None);
+
+        // CONV-006: Return None immediately when SOI marker is missing
+        let no_soi_stream = [
+            0x00, 0x00, 0xFF, 0xC0, 0x00, 0x11, 0x08, 0x02, 0xD0, 0x05, 0x00,
+            0x03, 0x01, 0x22, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01, 0xFF, 0xD9,
+        ];
+        assert_eq!(parse_jpeg_dimensions(&no_soi_stream), None);
+
+        // CONV-006: Reject SOF segment whose seg_len exceeds remaining buffer length
+        let truncated_sof_seg = [
+            0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x64, 0x08, 0x00, 0xF0, 0x01, 0x40,
+        ];
+        assert_eq!(parse_jpeg_dimensions(&truncated_sof_seg), None);
     }
 }

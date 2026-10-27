@@ -61,13 +61,16 @@ pub const DEFAULT_STREAM_PACING_MS: u32 = 50;
 /// Default non-blocking Wi-Fi reconnect timer interval in milliseconds (`2000 ms`, `APP-009`).
 pub const DEFAULT_WIFI_RECONNECT_MS: u32 = 2_000;
 
-/// Returns the active OTA token resolved at compile time via `option_env!("WIFI_OTA_TOKEN")`,
-/// falling back to [`DEFAULT_OTA_TOKEN`] if unset or empty.
+/// Returns the active OTA token resolved at compile time via `option_env!("OTA_TOKEN")`
+/// or `option_env!("WIFI_OTA_TOKEN")`, falling back to [`DEFAULT_OTA_TOKEN`] if unset or empty.
 #[inline]
 pub const fn active_ota_token() -> &'static str {
-    match COMPILE_TIME_OTA_TOKEN {
+    match option_env!("OTA_TOKEN") {
         Some(token) if !token.is_empty() => token,
-        _ => DEFAULT_OTA_TOKEN,
+        _ => match COMPILE_TIME_OTA_TOKEN {
+            Some(token) if !token.is_empty() => token,
+            _ => DEFAULT_OTA_TOKEN,
+        },
     }
 }
 
@@ -282,6 +285,7 @@ impl Ipv4Addr {
     }
 
     /// Parses a dotted-quad ASCII string (e.g. `"172.22.1.52"`) into an [`Ipv4Addr`].
+    /// Rejects leading zeros on multi-digit octets (e.g. `"01"`, `"001"`).
     pub const fn parse_ascii(input: &str) -> Option<Self> {
         let bytes = input.as_bytes();
         if bytes.is_empty() {
@@ -291,19 +295,24 @@ impl Ipv4Addr {
         let mut octet_idx = 0usize;
         let mut current_val = 0u16;
         let mut digits_in_octet = 0usize;
+        let mut leading_zero = false;
         let mut i = 0usize;
 
         while i < bytes.len() {
             let b = bytes[i];
             if b == b'.' {
-                if digits_in_octet == 0 || octet_idx >= 3 {
+                if digits_in_octet == 0 || octet_idx >= 3 || (leading_zero && digits_in_octet > 1) {
                     return None;
                 }
                 octets[octet_idx] = current_val as u8;
                 octet_idx += 1;
                 current_val = 0;
                 digits_in_octet = 0;
+                leading_zero = false;
             } else if b >= b'0' && b <= b'9' {
+                if digits_in_octet == 0 && b == b'0' {
+                    leading_zero = true;
+                }
                 if digits_in_octet >= 3 {
                     return None;
                 }
@@ -312,13 +321,16 @@ impl Ipv4Addr {
                     return None;
                 }
                 digits_in_octet += 1;
+                if leading_zero && digits_in_octet > 1 {
+                    return None;
+                }
             } else {
                 return None;
             }
             i += 1;
         }
 
-        if octet_idx != 3 || digits_in_octet == 0 {
+        if octet_idx != 3 || digits_in_octet == 0 || (leading_zero && digits_in_octet > 1) {
             return None;
         }
         octets[3] = current_val as u8;
@@ -337,24 +349,24 @@ impl fmt::Display for Ipv4Addr {
 pub struct StaticIpConfig {
     /// Station IPv4 address (`172.22.1.52`).
     pub ip: Ipv4Addr,
-    /// Subnet mask (`255.255.0.0` for `/16`).
+    /// Subnet mask (`255.255.255.0` for `/24`).
     pub netmask: Ipv4Addr,
-    /// Default gateway (`172.22.0.1`).
+    /// Default gateway (`172.22.1.1`).
     pub gateway: Ipv4Addr,
-    /// Primary DNS server (`172.22.0.1`).
+    /// Primary DNS server (`172.22.1.1`).
     pub dns: Ipv4Addr,
-    /// CIDR prefix length (`16`).
+    /// CIDR prefix length (`24`).
     pub prefix_len: u8,
 }
 
 impl StaticIpConfig {
-    /// Default Klipper camera static IP configuration (`172.22.1.52/16`, GW `172.22.0.1`).
+    /// Default Klipper camera static IP configuration (`172.22.1.52/24`, GW `172.22.1.1`).
     pub const KLIPPER_DEFAULT: Self = Self {
         ip: Ipv4Addr::new(172, 22, 1, 52),
-        netmask: Ipv4Addr::new(255, 255, 0, 0),
-        gateway: Ipv4Addr::new(172, 22, 0, 1),
-        dns: Ipv4Addr::new(172, 22, 0, 1),
-        prefix_len: 16,
+        netmask: Ipv4Addr::new(255, 255, 255, 0),
+        gateway: Ipv4Addr::new(172, 22, 1, 1),
+        dns: Ipv4Addr::new(172, 22, 1, 1),
+        prefix_len: 24,
     };
 
     /// Legacy fallback static IP configuration (`10.0.0.150/24`, GW `10.0.0.1`).
@@ -365,6 +377,21 @@ impl StaticIpConfig {
         dns: Ipv4Addr::new(10, 0, 0, 1),
         prefix_len: 24,
     };
+
+    /// Returns `true` if the static IP configuration is structurally valid.
+    #[inline]
+    pub const fn is_valid(&self) -> bool {
+        self.prefix_len > 0
+            && self.prefix_len <= 32
+            && (self.ip.0[0] != 0
+                || self.ip.0[1] != 0
+                || self.ip.0[2] != 0
+                || self.ip.0[3] != 0)
+            && (self.gateway.0[0] != 0
+                || self.gateway.0[1] != 0
+                || self.gateway.0[2] != 0
+                || self.gateway.0[3] != 0)
+    }
 }
 
 impl Default for StaticIpConfig {
@@ -379,7 +406,7 @@ impl Default for StaticIpConfig {
 pub struct NetworkConfig {
     /// Whether to use dynamic DHCP (`true`) or static IP (`false`).
     pub use_dhcp: bool,
-    /// Static IPv4 settings (`172.22.1.52/16`, GW `172.22.0.1`).
+    /// Static IPv4 settings (`172.22.1.52/24`, GW `172.22.1.1`).
     pub static_ip: StaticIpConfig,
     /// 2.4 GHz Wi-Fi SSID.
     pub wifi_ssid: &'static str,
@@ -392,7 +419,7 @@ pub struct NetworkConfig {
 }
 
 impl NetworkConfig {
-    /// Default network configuration with DHCP enabled and `172.22.1.52/16` static profile ready.
+    /// Default network configuration with DHCP enabled and `172.22.1.52/24` static profile ready.
     pub const DEFAULT: Self = Self {
         use_dhcp: true,
         static_ip: StaticIpConfig::KLIPPER_DEFAULT,
@@ -402,7 +429,7 @@ impl NetworkConfig {
         reconnect_delay_ms: DEFAULT_WIFI_RECONNECT_MS,
     };
 
-    /// Returns a network configuration pinned to static IP `172.22.1.52/16` (GW `172.22.0.1`).
+    /// Returns a network configuration pinned to static IP `172.22.1.52/24` (GW `172.22.1.1`).
     #[inline]
     pub const fn with_static_ip() -> Self {
         Self {
@@ -522,6 +549,79 @@ impl KlipperCamConfig {
     pub const fn height(&self) -> u16 {
         self.frame_size.height()
     }
+
+    /// Default OTA authentication token string.
+    pub const DEFAULT_OTA_TOKEN: &'static str = DEFAULT_OTA_TOKEN;
+
+    /// Returns `true` if the configured OTA token matches the factory default.
+    #[inline]
+    pub fn is_default_ota_token(&self) -> bool {
+        let expected = Self::DEFAULT_OTA_TOKEN.as_bytes();
+        let actual = self.ota_token.as_bytes();
+        if expected.len() != actual.len() {
+            return false;
+        }
+        let mut diff = 0usize;
+        let mut i = 0;
+        while i < expected.len() {
+            diff |= (expected[i] ^ actual[i]) as usize;
+            i += 1;
+        }
+        diff == 0
+    }
+
+    /// Returns the HTTP control port.
+    #[inline]
+    pub const fn http_port(&self) -> u16 {
+        self.control_port
+    }
+
+    /// Returns the static IP configuration.
+    #[inline]
+    pub const fn static_ip(&self) -> &StaticIpConfig {
+        &self.network.static_ip
+    }
+
+    /// Returns `true` if this configuration is structurally and semantically valid.
+    pub const fn is_valid(&self) -> bool {
+        let ssid = self.network.wifi_ssid.as_bytes();
+        let pass = self.network.wifi_password.as_bytes();
+        let token = self.ota_token.as_bytes();
+
+        if ssid.is_empty() || ssid.len() > 32 {
+            return false;
+        }
+        if !pass.is_empty() && (pass.len() < 8 || pass.len() > 63) {
+            return false;
+        }
+        if token.is_empty() {
+            return false;
+        }
+        if !self.network.static_ip.is_valid() {
+            return false;
+        }
+        if self.control_port == 0
+            || self.stream_port == 0
+            || self.control_port == self.stream_port
+        {
+            return false;
+        }
+        true
+    }
+
+    /// Resolves `KlipperCamConfig` from compile-time build environment variables.
+    pub const fn from_build_env() -> Self {
+        let mut cfg = Self::WROVER_KIT_HD;
+        let token = match option_env!("OTA_TOKEN") {
+            Some(tok) if !tok.is_empty() => tok,
+            _ => match option_env!("WIFI_OTA_TOKEN") {
+                Some(tok) if !tok.is_empty() => tok,
+                _ => Self::DEFAULT_OTA_TOKEN,
+            },
+        };
+        cfg.ota_token = token;
+        cfg
+    }
 }
 
 impl Default for KlipperCamConfig {
@@ -604,21 +704,40 @@ mod tests {
     fn test_static_ip_and_parsing() {
         let static_cfg = StaticIpConfig::default();
         assert_eq!(static_cfg.ip, Ipv4Addr::new(172, 22, 1, 52));
-        assert_eq!(static_cfg.gateway, Ipv4Addr::new(172, 22, 0, 1));
-        assert_eq!(static_cfg.netmask, Ipv4Addr::new(255, 255, 0, 0));
-        assert_eq!(static_cfg.prefix_len, 16);
+        assert_eq!(static_cfg.gateway, Ipv4Addr::new(172, 22, 1, 1));
+        assert_eq!(static_cfg.dns, Ipv4Addr::new(172, 22, 1, 1));
+        assert_eq!(static_cfg.netmask, Ipv4Addr::new(255, 255, 255, 0));
+        assert_eq!(static_cfg.prefix_len, 24);
+        assert!(static_cfg.is_valid());
 
         assert_eq!(
             Ipv4Addr::parse_ascii("172.22.1.52"),
             Some(Ipv4Addr::new(172, 22, 1, 52))
         );
         assert_eq!(
-            Ipv4Addr::parse_ascii("172.22.0.1"),
-            Some(Ipv4Addr::new(172, 22, 0, 1))
+            Ipv4Addr::parse_ascii("172.22.1.1"),
+            Some(Ipv4Addr::new(172, 22, 1, 1))
         );
+        assert_eq!(
+            Ipv4Addr::parse_ascii("0.0.0.0"),
+            Some(Ipv4Addr::new(0, 0, 0, 0))
+        );
+        // Reject leading zeros
+        assert_eq!(Ipv4Addr::parse_ascii("01.2.3.4"), None);
+        assert_eq!(Ipv4Addr::parse_ascii("172.022.1.1"), None);
+        assert_eq!(Ipv4Addr::parse_ascii("172.22.001.1"), None);
         assert_eq!(Ipv4Addr::parse_ascii("256.0.0.1"), None);
         assert_eq!(Ipv4Addr::parse_ascii("172.22.1"), None);
         assert_eq!(Ipv4Addr::parse_ascii(""), None);
+
+        let cfg = KlipperCamConfig::default();
+        assert!(cfg.is_valid());
+        assert!(cfg.is_default_ota_token());
+        assert_eq!(cfg.http_port(), 80);
+        assert_eq!(cfg.static_ip().prefix_len, 24);
+
+        let env_cfg = KlipperCamConfig::from_build_env();
+        assert!(env_cfg.is_valid());
     }
 
     #[test]

@@ -162,7 +162,7 @@ pub const JPEG_UNPACKED_HALF_BUFFER_SIZE: usize = 1024;
 /// Maps an ESP32 GPIO number (`0..=39`) to its physical `IO_MUX` pad register address
 /// (`0x3FF4_9004..=0x3FF4_908C`, ESP32 Technical Reference Manual Table 4-3).
 ///
-/// Returns `None` for unbonded/reserved GPIO indices (`24`, `28..=31`, or `>= 40`).
+/// Returns `None` for unbonded/reserved GPIO indices (`20`, `24`, `28..=31`, or `>= 40`).
 #[inline]
 pub const fn io_mux_reg_addr(gpio_num: u8) -> Option<usize> {
     let offset = match gpio_num {
@@ -186,7 +186,6 @@ pub const fn io_mux_reg_addr(gpio_num: u8) -> Option<usize> {
         17 => 0x50,
         18 => 0x70,
         19 => 0x74,
-        20 => 0x78,
         21 => 0x7C,
         22 => 0x80,
         23 => 0x8C,
@@ -314,12 +313,13 @@ fn xtensa_configure_input_pad(gpio_num: u8, enable_pullup: bool) {
     // Route RTC_IO-capable pads to the digital IO_MUX before configuring IO_MUX and GPIO matrix
     match gpio_num {
         36..=39 => {
-            let v = xtensa_mmio_read(RTC_IO_SENSOR_PADS_REG)
-                & !((1 << 30) | (1 << 29) | (1 << 28) | (1 << 27));
+            let bit = 30 - (gpio_num - 36);
+            let v = xtensa_mmio_read(RTC_IO_SENSOR_PADS_REG) & !(1u32 << bit);
             xtensa_mmio_write(RTC_IO_SENSOR_PADS_REG, v);
         }
         34 | 35 => {
-            let v = xtensa_mmio_read(RTC_IO_ADC_PAD_REG) & !((1 << 29) | (1 << 28));
+            let bit = if gpio_num == 34 { 29 } else { 28 };
+            let v = xtensa_mmio_read(RTC_IO_ADC_PAD_REG) & !(1u32 << bit);
             xtensa_mmio_write(RTC_IO_ADC_PAD_REG, v);
         }
         25 => {
@@ -468,9 +468,9 @@ fn append_unpacked_jpeg_chunk(
             return Ok(None);
         }
 
-        if *written >= 5 {
-            if let Some(rel_eoi) = find_jpeg_eoi(&jpeg_out[3..*written]) {
-                return Ok(Some(3 + rel_eoi + 2));
+        if *written >= 4 {
+            if let Some(rel_eoi) = find_jpeg_eoi(&jpeg_out[2..*written]) {
+                return Ok(Some(2 + rel_eoi + 2));
             }
         }
         return Ok(None);
@@ -479,7 +479,7 @@ fn append_unpacked_jpeg_chunk(
     if *written + n > jpeg_out.len() {
         return Err(CameraError::BufferTooSmall);
     }
-    let search_start = (*written).saturating_sub(1).max(3);
+    let search_start = (*written).saturating_sub(1).max(2);
     jpeg_out[*written..*written + n].copy_from_slice(chunk);
     *written += n;
 
@@ -511,6 +511,14 @@ pub struct Esp32I2sCamera {
 impl Default for Esp32I2sCamera {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for Esp32I2sCamera {
+    fn drop(&mut self) {
+        if self.running {
+            let _ = self.stop();
+        }
     }
 }
 
@@ -579,6 +587,12 @@ impl Esp32I2sCamera {
         &self.gpio_bindings[..self.gpio_binding_count]
     }
 
+    /// Returns the number of configured GPIO matrix bindings.
+    #[inline]
+    pub const fn gpio_binding_count(&self) -> usize {
+        self.gpio_binding_count
+    }
+
     /// Returns `true` if VSYNC GPIO interrupt is enabled.
     #[inline]
     pub const fn is_vsync_intr_enabled(&self) -> bool {
@@ -602,10 +616,13 @@ impl Esp32I2sCamera {
     pub fn set_pin(&mut self, cfg: &CamPinConfig) -> Result<(), CameraError> {
         if cfg.pin_vsync < 0
             || (cfg.pin_vsync as u8) >= ESP32_GPIO_NUM_MAX
+            || io_mux_reg_addr(cfg.pin_vsync as u8).is_none()
             || cfg.pin_pclk < 0
             || (cfg.pin_pclk as u8) >= ESP32_GPIO_NUM_MAX
+            || io_mux_reg_addr(cfg.pin_pclk as u8).is_none()
             || cfg.pin_href < 0
             || (cfg.pin_href as u8) >= ESP32_GPIO_NUM_MAX
+            || io_mux_reg_addr(cfg.pin_href as u8).is_none()
         {
             return Err(CameraError::InvalidArg);
         }
@@ -613,7 +630,10 @@ impl Esp32I2sCamera {
         let mut i = 0;
         while i < 8 {
             let pin = cfg.data_pins[i];
-            if pin < 0 || (pin as u8) >= ESP32_GPIO_NUM_MAX {
+            if pin < 0
+                || (pin as u8) >= ESP32_GPIO_NUM_MAX
+                || io_mux_reg_addr(pin as u8).is_none()
+            {
                 return Err(CameraError::InvalidArg);
             }
             i += 1;
@@ -945,6 +965,7 @@ impl Esp32I2sCamera {
         let _ = self.stop();
         self.vsync_intr_enabled = false;
         self.vsync_pin = None;
+        self.gpio_binding_count = 0;
 
         let clk = volatile_read_u32(&self.regs.dport_clk_en) & !DPORT_I2S0_CLK_EN;
         volatile_write_u32(&mut self.regs.dport_clk_en, clk);
@@ -989,6 +1010,7 @@ impl Esp32I2sCamera {
             || !desc_cnt.is_multiple_of(2)
             || jpeg_out.len() < JPEG_UNPACKED_HALF_BUFFER_SIZE
             || max_poll_iters == 0
+            || !dma_buf.as_ptr().cast::<u32>().is_aligned()
         {
             return Err(CameraError::InvalidArg);
         }
@@ -1016,9 +1038,24 @@ impl Esp32I2sCamera {
 
         #[cfg(target_arch = "xtensa")]
         {
+            let buf_start = dma_buf.as_ptr() as usize;
+            let buf_end = buf_start.saturating_add(required_dma_bytes.saturating_sub(1));
+            let desc_start = descriptors.as_ptr() as usize;
+            let desc_end = desc_start.saturating_add(
+                core::mem::size_of_val(descriptors).saturating_sub(1),
+            );
+            if buf_start < 0x3FFA_E000
+                || buf_end > 0x3FFF_FFFF
+                || desc_start < 0x3FFA_E000
+                || desc_end > 0x3FFF_FFFF
+            {
+                return Err(CameraError::InvalidArg);
+            }
+
             dma_buf[..required_dma_bytes].fill(0);
             build_circular_ring(descriptors, &dma_buf[..required_dma_bytes], JPEG_DMA_NODE_SIZE)?;
-            let first_desc_addr = descriptors[0].link_addr_20bit();
+            let first_desc_addr = (core::ptr::from_ref(&descriptors[0]) as usize as u32)
+                & I2S_INLINK_ADDR_MASK;
             let vsync_pin = self.vsync_pin.unwrap_or(25);
             let vsync_sync_level = !self.vsync_invert;
 
@@ -1029,10 +1066,16 @@ impl Esp32I2sCamera {
             {
                 sync_iters += 1;
             }
+            if sync_iters >= max_poll_iters {
+                return Err(CameraError::Timeout);
+            }
             while xtensa_read_gpio_level(vsync_pin) != vsync_sync_level
                 && sync_iters < max_poll_iters
             {
                 sync_iters += 1;
+            }
+            if sync_iters >= max_poll_iters {
+                return Err(CameraError::Timeout);
             }
 
             if !self.start(&dma_cfg, first_desc_addr) {
@@ -1064,15 +1107,24 @@ impl Esp32I2sCamera {
                     );
                     idle_since_eof = 0;
 
+                    #[cfg(target_arch = "xtensa")]
+                    // SAFETY: `memw` orders preceding volatile MMIO status reads before subsequent SRAM DMA buffer reads on Xtensa.
+                    unsafe {
+                        core::arch::asm!("memw");
+                    }
+                    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
+
                     let eof_desc_addr =
                         xtensa_mmio_read(I2S0_BASE_ADDR + I2S_IN_EOF_DES_ADDR_REG_OFFSET)
                             & I2S_INLINK_ADDR_MASK;
                     let mut target_half = None;
                     let mut h = 0usize;
                     while h < half_buf_cnt {
-                        if descriptors[2 * h + 1].link_addr_20bit() == eof_desc_addr
-                            || descriptors[2 * h].link_addr_20bit() == eof_desc_addr
-                        {
+                        let desc1_addr = (core::ptr::from_ref(&descriptors[2 * h + 1]) as usize as u32)
+                            & I2S_INLINK_ADDR_MASK;
+                        let desc0_addr = (core::ptr::from_ref(&descriptors[2 * h]) as usize as u32)
+                            & I2S_INLINK_ADDR_MASK;
+                        if desc1_addr == eof_desc_addr || desc0_addr == eof_desc_addr {
                             target_half = Some(h);
                             break;
                         }
@@ -1153,6 +1205,8 @@ impl Esp32I2sCamera {
                                 &mut prev_tail_len,
                             )? {
                                 return Ok(total_len);
+                            } else {
+                                return Err(CameraError::CorruptedFrame);
                             }
                         } else if vsync_eof {
                             // Also check the next half-buffer in case one full half-buffer was just written
@@ -1163,7 +1217,9 @@ impl Esp32I2sCamera {
                                 &mut next_chunk,
                                 &dma_buf[next_offset..next_offset + JPEG_DMA_HALF_BUFFER_SIZE],
                             );
-                            if find_jpeg_eoi(&next_chunk).is_some() {
+                            let cross_chunk_eoi = unpacked_chunk[JPEG_UNPACKED_HALF_BUFFER_SIZE - 1] == 0xFF
+                                && next_chunk[0] == 0xD9;
+                            if cross_chunk_eoi || find_jpeg_eoi(&next_chunk).is_some() {
                                 let _ = self.stop();
                                 let _ = append_unpacked_jpeg_chunk(
                                     &unpacked_chunk,
@@ -1182,6 +1238,8 @@ impl Esp32I2sCamera {
                                     &mut prev_tail_len,
                                 )? {
                                     return Ok(total_len);
+                                } else {
+                                    return Err(CameraError::CorruptedFrame);
                                 }
                             }
                         }
@@ -1197,7 +1255,8 @@ impl Esp32I2sCamera {
         #[cfg(not(target_arch = "xtensa"))]
         {
             build_circular_ring(descriptors, &dma_buf[..required_dma_bytes], JPEG_DMA_NODE_SIZE)?;
-            let first_desc_addr = descriptors[0].link_addr_20bit();
+            let first_desc_addr = (core::ptr::from_ref(&descriptors[0]) as usize as u32)
+                & I2S_INLINK_ADDR_MASK;
             if !self.start(&dma_cfg, first_desc_addr) {
                 return Err(CameraError::HardwareError);
             }
@@ -1277,7 +1336,8 @@ mod tests {
         assert_eq!(io_mux_reg_addr(34), Some(0x3FF4_9014)); // D6
         assert_eq!(io_mux_reg_addr(35), Some(0x3FF4_9018)); // D7
 
-        // Unbonded / out-of-range pins
+        // Unbonded / out-of-range pins (LL-005)
+        assert_eq!(io_mux_reg_addr(20), None);
         assert_eq!(io_mux_reg_addr(24), None);
         assert_eq!(io_mux_reg_addr(28), None);
         assert_eq!(io_mux_reg_addr(40), None);
@@ -1309,10 +1369,22 @@ mod tests {
         );
         assert_eq!(cam.gpio_bindings()[11].signal_idx, I2S0I_H_ENABLE_IDX);
 
-        // Out-of-range GPIO >= 40 rejected
+        // Out-of-range GPIO >= 40 and unbonded GPIO 20, 24, 28 rejected (LL-005)
         let mut bad_pins = valid_pins;
         bad_pins.pin_vsync = 40;
         assert_eq!(cam.set_pin(&bad_pins), Err(CameraError::InvalidArg));
+
+        let mut bad_pin20 = valid_pins;
+        bad_pin20.pin_vsync = 20;
+        assert_eq!(cam.set_pin(&bad_pin20), Err(CameraError::InvalidArg));
+
+        let mut bad_pin24 = valid_pins;
+        bad_pin24.pin_href = 24;
+        assert_eq!(cam.set_pin(&bad_pin24), Err(CameraError::InvalidArg));
+
+        let mut bad_pin28 = valid_pins;
+        bad_pin28.data_pins[0] = 28;
+        assert_eq!(cam.set_pin(&bad_pin28), Err(CameraError::InvalidArg));
 
         let mut bad_data = valid_pins;
         bad_data.data_pins[7] = -1;
@@ -1363,6 +1435,27 @@ mod tests {
         assert_eq!(cam.deinit(), Ok(()));
         assert_eq!(cam.regs().dport_clk_en & DPORT_I2S0_CLK_EN, 0);
         assert_eq!(cam.regs().dport_rst_en & DPORT_I2S0_RST, DPORT_I2S0_RST);
+        assert_eq!(cam.gpio_binding_count(), 0);
+    }
+
+    #[test]
+    fn test_esp32_i2s_deinit_resets_gpio_binding_count() {
+        let mut cam = Esp32I2sCamera::new();
+        let valid_pins = CamPinConfig {
+            pin_vsync: 25,
+            pin_href: 23,
+            pin_pclk: 22,
+            pin_xclk: 21,
+            data_pins: [4, 5, 18, 19, 36, 39, 34, 35],
+            vsync_invert: true,
+        };
+        assert_eq!(cam.set_pin(&valid_pins), Ok(()));
+        assert_eq!(cam.gpio_binding_count(), 12);
+        assert_eq!(cam.gpio_bindings().len(), 12);
+
+        assert_eq!(cam.deinit(), Ok(()));
+        assert_eq!(cam.gpio_binding_count(), 0);
+        assert_eq!(cam.gpio_bindings().len(), 0);
     }
 
     #[test]
@@ -1374,7 +1467,10 @@ mod tests {
             .expect("set jpeg sample mode");
 
         let mut descriptors = [Lldesc::empty(); 4];
-        let mut dma_buf = [0u8; 4 * JPEG_DMA_NODE_SIZE];
+        #[repr(C, align(4))]
+        struct AlignedBuf([u8; 4 * JPEG_DMA_NODE_SIZE]);
+        let mut dma_storage = AlignedBuf([0u8; 4 * JPEG_DMA_NODE_SIZE]);
+        let dma_buf = &mut dma_storage.0;
         let mut jpeg_out = [0u8; 2048];
 
         // Embed 4 leading padding bytes, followed by a 1030-byte JPEG frame spanning across
@@ -1400,11 +1496,84 @@ mod tests {
         }
 
         let captured_len = cam
-            .capture_jpeg_frame_polled(&mut descriptors, &mut dma_buf, &mut jpeg_out, 16)
+            .capture_jpeg_frame_polled(&mut descriptors, dma_buf, &mut jpeg_out, 16)
             .expect("polled JPEG capture should succeed");
         assert_eq!(captured_len, 1030);
         assert_eq!(&jpeg_out[..3], &[0xFF, 0xD8, 0xFF]);
         assert_eq!(&jpeg_out[captured_len - 2..captured_len], &[0xFF, 0xD9]);
         assert!(!cam.is_running());
+
+        // Verify descriptor 0 address was programmed into in_link (LL-001)
+        let expected_desc_addr =
+            (core::ptr::from_ref(&descriptors[0]) as usize as u32) & I2S_INLINK_ADDR_MASK;
+        assert_eq!(cam.regs().in_link & I2S_INLINK_ADDR_MASK, expected_desc_addr);
+    }
+
+    #[test]
+    fn test_polled_jpeg_capture_scans_and_truncates_at_eoi() {
+        let mut cam = Esp32I2sCamera::new();
+        assert_eq!(cam.config(), Ok(()));
+        let _ = cam
+            .set_sample_mode(PixelFormat::Jpeg, 20_000_000, CameraPid::OV2640.as_u16())
+            .expect("set jpeg sample mode");
+
+        let mut descriptors = [Lldesc::empty(); 2];
+        #[repr(C, align(4))]
+        struct AlignedBuf([u8; 2 * JPEG_DMA_NODE_SIZE]);
+        let mut dma_storage = AlignedBuf([0u8; 2 * JPEG_DMA_NODE_SIZE]);
+        let dma_buf = &mut dma_storage.0;
+        let mut jpeg_out = [0u8; 1024];
+
+        // Verify LL-002: unaligned dma_buf is rejected
+        #[repr(C, align(4))]
+        struct UnalignedTestBuf([u8; 2 * JPEG_DMA_NODE_SIZE + 4]);
+        let mut aligned = UnalignedTestBuf([0u8; 2 * JPEG_DMA_NODE_SIZE + 4]);
+        let unaligned_slice = &mut aligned.0[1..1 + 2 * JPEG_DMA_NODE_SIZE];
+        assert_eq!(
+            cam.capture_jpeg_frame_polled(&mut descriptors, unaligned_slice, &mut jpeg_out, 16),
+            Err(CameraError::InvalidArg)
+        );
+
+        // Verify LL-004: EOI at indices 2..=3
+        let el_soi0 = DmaElement::new(0xFF, 0);
+        let el_soi1 = DmaElement::new(0xD8, 0);
+        let el_eoi0 = DmaElement::new(0xFF, 0);
+        let el_eoi1 = DmaElement::new(0xD9, 0);
+        dma_buf[0..4].copy_from_slice(&el_soi0.0);
+        dma_buf[4..8].copy_from_slice(&el_soi1.0);
+        dma_buf[8..12].copy_from_slice(&el_eoi0.0);
+        dma_buf[12..16].copy_from_slice(&el_eoi1.0);
+
+        let captured = cam
+            .capture_jpeg_frame_polled(&mut descriptors, dma_buf, &mut jpeg_out, 16)
+            .expect("eoi at 2..=3 captured");
+        assert_eq!(captured, 4);
+        assert_eq!(&jpeg_out[..4], &[0xFF, 0xD8, 0xFF, 0xD9]);
+
+        // Verify LL-001: in_link holds descriptors[0] address, not descriptors[1]
+        let expected_desc0 =
+            (core::ptr::from_ref(&descriptors[0]) as usize as u32) & I2S_INLINK_ADDR_MASK;
+        assert_eq!(cam.regs().in_link & I2S_INLINK_ADDR_MASK, expected_desc0);
+
+        // Verify LL-002: Drop stops running camera
+        {
+            let mut cam2 = Esp32I2sCamera::new();
+            assert_eq!(cam2.config(), Ok(()));
+            let dma_cfg = DmaSizeConfig {
+                dma_bytes_per_item: 4,
+                dma_buffer_size: 4096,
+                dma_half_buffer_size: 2048,
+                dma_half_buffer_cnt: 2,
+                dma_node_buffer_size: 2048,
+                dma_node_cnt: 2,
+                lines_per_node: 1,
+                nodes_per_line: 1,
+                lines_per_half_buffer: 1,
+                image_size: 1024,
+            };
+            assert!(cam2.start(&dma_cfg, 0x1234));
+            assert!(cam2.is_running());
+            drop(cam2); // Drops and executes stop()
+        }
     }
 }

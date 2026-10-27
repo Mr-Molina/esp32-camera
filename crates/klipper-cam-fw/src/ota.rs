@@ -337,6 +337,7 @@ pub enum OtaImgState {
 
 impl OtaImgState {
     /// Converts a raw 32-bit `ota_state` field into an [`OtaImgState`].
+    /// Maps unknown values (`0x5..=0xFFFF_FFFE`) to [`Self::Invalid`] (`OTA-002`).
     #[inline]
     pub const fn from_u32(val: u32) -> Self {
         match val {
@@ -345,7 +346,8 @@ impl OtaImgState {
             0x2 => Self::Valid,
             0x3 => Self::Invalid,
             0x4 => Self::Aborted,
-            _ => Self::Undefined,
+            0xFFFF_FFFF => Self::Undefined,
+            _ => Self::Invalid,
         }
     }
 }
@@ -762,10 +764,22 @@ impl OtaDataManager {
         &mut self,
         flash: &mut F,
     ) -> Result<bool, OtaError> {
-        let active = self.active_slot();
-        let changed = self.mark_app_valid_cancel_rollback()?;
+        let s0_ok = self.sector_0.is_bootable();
+        let s1_ok = self.sector_1.is_bootable();
+        let (mutated_slot, changed) = match (s0_ok, s1_ok) {
+            (true, true) => {
+                if self.sector_0.ota_seq >= self.sector_1.ota_seq {
+                    (OtaSlot::Ota0, self.sector_0.mark_app_valid_cancel_rollback()?)
+                } else {
+                    (OtaSlot::Ota1, self.sector_1.mark_app_valid_cancel_rollback()?)
+                }
+            }
+            (true, false) => (OtaSlot::Ota0, self.sector_0.mark_app_valid_cancel_rollback()?),
+            (false, true) => (OtaSlot::Ota1, self.sector_1.mark_app_valid_cancel_rollback()?),
+            (false, false) => return Err(OtaError::InvalidOtaDataCrc),
+        };
         if changed {
-            self.sync_slot_to_flash(flash, active)?;
+            self.sync_slot_to_flash(flash, mutated_slot)?;
         }
         Ok(changed)
     }
@@ -788,6 +802,7 @@ impl OtaDataManager {
         };
 
         validate_ota_image_header(payload, payload.len(), max_size)?;
+        validate_ota_image_integrity(payload)?;
 
         let erase_len = ((payload.len() as u32) + 0xFFF) & !0xFFF;
         flash.erase_range(
@@ -869,10 +884,18 @@ impl OtaDataManager {
             (false, false) => 0,
         };
 
-        let mut next_seq = current_max.checked_add(1).ok_or(OtaError::SequenceOverflow)?;
-        if OtaSlot::from_seq(next_seq) != Some(target_slot) {
-            next_seq = next_seq.checked_add(1).ok_or(OtaError::SequenceOverflow)?;
-        }
+        let next_seq = if current_max >= u32::MAX - 3 {
+            match target_slot {
+                OtaSlot::Ota0 => 1,
+                OtaSlot::Ota1 => 2,
+            }
+        } else {
+            let mut seq = current_max.checked_add(1).ok_or(OtaError::SequenceOverflow)?;
+            if OtaSlot::from_seq(seq) != Some(target_slot) {
+                seq = seq.checked_add(1).ok_or(OtaError::SequenceOverflow)?;
+            }
+            seq
+        };
 
         let entry = OtaDataSelect::new(next_seq, OtaImgState::PendingVerify);
         match target_slot {
@@ -939,15 +962,48 @@ impl EspImageHeader {
         hdr[23] = 0x01; // append_digest = 1
         hdr
     }
+
+    /// Constructs a valid 64-byte single-segment ESP32 application image with valid XOR checksum.
+    pub const fn minimal_valid_image_64() -> [u8; 64] {
+        let mut img = [0u8; 64];
+        img[0] = ESP_IMAGE_HEADER_MAGIC;
+        img[1] = 1;
+        img[2] = 0x02; // DIO
+        img[3] = 0x20; // 4MB, 40MHz
+        img[4] = 0x00;
+        img[5] = 0x04;
+        img[6] = 0x08;
+        img[7] = 0x40; // Entry point 0x4008_0400
+        // Segment 0 header
+        img[24] = 0x00;
+        img[25] = 0x04;
+        img[26] = 0x08;
+        img[27] = 0x40; // Load address 0x4008_0400
+        img[28] = 16;
+        img[29] = 0;
+        img[30] = 0;
+        img[31] = 0; // Length 16 bytes
+        let mut chk = 0xEFu8;
+        let mut i = 0usize;
+        while i < 16 {
+            let val = (i as u8) ^ 0x5A;
+            img[32 + i] = val;
+            chk ^= val;
+            i += 1;
+        }
+        img[63] = chk;
+        img
+    }
 }
 
 /// Validates an ESP32 OTA image prefix and total `Content-Length` against target partition bounds (`OTA-002`, `APP-008`).
 ///
 /// Checks:
-/// 1. `total_image_len > 0`
+/// 1. `total_image_len >= ESP_IMAGE_HEADER_LEN` (`24`) and `image_prefix.len() >= ESP_IMAGE_HEADER_LEN` (`24`)
 /// 2. `total_image_len <= max_partition_size` (`0x1B0000`)
 /// 3. `image_prefix[0] == ESP_IMAGE_HEADER_MAGIC` (`0xE9`)
 /// 4. `segment_count` in `1..=16` (`ESP_IMAGE_MIN_SEGMENTS..=ESP_IMAGE_MAX_SEGMENTS`)
+/// 5. `entry_addr` in ESP32 executable memory regions (`0x4008_0000..0x4080_0000` or `0x3F40_0000..0x3F80_0000`)
 pub fn validate_ota_image_header(
     image_prefix: &[u8],
     total_image_len: usize,
@@ -956,50 +1012,40 @@ pub fn validate_ota_image_header(
     if total_image_len == 0 {
         return Err(OtaError::MissingContentLength);
     }
+    if total_image_len < ESP_IMAGE_HEADER_LEN || image_prefix.len() < ESP_IMAGE_HEADER_LEN {
+        return Err(OtaError::ImageTooSmall);
+    }
     if total_image_len > max_partition_size {
         return Err(OtaError::ImageTooLarge {
             image_size: total_image_len,
             partition_size: max_partition_size,
         });
     }
-    if image_prefix.is_empty() {
-        return Err(OtaError::HeaderTooShort);
-    }
+
     let magic = image_prefix[0];
     if magic != ESP_IMAGE_HEADER_MAGIC {
         return Err(OtaError::InvalidMagicByte(magic));
     }
 
-    let segment_count = if image_prefix.len() >= 2 {
-        let count = image_prefix[1];
-        if !(ESP_IMAGE_MIN_SEGMENTS..=ESP_IMAGE_MAX_SEGMENTS).contains(&count) {
-            return Err(OtaError::InvalidSegmentCount(count));
-        }
-        count
-    } else {
-        1
-    };
+    let segment_count = image_prefix[1];
+    if !(ESP_IMAGE_MIN_SEGMENTS..=ESP_IMAGE_MAX_SEGMENTS).contains(&segment_count) {
+        return Err(OtaError::InvalidSegmentCount(segment_count));
+    }
 
-    let spi_mode = if image_prefix.len() >= 3 {
-        image_prefix[2]
-    } else {
-        0
-    };
-    let spi_speed_size = if image_prefix.len() >= 4 {
-        image_prefix[3]
-    } else {
-        0
-    };
-    let entry_addr = if image_prefix.len() >= 8 {
-        u32::from_le_bytes([
-            image_prefix[4],
-            image_prefix[5],
-            image_prefix[6],
-            image_prefix[7],
-        ])
-    } else {
-        0x4008_0000
-    };
+    let spi_mode = image_prefix[2];
+    let spi_speed_size = image_prefix[3];
+    let entry_addr = u32::from_le_bytes([
+        image_prefix[4],
+        image_prefix[5],
+        image_prefix[6],
+        image_prefix[7],
+    ]);
+
+    let is_valid_entry = (0x4008_0000..0x4080_0000).contains(&entry_addr)
+        || (0x3F40_0000..0x3F80_0000).contains(&entry_addr);
+    if !is_valid_entry {
+        return Err(OtaError::InvalidEntryAddr(entry_addr));
+    }
 
     Ok(EspImageHeader {
         magic,
@@ -1007,6 +1053,283 @@ pub fn validate_ota_image_header(
         spi_mode,
         spi_speed_size,
         entry_addr,
+    })
+}
+
+/// Summary returned by [`validate_ota_image_integrity`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EspImageHeaderSummary {
+    /// Parsed 24-byte image header.
+    pub header: EspImageHeader,
+    /// Number of segments validated.
+    pub segment_count: u8,
+    /// Entry address.
+    pub entry_addr: u32,
+    /// Total data length across all segments.
+    pub total_segment_len: usize,
+    /// Computed 8-bit XOR checksum byte (seeded with `0xEF`).
+    pub checksum: u8,
+    /// Whether a trailing SHA-256 digest was present and verified.
+    pub hash_appended: bool,
+}
+
+/// Pure `#![no_std]` SHA-256 state and digest computation.
+pub struct Sha256 {
+    state: [u32; 8],
+    buffer: [u8; 64],
+    buf_len: usize,
+    total_len: u64,
+}
+
+impl Sha256 {
+    /// Creates a new SHA-256 hasher initialized to standard initial constants.
+    pub const fn new() -> Self {
+        Self {
+            state: [
+                0x6a09_e667, 0xbb67_ae85, 0x3c6e_f372, 0xa54f_f53a,
+                0x510e_527f, 0x9b05_688c, 0x1f83_d9ab, 0x5be0_cd19,
+            ],
+            buffer: [0u8; 64],
+            buf_len: 0,
+            total_len: 0,
+        }
+    }
+
+    /// Appends `data` bytes to the hash state.
+    pub fn update(&mut self, data: &[u8]) {
+        self.total_len = self.total_len.saturating_add(data.len() as u64);
+        let mut i = 0;
+        while i < data.len() {
+            self.buffer[self.buf_len] = data[i];
+            self.buf_len += 1;
+            if self.buf_len == 64 {
+                self.process_block();
+                self.buf_len = 0;
+            }
+            i += 1;
+        }
+    }
+
+    /// Consumes the hasher and returns the computed 32-byte SHA-256 digest.
+    pub fn finalize(mut self) -> [u8; 32] {
+        let bit_len = self.total_len.wrapping_mul(8);
+        self.buffer[self.buf_len] = 0x80;
+        self.buf_len += 1;
+
+        if self.buf_len > 56 {
+            while self.buf_len < 64 {
+                self.buffer[self.buf_len] = 0;
+                self.buf_len += 1;
+            }
+            self.process_block();
+            self.buf_len = 0;
+        }
+
+        while self.buf_len < 56 {
+            self.buffer[self.buf_len] = 0;
+            self.buf_len += 1;
+        }
+
+        let len_bytes = bit_len.to_be_bytes();
+        let mut j = 0;
+        while j < 8 {
+            self.buffer[56 + j] = len_bytes[j];
+            j += 1;
+        }
+        self.process_block();
+
+        let mut out = [0u8; 32];
+        let mut k = 0;
+        while k < 8 {
+            let bytes = self.state[k].to_be_bytes();
+            out[k * 4] = bytes[0];
+            out[k * 4 + 1] = bytes[1];
+            out[k * 4 + 2] = bytes[2];
+            out[k * 4 + 3] = bytes[3];
+            k += 1;
+        }
+        out
+    }
+
+    fn process_block(&mut self) {
+        const K: [u32; 64] = [
+            0x428a_2f98, 0x7137_4491, 0xb5c0_fbcf, 0xe9b5_dba5,
+            0x3956_c25b, 0x59f1_11f1, 0x923f_82a4, 0xab1c_5ed5,
+            0xd807_aa98, 0x1283_5b01, 0x2431_85be, 0x550c_7dc3,
+            0x72be_5d74, 0x80de_b1fe, 0x9bdc_06a7, 0xc19b_f174,
+            0xe49b_69c1, 0xefbe_4786, 0x0fc1_9dc6, 0x240c_a1cc,
+            0x2de9_2c6f, 0x4a74_84aa, 0x5cb0_a9dc, 0x76f9_88da,
+            0x983e_5152, 0xa831_c66d, 0xb003_27c8, 0xbf59_7fc7,
+            0xc6e0_0bf3, 0xd5a7_9147, 0x06ca_6351, 0x1429_2967,
+            0x27b7_0a85, 0x2e1b_2138, 0x4d2c_6dfc, 0x5338_0d13,
+            0x650a_7354, 0x766a_0abb, 0x81c2_c92e, 0x9272_2c85,
+            0xa2bf_e8a1, 0xa81a_664b, 0xc24b_8b70, 0xc76c_51a3,
+            0xd192_e819, 0xd699_0624, 0xf40e_3585, 0x106a_a070,
+            0x19a4_c116, 0x1e37_6c08, 0x2748_774c, 0x34b0_bcb5,
+            0x391c_0cb3, 0x4ed8_aa4a, 0x5b9c_ca4f, 0x682e_6ff3,
+            0x748f_82ee, 0x78a5_636f, 0x84c8_7814, 0x8cc7_0208,
+            0x90be_fffa, 0xa450_6ceb, 0xbef9_a3f7, 0xc671_78f2,
+        ];
+
+        let mut w = [0u32; 64];
+        let mut t = 0;
+        while t < 16 {
+            w[t] = u32::from_be_bytes([
+                self.buffer[t * 4],
+                self.buffer[t * 4 + 1],
+                self.buffer[t * 4 + 2],
+                self.buffer[t * 4 + 3],
+            ]);
+            t += 1;
+        }
+        while t < 64 {
+            let s0 = w[t - 15].rotate_right(7) ^ w[t - 15].rotate_right(18) ^ (w[t - 15] >> 3);
+            let s1 = w[t - 2].rotate_right(17) ^ w[t - 2].rotate_right(19) ^ (w[t - 2] >> 10);
+            w[t] = w[t - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[t - 7])
+                .wrapping_add(s1);
+            t += 1;
+        }
+
+        let mut a = self.state[0];
+        let mut b = self.state[1];
+        let mut c = self.state[2];
+        let mut d = self.state[3];
+        let mut e = self.state[4];
+        let mut f = self.state[5];
+        let mut g = self.state[6];
+        let mut h = self.state[7];
+
+        let mut i = 0;
+        while i < 64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = h
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+            i += 1;
+        }
+
+        self.state[0] = self.state[0].wrapping_add(a);
+        self.state[1] = self.state[1].wrapping_add(b);
+        self.state[2] = self.state[2].wrapping_add(c);
+        self.state[3] = self.state[3].wrapping_add(d);
+        self.state[4] = self.state[4].wrapping_add(e);
+        self.state[5] = self.state[5].wrapping_add(f);
+        self.state[6] = self.state[6].wrapping_add(g);
+        self.state[7] = self.state[7].wrapping_add(h);
+    }
+}
+
+impl Default for Sha256 {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Computes the 32-byte SHA-256 digest of `data` (`#![no_std]`, zero allocation).
+pub fn sha256_digest(data: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(data);
+    h.finalize()
+}
+
+/// Validates the full integrity of an ESP32 firmware application image.
+///
+/// 1. Validates the 24-byte header via [`validate_ota_image_header`].
+/// 2. Iterates over each of the `segment_count` segments starting at offset 24,
+///    verifying that each segment's header (8 bytes) and payload lie within `image`.
+/// 3. Computes the ESP-IDF 8-bit XOR checksum (seeded with `0xEF`) over all segment payloads
+///    and verifies the byte at 16-byte boundary `((offset + 15) & !15) | 15`.
+/// 4. If `image[23] == 1` (`hash_appended`), validates the trailing 32-byte SHA-256 digest
+///    over `image[..image.len() - 32]`.
+pub fn validate_ota_image_integrity(image: &[u8]) -> Result<EspImageHeaderSummary, OtaError> {
+    let header = validate_ota_image_header(image, image.len(), OTA_PARTITION_MAX_SIZE)?;
+
+    let mut offset = ESP_IMAGE_HEADER_LEN;
+    let mut chk = 0xEFu8;
+    let mut total_seg_len = 0usize;
+
+    let mut seg_idx = 0u8;
+    while seg_idx < header.segment_count {
+        if offset.checked_add(8).ok_or(OtaError::ImageTooSmall)? > image.len() {
+            return Err(OtaError::ImageTooSmall);
+        }
+        let _load_addr = u32::from_le_bytes([
+            image[offset],
+            image[offset + 1],
+            image[offset + 2],
+            image[offset + 3],
+        ]);
+        let data_len = u32::from_le_bytes([
+            image[offset + 4],
+            image[offset + 5],
+            image[offset + 6],
+            image[offset + 7],
+        ]) as usize;
+        offset += 8;
+
+        let end_seg = offset.checked_add(data_len).ok_or(OtaError::ImageTooSmall)?;
+        if end_seg > image.len() {
+            return Err(OtaError::ImageTooSmall);
+        }
+
+        let mut b_idx = offset;
+        while b_idx < end_seg {
+            chk ^= image[b_idx];
+            b_idx += 1;
+        }
+
+        offset = end_seg;
+        total_seg_len = total_seg_len.saturating_add(data_len);
+        seg_idx += 1;
+    }
+
+    let checksum_offset = offset | 15;
+    if image.len() <= checksum_offset {
+        return Err(OtaError::ImageTooSmall);
+    }
+
+    if image[checksum_offset] != chk {
+        return Err(OtaError::InvalidChecksum);
+    }
+
+    let hash_appended = image[23] == 1;
+    if hash_appended {
+        let min_required = checksum_offset.checked_add(33).ok_or(OtaError::ImageTooSmall)?;
+        if image.len() < min_required {
+            return Err(OtaError::ImageTooSmall);
+        }
+        let expected_hash = &image[image.len() - 32..];
+        let computed_hash = sha256_digest(&image[..image.len() - 32]);
+        if computed_hash != expected_hash {
+            return Err(OtaError::InvalidSha256);
+        }
+    }
+
+    Ok(EspImageHeaderSummary {
+        header,
+        segment_count: header.segment_count,
+        entry_addr: header.entry_addr,
+        total_segment_len: total_seg_len,
+        checksum: chk,
+        hash_appended,
     })
 }
 
@@ -1024,12 +1347,20 @@ pub enum OtaError {
         image_size: usize,
         partition_size: usize,
     },
+    /// Firmware payload is smaller than minimal header or segment length (`400 Bad Request`).
+    ImageTooSmall,
     /// Firmware payload is empty or too short to inspect header (`400 Bad Request`).
     HeaderTooShort,
     /// First byte of firmware image is not `0xE9` (`400 Bad Request`, `OTA-002`).
     InvalidMagicByte(u8),
     /// Segment count in ESP32 image header is outside `1..=16` (`400 Bad Request`, `OTA-002`).
     InvalidSegmentCount(u8),
+    /// Entry address outside ESP32 executable memory regions (`400 Bad Request`).
+    InvalidEntryAddr(u32),
+    /// ESP-IDF 8-bit XOR checksum mismatch (`400 Bad Request`).
+    InvalidChecksum,
+    /// Appended SHA-256 digest mismatch (`400 Bad Request`).
+    InvalidSha256,
     /// Number of received bytes did not match `Content-Length` (`400 Bad Request`).
     IncompletePayload { received: usize, expected: usize },
     /// Socket read error or retry limit exceeded (`500 Internal Server Error`, `APP-007`).
@@ -1058,6 +1389,7 @@ impl fmt::Display for OtaError {
                 "OTA image size ({}) exceeds target partition size ({})",
                 image_size, partition_size
             ),
+            Self::ImageTooSmall => write!(f, "Firmware image validation failed: image too small"),
             Self::HeaderTooShort => write!(f, "Firmware image validation failed"),
             Self::InvalidMagicByte(b) => {
                 write!(f, "Firmware image validation failed: invalid magic 0x{:02X}", b)
@@ -1065,6 +1397,11 @@ impl fmt::Display for OtaError {
             Self::InvalidSegmentCount(c) => {
                 write!(f, "Firmware image validation failed: invalid segments {}", c)
             }
+            Self::InvalidEntryAddr(addr) => {
+                write!(f, "Firmware image validation failed: invalid entry 0x{:08X}", addr)
+            }
+            Self::InvalidChecksum => write!(f, "Firmware image validation failed: checksum mismatch"),
+            Self::InvalidSha256 => write!(f, "Firmware image validation failed: SHA-256 mismatch"),
             Self::IncompletePayload { received, expected } => write!(
                 f,
                 "OTA socket read error: received {} of {} bytes",
@@ -1080,6 +1417,47 @@ impl fmt::Display for OtaError {
 }
 
 #[cfg(test)]
+pub fn make_valid_esp_image(hash_appended: bool) -> alloc::vec::Vec<u8> {
+    make_valid_esp_image_with_len(16, hash_appended)
+}
+
+#[cfg(test)]
+pub fn make_valid_esp_image_with_len(
+    payload_len: usize,
+    hash_appended: bool,
+) -> alloc::vec::Vec<u8> {
+    let seg_offset = 24 + 8;
+    let end_of_seg = seg_offset + payload_len;
+    let checksum_offset = end_of_seg | 15;
+    let base_len = checksum_offset + 1;
+    let mut img = alloc::vec![0u8; base_len];
+    img[0] = ESP_IMAGE_HEADER_MAGIC;
+    img[1] = 1; // 1 segment
+    img[2] = 0x02; // DIO
+    img[3] = 0x20; // 4MB, 40MHz
+    img[4..8].copy_from_slice(&0x4008_0400u32.to_le_bytes());
+    if hash_appended {
+        img[23] = 1;
+    }
+    // Segment 0 header
+    img[24..28].copy_from_slice(&0x4008_0400u32.to_le_bytes());
+    img[28..32].copy_from_slice(&(payload_len as u32).to_le_bytes());
+    // Fill payload
+    let mut chk = 0xEFu8;
+    for (idx, b) in img[seg_offset..end_of_seg].iter_mut().enumerate() {
+        let val = (idx as u8) ^ 0x5A;
+        *b = val;
+        chk ^= val;
+    }
+    img[checksum_offset] = chk;
+    if hash_appended {
+        let digest = sha256_digest(&img[..base_len]);
+        img.extend_from_slice(&digest);
+    }
+    img
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1088,43 +1466,40 @@ mod tests {
         assert!(verify_partition_table_integrity());
         assert_eq!(PARTITION_TABLE.len(), 5);
 
-        let nvs = find_partition_by_label("nvs");
-        assert!(nvs.is_some());
-        if let Some(p) = nvs {
-            assert_eq!(p.offset, 0x11000);
-            assert_eq!(p.size, 0x6000);
-        }
+        let csv = include_str!("../../../partitions_rust_ota.csv");
+        for line in csv.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut parts = line.split(',').map(|s| s.trim());
+            let name = parts.next().expect("partition name");
+            let _part_type = parts.next().expect("partition type");
+            let _sub_type = parts.next().expect("partition subtype");
+            let offset_str = parts.next().expect("offset");
+            let size_str = parts.next().expect("size");
 
-        let otadata = find_partition_by_label("otadata");
-        assert!(otadata.is_some());
-        if let Some(p) = otadata {
-            assert_eq!(p.offset, 0x17000);
-            assert_eq!(p.size, 0x2000);
-        }
+            let offset = if let Some(hex) = offset_str
+                .strip_prefix("0x")
+                .or_else(|| offset_str.strip_prefix("0X"))
+            {
+                u32::from_str_radix(hex, 16).expect("hex offset")
+            } else {
+                offset_str.parse::<u32>().expect("dec offset")
+            };
+            let size = if let Some(hex) = size_str
+                .strip_prefix("0x")
+                .or_else(|| size_str.strip_prefix("0X"))
+            {
+                u32::from_str_radix(hex, 16).expect("hex size")
+            } else {
+                size_str.parse::<u32>().expect("dec size")
+            };
 
-        let phy = find_partition_by_label("phy_init");
-        assert!(phy.is_some());
-        if let Some(p) = phy {
-            assert_eq!(p.offset, 0x19000);
-            assert_eq!(p.size, 0x1000);
-        }
-
-        let ota0 = find_partition_by_label("ota_0");
-        assert!(ota0.is_some());
-        if let Some(p) = ota0 {
-            assert_eq!(p.offset, 0x20000);
-            assert_eq!(p.size, 0x1B0000);
-            assert_eq!(p.size, 1_769_472);
-            assert_eq!(p.end_offset(), 0x1D0000);
-        }
-
-        let ota1 = find_partition_by_label("ota_1");
-        assert!(ota1.is_some());
-        if let Some(p) = ota1 {
-            assert_eq!(p.offset, 0x1D0000);
-            assert_eq!(p.size, 0x1B0000);
-            assert_eq!(p.size, 1_769_472);
-            assert_eq!(p.end_offset(), 0x380000);
+            let entry = find_partition_by_label(name)
+                .unwrap_or_else(|| panic!("Partition {} not found", name));
+            assert_eq!(entry.offset, offset, "Partition {} offset mismatch", name);
+            assert_eq!(entry.size, size, "Partition {} size mismatch", name);
         }
     }
 
@@ -1212,23 +1587,40 @@ mod tests {
             assert_eq!(hdr.entry_addr, 0x4008_0400);
         }
 
+        // Header < 24 bytes
+        assert_eq!(
+            validate_ota_image_header(&valid_hdr[..23], 1024, OTA_PARTITION_MAX_SIZE),
+            Err(OtaError::ImageTooSmall)
+        );
+
         // Bad magic byte (0x00 instead of 0xE9)
-        let bad_magic = [0x00, 0x03, 0x02, 0x20];
+        let mut bad_magic = valid_hdr;
+        bad_magic[0] = 0x00;
         assert_eq!(
             validate_ota_image_header(&bad_magic, 1024, OTA_PARTITION_MAX_SIZE),
             Err(OtaError::InvalidMagicByte(0x00))
         );
 
         // Invalid segment count (0 and 17)
-        let zero_seg = [0xE9, 0x00, 0x02, 0x20];
+        let mut zero_seg = valid_hdr;
+        zero_seg[1] = 0;
         assert_eq!(
             validate_ota_image_header(&zero_seg, 1024, OTA_PARTITION_MAX_SIZE),
             Err(OtaError::InvalidSegmentCount(0))
         );
-        let seventeen_seg = [0xE9, 17, 0x02, 0x20];
+        let mut seventeen_seg = valid_hdr;
+        seventeen_seg[1] = 17;
         assert_eq!(
             validate_ota_image_header(&seventeen_seg, 1024, OTA_PARTITION_MAX_SIZE),
             Err(OtaError::InvalidSegmentCount(17))
+        );
+
+        // Invalid entry address
+        let mut bad_entry = valid_hdr;
+        bad_entry[4..8].copy_from_slice(&0x1000_0000u32.to_le_bytes());
+        assert_eq!(
+            validate_ota_image_header(&bad_entry, 1024, OTA_PARTITION_MAX_SIZE),
+            Err(OtaError::InvalidEntryAddr(0x1000_0000))
         );
 
         // Exceeds partition size (0x1B0000 + 1)
@@ -1248,6 +1640,76 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_ota_image_integrity() {
+        // Valid image without appended SHA-256
+        let img_no_hash = make_valid_esp_image(false);
+        let summary_no_hash = validate_ota_image_integrity(&img_no_hash);
+        assert!(summary_no_hash.is_ok());
+        if let Ok(sum) = summary_no_hash {
+            assert_eq!(sum.segment_count, 1);
+            assert_eq!(sum.entry_addr, 0x4008_0400);
+            assert!(!sum.hash_appended);
+        }
+
+        // Valid image with appended SHA-256
+        let img_hash = make_valid_esp_image(true);
+        let summary_hash = validate_ota_image_integrity(&img_hash);
+        assert!(summary_hash.is_ok());
+        if let Ok(sum) = summary_hash {
+            assert!(sum.hash_appended);
+        }
+
+        // Corrupted checksum byte
+        let mut corrupted_chk = img_no_hash.clone();
+        let chk_idx = 63;
+        corrupted_chk[chk_idx] ^= 0xFF;
+        assert_eq!(
+            validate_ota_image_integrity(&corrupted_chk),
+            Err(OtaError::InvalidChecksum)
+        );
+
+        // Corrupted payload byte -> checksum mismatch
+        let mut corrupted_payload = img_no_hash.clone();
+        corrupted_payload[35] ^= 0x01;
+        assert_eq!(
+            validate_ota_image_integrity(&corrupted_payload),
+            Err(OtaError::InvalidChecksum)
+        );
+
+        // Corrupted appended SHA-256
+        let mut corrupted_sha = img_hash.clone();
+        let last_idx = corrupted_sha.len() - 1;
+        corrupted_sha[last_idx] ^= 0x55;
+        assert_eq!(
+            validate_ota_image_integrity(&corrupted_sha),
+            Err(OtaError::InvalidSha256)
+        );
+
+        // Truncated image
+        assert_eq!(
+            validate_ota_image_integrity(&img_no_hash[..40]),
+            Err(OtaError::ImageTooSmall)
+        );
+    }
+
+    #[test]
+    fn test_set_boot_slot_wraparound() {
+        let mut mgr = OtaDataManager::new_booted_ota0();
+        mgr.sector_0.ota_seq = u32::MAX - 2;
+        mgr.sector_0.crc = mgr.sector_0.calculate_crc();
+
+        let res = mgr.set_boot_slot(OtaSlot::Ota1);
+        assert!(res.is_ok());
+        assert_eq!(mgr.sector_1.ota_seq, 2);
+        assert_eq!(mgr.sector_1.slot(), Some(OtaSlot::Ota1));
+
+        let res0 = mgr.set_boot_slot(OtaSlot::Ota0);
+        assert!(res0.is_ok());
+        assert_eq!(mgr.sector_0.ota_seq, 1);
+        assert_eq!(mgr.sector_0.slot(), Some(OtaSlot::Ota0));
+    }
+
+    #[test]
     fn test_ota_flash_storage_load_write_and_cancel_rollback() {
         let mut flash: MockNorFlash<8192> = MockNorFlash::new();
         assert_eq!(core::mem::align_of::<AlignedOtaBuf>(), 4);
@@ -1260,10 +1722,9 @@ mod tests {
         mgr.sync_slot_to_flash(&mut flash, OtaSlot::Ota0)
             .expect("sync initial ota_0 sector");
 
-        // 2. Build a 1029-byte firmware image (1024 + 5 bytes -> tests multi-chunk + 3-byte 0xFF alignment padding)
-        let mut image = [0x5Au8; 1029];
-        let hdr = EspImageHeader::minimal_valid_header_bytes(4, 0x4008_0400);
-        image[..24].copy_from_slice(&hdr);
+        // 2. Build a valid firmware image with multi-chunk data
+        let image = make_valid_esp_image_with_len(980, false);
+        let img_len = image.len();
 
         let slot = mgr
             .write_ota_image_to_flash(&mut flash, &image)
@@ -1272,9 +1733,8 @@ mod tests {
         assert_eq!(mgr.active_slot(), OtaSlot::Ota1);
         assert_eq!(mgr.sector_1.state(), OtaImgState::PendingVerify);
 
-        // Verify ota_1 flash contents and 0xFF trailing padding up to 1032-byte 4-byte boundary
-        assert_eq!(&flash.ota_1[..1029], &image[..]);
-        assert_eq!(&flash.ota_1[1029..1032], &[0xFF, 0xFF, 0xFF]);
+        // Verify ota_1 flash contents
+        assert_eq!(&flash.ota_1[..img_len], &image[..]);
 
         // 3. Simulate reboot: reload OtaDataManager from flash and verify PendingVerify state on ota_1
         let mut booted_mgr =

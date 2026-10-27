@@ -73,7 +73,7 @@ impl CameraPid {
             0x77 => Some(Self::OV7725),
             0x26 => Some(Self::OV2640),
             0x3660 => Some(Self::OV3660),
-            0x3640 => Some(Self::OV3640),
+            0x3640..=0x364F => Some(Self::OV3640),
             0x5640 => Some(Self::OV5640),
             0x76 => Some(Self::OV7670),
             0x1410 => Some(Self::NT99141),
@@ -614,9 +614,10 @@ pub const CAMERA_SENSOR_INFO: [SensorInfo; 18] = [
 
 /// Looks up [`SensorInfo`] by 16-bit sensor PID (`esp_camera_sensor_get_info` in `driver/sensor.c`).
 pub fn esp_camera_sensor_get_info(id: &SensorId) -> Option<&'static SensorInfo> {
+    let pid = CameraPid::from_u16(id.pid)?;
     CAMERA_SENSOR_INFO
         .iter()
-        .find(|info| info.pid.as_u16() == id.pid)
+        .find(|info| info.pid == pid)
 }
 
 /// Sensor AGC gain ceiling (`gainceiling_t` from `driver/include/sensor.h`).
@@ -692,7 +693,7 @@ pub struct SensorId {
 }
 
 /// Mutable camera control state (`camera_status_t` from `driver/include/sensor.h`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CameraStatus {
     pub framesize: FrameSize,
     pub scale: bool,
@@ -915,6 +916,16 @@ mod tests {
             let found = esp_camera_sensor_get_info(&id);
             assert_eq!(found, Some(entry));
         }
+
+        // OV3640 revision PIDs like 0x364C resolve to OV3640 SensorInfo
+        let rev_id = SensorId {
+            midh: 0,
+            midl: 0,
+            pid: 0x364C,
+            ver: 0x0C,
+        };
+        let info = esp_camera_sensor_get_info(&rev_id);
+        assert_eq!(info.map(|i| i.model), Some(CameraModel::Ov3640));
     }
 
     #[test]

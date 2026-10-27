@@ -14,7 +14,7 @@ pub mod frame_pool;
 
 pub use board_pins::{
     AiThinkerPins, BoardPins, CameraPins, Esp32S3GoouuuPins, Esp32S3WroomPins, Esp32S3XiaoPins,
-    TargetChip, WroverKitPins,
+    EspEyePins, TargetChip, WroverKitPins,
 };
 pub use driver::{
     eoi_probe_window, verify_jpeg_eoi, verify_jpeg_soi, AfConfig, AfMode, AfStatus,

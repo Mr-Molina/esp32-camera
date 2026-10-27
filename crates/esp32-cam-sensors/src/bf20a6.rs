@@ -364,10 +364,12 @@ impl<B: SccbBus> CameraSensor<B> for Bf20a6 {
     fn set_pixformat(&mut self, bus: &mut B, pixformat: PixelFormat) -> Result<(), CameraError> {
         match pixformat {
             PixelFormat::Yuv422 => {
-                set_reg_bits(bus, self.slv_addr, 0x12, 0, 1, 0)?;
+                set_reg_bits(bus, self.slv_addr, 0x12, 0, 2, 0)?;
+                bus.write_reg8(self.slv_addr, 0xE3, 0x12)?;
             }
             PixelFormat::Raw => {
-                set_reg_bits(bus, self.slv_addr, 0x12, 0, 1, 1)?;
+                set_reg_bits(bus, self.slv_addr, 0x12, 0, 2, 1)?;
+                bus.write_reg8(self.slv_addr, 0xE3, 0x12)?;
             }
             PixelFormat::Grayscale => {
                 bus.write_reg8(self.slv_addr, 0x12, 0x23)?;
@@ -389,18 +391,16 @@ impl<B: SccbBus> CameraSensor<B> for Bf20a6 {
         let h = framesize.height();
         self.status.framesize = framesize;
 
-        bus.write_reg8(self.slv_addr, 0x17, 0)?;
-        bus.write_reg8(self.slv_addr, 0x18, (w >> 2) as u8)?;
-        bus.write_reg8(self.slv_addr, 0x19, 0)?;
-        bus.write_reg8(self.slv_addr, 0x1A, (h >> 2) as u8)?;
         bus.write_reg8(self.slv_addr, 0x1B, 0)?;
 
         if w <= 320 && h <= 240 {
+            set_reg_bits(bus, self.slv_addr, 0x12, 4, 1, 1)?;
             bus.write_reg8(self.slv_addr, 0x17, (80 - w / 4) as u8)?;
             bus.write_reg8(self.slv_addr, 0x18, (80 + w / 4) as u8)?;
             bus.write_reg8(self.slv_addr, 0x19, (60 - h / 4) as u8)?;
             bus.write_reg8(self.slv_addr, 0x1A, (60 + h / 4) as u8)?;
         } else if w <= 640 && h <= 480 {
+            set_reg_bits(bus, self.slv_addr, 0x12, 4, 1, 0)?;
             bus.write_reg8(self.slv_addr, 0x17, (80 - w / 8) as u8)?;
             bus.write_reg8(self.slv_addr, 0x18, (80 + w / 8) as u8)?;
             bus.write_reg8(self.slv_addr, 0x19, (60 - h / 8) as u8)?;

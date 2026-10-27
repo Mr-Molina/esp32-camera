@@ -1154,6 +1154,7 @@ dependencies = [
  "esp32-cam-sensors",
  "esp32-cam-types",
  "smoltcp",
+ "static_cell",
 ]
 
 [[package]]

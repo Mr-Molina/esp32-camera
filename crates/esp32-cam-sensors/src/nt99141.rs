@@ -745,15 +745,14 @@ impl Nt99141 {
     }
 
     fn set_image_options<B: SccbBus>(&self, bus: &mut B) -> Result<(), CameraError> {
-        let mut reg20 = 0u8;
-        let mut reg21 = 0u8;
+        let mut bits = 0u8;
         if self.status.vflip != 0 {
-            reg20 |= TIMING_TC_REG20_VFLIP;
+            bits |= TIMING_TC_REG20_VFLIP;
         }
         if self.status.hmirror != 0 {
-            reg21 |= TIMING_TC_REG21_HMIRROR;
+            bits |= TIMING_TC_REG21_HMIRROR;
         }
-        bus.write_reg16(self.slv_addr, TIMING_TC_REG20, reg20 | reg21)
+        set_reg_bits(bus, self.slv_addr, TIMING_TC_REG20, 0, 0x03, bits)
     }
 }
 
@@ -790,8 +789,7 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
         self.status.sharpness = bus.read_reg16(self.slv_addr, 0x3301)? as i8;
         self.status.denoise = (bus.read_reg16(self.slv_addr, 0x5306)? / 4).wrapping_add(1);
         self.status.ae_level = 0;
-        self.status.gainceiling =
-            (bus.read_reg16_val16(self.slv_addr, 0x32F0)? & 0xFF) as u8;
+        self.status.gainceiling = bus.read_reg16(self.slv_addr, 0x32F0)?;
         self.status.awb = check_reg_mask(bus, self.slv_addr, ISP_CONTROL_01, 0x10)?;
         self.status.dcw = u8::from(check_reg_mask(bus, self.slv_addr, 0x5183, 0x80)? == 0);
         self.status.agc = u8::from(
@@ -835,17 +833,22 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
     }
 
     fn set_framesize(&mut self, bus: &mut B, framesize: FrameSize) -> Result<(), CameraError> {
+        if framesize > FrameSize::Hd {
+            return Err(CameraError::FailedToSetFrameSize);
+        }
         self.status.framesize = framesize;
         write_reg_list(bus, self.slv_addr, SENSOR_DEFAULT_REGS)?;
         if framesize == FrameSize::Qvga {
-            write_reg_list(bus, self.slv_addr, SENSOR_FRAMESIZE_QVGA)
+            write_reg_list(bus, self.slv_addr, SENSOR_FRAMESIZE_QVGA)?;
         } else if framesize == FrameSize::Vga {
-            write_reg_list(bus, self.slv_addr, SENSOR_FRAMESIZE_VGA_XYSKIP)
+            write_reg_list(bus, self.slv_addr, SENSOR_FRAMESIZE_VGA_XYSKIP)?;
         } else if framesize >= FrameSize::Hd {
-            write_reg_list(bus, self.slv_addr, SENSOR_FRAMESIZE_HD)
+            write_reg_list(bus, self.slv_addr, SENSOR_FRAMESIZE_HD)?;
         } else {
-            write_reg_list(bus, self.slv_addr, SENSOR_FRAMESIZE_VGA)
+            write_reg_list(bus, self.slv_addr, SENSOR_FRAMESIZE_VGA)?;
         }
+        let pixformat = self.pixformat;
+        self.set_pixformat(bus, pixformat)
     }
 
     fn set_contrast(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
@@ -877,6 +880,7 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
             _ => 0x00,
         };
         bus.write_reg16(self.slv_addr, 0x32F2, value)?;
+        bus.write_reg16(self.slv_addr, 0x3060, 0x01)?;
         self.status.brightness = level as i8;
         Ok(())
     }
@@ -887,6 +891,7 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
         }
         let reg_val = SENSOR_SATURATION_LEVELS[(level + 4) as usize];
         bus.write_reg16(self.slv_addr, 0x32F3, reg_val)?;
+        bus.write_reg16(self.slv_addr, 0x3060, 0x01)?;
         self.status.saturation = level as i8;
         Ok(())
     }
@@ -1000,8 +1005,8 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
     }
 
     fn set_aec_value(&mut self, bus: &mut B, gain: i32) -> Result<(), CameraError> {
-        write_reg_bits(bus, self.slv_addr, 0x3012, 0x00, ((gain >> 8) & 0xFF) != 0)?;
-        write_reg_bits(bus, self.slv_addr, 0x3013, 0x01, (gain & 0xFF) != 0)?;
+        bus.write_reg16(self.slv_addr, 0x3012, ((gain >> 8) & 0xFF) as u8)?;
+        bus.write_reg16(self.slv_addr, 0x3013, (gain & 0xFF) as u8)?;
         self.status.aec_value = gain as u16;
         Ok(())
     }
@@ -1023,7 +1028,7 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
         if !(0..=4).contains(&mode) {
             return Err(CameraError::InvalidArg);
         }
-        bus.write_reg16(self.slv_addr, 0x3201, u8::from(mode != 0))?;
+        write_reg_bits(bus, self.slv_addr, 0x3201, 0x01, mode != 0)?;
         let preset = match mode {
             1 => Some((0x01, 0x38, 0x01, 0x68, 0x01)), // Sunny
             2 => Some((0x01, 0x51, 0x01, 0x00, 0x01)), // Cloudy
@@ -1032,11 +1037,11 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
             _ => None,
         };
         if let Some((r90, r91, r96, r97, r60)) = preset {
-            bus.write_reg16_val16(self.slv_addr, 0x3290, r90)?;
-            bus.write_reg16_val16(self.slv_addr, 0x3291, r91)?;
-            bus.write_reg16_val16(self.slv_addr, 0x3296, r96)?;
-            bus.write_reg16_val16(self.slv_addr, 0x3297, r97)?;
-            bus.write_reg16_val16(self.slv_addr, 0x3060, r60)?;
+            bus.write_reg16(self.slv_addr, 0x3290, r90)?;
+            bus.write_reg16(self.slv_addr, 0x3291, r91)?;
+            bus.write_reg16(self.slv_addr, 0x3296, r96)?;
+            bus.write_reg16(self.slv_addr, 0x3297, r97)?;
+            bus.write_reg16(self.slv_addr, 0x3060, r60)?;
         }
         self.status.wb_mode = mode as u8;
         Ok(())
@@ -1049,6 +1054,7 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
             let entry = SENSOR_AE_LEVEL[base + i];
             bus.write_reg16(self.slv_addr, entry.reg, entry.val)?;
         }
+        bus.write_reg16(self.slv_addr, 0x3060, 0x01)?;
         self.status.ae_level = clamped as i8;
         Ok(())
     }

@@ -1249,19 +1249,21 @@ impl<B: SccbBus> CameraSensor<B> for Ov3660 {
         pclken: i32,
         pclk: i32,
     ) -> Result<(), CameraError> {
-        if mul < 0 || sys < 0 || pre < 0 || seld5 < 0 || pclk < 0 {
-            return Err(CameraError::InvalidArg);
-        }
+        let mul = u8::try_from(mul).map_err(|_| CameraError::InvalidArg)?;
+        let sys = u8::try_from(sys).map_err(|_| CameraError::InvalidArg)?;
+        let pre = u8::try_from(pre).map_err(|_| CameraError::InvalidArg)?;
+        let seld5 = u8::try_from(seld5).map_err(|_| CameraError::InvalidArg)?;
+        let pclk = u8::try_from(pclk).map_err(|_| CameraError::InvalidArg)?;
         self.configure_pll(
             bus,
             bypass > 0,
-            mul as u8,
-            sys as u8,
-            pre as u8,
+            mul,
+            sys,
+            pre,
             root > 0,
-            seld5 as u8,
+            seld5,
             pclken > 0,
-            pclk as u8,
+            pclk,
         )
     }
 

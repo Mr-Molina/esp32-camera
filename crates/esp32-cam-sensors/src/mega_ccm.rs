@@ -331,7 +331,7 @@ impl<B: SccbBus> CameraSensor<B> for MegaCcm {
     fn set_aec2(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let val = u8::from(enable);
         bus.write_reg16(self.slv_addr, AGC_MODE_REG, val)?;
-        self.status.aec = val;
+        self.status.aec2 = val;
         Ok(())
     }
 

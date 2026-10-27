@@ -141,13 +141,21 @@ pub fn rgb888_to_bmp(
 
     let mut out_off = BMP_HEADER_LEN;
     let mut in_off = 0usize;
+    let w = width as usize;
     let h = height as usize;
 
     for _y in 0..h {
-        dst[out_off..out_off + layout.row_bytes]
-            .copy_from_slice(&src[in_off..in_off + layout.row_bytes]);
-        out_off += layout.row_bytes;
-        in_off += layout.row_bytes;
+        for _x in 0..w {
+            let r = src[in_off];
+            let g = src[in_off + 1];
+            let b = src[in_off + 2];
+            in_off += 3;
+
+            dst[out_off] = b;
+            dst[out_off + 1] = g;
+            dst[out_off + 2] = r;
+            out_off += 3;
+        }
         for _p in 0..layout.padding {
             dst[out_off] = 0;
             out_off += 1;
@@ -263,6 +271,9 @@ pub fn yuv422_to_bmp(
     width: u16,
     height: u16,
 ) -> Result<usize, CameraError> {
+    if (width & 1) != 0 {
+        return Err(CameraError::InvalidArg);
+    }
     let layout = compute_bmp_layout(width, height, 2, 3, 0)?;
     if src.len() < layout.src_required {
         return Err(CameraError::InvalidArg);
@@ -297,16 +308,6 @@ pub fn yuv422_to_bmp(
             dst[out_off + 5] = r1;
             out_off += 6;
         }
-        if (w & 1) != 0 {
-            let y0 = src[in_off];
-            let u = src[in_off + 1];
-            in_off += 2;
-            let (r0, g0, b0) = yuv2rgb(y0, u, 128);
-            dst[out_off] = b0;
-            dst[out_off + 1] = g0;
-            dst[out_off + 2] = r0;
-            out_off += 3;
-        }
         for _p in 0..layout.padding {
             dst[out_off] = 0;
             out_off += 1;
@@ -332,7 +333,18 @@ pub fn frame_to_bmp(
         PixelFormat::Rgb565 => rgb565_to_bmp(src, dst, width, height),
         PixelFormat::Grayscale => grayscale_to_bmp(src, dst, width, height),
         PixelFormat::Yuv422 => yuv422_to_bmp(src, dst, width, height),
-        PixelFormat::Jpeg => crate::jpeg_codec::jpeg_to_bmp(src, dst),
+        PixelFormat::Jpeg => {
+            if let Some((jw, jh)) = crate::jpeg_scan::parse_jpeg_dimensions(src) {
+                if (width != 0 && width != jw) || (height != 0 && height != jh) {
+                    return Err(CameraError::InvalidArg);
+                }
+            }
+            let (dec_w, dec_h, written) = crate::jpeg_codec::jpeg_to_bmp(src, dst)?;
+            if (width != 0 && width != dec_w) || (height != 0 && height != dec_h) {
+                return Err(CameraError::InvalidArg);
+            }
+            Ok(written)
+        }
         _ => Err(CameraError::InvalidFormat),
     }
 }
@@ -344,7 +356,13 @@ mod tests {
     #[test]
     fn test_rgb888_to_bmp_with_padding() {
         // 3x2 image: row_bytes = 9, row_stride = 12 (3 bytes padding per row), image_size = 24
-        let src = [0xAAu8; 18];
+        // CONV-002: Provide distinct [R, G, B] pixels to verify little-endian [B, G, R] output
+        let mut src = [0u8; 18];
+        for i in 0..6 {
+            src[i * 3] = 0x11;     // R
+            src[i * 3 + 1] = 0x22; // G
+            src[i * 3 + 2] = 0x33; // B
+        }
         let mut dst = [0u8; BMP_HEADER_LEN + 24];
         let written = rgb888_to_bmp(&src, &mut dst, 3, 2).expect("rgb888_to_bmp should succeed");
         assert_eq!(written, BMP_HEADER_LEN + 24);
@@ -354,8 +372,11 @@ mod tests {
         assert_eq!(i32::from_le_bytes([dst[18], dst[19], dst[20], dst[21]]), 3);
         assert_eq!(i32::from_le_bytes([dst[22], dst[23], dst[24], dst[25]]), -2);
         assert_eq!(u16::from_le_bytes([dst[28], dst[29]]), 24);
+        // Verify CONV-002: little-endian BMP pixel byte order is [B, G, R] = [0x33, 0x22, 0x11]
+        assert_eq!(&dst[54..57], &[0x33, 0x22, 0x11]);
+        assert_eq!(&dst[57..60], &[0x33, 0x22, 0x11]);
+        assert_eq!(&dst[60..63], &[0x33, 0x22, 0x11]);
         // Check row 0 padding bytes are 0
-        assert_eq!(&dst[54..63], &[0xAAu8; 9]);
         assert_eq!(&dst[63..66], &[0, 0, 0]);
     }
 
@@ -418,12 +439,48 @@ mod tests {
             Err(CameraError::Overflow)
         );
         assert_eq!(
-            yuv422_to_bmp(&[], &mut dst, u16::MAX, u16::MAX),
+            yuv422_to_bmp(&[], &mut dst, u16::MAX - 1, u16::MAX),
             Err(CameraError::Overflow)
         );
         assert_eq!(
             frame_to_bmp(&[], &mut dst, u16::MAX, u16::MAX, PixelFormat::Rgb888),
             Err(CameraError::Overflow)
         );
+    }
+
+    #[test]
+    fn test_yuv422_to_bmp_odd_width_rejection() {
+        // CONV-005: Reject odd width in yuv422_to_bmp
+        let mut dst = [0u8; 128];
+        assert_eq!(
+            yuv422_to_bmp(&[128u8; 12], &mut dst, 3, 2),
+            Err(CameraError::InvalidArg)
+        );
+    }
+
+    #[test]
+    fn test_frame_to_bmp_jpeg_dimension_mismatch() {
+        // CONV-006: In frame_to_bmp(..., PixelFormat::Jpeg), verify caller width/height
+        let rgb_in = [100u8; 8 * 8 * 3];
+        let mut jpeg_buf = [0u8; 2048];
+        let jpeg_len = crate::jpeg_codec::encode_rgb888_to_jpeg(&rgb_in, &mut jpeg_buf, 8, 8, 90)
+            .expect("encode should succeed");
+        let jpeg_slice = &jpeg_buf[..jpeg_len];
+
+        let mut bmp_buf = [0u8; BMP_HEADER_LEN + 16 * 16 * 3];
+        // Mismatched width (16 instead of 8)
+        assert_eq!(
+            frame_to_bmp(jpeg_slice, &mut bmp_buf, 16, 8, PixelFormat::Jpeg),
+            Err(CameraError::InvalidArg)
+        );
+        // Mismatched height (16 instead of 8)
+        assert_eq!(
+            frame_to_bmp(jpeg_slice, &mut bmp_buf, 8, 16, PixelFormat::Jpeg),
+            Err(CameraError::InvalidArg)
+        );
+        // Matching dimensions succeed
+        assert!(frame_to_bmp(jpeg_slice, &mut bmp_buf, 8, 8, PixelFormat::Jpeg).is_ok());
+        // Unspecified dimensions (0, 0) succeed
+        assert!(frame_to_bmp(jpeg_slice, &mut bmp_buf, 0, 0, PixelFormat::Jpeg).is_ok());
     }
 }

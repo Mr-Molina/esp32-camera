@@ -432,17 +432,23 @@ impl<B: SccbBus> CameraSensor<B> for Ov7670 {
         Ok(())
     }
 
-    fn init_status(&mut self, _bus: &mut B) -> Result<(), CameraError> {
-        self.status.awb = 0;
-        self.status.aec = 0;
-        self.status.agc = 0;
-        self.status.hmirror = 0;
-        self.status.vflip = 0;
-        self.status.colorbar = 0;
+    fn init_status(&mut self, bus: &mut B) -> Result<(), CameraError> {
+        let com8 = bus.read_reg8(self.slv_addr, COM8)?;
+        self.status.aec = com8 & 0x01;
+        self.status.awb = (com8 >> 1) & 0x01;
+        self.status.agc = (com8 >> 2) & 0x01;
+
+        let mvfp = bus.read_reg8(self.slv_addr, MVFP)?;
+        self.status.vflip = (mvfp >> 4) & 0x01;
+        self.status.hmirror = (mvfp >> 5) & 0x01;
+
+        let ysc = bus.read_reg8(self.slv_addr, SCALING_YSC)?;
+        self.status.colorbar = (ysc >> 7) & 0x01;
         Ok(())
     }
 
     fn set_pixformat(&mut self, bus: &mut B, pixformat: PixelFormat) -> Result<(), CameraError> {
+        let mvfp_old = bus.read_reg8(self.slv_addr, MVFP)?;
         match pixformat {
             PixelFormat::Rgb565 | PixelFormat::Rgb888 => {
                 write_regs8(bus, self.slv_addr, OV7670_FMT_RGB565)?;
@@ -452,6 +458,9 @@ impl<B: SccbBus> CameraSensor<B> for Ov7670 {
             }
             _ => return Err(CameraError::NotSupported),
         }
+        let mvfp_new = (bus.read_reg8(self.slv_addr, MVFP)? & !0x30) | (mvfp_old & 0x30);
+        bus.write_reg8(self.slv_addr, MVFP, mvfp_new)?;
+
         bus.delay_ms(30);
         if pixformat == PixelFormat::Rgb565 {
             bus.write_reg8(self.slv_addr, CLKRC, self.clkrc)?;
@@ -461,6 +470,9 @@ impl<B: SccbBus> CameraSensor<B> for Ov7670 {
     }
 
     fn set_framesize(&mut self, bus: &mut B, framesize: FrameSize) -> Result<(), CameraError> {
+        if framesize > FrameSize::Vga {
+            return Err(CameraError::FailedToSetFrameSize);
+        }
         self.clkrc = bus.read_reg8(self.slv_addr, CLKRC)?;
 
         match framesize {

@@ -336,8 +336,8 @@ impl<B: SccbBus> CameraSensor<B> for Bf3005 {
         self.status.awb_gain = bus.read_reg8(self.slv_addr, 0xA6)?;
         self.status.aec = get_reg_bits(bus, self.slv_addr, 0x13, 0, 1)?;
         self.status.agc = get_reg_bits(bus, self.slv_addr, 0x13, 2, 1)?;
-        self.status.raw_gma = get_reg_bits(bus, self.slv_addr, 0xF1, 1, 1)?;
-        self.status.lenc = get_reg_bits(bus, self.slv_addr, 0xF1, 0, 1)?;
+        self.status.raw_gma = u8::from(get_reg_bits(bus, self.slv_addr, 0xF1, 1, 1)? == 0);
+        self.status.lenc = u8::from(get_reg_bits(bus, self.slv_addr, 0xF1, 0, 1)? == 0);
         self.status.hmirror = get_reg_bits(bus, self.slv_addr, 0x1E, 5, 1)?;
         self.status.vflip = get_reg_bits(bus, self.slv_addr, 0x1E, 4, 1)?;
         self.status.colorbar = bus.read_reg8(self.slv_addr, 0xB9)?;
@@ -348,13 +348,13 @@ impl<B: SccbBus> CameraSensor<B> for Bf3005 {
     fn set_pixformat(&mut self, bus: &mut B, pixformat: PixelFormat) -> Result<(), CameraError> {
         match pixformat {
             PixelFormat::Rgb565 => {
-                set_reg_bits(bus, self.slv_addr, 0x12, 2, 1, 1)?;
-            }
-            PixelFormat::Raw => {
                 set_reg_bits(bus, self.slv_addr, 0x12, 0, 3, 0x04)?;
             }
+            PixelFormat::Raw => {
+                set_reg_bits(bus, self.slv_addr, 0x12, 0, 3, 0x01)?;
+            }
             PixelFormat::Yuv422 | PixelFormat::Grayscale => {
-                set_reg_bits(bus, self.slv_addr, 0x12, 2, 1, 0)?;
+                set_reg_bits(bus, self.slv_addr, 0x12, 0, 3, 0x00)?;
             }
             _ => return Err(CameraError::NotSupported),
         }
@@ -370,12 +370,6 @@ impl<B: SccbBus> CameraSensor<B> for Bf3005 {
         let w = framesize.width();
         let h = framesize.height();
         self.status.framesize = framesize;
-
-        bus.write_reg8(self.slv_addr, 0x17, 0)?;
-        bus.write_reg8(self.slv_addr, 0x18, (w >> 2) as u8)?;
-        bus.write_reg8(self.slv_addr, 0x19, 0)?;
-        bus.write_reg8(self.slv_addr, 0x1A, (h >> 2) as u8)?;
-        bus.write_reg8(self.slv_addr, 0x03, 0)?;
 
         if w <= 320 && h <= 240 {
             set_reg_bits(bus, self.slv_addr, 0x12, 4, 1, 1)?;
@@ -473,14 +467,14 @@ impl<B: SccbBus> CameraSensor<B> for Bf3005 {
     fn set_raw_gma(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let inv = u8::from(!enable);
         set_reg_bits(bus, self.slv_addr, 0xF1, 1, 1, inv)?;
-        self.status.raw_gma = inv;
+        self.status.raw_gma = u8::from(enable);
         Ok(())
     }
 
     fn set_lenc(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let inv = u8::from(!enable);
         set_reg_bits(bus, self.slv_addr, 0xF1, 0, 1, inv)?;
-        self.status.lenc = inv;
+        self.status.lenc = u8::from(enable);
         Ok(())
     }
 

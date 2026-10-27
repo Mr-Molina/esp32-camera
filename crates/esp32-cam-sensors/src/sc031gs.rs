@@ -7,8 +7,8 @@ use crate::{
     PixelFormat, Reg16, SccbBus, SensorId,
 };
 
-pub const SC031GS_PID_LOW_REG: u16 = 0x3107;
-pub const SC031GS_PID_HIGH_REG: u16 = 0x3108;
+pub const SC031GS_PID_HIGH_REG: u16 = 0x3107;
+pub const SC031GS_PID_LOW_REG: u16 = 0x3108;
 pub const SC031GS_MAX_FRAME_WIDTH: u16 = 640;
 pub const SC031GS_MAX_FRAME_HEIGHT: u16 = 480;
 pub const SC031GS_GAIN_CTRL_COARSE_REG: u16 = 0x3E08;
@@ -373,8 +373,8 @@ impl Sc031Gs {
         if slv_addr != CameraSccbAddr::SC031GS {
             return Err(CameraError::NotDetected);
         }
-        let midl = bus.read_reg16(slv_addr, SC031GS_PID_HIGH_REG)? as u16;
-        let midh = bus.read_reg16(slv_addr, SC031GS_PID_LOW_REG)? as u16;
+        let midh = bus.read_reg16(slv_addr, SC031GS_PID_HIGH_REG)? as u16;
+        let midl = bus.read_reg16(slv_addr, SC031GS_PID_LOW_REG)? as u16;
         let pid = (midh << 8) | midl;
         if pid == CameraPid::SC031GS.as_u16() {
             Ok(SensorId {
@@ -527,13 +527,19 @@ impl<B: SccbBus> CameraSensor<B> for Sc031Gs {
         }
         let w = framesize.width();
         let h = framesize.height();
-        let framesize_regs = if framesize > FrameSize::Qvga {
-            SC031GS_640X480_50FPS_INIT_REGS
+        let (framesize_regs, offset_x, offset_y) = if w <= 200 && h <= 200 {
+            (
+                SC031GS_200X200_INIT_REGS,
+                (200 - w) / 2 + 4,
+                (200 - h) / 2 + 8,
+            )
         } else {
-            SC031GS_200X200_INIT_REGS
+            (
+                SC031GS_640X480_50FPS_INIT_REGS,
+                (SC031GS_MAX_FRAME_WIDTH - w) / 2 + 4,
+                (SC031GS_MAX_FRAME_HEIGHT - h) / 2 + 4,
+            )
         };
-        let offset_x = (SC031GS_MAX_FRAME_WIDTH - w) / 2 + 4;
-        let offset_y = (SC031GS_MAX_FRAME_HEIGHT - h) / 2 + 4;
 
         write_reg_list(bus, self.slv_addr, framesize_regs)?;
         self.set_output_window(bus, offset_x, offset_y, w, h)?;
@@ -544,8 +550,8 @@ impl<B: SccbBus> CameraSensor<B> for Sc031Gs {
     fn set_colorbar(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let val = u8::from(enable);
         set_reg_bits(bus, self.slv_addr, 0x4501, 3, 1, val)?;
-        set_reg_bits(bus, self.slv_addr, 0x3902, 6, 1, 1)?;
-        set_reg_bits(bus, self.slv_addr, 0x3E06, 0, 2, 3)?;
+        set_reg_bits(bus, self.slv_addr, 0x3902, 6, 1, val)?;
+        set_reg_bits(bus, self.slv_addr, 0x3E06, 0, 2, if enable { 3 } else { 0 })?;
         self.status.colorbar = val;
         Ok(())
     }

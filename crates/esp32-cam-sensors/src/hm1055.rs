@@ -1015,7 +1015,7 @@ impl<B: SccbBus> CameraSensor<B> for Hm1055 {
         self.status.ae_level = 0;
         self.status.awb = check_reg_mask(bus, self.slv_addr, AEWBCFG, 0x02)?;
         self.status.agc = 1;
-        self.status.aec = check_reg_mask(bus, self.slv_addr, AEWBCFG, 0x04)?;
+        self.status.aec = check_reg_mask(bus, self.slv_addr, AEWBCFG, 0x01)?;
         self.status.hmirror = check_reg_mask(bus, self.slv_addr, RDCFG, 0x02)?;
         self.status.vflip = check_reg_mask(bus, self.slv_addr, RDCFG, 0x01)?;
         self.status.lenc = check_reg_mask(bus, self.slv_addr, ISPCTRL3, 0x40)?;
@@ -1035,11 +1035,15 @@ impl<B: SccbBus> CameraSensor<B> for Hm1055 {
             _ => return Err(CameraError::NotSupported),
         };
         bus.write_reg16(self.slv_addr, PORTCTRL, portctrl)?;
+        bus.write_reg16(self.slv_addr, CMU, 0x01)?;
         self.pixformat = pixformat;
         Ok(())
     }
 
     fn set_framesize(&mut self, bus: &mut B, framesize: FrameSize) -> Result<(), CameraError> {
+        if framesize > FrameSize::Hd {
+            return Err(CameraError::FailedToSetFrameSize);
+        }
         self.status.framesize = framesize;
         write_reg_list(bus, self.slv_addr, SENSOR_DEFAULT_REGS)?;
         match framesize {
@@ -1056,6 +1060,8 @@ impl<B: SccbBus> CameraSensor<B> for Hm1055 {
             }
             _ => write_reg_list(bus, self.slv_addr, SENSOR_FRAMESIZE_VGA)?,
         }
+        let pixformat = self.pixformat;
+        self.set_pixformat(bus, pixformat)?;
         bus.write_reg16(self.slv_addr, CMU, 0x01)?;
         bus.write_reg16(self.slv_addr, TGRDCFG, 0x01)
     }
@@ -1064,6 +1070,7 @@ impl<B: SccbBus> CameraSensor<B> for Hm1055 {
         let ispctrl5 = bus.read_reg16(self.slv_addr, ISPCTRL5)? | 0x80;
         bus.write_reg16(self.slv_addr, ISPCTRL5, ispctrl5)?;
         bus.write_reg16(self.slv_addr, ACONTQ, ((level.wrapping_mul(0x20)) & 0xFF) as u8)?;
+        bus.write_reg16(self.slv_addr, CMU, 0x01)?;
         self.status.contrast = level as i8;
         Ok(())
     }
@@ -1082,6 +1089,7 @@ impl<B: SccbBus> CameraSensor<B> for Hm1055 {
         };
         bus.write_reg16(self.slv_addr, ISPCTRL5, ispctrl5)?;
         bus.write_reg16(self.slv_addr, BRIGHT, brightness)?;
+        bus.write_reg16(self.slv_addr, CMU, 0x01)?;
         self.status.brightness = level as i8;
         Ok(())
     }
@@ -1089,6 +1097,7 @@ impl<B: SccbBus> CameraSensor<B> for Hm1055 {
     fn set_saturation(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
         let val = ((level.wrapping_mul(0x20).wrapping_add(0x4A)) & 0xFF) as u8;
         bus.write_reg16(self.slv_addr, SAT, val)?;
+        bus.write_reg16(self.slv_addr, CMU, 0x01)?;
         self.status.saturation = level as i8;
         Ok(())
     }
@@ -1096,6 +1105,7 @@ impl<B: SccbBus> CameraSensor<B> for Hm1055 {
     fn set_sharpness(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
         let val = ((level.wrapping_mul(0x20).wrapping_add(0x60)) & 0xFF) as u8;
         bus.write_reg16(self.slv_addr, EDGE, val)?;
+        bus.write_reg16(self.slv_addr, CMU, 0x01)?;
         self.status.sharpness = level as i8;
         Ok(())
     }
@@ -1105,6 +1115,7 @@ impl<B: SccbBus> CameraSensor<B> for Hm1055 {
         bus.write_reg16(self.slv_addr, ISPCTRL5, ispctrl5)?;
         let val = ((level.wrapping_mul(2).wrapping_add(0x07)) & 0xFF) as u8;
         bus.write_reg16(self.slv_addr, YDN, val)?;
+        bus.write_reg16(self.slv_addr, CMU, 0x01)?;
         self.status.denoise = (level & 0xFF) as u8;
         Ok(())
     }
@@ -1121,6 +1132,7 @@ impl<B: SccbBus> CameraSensor<B> for Hm1055 {
 
     fn set_whitebal(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         write_reg_bits(bus, self.slv_addr, AEWBCFG, 0x02, enable)?;
+        bus.write_reg16(self.slv_addr, CMU, 0x01)?;
         self.status.awb = u8::from(enable);
         Ok(())
     }
@@ -1132,18 +1144,21 @@ impl<B: SccbBus> CameraSensor<B> for Hm1055 {
 
     fn set_exposure_ctrl(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         write_reg_bits(bus, self.slv_addr, AEWBCFG, 0x01, enable)?;
+        bus.write_reg16(self.slv_addr, CMU, 0x01)?;
         self.status.aec = u8::from(enable);
         Ok(())
     }
 
     fn set_hmirror(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         write_reg_bits(bus, self.slv_addr, RDCFG, 0x02, enable)?;
+        bus.write_reg16(self.slv_addr, CMU, 0x01)?;
         self.status.hmirror = u8::from(enable);
         Ok(())
     }
 
     fn set_vflip(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         write_reg_bits(bus, self.slv_addr, RDCFG, 0x01, enable)?;
+        bus.write_reg16(self.slv_addr, CMU, 0x01)?;
         self.status.vflip = u8::from(enable);
         Ok(())
     }
@@ -1153,12 +1168,14 @@ impl<B: SccbBus> CameraSensor<B> for Hm1055 {
             return Err(CameraError::InvalidArg);
         }
         bus.write_reg16(self.slv_addr, AGAIN, gain as u8)?;
+        bus.write_reg16(self.slv_addr, CMU, 0x01)?;
         self.status.agc_gain = gain as u8;
         Ok(())
     }
 
     fn set_aec_value(&mut self, bus: &mut B, gain: i32) -> Result<(), CameraError> {
         bus.write_reg16(self.slv_addr, AETARGM, (gain & 0xFF) as u8)?;
+        bus.write_reg16(self.slv_addr, CMU, 0x01)?;
         self.status.aec_value = (gain & 0xFFFF) as u16;
         Ok(())
     }
@@ -1172,18 +1189,21 @@ impl<B: SccbBus> CameraSensor<B> for Hm1055 {
         let lower = ((target_level * 23) / 25) as u8;
         bus.write_reg16(self.slv_addr, AETARGU, upper)?;
         bus.write_reg16(self.slv_addr, AETARGL, lower)?;
+        bus.write_reg16(self.slv_addr, CMU, 0x01)?;
         self.status.ae_level = level as i8;
         Ok(())
     }
 
     fn set_raw_gma(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         write_reg_bits(bus, self.slv_addr, ISPCTRL1, 0x04, enable)?;
+        bus.write_reg16(self.slv_addr, CMU, 0x01)?;
         self.status.raw_gma = u8::from(enable);
         Ok(())
     }
 
     fn set_lenc(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         write_reg_bits(bus, self.slv_addr, ISPCTRL3, 0x40, enable)?;
+        bus.write_reg16(self.slv_addr, CMU, 0x01)?;
         self.status.lenc = u8::from(enable);
         Ok(())
     }

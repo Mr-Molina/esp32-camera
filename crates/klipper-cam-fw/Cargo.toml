@@ -11,18 +11,19 @@ esp32-cam-sccb.workspace = true
 esp32-cam-sensors.workspace = true
 esp32-cam-conversions.workspace = true
 esp32-cam-ll.workspace = true
-esp32-cam-hal.workspace = true
+esp32-cam-hal = { workspace = true, features = ["sensors"] }
 
 [target.'cfg(target_arch = "xtensa")'.dependencies]
 esp-hal = { version = "1.2.2", features = ["esp32", "unstable"] }
-esp-alloc = "0.11.0"
+esp-alloc = { version = "0.11.0", features = ["esp32"] }
 esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32"] }
-esp-backtrace = { version = "0.20.0", features = ["esp32", "println", "panic-handler"] }
+esp-backtrace = { version = "0.20.0", features = ["esp32", "println", "panic-handler", "custom-halt"] }
 esp-println = { version = "0.18.0", features = ["esp32"] }
 esp-rtos = { version = "0.4.0", features = ["esp32", "esp-radio", "esp-alloc"] }
 esp-radio = { version = "1.0.0-beta.1", features = ["esp32", "wifi", "unstable", "esp-alloc"] }
 esp-storage = { version = "0.10.0", features = ["esp32"] }
 embassy-futures = "0.1.2"
+static_cell = "2.1.1"
 smoltcp = { version = "0.12.0", default-features = false, features = ["medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-raw", "socket-icmp", "socket-udp", "socket-tcp", "socket-dhcpv4", "iface-max-addr-count-2"] }
 
 [lints]

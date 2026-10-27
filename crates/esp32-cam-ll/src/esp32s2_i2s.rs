@@ -145,6 +145,24 @@ impl Esp32S2I2sCamera {
         self.psram_mode = psram_mode;
     }
 
+    /// Returns `true` if PSRAM direct-DMA mode is enabled.
+    #[inline]
+    pub const fn psram_mode(&self) -> bool {
+        self.psram_mode
+    }
+
+    /// Sets byte swapping (`rx_msb_right`).
+    #[inline]
+    pub fn set_swap_data(&mut self, swap_data: bool) {
+        self.swap_data = swap_data;
+    }
+
+    /// Returns `true` if byte swapping (`rx_msb_right`) is enabled.
+    #[inline]
+    pub const fn swap_data(&self) -> bool {
+        self.swap_data
+    }
+
     /// Returns the configured GPIO matrix bindings.
     #[inline]
     pub fn gpio_bindings(&self) -> &[GpioMatrixBinding] {
@@ -229,8 +247,8 @@ impl Esp32S2I2sCamera {
             I2S_LCD_EN_BIT | I2S_CAMERA_EN_BIT | (1 << 11) | (4 << 8),
         );
 
-        // `rx_bck_div_num = 1, rx_bits_mod = 8`
-        volatile_write_u32(&mut self.regs.sample_rate_conf, 1 | (8 << 18));
+        // `rx_bck_div_num = 1 (bit 6), rx_bits_mod = 8 (bits 18..23)`
+        volatile_write_u32(&mut self.regs.sample_rate_conf, (1 << 6) | (8 << 18));
         volatile_write_u32(&mut self.regs.conf_chan, 1 << 3);
 
         // `dscr_en = 1 (bit 12), rx_fifo_mod_force_en = 1 (bit 20), rx_data_num = 32 (bits 6..11), rx_fifo_mod = 2 (bits 16..18)`
@@ -242,7 +260,7 @@ impl Esp32S2I2sCamera {
         let swap_bit = if self.swap_data { 1 << 9 } else { 0 };
         volatile_write_u32(
             &mut self.regs.conf,
-            (1 << 7) | (1 << 26) | swap_bit | I2S_RX_START_BIT,
+            (1 << 7) | (1 << 26) | swap_bit,
         );
 
         Ok(())
@@ -396,7 +414,14 @@ impl Esp32S2I2sCamera {
                 dst[out_off + 3] = src[in_off + 6];
                 i += 1;
             }
-            end * 4
+            let mut out_bytes = end * 4;
+            let mut rem_in = end * 8;
+            while rem_in + 1 < src.len() && out_bytes < dst.len() {
+                dst[out_bytes] = src[rem_in];
+                out_bytes += 1;
+                rem_in += 2;
+            }
+            out_bytes
         } else {
             let n = src.len().min(dst.len());
             dst[..n].copy_from_slice(&src[..n]);
@@ -428,6 +453,17 @@ mod tests {
         assert_eq!(cam.dma_align(), 64);
 
         assert_eq!(cam.config(), Ok(()));
+        // Verify rx_bck_div_num is shifted by 6, and rx_start bit is NOT set prematurely (LL-010)
+        assert_ne!(cam.regs().sample_rate_conf & (1 << 6), 0);
+        assert_eq!(cam.regs().conf & I2S_RX_START_BIT, 0);
+
+        // Swap data getter and setter
+        assert!(!cam.swap_data());
+        cam.set_swap_data(true);
+        assert!(cam.swap_data());
+        assert_eq!(cam.config(), Ok(()));
+        assert_ne!(cam.regs().conf & (1 << 9), 0);
+
         assert_eq!(
             cam.set_sample_mode(PixelFormat::Grayscale, CameraPid::OV2640.as_u16()),
             Ok((2, 1))
@@ -437,6 +473,12 @@ mod tests {
         let mut dst = [0u8; 4];
         assert_eq!(cam.memcpy(&mut dst, &src), 4);
         assert_eq!(dst, [10, 20, 30, 40]);
+
+        // Remainder 1..=3 tail pixels (LL-010)
+        let src_tail = [10, 99, 20, 99, 30, 99, 40, 99, 50, 99, 60, 99, 70, 99]; // 14 bytes = 8 + 6 (3 tail pixels)
+        let mut dst_tail = [0u8; 8];
+        assert_eq!(cam.memcpy(&mut dst_tail, &src_tail), 7);
+        assert_eq!(&dst_tail[..7], &[10, 20, 30, 40, 50, 60, 70]);
 
         let dma_cfg = cam
             .dma_sizes(320, 240, 320 * 240 * 2, DEFAULT_CAMERA_DMA_BUFFER_SIZE_MAX)

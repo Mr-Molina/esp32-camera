@@ -1,6 +1,7 @@
 //! Low-level `#![no_std]` DMA descriptor ring, I2S0/LCD_CAM capture filter, and XCLK configuration.
 
 #![no_std]
+#![cfg_attr(target_arch = "xtensa", feature(asm_experimental_arch))]
 
 pub use esp32_cam_types::{CameraConvMode, CameraError, CameraPid, FrameSize, PixelFormat};
 

@@ -294,6 +294,7 @@ impl Sc101Iot {
         if slv_addr != CameraSccbAddr::SC101IOT {
             return Err(CameraError::NotDetected);
         }
+        bus.write_reg8(slv_addr, 0xF0, 0x00)?;
         let midl = bus.read_reg8(slv_addr, SC101_SENSOR_ID_LOW_REG)? as u16;
         let midh = bus.read_reg8(slv_addr, SC101_SENSOR_ID_HIGH_REG)? as u16;
         let pid = (midh << 8) | midl;
@@ -487,10 +488,7 @@ impl<B: SccbBus> CameraSensor<B> for Sc101Iot {
     }
 
     fn set_awb_gain(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        let val = i32::from(enable);
-        self.set_reg_bits(bus, 0x00B0, 0, 1, 1)?;
-        self.set_reg(bus, 0x00C8, 0xFF, val & 0xFF)?;
-        self.set_reg(bus, 0x00C9, 0xFF, (val >> 8) & 0xFF)?;
+        self.set_reg_bits(bus, 0x00B0, 0, 1, u8::from(enable))?;
         self.status.awb_gain = u8::from(enable);
         Ok(())
     }
@@ -508,6 +506,7 @@ impl<B: SccbBus> CameraSensor<B> for Sc101Iot {
     fn set_aec_value(&mut self, bus: &mut B, gain: i32) -> Result<(), CameraError> {
         self.set_reg_bits(bus, 0x0070, 0, 1, 1)?;
         self.set_reg(bus, 0x0072, 0xFF, gain & 0xFF)?;
+        self.set_reg(bus, 0x0073, 0xFF, (gain >> 8) & 0xFF)?;
         self.status.aec_value = (gain & 0xFFFF) as u16;
         Ok(())
     }

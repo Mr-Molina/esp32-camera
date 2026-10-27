@@ -39,11 +39,11 @@ mod tests {
 
         assert_eq!(sensor.reset(&mut bus), Ok(()));
         assert_eq!(sensor.init_status(&mut bus), Ok(()));
-        assert_eq!(sensor.set_pixformat(&mut bus, PixelFormat::Jpeg), Ok(()));
 
-        // Reset again to load UXGA defaults (`HSIZE8 = 0xC8`, `VSIZE8 = 0x96`, `SIZEL = 0x00`)
-        // then configure `FrameSize::Hd` (1280x720, 16:9 crop with `offset_y = 150`, `max_y = 900`).
+        // Reset to load UXGA defaults (`HSIZE8 = 0xC8`, `VSIZE8 = 0x96`, `SIZEL = 0x00`)
+        // then configure `PixelFormat::Jpeg` and `FrameSize::Hd` (1280x720, 16:9 crop with `offset_y = 150`, `max_y = 900`).
         assert_eq!(sensor.reset(&mut bus), Ok(()));
+        assert_eq!(sensor.set_pixformat(&mut bus, PixelFormat::Jpeg), Ok(()));
         assert_eq!(sensor.set_framesize(&mut bus, FrameSize::Hd), Ok(()));
         assert_eq!(sensor.status().framesize, FrameSize::Hd);
 
@@ -87,6 +87,26 @@ mod tests {
         assert_eq!(sensor.set_colorbar(&mut bus, true), Ok(()));
         assert_eq!(sensor.set_agc_gain(&mut bus, 15), Ok(()));
         assert_eq!(sensor.set_aec_value(&mut bus, 600), Ok(()));
+
+        // FrameSize > Uxga returns FailedToSetFrameSize and preserves previous framesize
+        assert_eq!(
+            sensor.set_framesize(&mut bus, FrameSize::Fhd),
+            Err(CameraError::FailedToSetFrameSize)
+        );
+        assert_eq!(sensor.status().framesize, FrameSize::Hd);
+
+        // Invalid pixformat returns NotSupported and does not mutate sensor.pixformat()
+        assert_eq!(
+            sensor.set_pixformat(&mut bus, PixelFormat::Raw),
+            Err(CameraError::NotSupported)
+        );
+        assert_eq!(sensor.pixformat(), PixelFormat::Jpeg);
+
+        // get_reg / set_reg bounds validation (0..=0x1FF)
+        assert_eq!(sensor.get_reg(&mut bus, -1, 0xFF), Err(CameraError::InvalidArg));
+        assert_eq!(sensor.get_reg(&mut bus, 0x200, 0xFF), Err(CameraError::InvalidArg));
+        assert_eq!(sensor.set_reg(&mut bus, -1, 0xFF, 0x12), Err(CameraError::InvalidArg));
+        assert_eq!(sensor.set_reg(&mut bus, 0x200, 0xFF, 0x12), Err(CameraError::InvalidArg));
 
         // Verify bus error propagation
         bus.set_fail(true);
@@ -161,6 +181,16 @@ mod tests {
         assert_eq!(sensor.set_wb_mode(&mut bus, 2), Ok(()));
         assert_eq!(sensor.set_special_effect(&mut bus, 3), Ok(()));
 
+        // set_pll bounds validation
+        assert_eq!(
+            sensor.set_pll(&mut bus, 0, 300, 1, 0, 1, 0, 1, 1),
+            Err(CameraError::InvalidArg)
+        );
+        assert_eq!(
+            sensor.set_pll(&mut bus, 0, -1, 1, 0, 1, 0, 1, 1),
+            Err(CameraError::InvalidArg)
+        );
+
         bus.set_fail(true);
         assert_eq!(sensor.set_aec_value(&mut bus, 100), Err(CameraError::SccbError));
     }
@@ -215,15 +245,38 @@ mod tests {
         assert_eq!(sensor.set_contrast(&mut bus, 2), Ok(()));
         assert_eq!(sensor.set_brightness(&mut bus, 1), Ok(()));
         assert_eq!(sensor.set_saturation(&mut bus, -2), Ok(()));
+        // SDE_ENABLE (0x3355) preserves both contrast/brightness bit (0x04) and saturation bit (0x02)
+        assert_eq!(
+            bus.get_reg16(CameraSccbAddr::OV3640, ov3640::OV3640_SDE_ENABLE) & 0x06,
+            0x06
+        );
+
         assert_eq!(sensor.set_sharpness(&mut bus, 3), Ok(()));
         assert_eq!(sensor.set_denoise(&mut bus, 5), Ok(()));
         assert_eq!(sensor.set_agc_gain(&mut bus, 32), Ok(()));
         assert_eq!(sensor.set_aec_value(&mut bus, 500), Ok(()));
+
+        // set_pll bounds validation via u8::try_from
+        assert_eq!(
+            sensor.set_pll(&mut bus, 0, 256, 1, 0, 1, 0, 1, 1),
+            Err(CameraError::InvalidArg)
+        );
+        assert_eq!(
+            sensor.set_pll(&mut bus, 0, -1, 1, 0, 1, 0, 1, 1),
+            Err(CameraError::InvalidArg)
+        );
+
+        // init_status sharpness and awb_gain decoding verification
+        bus.preset_reg16(CameraSccbAddr::OV3640, ov3640::OV3640_SHARPNESS, 0x45); // negative: -(0x05) = -5
+        bus.preset_reg16(CameraSccbAddr::OV3640, 0x3406, 0x00); // awb_gain = 1
+        assert_eq!(sensor.init_status(&mut bus), Ok(()));
+        assert_eq!(sensor.status().sharpness, -5);
+        assert_eq!(sensor.status().awb_gain, 1);
     }
 
     #[test]
     fn test_ov5640_and_ov5640_af_lifecycle_and_bounds() {
-        let mut bus: MockSccbBus<512> = MockSccbBus::new();
+        let mut bus: MockSccbBus<8192> = MockSccbBus::new();
         bus.preset_reg16(CameraSccbAddr::OV5640, 0x300A, 0x56);
         bus.preset_reg16(CameraSccbAddr::OV5640, 0x300B, 0x40);
 
@@ -263,6 +316,19 @@ mod tests {
         );
         assert_eq!(sensor.set_agc_gain(&mut bus, 32), Ok(()));
         assert_eq!(sensor.set_aec_value(&mut bus, 800), Ok(()));
+
+        // Ratio1x1 end_x fix verification
+        assert_eq!(ov5640::RATIO_TABLE[7].end_x, 2303);
+
+        // set_pll bounds validation
+        assert_eq!(
+            sensor.set_pll(&mut bus, 0, 300, 1, 0, 1, 0, 1, 1),
+            Err(CameraError::InvalidArg)
+        );
+        assert_eq!(
+            sensor.set_pll(&mut bus, 0, -1, 1, 0, 1, 0, 1, 1),
+            Err(CameraError::InvalidArg)
+        );
 
         // Verify Ov5640Af status decoding, mode setting, and timeout handling
         assert_eq!(ov5640::OV5640_AF_FIRMWARE.len(), 4077);
@@ -362,12 +428,28 @@ mod tests {
             bus.get_reg8(CameraSccbAddr::OV7725, ov7725::VOUTSIZE),
             (240 >> 1) as u8
         );
+        // EXHCH (0x2A) receives lower resolution bits (320 & 3 = 0, (240 & 1) << 2 = 0)
+        assert_eq!(bus.get_reg8(CameraSccbAddr::OV7725, ov7725::EXHCH), 0x00);
 
         assert_eq!(sensor.set_framesize(&mut bus, FrameSize::Vga), Ok(()));
         assert_eq!(bus.get_reg8(CameraSccbAddr::OV7725, ov7725::DSPAUTO), 0xF3);
         assert_eq!(
             sensor.set_framesize(&mut bus, FrameSize::Svga),
             Err(CameraError::InvalidArg)
+        );
+
+        // Gain ceiling: Gain64x and Gain128x unsupported on OV7725
+        assert_eq!(
+            sensor.set_gainceiling(&mut bus, GainCeiling::Gain64x),
+            Err(CameraError::NotSupported)
+        );
+        assert_eq!(
+            sensor.set_gainceiling(&mut bus, GainCeiling::Gain128x),
+            Err(CameraError::NotSupported)
+        );
+        assert_eq!(
+            sensor.set_gainceiling(&mut bus, GainCeiling::Gain32x),
+            Ok(())
         );
 
         assert_eq!(sensor.set_dcw(&mut bus, true), Ok(()));
@@ -413,6 +495,10 @@ mod tests {
             sensor.set_framesize(&mut bus, FrameSize::Cif),
             Err(CameraError::InvalidArg)
         );
+        assert_eq!(
+            sensor.set_framesize(&mut bus, FrameSize::Uxga),
+            Err(CameraError::FailedToSetFrameSize)
+        );
 
         assert_eq!(sensor.set_colorbar(&mut bus, true), Ok(()));
         assert_eq!(
@@ -421,6 +507,26 @@ mod tests {
         );
         assert_eq!(sensor.set_hmirror(&mut bus, true), Ok(()));
         assert_eq!(sensor.set_vflip(&mut bus, true), Ok(()));
+
+        // Format switch must preserve MVFP mirror (bit 5) and flip (bit 4) bits
+        assert_eq!(sensor.set_pixformat(&mut bus, PixelFormat::Yuv422), Ok(()));
+        assert_eq!(
+            bus.get_reg8(CameraSccbAddr::OV7670, ov7670::MVFP) & 0x30,
+            0x30
+        );
+
+        // Hardware status init test
+        bus.preset_reg8(CameraSccbAddr::OV7670, ov7670::COM8, 0b0000_0111); // aec=1, awb=1, agc=1
+        bus.preset_reg8(CameraSccbAddr::OV7670, ov7670::MVFP, 0b0011_0000); // hmirror=1, vflip=1
+        bus.preset_reg8(CameraSccbAddr::OV7670, ov7670::SCALING_YSC, 0x80); // colorbar=1
+        assert_eq!(sensor.init_status(&mut bus), Ok(()));
+        assert_eq!(sensor.status().aec, 1);
+        assert_eq!(sensor.status().awb, 1);
+        assert_eq!(sensor.status().agc, 1);
+        assert_eq!(sensor.status().hmirror, 1);
+        assert_eq!(sensor.status().vflip, 1);
+        assert_eq!(sensor.status().colorbar, 1);
+
         assert_eq!(sensor.set_whitebal(&mut bus, true), Ok(()));
         assert_eq!(sensor.set_gain_ctrl(&mut bus, true), Ok(()));
         assert_eq!(sensor.set_exposure_ctrl(&mut bus, true), Ok(()));

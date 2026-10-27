@@ -450,7 +450,7 @@ impl<B: SccbBus> CameraSensor<B> for Ov7725 {
                 reg = (reg & 0xF0) | (COM7_FMT_RGB565 & 0x0C) | COM7_FMT_RGB;
             }
             PixelFormat::Yuv422 | PixelFormat::Grayscale => {
-                reg = (reg & 0xFC) | (COM7_FMT_YUV & 0x03);
+                reg = (reg & 0xF0) | (COM7_FMT_YUV & 0x03);
             }
             _ => return Err(CameraError::NotSupported),
         }
@@ -477,11 +477,11 @@ impl<B: SccbBus> CameraSensor<B> for Ov7725 {
         bus.write_reg8(self.slv_addr, VSIZE, (h >> 1) as u8)?;
         bus.write_reg8(
             self.slv_addr,
-            HREF,
+            EXHCH,
             ((w & 0x03) as u8) | (((h & 0x01) as u8) << 2),
         )?;
 
-        if (framesize as u8) < (FrameSize::Vga as u8) {
+        if !(w > 320 || h > 240) {
             bus.write_reg8(self.slv_addr, DSPAUTO, 0xFF)?;
             bus.write_reg8(self.slv_addr, HSTART, 0x3F)?;
             bus.write_reg8(self.slv_addr, VSTART, 0x03)?;
@@ -519,6 +519,10 @@ impl<B: SccbBus> CameraSensor<B> for Ov7725 {
         bus: &mut B,
         gainceiling: GainCeiling,
     ) -> Result<(), CameraError> {
+        match gainceiling {
+            GainCeiling::Gain64x | GainCeiling::Gain128x => return Err(CameraError::NotSupported),
+            _ => {}
+        }
         let level = (gainceiling as u8) % 5;
         self.set_reg_bits(bus, COM9, 4, 3, level)?;
         self.status.gainceiling = gainceiling as u8;

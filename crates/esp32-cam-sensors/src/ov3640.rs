@@ -687,9 +687,11 @@ impl<B: SccbBus> CameraSensor<B> for Ov3640 {
         self.status.saturation = 0;
         self.status.sharpness = 0;
         let sharp = bus.read_reg16(self.slv_addr, OV3640_SHARPNESS)?;
-        if (0x41..=0x48).contains(&sharp) {
-            self.status.sharpness = (sharp as i8) - 0x43;
-        }
+        self.status.sharpness = if (sharp & 0x40) != 0 {
+            -((sharp & 0x3F) as i8)
+        } else {
+            (sharp & 0x3F) as i8
+        };
         self.status.denoise = self.get_denoise(bus)?;
         self.status.ae_level = 0;
 
@@ -736,7 +738,7 @@ impl<B: SccbBus> CameraSensor<B> for Ov3640 {
         self.status.special_effect = 0;
         self.status.wb_mode = 0;
         self.status.awb = u8::from(!self.check_reg_mask(bus, OV3640_AWB_CTRL, 0x08)?);
-        self.status.awb_gain = u8::from(self.status.wb_mode != 0);
+        self.status.awb_gain = u8::from(bus.read_reg16(self.slv_addr, 0x3406)? == 0);
         self.status.agc_gain = self.get_agc_gain(bus)?;
         self.status.aec_value = self.get_aec_value(bus)?;
         self.status.aec2 = u8::from(self.check_reg_mask(bus, 0x3A00, 0x04)?);
@@ -828,8 +830,8 @@ impl<B: SccbBus> CameraSensor<B> for Ov3640 {
         }
         let c = OV3640_CONTRAST_LEVELS[(level + 3) as usize];
         self.enable_sde(bus)?;
-        bus.write_reg16(self.slv_addr, OV3640_SDE_ENABLE, 0x04)?;
-        bus.write_reg16(self.slv_addr, OV3640_SDE_OFFSET, 0x01)?;
+        crate::set_reg_bits16(bus, self.slv_addr, OV3640_SDE_ENABLE, 2, 1, 1)?;
+        crate::set_reg_bits16(bus, self.slv_addr, OV3640_SDE_OFFSET, 0, 1, 1)?;
         bus.write_reg16(self.slv_addr, OV3640_CONTRAST_Y1, c.y1)?;
         bus.write_reg16(self.slv_addr, OV3640_CONTRAST_Y2, c.y2)?;
         self.status.contrast = level as i8;
@@ -842,8 +844,8 @@ impl<B: SccbBus> CameraSensor<B> for Ov3640 {
         }
         let b = OV3640_BRIGHTNESS_LEVELS[(level + 3) as usize];
         self.enable_sde(bus)?;
-        bus.write_reg16(self.slv_addr, OV3640_SDE_ENABLE, 0x04)?;
-        bus.write_reg16(self.slv_addr, OV3640_SDE_OFFSET, b.reg3354)?;
+        crate::set_reg_bits16(bus, self.slv_addr, OV3640_SDE_ENABLE, 2, 1, 1)?;
+        crate::set_reg_bits16(bus, self.slv_addr, OV3640_SDE_OFFSET, 0, 0x09, b.reg3354)?;
         bus.write_reg16(self.slv_addr, OV3640_BRIGHTNESS, b.reg335e)?;
         self.status.brightness = level as i8;
         Ok(())
@@ -856,7 +858,7 @@ impl<B: SccbBus> CameraSensor<B> for Ov3640 {
         let clamped = level.clamp(-2, 2);
         let s = &OV3640_SATURATION_LEVELS[(clamped + 2) as usize];
         self.enable_sde(bus)?;
-        bus.write_reg16(self.slv_addr, OV3640_SDE_ENABLE, 0x02)?;
+        crate::set_reg_bits16(bus, self.slv_addr, OV3640_SDE_ENABLE, 1, 1, 1)?;
         bus.write_reg16(self.slv_addr, OV3640_SATURATION_C, s[0])?;
         bus.write_reg16(self.slv_addr, OV3640_SATURATION_M, s[1])?;
         self.status.saturation = clamped as i8;
@@ -997,7 +999,7 @@ impl<B: SccbBus> CameraSensor<B> for Ov3640 {
         }
         let e = OV3640_SPECIAL_EFFECTS[effect as usize];
         self.enable_sde(bus)?;
-        bus.write_reg16(self.slv_addr, OV3640_SDE_ENABLE, e.reg3355)?;
+        crate::set_reg_bits16(bus, self.slv_addr, OV3640_SDE_ENABLE, 0, 0x58, e.reg3355)?;
         if e.reg3355 == 0x18 {
             bus.write_reg16(self.slv_addr, OV3640_EFFECT_C1, e.reg335a)?;
             bus.write_reg16(self.slv_addr, OV3640_EFFECT_C2, e.reg335b)?;
@@ -1174,19 +1176,21 @@ impl<B: SccbBus> CameraSensor<B> for Ov3640 {
         pclken: i32,
         pclk: i32,
     ) -> Result<(), CameraError> {
-        if mul < 0 || sys < 0 || pre < 0 || seld5 < 0 || pclk < 0 {
-            return Err(CameraError::InvalidArg);
-        }
+        let mul = u8::try_from(mul).map_err(|_| CameraError::InvalidArg)?;
+        let sys = u8::try_from(sys).map_err(|_| CameraError::InvalidArg)?;
+        let pre = u8::try_from(pre).map_err(|_| CameraError::InvalidArg)?;
+        let seld5 = u8::try_from(seld5).map_err(|_| CameraError::InvalidArg)?;
+        let pclk = u8::try_from(pclk).map_err(|_| CameraError::InvalidArg)?;
         self.configure_pll(
             bus,
             bypass > 0,
-            mul as u8,
-            sys as u8,
-            pre as u8,
+            mul,
+            sys,
+            pre,
             root > 0,
-            seld5 as u8,
+            seld5,
             pclken > 0,
-            pclk as u8,
+            pclk,
         )
     }
 

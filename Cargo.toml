@@ -32,3 +32,4 @@ esp32-cam-conversions = { path = "crates/esp32-cam-conversions" }
 esp32-cam-ll = { path = "crates/esp32-cam-ll" }
 esp32-cam-hal = { path = "crates/esp32-cam-hal" }
 embedded-hal = { version = "1.0.0", default-features = false }
+

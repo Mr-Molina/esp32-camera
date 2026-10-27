@@ -796,7 +796,13 @@ impl Ov2640 {
         value: u8,
     ) -> Result<(), CameraError> {
         self.set_bank(bus, bank)?;
-        bus.write_reg8(self.slv_addr, reg, value)
+        bus.write_reg8(self.slv_addr, reg, value)?;
+        if reg == BANK_SEL {
+            self.reg_bank = Ov2640Bank::from_u8(value);
+        } else if reg == COM7 && (value & COM7_SRST) != 0 {
+            self.reg_bank = Ov2640Bank::Max;
+        }
+        Ok(())
     }
 
     fn read_reg<B: SccbBus>(
@@ -996,26 +1002,21 @@ impl<B: SccbBus> CameraSensor<B> for Ov2640 {
     }
 
     fn set_pixformat(&mut self, bus: &mut B, pixformat: PixelFormat) -> Result<(), CameraError> {
-        self.pixformat = pixformat;
-        match pixformat {
-            PixelFormat::Rgb565 | PixelFormat::Rgb888 => {
-                self.write_regs(bus, &OV2640_SETTINGS_RGB565)?;
-            }
-            PixelFormat::Yuv422 | PixelFormat::Grayscale => {
-                self.write_regs(bus, &OV2640_SETTINGS_YUV422)?;
-            }
-            PixelFormat::Jpeg => {
-                self.write_regs(bus, &OV2640_SETTINGS_JPEG3)?;
-            }
+        let regs: &[Reg8] = match pixformat {
+            PixelFormat::Rgb565 | PixelFormat::Rgb888 => &OV2640_SETTINGS_RGB565,
+            PixelFormat::Yuv422 | PixelFormat::Grayscale => &OV2640_SETTINGS_YUV422,
+            PixelFormat::Jpeg => &OV2640_SETTINGS_JPEG3,
             _ => return Err(CameraError::NotSupported),
-        }
+        };
+        self.write_regs(bus, regs)?;
         bus.delay_ms(10);
+        self.pixformat = pixformat;
         Ok(())
     }
 
     fn set_framesize(&mut self, bus: &mut B, framesize: FrameSize) -> Result<(), CameraError> {
-        if (framesize as u8) > (FrameSize::Uxga as u8) {
-            return Err(CameraError::InvalidArg);
+        if framesize > FrameSize::Uxga {
+            return Err(CameraError::FailedToSetFrameSize);
         }
         let res = framesize.resolution();
         let w = res.width;
@@ -1027,8 +1028,6 @@ impl<B: SccbBus> CameraSensor<B> for Ov2640 {
         let mut offset_x = ratio_entry.offset_x;
         let mut offset_y = ratio_entry.offset_y;
         let mut mode = Ov2640SensorMode::Uxga;
-
-        self.status.framesize = framesize;
 
         if (framesize as u8) <= (FrameSize::Cif as u8) {
             mode = Ov2640SensorMode::Cif;
@@ -1047,7 +1046,9 @@ impl<B: SccbBus> CameraSensor<B> for Ov2640 {
             offset_y /= 2;
         }
 
-        self.set_window(bus, mode, offset_x, offset_y, max_x, max_y, w, h)
+        self.set_window(bus, mode, offset_x, offset_y, max_x, max_y, w, h)?;
+        self.status.framesize = framesize;
+        Ok(())
     }
 
     fn set_contrast(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
@@ -1257,6 +1258,9 @@ impl<B: SccbBus> CameraSensor<B> for Ov2640 {
     }
 
     fn get_reg(&mut self, bus: &mut B, reg: i32, mask: i32) -> Result<i32, CameraError> {
+        if !(0..=0x1FF).contains(&reg) {
+            return Err(CameraError::InvalidArg);
+        }
         let bank = Ov2640Bank::from_u8(((reg >> 8) & 0x01) as u8);
         let val = self.read_reg(bus, bank, (reg & 0xFF) as u8)? as i32;
         Ok(val & mask)
@@ -1269,6 +1273,9 @@ impl<B: SccbBus> CameraSensor<B> for Ov2640 {
         mask: i32,
         value: i32,
     ) -> Result<(), CameraError> {
+        if !(0..=0x1FF).contains(&reg) {
+            return Err(CameraError::InvalidArg);
+        }
         let bank = Ov2640Bank::from_u8(((reg >> 8) & 0x01) as u8);
         let addr = (reg & 0xFF) as u8;
         let current = self.read_reg(bus, bank, addr)? as i32;

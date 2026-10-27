@@ -492,7 +492,7 @@ pub const SENSOR_FRAMESIZE_QVGA: &[Reg16] = &[
     Reg16::new(0x35AF, 0x06),
     Reg16::new(0x35B0, 0x0C),
     Reg16::new(0x35B1, 0x12),
-    Reg16::new(0x35BC, 0x1C),
+    Reg16::new(0x35B2, 0x1C),
     Reg16::new(0x35B3, 0x30),
     Reg16::new(0x35A3, 0x02),
     Reg16::new(0x35A4, 0x03),
@@ -808,6 +808,9 @@ impl<B: SccbBus> CameraSensor<B> for Hm0360 {
     }
 
     fn set_framesize(&mut self, bus: &mut B, framesize: FrameSize) -> Result<(), CameraError> {
+        if framesize > FrameSize::Vga {
+            return Err(CameraError::FailedToSetFrameSize);
+        }
         self.status.framesize = framesize;
         write_reg_list(bus, self.slv_addr, SENSOR_DEFAULT_REGS)?;
         match framesize {
@@ -839,6 +842,7 @@ impl<B: SccbBus> CameraSensor<B> for Hm0360 {
             _ => 80,
         };
         bus.write_reg16(self.slv_addr, AE_TARGET_MEAN, ae_mean)?;
+        bus.write_reg16(self.slv_addr, COMMAND_UPDATE, 0x01)?;
         self.status.brightness = level as i8;
         Ok(())
     }
@@ -846,6 +850,7 @@ impl<B: SccbBus> CameraSensor<B> for Hm0360 {
     fn set_colorbar(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let val = u8::from(enable);
         set_reg_bits(bus, self.slv_addr, TEST_PATTERN_MODE, 0, 0x01, val)?;
+        bus.write_reg16(self.slv_addr, COMMAND_UPDATE, 0x01)?;
         self.status.colorbar = val;
         Ok(())
     }
@@ -853,6 +858,7 @@ impl<B: SccbBus> CameraSensor<B> for Hm0360 {
     fn set_exposure_ctrl(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let val = u8::from(enable);
         set_reg_bits(bus, self.slv_addr, AE_CTRL, 0, 0x01, val)?;
+        bus.write_reg16(self.slv_addr, COMMAND_UPDATE, 0x01)?;
         self.status.aec = val;
         Ok(())
     }
@@ -860,6 +866,7 @@ impl<B: SccbBus> CameraSensor<B> for Hm0360 {
     fn set_hmirror(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let val = u8::from(enable);
         set_reg_bits(bus, self.slv_addr, IMAGE_ORIENTATION, 0, 0x01, val)?;
+        bus.write_reg16(self.slv_addr, COMMAND_UPDATE, 0x01)?;
         self.status.hmirror = val;
         Ok(())
     }
@@ -867,6 +874,7 @@ impl<B: SccbBus> CameraSensor<B> for Hm0360 {
     fn set_vflip(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let val = u8::from(enable);
         set_reg_bits(bus, self.slv_addr, IMAGE_ORIENTATION, 1, 0x01, val)?;
+        bus.write_reg16(self.slv_addr, COMMAND_UPDATE, 0x01)?;
         self.status.vflip = val;
         Ok(())
     }
@@ -944,7 +952,8 @@ impl<B: SccbBus> CameraSensor<B> for Hm0360 {
             0x00
         };
         let pll_cfg = bus.read_reg16(self.slv_addr, PLL1CFG)?;
-        bus.write_reg16(self.slv_addr, PLL1CFG, (pll_cfg & 0xFC) | value)
+        bus.write_reg16(self.slv_addr, PLL1CFG, (pll_cfg & 0xFC) | value)?;
+        bus.write_reg16(self.slv_addr, COMMAND_UPDATE, 0x01)
     }
 
     fn set_xclk(&mut self, _bus: &mut B, _timer: i32, xclk: i32) -> Result<(), CameraError> {

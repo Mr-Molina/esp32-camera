@@ -38,6 +38,9 @@ pub const fn align_cache_region(addr: usize, len: usize, line_size: usize) -> (u
     };
     let mask = !(line - 1);
     let start = addr & mask;
+    if len == 0 {
+        return (start, 0);
+    }
     let offset = addr - start;
     let padded = len.saturating_add(offset).saturating_add(line - 1);
     let sync_len = padded & mask;
@@ -189,6 +192,18 @@ mod tests {
             align_cache_region(0x3F80_0004, 10, 0),
             (0x3F80_0000, 32)
         );
+    }
+
+    #[test]
+    fn test_align_cache_region_zero_len_unaligned() {
+        // Zero-length slice on unaligned address returns length 0 (LOGIC-008)
+        let (start, len) = align_cache_region(0x3F80_0015, 0, 32);
+        assert_eq!(start, 0x3F80_0000);
+        assert_eq!(len, 0);
+
+        let (start_aligned, len_aligned) = align_cache_region(0x3F80_0000, 0, 32);
+        assert_eq!(start_aligned, 0x3F80_0000);
+        assert_eq!(len_aligned, 0);
     }
 
     #[test]

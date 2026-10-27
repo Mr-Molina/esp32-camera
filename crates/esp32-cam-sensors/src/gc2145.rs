@@ -1050,7 +1050,9 @@ impl<B: SccbBus> CameraSensor<B> for Gc2145 {
         bus.write_reg8(self.slv_addr, 0x98, l8(w))
     }
 
-    fn set_colorbar(&mut self, _bus: &mut B, enable: bool) -> Result<(), CameraError> {
+    fn set_colorbar(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
+        bus.write_reg8(self.slv_addr, 0xFE, 0x00)?;
+        set_reg_bits(bus, self.slv_addr, P0_DEBUG_MODE2, 3, 0x01, u8::from(enable))?;
         self.status.colorbar = u8::from(enable);
         Ok(())
     }

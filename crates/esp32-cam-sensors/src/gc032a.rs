@@ -405,6 +405,7 @@ pub const GC032A_DEFAULT_REGS: &[Reg16] = &[
     Reg16::new(0xCD, 0x04),
     Reg16::new(0xCE, 0x72),
     Reg16::new(0xCF, 0x52),
+    Reg16::new(0xFE, 0x00),
 ];
 
 #[inline]
@@ -685,7 +686,14 @@ impl<B: SccbBus> CameraSensor<B> for Gc032a {
         bus.write_reg8(self.slv_addr, P0_OUT_WIN_HEIGHT_HIGH, h8(h))?;
         bus.write_reg8(self.slv_addr, P0_OUT_WIN_HEIGHT_LOW, l8(h))?;
         bus.write_reg8(self.slv_addr, P0_OUT_WIN_WIDTH_HIGH, h8(w))?;
-        bus.write_reg8(self.slv_addr, P0_OUT_WIN_WIDTH_LOW, l8(w))
+        bus.write_reg8(self.slv_addr, P0_OUT_WIN_WIDTH_LOW, l8(w))?;
+
+        bus.write_reg8(self.slv_addr, 0xFE, 0x03)?;
+        bus.write_reg8(self.slv_addr, P3_IMAGE_WIDTH_LOW, l8(w))?;
+        bus.write_reg8(self.slv_addr, P3_IMAGE_WIDTH_HIGH, h8(w))?;
+        bus.write_reg8(self.slv_addr, P3_IMAGE_HEIGHT_LOW, l8(h))?;
+        bus.write_reg8(self.slv_addr, P3_IMAGE_HEIGHT_HIGH, h8(h))?;
+        bus.write_reg8(self.slv_addr, 0xFE, 0x00)
     }
 
     fn set_colorbar(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {

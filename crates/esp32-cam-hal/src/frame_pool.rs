@@ -221,56 +221,33 @@ impl<const COUNT: usize, const BUF_CAP: usize> FramePool<COUNT, BUF_CAP> {
         }
 
         // First look for any SLOT_FREE buffer
-        let mut free_idx = None;
-        let mut i = 0;
-        while i < COUNT {
+        for i in 0..COUNT {
             if self.states[i].load(Ordering::Acquire) == SLOT_FREE {
-                free_idx = Some(i);
-                break;
+                return Ok(i);
             }
-            i += 1;
         }
 
         match self.grab_mode {
-            GrabMode::WhenEmpty => free_idx.ok_or(CameraError::NoMem),
+            GrabMode::WhenEmpty => Err(CameraError::NoMem),
             GrabMode::Latest => {
-                if let Some(idx) = free_idx {
-                    // In Latest mode, invalidate older ready slots so the new frame is the sole latest ready frame
-                    let mut j = 0;
-                    while j < COUNT {
-                        if self.states[j].load(Ordering::Acquire) == SLOT_READY {
-                            self.states[j].store(SLOT_FREE, Ordering::Release);
+                // In Latest mode, if no slot is free, reclaim ONLY the oldest SLOT_READY slot.
+                // Existing ready slots are not wiped here; older ready slots are only drained after
+                // write successfully finishes. Never evict a SLOT_LEASED slot.
+                let mut oldest: Option<(u64, usize)> = None;
+                for j in 0..COUNT {
+                    if self.states[j].load(Ordering::Acquire) == SLOT_READY {
+                        let seq = self.meta[j].sequence;
+                        match oldest {
+                            None => oldest = Some((seq, j)),
+                            Some((best_seq, _)) if seq < best_seq => oldest = Some((seq, j)),
+                            _ => {}
                         }
-                        j += 1;
                     }
+                }
+                if let Some((_, idx)) = oldest {
                     Ok(idx)
                 } else {
-                    // Evict the oldest SLOT_READY slot (never evict a SLOT_LEASED slot)
-                    let mut oldest_idx = None;
-                    let mut oldest_seq = u64::MAX;
-                    let mut j = 0;
-                    while j < COUNT {
-                        if self.states[j].load(Ordering::Acquire) == SLOT_READY
-                            && self.meta[j].sequence < oldest_seq
-                        {
-                            oldest_seq = self.meta[j].sequence;
-                            oldest_idx = Some(j);
-                        }
-                        j += 1;
-                    }
-                    if let Some(idx) = oldest_idx {
-                        // Also mark any other READY slots free
-                        let mut k = 0;
-                        while k < COUNT {
-                            if self.states[k].load(Ordering::Acquire) == SLOT_READY {
-                                self.states[k].store(SLOT_FREE, Ordering::Release);
-                            }
-                            k += 1;
-                        }
-                        Ok(idx)
-                    } else {
-                        Err(CameraError::NoMem)
-                    }
+                    Err(CameraError::NoMem)
                 }
             }
         }
@@ -290,10 +267,21 @@ impl<const COUNT: usize, const BUF_CAP: usize> FramePool<COUNT, BUF_CAP> {
             return Err(CameraError::BufferTooSmall);
         }
         let idx = self.select_write_slot()?;
+
+        self.buffers[idx][..payload.len()].copy_from_slice(payload);
+
+        // Only after payload is successfully written, drain older ready slots in GrabMode::Latest
+        if self.grab_mode == GrabMode::Latest {
+            for j in 0..COUNT {
+                if j != idx && self.states[j].load(Ordering::Acquire) == SLOT_READY {
+                    self.states[j].store(SLOT_FREE, Ordering::Release);
+                }
+            }
+        }
+
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
 
-        self.buffers[idx][..payload.len()].copy_from_slice(payload);
         self.meta[idx] = FrameMetadata {
             len: payload.len(),
             width,
@@ -320,9 +308,27 @@ impl<const COUNT: usize, const BUF_CAP: usize> FramePool<COUNT, BUF_CAP> {
         F: FnOnce(&mut [u8]) -> Result<usize, CameraError>,
     {
         let idx = self.select_write_slot()?;
-        let written_len = writer(&mut self.buffers[idx])?;
+        let written_len = match writer(&mut self.buffers[idx]) {
+            Ok(len) => len,
+            Err(e) => {
+                self.meta[idx].len = 0;
+                self.states[idx].store(SLOT_FREE, Ordering::Release);
+                return Err(e);
+            }
+        };
         if written_len > BUF_CAP {
+            self.meta[idx].len = 0;
+            self.states[idx].store(SLOT_FREE, Ordering::Release);
             return Err(CameraError::BufferTooSmall);
+        }
+
+        // Only after writer succeeds and validates capacity, drain any older SLOT_READY slots in GrabMode::Latest
+        if self.grab_mode == GrabMode::Latest {
+            for j in 0..COUNT {
+                if j != idx && self.states[j].load(Ordering::Acquire) == SLOT_READY {
+                    self.states[j].store(SLOT_FREE, Ordering::Release);
+                }
+            }
         }
 
         let seq = self.next_seq;
@@ -357,37 +363,37 @@ impl<const COUNT: usize, const BUF_CAP: usize> FramePool<COUNT, BUF_CAP> {
         let mut chosen_idx = None;
         match self.grab_mode {
             GrabMode::WhenEmpty => {
-                let mut best_seq = u64::MAX;
-                let mut i = 0;
-                while i < COUNT {
-                    if self.states[i].load(Ordering::Acquire) == SLOT_READY
-                        && self.meta[i].sequence < best_seq
-                    {
-                        best_seq = self.meta[i].sequence;
-                        chosen_idx = Some(i);
+                let mut oldest: Option<(u64, usize)> = None;
+                for i in 0..COUNT {
+                    if self.states[i].load(Ordering::Acquire) == SLOT_READY {
+                        let seq = self.meta[i].sequence;
+                        match oldest {
+                            None => oldest = Some((seq, i)),
+                            Some((best_seq, _)) if seq < best_seq => oldest = Some((seq, i)),
+                            _ => {}
+                        }
                     }
-                    i += 1;
                 }
+                chosen_idx = oldest.map(|(_, idx)| idx);
             }
             GrabMode::Latest => {
-                let mut best_seq = 0u64;
-                let mut i = 0;
-                while i < COUNT {
-                    if self.states[i].load(Ordering::Acquire) == SLOT_READY
-                        && self.meta[i].sequence >= best_seq
-                    {
-                        best_seq = self.meta[i].sequence;
-                        chosen_idx = Some(i);
+                let mut newest: Option<(u64, usize)> = None;
+                for i in 0..COUNT {
+                    if self.states[i].load(Ordering::Acquire) == SLOT_READY {
+                        let seq = self.meta[i].sequence;
+                        match newest {
+                            None => newest = Some((seq, i)),
+                            Some((best_seq, _)) if seq >= best_seq => newest = Some((seq, i)),
+                            _ => {}
+                        }
                     }
-                    i += 1;
                 }
-                if let Some(win) = chosen_idx {
-                    let mut j = 0;
-                    while j < COUNT {
+                if let Some((_, win)) = newest {
+                    chosen_idx = Some(win);
+                    for j in 0..COUNT {
                         if j != win && self.states[j].load(Ordering::Acquire) == SLOT_READY {
                             self.states[j].store(SLOT_FREE, Ordering::Release);
                         }
-                        j += 1;
                     }
                 }
             }
@@ -475,5 +481,62 @@ mod tests {
         let latest = pool_latest.take().expect("latest frame");
         assert_eq!(latest.as_slice(), &[30, 30]);
         assert_eq!(latest.timestamp_us(), 300);
+    }
+
+    #[test]
+    fn test_hal_005_write_and_lease_writer_failure_preserves_ready_slots() {
+        let mut pool: FramePool<2, 16> = FramePool::new(GrabMode::Latest);
+        pool.push_frame(&[42, 42], 160, 120, PixelFormat::Grayscale, 100)
+            .expect("push valid ready frame");
+        assert_eq!(pool.available_frames(), 1);
+
+        // A failed writer must NOT wipe existing ready frames before writing succeeds!
+        let write_res = pool.write_and_lease(160, 120, PixelFormat::Grayscale, 200, |_buf| {
+            Err(CameraError::CorruptedFrame)
+        });
+        assert_eq!(write_res.err(), Some(CameraError::CorruptedFrame));
+
+        // Ready frame 1 is still intact and can be taken
+        assert_eq!(pool.available_frames(), 1);
+        let guard = pool.take().expect("take existing ready frame");
+        assert_eq!(guard.as_slice(), &[42, 42]);
+    }
+
+    #[test]
+    fn test_hal_005_u64_max_sequence_handling() {
+        let mut pool: FramePool<2, 16> = FramePool::new(GrabMode::WhenEmpty);
+        // Force sequence number to u64::MAX
+        pool.next_seq = u64::MAX;
+        pool.push_frame(&[99, 99], 160, 120, PixelFormat::Grayscale, 10)
+            .expect("push u64::MAX sequence frame");
+        assert_eq!(pool.available_frames(), 1);
+
+        let guard = pool.take().expect("take u64::MAX sequence frame");
+        assert_eq!(guard.sequence(), u64::MAX);
+        assert_eq!(guard.as_slice(), &[99, 99]);
+    }
+
+    #[test]
+    fn test_write_and_lease_error_in_latest_mode_marks_slot_free() {
+        let mut pool: FramePool<1, 16> = FramePool::new(GrabMode::Latest);
+        pool.push_frame(&[1, 1], 160, 120, PixelFormat::Grayscale, 100)
+            .expect("push frame 1");
+        assert_eq!(pool.available_frames(), 1);
+        assert_eq!(pool.free_count(), 0);
+
+        // In Latest mode with no free slots, write_and_lease reclaims the oldest ready slot (slot 0).
+        // If writer fails after partially writing, slot 0 MUST become SLOT_FREE with len 0,
+        // and must NOT be left in SLOT_READY with corrupted data.
+        let res = pool.write_and_lease(160, 120, PixelFormat::Grayscale, 300, |buf| {
+            buf[0] = 0xDE;
+            buf[1] = 0xAD;
+            Err(CameraError::CorruptedFrame)
+        });
+        assert_eq!(res.err(), Some(CameraError::CorruptedFrame));
+
+        // Slot 0 was freed; no frames are ready and corrupted data cannot be taken.
+        assert_eq!(pool.available_frames(), 0);
+        assert_eq!(pool.free_count(), 1);
+        assert_eq!(pool.take().err(), Some(CameraError::Timeout));
     }
 }

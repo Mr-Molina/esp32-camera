@@ -140,25 +140,21 @@ pub struct SampleModeConfig {
 /// Unpacks JPEG DMA elements by extracting `sample1` from each 4-byte word (`ll_cam_dma_filter_jpeg`).
 ///
 /// Unrolls 4 elements per iteration matching `target/esp32/ll_cam.c:107-122`.
+#[inline]
 pub fn filter_jpeg(dst: &mut [u8], src: &[u8]) -> usize {
     let elements = (src.len() / 4).min(dst.len());
-    let end = elements / 4;
+    let src_valid = &src[..elements * 4];
+    let dst_valid = &mut dst[..elements];
 
-    let mut i = 0;
-    while i < end {
-        let base_in = i * 16;
-        let base_out = i * 4;
-        dst[base_out] = src[base_in + 2];
-        dst[base_out + 1] = src[base_in + 6];
-        dst[base_out + 2] = src[base_in + 10];
-        dst[base_out + 3] = src[base_in + 14];
-        i += 1;
+    let (src_chunks, rem_in) = src_valid.as_chunks::<16>();
+    let (dst_chunks, rem_out) = dst_valid.as_chunks_mut::<4>();
+    for (c_out, c_in) in dst_chunks.iter_mut().zip(src_chunks.iter()) {
+        *c_out = [c_in[2], c_in[6], c_in[10], c_in[14]];
     }
 
-    let mut rem_idx = end * 4;
-    while rem_idx < elements {
-        dst[rem_idx] = src[rem_idx * 4 + 2];
-        rem_idx += 1;
+    let (rem_in_words, _) = rem_in.as_chunks::<4>();
+    for (b_out, c_in) in rem_out.iter_mut().zip(rem_in_words.iter()) {
+        *b_out = c_in[2];
     }
 
     elements
@@ -167,6 +163,7 @@ pub fn filter_jpeg(dst: &mut [u8], src: &[u8]) -> usize {
 /// Unpacks standard-speed grayscale DMA elements by extracting `sample1` (`ll_cam_dma_filter_grayscale`).
 ///
 /// Matches `target/esp32/ll_cam.c:124-139`.
+#[inline]
 pub fn filter_grayscale(dst: &mut [u8], src: &[u8]) -> usize {
     filter_jpeg(dst, src)
 }
@@ -174,7 +171,9 @@ pub fn filter_grayscale(dst: &mut [u8], src: &[u8]) -> usize {
 /// Unpacks high-speed grayscale DMA elements (`ll_cam_dma_filter_grayscale_highspeed`).
 ///
 /// Extracts `sample1` from every even-indexed [`DmaElement`] (`0, 2, 4, 6`), with special
-/// handling for line remainders (`rem > 0` and `rem >= 3`), matching `target/esp32/ll_cam.c:141-167`.
+/// handling for line remainders (`rem > 0`, `rem >= 3`, `rem >= 5`, and `rem >= 7`),
+/// matching `target/esp32/ll_cam.c:141-167`.
+#[inline]
 pub fn filter_grayscale_highspeed(dst: &mut [u8], src: &[u8]) -> usize {
     let elements = src.len() / 4;
     let end = elements / 8;
@@ -183,7 +182,7 @@ pub fn filter_grayscale_highspeed(dst: &mut [u8], src: &[u8]) -> usize {
     let mut out_bytes = 0;
     while i < end {
         if out_bytes + 4 > dst.len() {
-            return out_bytes;
+            break;
         }
         let base_in = i * 32;
         dst[out_bytes] = src[base_in + 2]; // dma_el[0].sample1
@@ -194,14 +193,22 @@ pub fn filter_grayscale_highspeed(dst: &mut [u8], src: &[u8]) -> usize {
         i += 1;
     }
 
-    let rem = elements & 0x7;
-    let tail_base = end * 32;
+    let rem = elements - i * 8;
+    let tail_base = i * 32;
     if rem > 0 && out_bytes < dst.len() {
         dst[out_bytes] = src[tail_base + 2]; // dma_el[0].sample1
         out_bytes += 1;
         if rem >= 3 && out_bytes < dst.len() {
             dst[out_bytes] = src[tail_base + 10]; // dma_el[2].sample1
             out_bytes += 1;
+            if rem >= 5 && out_bytes < dst.len() {
+                dst[out_bytes] = src[tail_base + 18]; // dma_el[4].sample1
+                out_bytes += 1;
+                if rem >= 7 && out_bytes < dst.len() {
+                    dst[out_bytes] = src[tail_base + 26]; // dma_el[6].sample1
+                    out_bytes += 1;
+                }
+            }
         }
     }
 
@@ -212,6 +219,7 @@ pub fn filter_grayscale_highspeed(dst: &mut [u8], src: &[u8]) -> usize {
 ///
 /// Extracts `[sample1, sample2]` from each [`DmaElement`] (2 output bytes per 4-byte element),
 /// matching `target/esp32/ll_cam.c:169-188`.
+#[inline]
 pub fn filter_yuyv(dst: &mut [u8], src: &[u8]) -> usize {
     let max_elements = dst.len() / 2;
     let elements = (src.len() / 4).min(max_elements);
@@ -248,8 +256,9 @@ pub fn filter_yuyv(dst: &mut [u8], src: &[u8]) -> usize {
 /// Unpacks high-speed YUYV / RGB565 DMA elements (`ll_cam_dma_filter_yuyv_highspeed`).
 ///
 /// Extracts `sample1` from each of 8 consecutive [`DmaElement`]s, with special remainder handling
-/// (`rem == 1`, `rem == 2`, `rem >= 3` where `dst[3] = dma_el[2].sample2`), matching
-/// `target/esp32/ll_cam.c:190-224`.
+/// (`rem == 1`, `rem == 2`, `rem == 3` where `dst[3] = dma_el[2].sample2`, and `rem >= 4`
+/// where `dst[3] = dma_el[3].sample1`), matching `target/esp32/ll_cam.c:190-224`.
+#[inline]
 pub fn filter_yuyv_highspeed(dst: &mut [u8], src: &[u8]) -> usize {
     let elements = src.len() / 4;
     let end = elements / 8;
@@ -258,7 +267,7 @@ pub fn filter_yuyv_highspeed(dst: &mut [u8], src: &[u8]) -> usize {
     let mut out_bytes = 0;
     while i < end {
         if out_bytes + 8 > dst.len() {
-            return out_bytes;
+            break;
         }
         let base_in = i * 32;
         dst[out_bytes] = src[base_in + 2]; // dma_el[0].sample1 (y0)
@@ -273,8 +282,8 @@ pub fn filter_yuyv_highspeed(dst: &mut [u8], src: &[u8]) -> usize {
         i += 1;
     }
 
-    let rem = elements & 0x7;
-    let tail_base = end * 32;
+    let rem = elements - i * 8;
+    let tail_base = i * 32;
     if rem > 0 && out_bytes < dst.len() {
         dst[out_bytes] = src[tail_base + 2]; // dma_el[0].sample1 (y0)
         out_bytes += 1;
@@ -282,10 +291,37 @@ pub fn filter_yuyv_highspeed(dst: &mut [u8], src: &[u8]) -> usize {
             dst[out_bytes] = src[tail_base + 6]; // dma_el[1].sample1 (u)
             out_bytes += 1;
         }
-        if rem >= 3 && out_bytes + 2 <= dst.len() {
+        if rem >= 3 && out_bytes < dst.len() {
             dst[out_bytes] = src[tail_base + 10]; // dma_el[2].sample1 (y1)
-            dst[out_bytes + 1] = src[tail_base + 8]; // dma_el[2].sample2 (v)
-            out_bytes += 2;
+            out_bytes += 1;
+            if out_bytes < dst.len() {
+                dst[out_bytes] = if rem >= 4 {
+                    src[tail_base + 14] // dma_el[3].sample1 (v)
+                } else {
+                    src[tail_base + 8] // dma_el[2].sample2 (v)
+                };
+                out_bytes += 1;
+            }
+        }
+        if rem >= 5 && out_bytes < dst.len() {
+            dst[out_bytes] = src[tail_base + 18]; // dma_el[4].sample1 (y0)
+            out_bytes += 1;
+            if rem >= 6 && out_bytes < dst.len() {
+                dst[out_bytes] = src[tail_base + 22]; // dma_el[5].sample1 (u)
+                out_bytes += 1;
+            }
+            if rem >= 7 && out_bytes < dst.len() {
+                dst[out_bytes] = src[tail_base + 26]; // dma_el[6].sample1 (y1)
+                out_bytes += 1;
+                if out_bytes < dst.len() {
+                    dst[out_bytes] = if rem >= 8 {
+                        src[tail_base + 30] // dma_el[7].sample1 (v)
+                    } else {
+                        src[tail_base + 24] // dma_el[6].sample2 (v)
+                    };
+                    out_bytes += 1;
+                }
+            }
         }
     }
 
@@ -422,6 +458,29 @@ mod tests {
         // 3 rem elements -> indices 8, 10 -> values 27, 33
         assert_eq!(n, 6);
         assert_eq!(&dst[..6], &[3, 9, 15, 21, 27, 33]);
+
+        // Remainder 5 (indices 8, 10, 12) and Remainder 7 (indices 8, 10, 12, 14) (LL-009)
+        let mut src15 = [0u8; 60]; // 15 elements = 8 + 7 remainder
+        for i in 0..15 {
+            let el = DmaElement::new((i as u8 + 1) * 2, 0xFF);
+            src15[i * 4..i * 4 + 4].copy_from_slice(&el.0);
+        }
+        let mut dst15 = [0u8; 16];
+        // Test rem = 5 with 13 elements (52 bytes)
+        let n13 = filter_grayscale_highspeed(&mut dst15, &src15[..52]);
+        assert_eq!(n13, 7); // 4 + 3 = 7
+        assert_eq!(&dst15[..7], &[2, 6, 10, 14, 18, 22, 26]);
+
+        // Test rem = 7 with 15 elements (60 bytes)
+        let n15 = filter_grayscale_highspeed(&mut dst15, &src15);
+        assert_eq!(n15, 8); // 4 + 4 = 8
+        assert_eq!(&dst15[..8], &[2, 6, 10, 14, 18, 22, 26, 30]);
+
+        // Test loop break with partial dst buffer (LL-009)
+        let mut dst_small = [0u8; 6];
+        let n_small = filter_grayscale_highspeed(&mut dst_small, &src15);
+        assert_eq!(n_small, 6);
+        assert_eq!(&dst_small, &[2, 6, 10, 14, 18, 22]);
     }
 
     #[test]
@@ -452,6 +511,32 @@ mod tests {
             &[
                 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4A, 0x9A
             ]
+        );
+
+        // High-speed YUYV: 12 elements (8 + 4 remainder) (LL-009)
+        let mut hs_src12 = [0u8; 48];
+        for i in 0..12 {
+            let el = DmaElement::new(0x40 + i as u8, 0x90 + i as u8);
+            hs_src12[i * 4..i * 4 + 4].copy_from_slice(&el.0);
+        }
+        let mut hs_dst12 = [0u8; 16];
+        let hs_n12 = filter_yuyv_highspeed(&mut hs_dst12, &hs_src12);
+        // Remainder 4 elements -> el[8..11].sample1: 0x48, 0x49, 0x4A, 0x4B
+        assert_eq!(hs_n12, 12);
+        assert_eq!(
+            &hs_dst12[..12],
+            &[
+                0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4A, 0x4B
+            ]
+        );
+
+        // Test loop break with partial dst buffer (LL-009)
+        let mut hs_dst_small = [0u8; 10];
+        let hs_n_small = filter_yuyv_highspeed(&mut hs_dst_small, &hs_src12);
+        assert_eq!(hs_n_small, 10);
+        assert_eq!(
+            &hs_dst_small,
+            &[0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49]
         );
     }
 

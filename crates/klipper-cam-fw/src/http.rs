@@ -62,8 +62,8 @@ Moonraker Configuration:\n\
 /// APP0 `JFIF\0` (`FF E0`), SOF0 (`FF C0`), SOS (`FF DA`), and EOI (`FF D9`) markers.
 pub const SYNTHETIC_HD_JFIF_FRAME: [u8; 43] = [
     0xFF, 0xD8, // SOI
-    0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01, 0x01, 0x00, 0x48, 0x00,
-    0x48, 0x00, 0x00, // APP0 JFIF 1.1
+    0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01, 0x01, 0x00, 0x48, 0x00, 0x48,
+    0x00, 0x00, // APP0 JFIF 1.1
     0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x02, 0xD0, 0x05, 0x00, 0x01, 0x01, 0x11,
     0x00, // SOF0: 8-bit, height=720 (0x02D0), width=1280 (0x0500)
     0xFF, 0xDA, 0x00, 0x04, 0x00, 0x00, 0x00, 0xFF, // SOS + minimal scan byte
@@ -261,18 +261,31 @@ fn parse_isize_ascii(s: &str) -> Option<isize> {
 }
 
 /// Zero-allocation HTTP/1.1 request parser (`#![no_std]`).
+/// Enforces RFC 9112 request-line and header syntax invariants (`SEC-201`).
 pub fn parse_http_request(raw: &[u8]) -> Result<HttpRequest<'_>, HttpError> {
     let hdr_end = find_subslice(raw, b"\r\n\r\n").ok_or(HttpError::MalformedRequest)?;
-    let header_block =
-        core::str::from_utf8(&raw[..hdr_end]).map_err(|_| HttpError::InvalidUtf8)?;
+    let header_block = core::str::from_utf8(&raw[..hdr_end]).map_err(|_| HttpError::InvalidUtf8)?;
     let body = &raw[hdr_end + 4..];
 
     let mut lines = header_block.split("\r\n");
-    let request_line = lines.next().ok_or(HttpError::MalformedRequest)?;
+    let request_line = lines
+        .find(|l| !l.is_empty())
+        .ok_or(HttpError::MalformedRequest)?;
     let mut parts = request_line.split_whitespace();
     let method_str = parts.next().ok_or(HttpError::MalformedRequest)?;
     let target_str = parts.next().ok_or(HttpError::MalformedRequest)?;
     let version = parts.next().ok_or(HttpError::MalformedRequest)?;
+    if parts.next().is_some() {
+        return Err(HttpError::MalformedRequest);
+    }
+
+    if version != "HTTP/1.1" && version != "HTTP/1.0" {
+        return Err(HttpError::MalformedRequest);
+    }
+
+    if !target_str.starts_with('/') {
+        return Err(HttpError::MalformedRequest);
+    }
 
     let method = match method_str {
         "GET" => HttpMethod::Get,
@@ -295,16 +308,32 @@ pub fn parse_http_request(raw: &[u8]) -> Result<HttpRequest<'_>, HttpError> {
         if line.is_empty() {
             continue;
         }
-        if let Some(colon) = line.find(':') {
-            let name = line[..colon].trim();
-            let val = line[colon + 1..].trim();
-            if name.eq_ignore_ascii_case("X-OTA-Token") {
-                ota_token = Some(val.as_bytes());
-            } else if name.eq_ignore_ascii_case("Content-Length") {
-                content_length = parse_isize_ascii(val);
-            } else if name.eq_ignore_ascii_case("Content-Type") {
-                content_type = Some(val);
+        let colon = line.find(':').ok_or(HttpError::MalformedRequest)?;
+        let name = &line[..colon];
+        if name.is_empty() || name.bytes().any(|b| b.is_ascii_whitespace()) {
+            return Err(HttpError::MalformedRequest);
+        }
+        let val = line[colon + 1..].trim();
+        if name.eq_ignore_ascii_case("X-OTA-Token") {
+            if ota_token.is_some() {
+                return Err(HttpError::MalformedRequest);
             }
+            ota_token = Some(val.as_bytes());
+        } else if name.eq_ignore_ascii_case("Transfer-Encoding") {
+            return Err(HttpError::MalformedRequest);
+        } else if name.eq_ignore_ascii_case("Content-Length") {
+            if content_length.is_some() {
+                return Err(HttpError::MalformedRequest);
+            }
+            let cl = val
+                .parse::<usize>()
+                .map_err(|_| HttpError::MalformedRequest)?;
+            if cl > isize::MAX as usize {
+                return Err(HttpError::MalformedRequest);
+            }
+            content_length = Some(cl as isize);
+        } else if name.eq_ignore_ascii_case("Content-Type") {
+            content_type = Some(val);
         }
     }
 
@@ -425,11 +454,33 @@ impl Default for TelemetrySnapshot<'static> {
     }
 }
 
+fn sanitize_status_json_field<'a>(field: &'a str, buf: &'a mut [u8; 64]) -> &'a str {
+    let bytes = field.as_bytes();
+    let len = bytes.len().min(64);
+    let mut i = 0;
+    while i < len {
+        let b = bytes[i];
+        if b < 0x20 || b == b'"' || b == b'\\' || b == 0x7F {
+            buf[i] = b'_';
+        } else {
+            buf[i] = b;
+        }
+        i += 1;
+    }
+    core::str::from_utf8(&buf[..len]).unwrap_or("unknown")
+}
+
 /// Formats the exact 7-key JSON telemetry payload into a 384-byte stack buffer (`klipper_cam.c`).
+/// Sanitizes `active_partition` and `framesize` to prevent JSON structure breakage (`SEC-202`).
 pub fn format_status_json<'a>(
     telemetry: &TelemetrySnapshot<'_>,
     stack_buf: &'a mut [u8; STATUS_JSON_BUF_LEN],
 ) -> Result<&'a str, HttpError> {
+    let mut p_buf = [0u8; 64];
+    let mut f_buf = [0u8; 64];
+    let safe_part = sanitize_status_json_field(telemetry.active_partition, &mut p_buf);
+    let safe_framesize = sanitize_status_json_field(telemetry.framesize, &mut f_buf);
+
     let mut writer = SliceWriter::new(stack_buf);
     writeln!(
         writer,
@@ -438,8 +489,8 @@ pub fn format_status_json<'a>(
         telemetry.free_heap,
         telemetry.free_psram,
         telemetry.wifi_rssi,
-        telemetry.active_partition,
-        telemetry.framesize,
+        safe_part,
+        safe_framesize,
         if telemetry.stream_active { "true" } else { "false" }
     )
     .map_err(|_| HttpError::BufferTooSmall)?;
@@ -590,32 +641,37 @@ button{background:#007acc;color:#fff;border:none;padding:7px 12px;border-radius:
 #st{font-family:monospace;font-size:12px;color:#9cdcfe;margin-top:10px}\
 </style></head><body><div class=\"wrap\">\
 <div class=\"card\"><h2>Klipper Camera Live Preview</h2>\
-<img id=\"view\" src=\"/snapshot\" alt=\"Preview\">\
+<img id=\"view\" src=\"/snapshot\" alt=\"Preview\" onload=\"ie=0\" onerror=\"oe()\">\
 <div style=\"margin-top:10px\">\
-<button onclick=\"startStream()\">Live Stream (:81)</button>\
+<button onclick=\"ss()\">Live Stream (:81)</button>\
 <button onclick=\"snap()\">Snapshot</button>\
 <a href=\"/update\" style=\"color:#569cd6;font-size:13px\">OTA Update</a>\
 </div><div id=\"st\">Loading...</div></div>\
 <div class=\"card\"><h2>OV2640 Controls</h2>\
-<div class=\"r\"><label>Resolution</label><select id=\"framesize\" onchange=\"setCtrl('framesize',this.value)\">\
-<option value=\"5\">320x240</option><option value=\"6\">400x296</option><option value=\"7\">480x320</option>\
-<option value=\"8\">640x480</option><option value=\"9\">800x600</option><option value=\"10\">1024x768</option>\
-<option value=\"11\" selected>1280x720</option><option value=\"12\">1280x1024</option><option value=\"13\">1600x1200</option>\
-</select></div><div id=\"sl\"></div></div></div><script>\
+<div class=\"r\"><label>Resolution</label><select id=\"framesize\" onchange=\"setCtrl('framesize',this.value)\"></select></div>\
+<div id=\"sl\"></div></div></div><script>\
+function $(i){return document.getElementById(i);}\
+function rj(r){return r.json();}\
+['320x240','400x296','480x320','640x480','800x600','1024x768','1280x720','1280x1024','1600x1200'].forEach(function(r,i){$('framesize').innerHTML+='<option value=\"'+(i+5)+'\"'+(i==6?' selected':'')+'>'+r+'</option>';});\
 var S=[['quality','Quality',4,63,12],['brightness','Brightness',-2,2,0],['contrast','Contrast',-2,2,0],\
 ['saturation','Saturation',-2,2,0],['ae_level','AE Level',-2,2,0],['special_effect','Effect',0,6,0]];\
 var B=[['hmirror','H-Mirror',0],['vflip','V-Flip',0],['awb','Auto WB',1],['agc','Auto Gain',1],['aec','Auto Exp',1]];\
 var h='';S.forEach(function(x){h+='<div class=\"r\"><label>'+x[1]+'</label><input id=\"'+x[0]+'\" type=\"range\" min=\"'+x[2]+'\" max=\"'+x[3]+'\" value=\"'+x[4]+'\" onchange=\"setCtrl(\\''+x[0]+'\\',this.value)\"></div>';});\
 B.forEach(function(x){h+='<div class=\"r\"><label>'+x[1]+'</label><input id=\"'+x[0]+'\" type=\"checkbox\"'+(x[2]?' checked':'')+' onchange=\"setCtrl(\\''+x[0]+'\\',this.checked?1:0)\"></div>';});\
-document.getElementById('sl').innerHTML=h;\
-function startStream(){document.getElementById('view').src='http://'+location.hostname+':81/stream';}\
-function snap(){document.getElementById('view').src='/snapshot?t='+Date.now();}\
-function applyUi(c){['framesize','quality','brightness','contrast','saturation','ae_level','special_effect'].forEach(function(k){if(c[k]!==undefined)document.getElementById(k).value=c[k];});\
-['hmirror','vflip','awb','agc','aec'].forEach(function(k){if(c[k]!==undefined)document.getElementById(k).checked=!!c[k];});}\
-function setCtrl(k,v){fetch('/control?var='+k+'&val='+v).then(function(r){return r.json();}).then(applyUi);}\
-function poll(){fetch('/status').then(function(r){return r.json();}).then(function(s){\
-document.getElementById('st').innerText='Res: '+s.framesize+' | RSSI: '+s.wifi_rssi+' dBm | PSRAM: '+s.free_psram+' B | Part: '+s.active_partition+' | Stream: '+s.stream_active;});}\
-fetch('/control').then(function(r){return r.json();}).then(applyUi);poll();setInterval(poll,3000);\
+$('sl').innerHTML=h;\
+var m='stream',lu=0,ne=0,ie=0,pb=0,ls=0,rt=0;\
+function ss(){m='stream';ie=0;ls=Date.now();$('view').src='http://'+location.hostname+':81/stream?t='+ls;}\
+function snap(){m='snap';ie=0;$('view').src='/snapshot?t='+Date.now();}\
+function oe(){ie=1;if(!rt)rt=setTimeout(recover,1500);}\
+function recover(){if(rt){clearTimeout(rt);rt=0;}if(m==='stream')ss();else snap();}\
+function u(c){if(c.framesize)$('framesize').value=c.framesize;S.forEach(function(x){if(c[x[0]]!==undefined)$(x[0]).value=c[x[0]];});\
+B.forEach(function(x){if(c[x[0]]!==undefined)$(x[0]).checked=!!c[x[0]];});}\
+function sc(){fetch('/control').then(rj).then(u).catch(function(){});}\
+function setCtrl(k,v){fetch('/control?var='+k+'&val='+v).then(rj).then(function(c){u(c);if(m==='snap')setTimeout(snap,250);}).catch(function(){ne=1;});}\
+function poll(){if(pb)return;pb=1;var bt=setTimeout(function(){pb=0;},2500);fetch('/status').then(rj).then(function(s){clearTimeout(bt);pb=0;\
+$('st').innerText='Res: '+s.framesize+' | RSSI: '+s.wifi_rssi+' dBm | PSRAM: '+s.free_psram+' B | Part: '+s.active_partition+' | Stream: '+s.stream_active;\
+var rb=(lu>0&&s.uptime_ms<lu);lu=s.uptime_ms;if(ne||rb){ne=0;sc();recover();}else if(ie||(m==='stream'&&!s.stream_active&&(Date.now()-ls>3500))){recover();}}).catch(function(){clearTimeout(bt);pb=0;ne=1;$('st').innerText='Offline - reconnecting...';});}\
+sc();ss();poll();setInterval(poll,3000);\
 </script></body></html>";
 
 /// Formats an MJPEG multipart frame boundary header into a 128-byte stack buffer (`klipper_cam.c`).
@@ -713,6 +769,18 @@ impl<'a> CameraDriver<'a> {
     pub fn set_frame(&mut self, frame_data: &'a [u8], frame_size: FrameSize) {
         self.frame_data = frame_data;
         self.frame_size = frame_size;
+    }
+
+    /// Updates the frame size resolution of the camera driver.
+    #[inline]
+    pub fn set_frame_size(&mut self, frame_size: FrameSize) {
+        self.frame_size = frame_size;
+    }
+
+    /// Returns the active frame size resolution.
+    #[inline]
+    pub const fn frame_size(&self) -> FrameSize {
+        self.frame_size
     }
 
     /// Returns the underlying JPEG frame slice currently configured in the driver.
@@ -830,7 +898,10 @@ impl<'a> StreamSessionGuard<'a> {
                 self.consecutive_failures = 0;
                 g
             }
-            Err(CameraError::InvalidState) => return Err(HttpError::CameraBusy),
+            Err(CameraError::InvalidState) => {
+                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+                return Err(HttpError::CameraBusy);
+            }
             Err(_) => {
                 self.consecutive_failures = self.consecutive_failures.saturating_add(1);
                 return Err(HttpError::CaptureFailed);
@@ -904,7 +975,16 @@ impl<'a> KlipperCamServer<'a> {
 
     /// Creates a default [`KlipperCamServer`] with `WroverKit` 1280x720 HD configuration.
     pub const fn new_default() -> KlipperCamServer<'static> {
-        KlipperCamServer::new(KlipperCamConfig::WROVER_KIT_HD, CameraDriver::new_hd_default())
+        KlipperCamServer::new(
+            KlipperCamConfig::WROVER_KIT_HD,
+            CameraDriver::new_hd_default(),
+        )
+    }
+
+    /// Returns the configured OTA shared secret token as a byte slice.
+    #[inline]
+    pub fn ota_token(&self) -> &[u8] {
+        self.config.ota_token.as_bytes()
     }
 
     /// Returns `Some(CameraControlState)` and clears `dirty` if a camera control setting
@@ -919,7 +999,13 @@ impl<'a> KlipperCamServer<'a> {
     }
 
     /// Updates the live system telemetry metrics reported by `GET /status`.
-    pub fn set_telemetry(&mut self, uptime_ms: i64, free_heap: u32, free_psram: u32, wifi_rssi: i32) {
+    pub fn set_telemetry(
+        &mut self,
+        uptime_ms: i64,
+        free_heap: u32,
+        free_psram: u32,
+        wifi_rssi: i32,
+    ) {
         self.uptime_ms = uptime_ms;
         self.free_heap = free_heap;
         self.free_psram = free_psram;
@@ -1056,11 +1142,19 @@ impl<'a> KlipperCamServer<'a> {
         out_buf: &'b mut [u8],
     ) -> Result<&'b [u8], HttpError> {
         if let Some(q) = req.query {
-            if !q.is_empty() && q.len() <= MAX_URL_QUERY_LEN {
-                if q.contains("action=snapshot") {
+            if q.len() > MAX_URL_QUERY_LEN {
+                return write_http_error(
+                    out_buf,
+                    400,
+                    "Bad Request",
+                    "Query string exceeds maximum length\n",
+                    false,
+                );
+            }
+            for param in q.split('&') {
+                if param == "action=snapshot" {
                     return self.handle_snapshot(out_buf);
-                }
-                if q.contains("action=stream") {
+                } else if param == "action=stream" {
                     return write_http_error(
                         out_buf,
                         400,
@@ -1075,7 +1169,7 @@ impl<'a> KlipperCamServer<'a> {
         let mut writer = SliceWriter::new(out_buf);
         write!(
             writer,
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
             KLIPPER_ROOT_STATUS_PAGE.len(),
             KLIPPER_ROOT_STATUS_PAGE
         )
@@ -1093,7 +1187,7 @@ impl<'a> KlipperCamServer<'a> {
                     500,
                     "Internal Server Error",
                     "Camera busy",
-                    false,
+                    true,
                 );
             }
             Err(_) => {
@@ -1102,7 +1196,7 @@ impl<'a> KlipperCamServer<'a> {
                     500,
                     "Internal Server Error",
                     "Camera snapshot capture failed",
-                    false,
+                    true,
                 );
             }
         };
@@ -1110,7 +1204,7 @@ impl<'a> KlipperCamServer<'a> {
         let mut writer = SliceWriter::new(out_buf);
         write!(
             writer,
-            "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Disposition: inline; filename=capture.jpg\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Disposition: inline; filename=capture.jpg\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
             guard.len()
         )
         .map_err(|_| HttpError::BufferTooSmall)?;
@@ -1137,7 +1231,7 @@ impl<'a> KlipperCamServer<'a> {
         let mut writer = SliceWriter::new(out_buf);
         write!(
             writer,
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
             json_str.len(),
             json_str
         )
@@ -1170,8 +1264,26 @@ impl<'a> KlipperCamServer<'a> {
                         let k = &pair[..eq_idx];
                         let v = &pair[eq_idx + 1..];
                         if k == "var" {
+                            if var_opt.is_some() {
+                                return write_http_error(
+                                    out_buf,
+                                    400,
+                                    "Bad Request",
+                                    "Duplicate 'var' parameter\n",
+                                    true,
+                                );
+                            }
                             var_opt = Some(v);
                         } else if k == "val" {
+                            if val_str_opt.is_some() {
+                                return write_http_error(
+                                    out_buf,
+                                    400,
+                                    "Bad Request",
+                                    "Duplicate 'val' parameter\n",
+                                    true,
+                                );
+                            }
                             val_str_opt = Some(v);
                         }
                     }
@@ -1205,7 +1317,10 @@ impl<'a> KlipperCamServer<'a> {
 
                 match var_name {
                     "framesize" => match parse_framesize_val(val) {
-                        Some(fs) => self.control_state.framesize = fs,
+                        Some(fs) => {
+                            self.control_state.framesize = fs;
+                            self.camera.set_frame_size(fs);
+                        }
                         None => {
                             return write_http_error(
                                 out_buf,
@@ -1369,7 +1484,7 @@ impl<'a> KlipperCamServer<'a> {
         let mut writer = SliceWriter::new(out_buf);
         write!(
             writer,
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
             json_str.len(),
             json_str
         )
@@ -1382,7 +1497,7 @@ impl<'a> KlipperCamServer<'a> {
         let mut writer = SliceWriter::new(out_buf);
         write!(
             writer,
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
             KLIPPER_CONTROL_PANEL_HTML.len(),
             KLIPPER_CONTROL_PANEL_HTML
         )
@@ -1405,7 +1520,8 @@ button{background:#007acc;color:#fff;cursor:pointer;width:100%}\
 #bar{width:0%;height:100%;background:#28a745;border-radius:4px;text-align:center;font-size:12px;line-height:20px}\
 </style></head><body><div class=\"card\"><h2>Klipper Cam OTA Update</h2>";
 
-        let html_suffix = "<input type=\"password\" id=\"tok\" placeholder=\"OTA Security Token\"><br>\
+        let html_suffix =
+            "<input type=\"password\" id=\"tok\" placeholder=\"OTA Security Token\"><br>\
 <input type=\"file\" id=\"f\" accept=\".bin\"><br>\
 <button id=\"btn\" onclick=\"upload()\">Flash Firmware</button>\
 <div id=\"prg\"><div id=\"bar\">0%</div></div><p id=\"st\"></p></div><script>\
@@ -1450,7 +1566,7 @@ xhr.send(file);}</script></body></html>";
         let mut writer = SliceWriter::new(out_buf);
         write!(
             writer,
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}{}{}",
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}{}{}",
             body_len, html_prefix, info_str, html_suffix
         )
         .map_err(|_| HttpError::BufferTooSmall)?;
@@ -1476,7 +1592,7 @@ xhr.send(file);}</script></body></html>";
             let mut writer = SliceWriter::new(out_buf);
             write!(
                 writer,
-                "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+                "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
                 unauthorized_body.len(),
                 unauthorized_body
             )
@@ -1557,7 +1673,7 @@ xhr.send(file);}</script></body></html>";
         let mut writer = SliceWriter::new(out_buf);
         write!(
             writer,
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
             ok_body.len(),
             ok_body
         )
@@ -1647,7 +1763,7 @@ Upload Main Firmware:\n\
     let mut writer = SliceWriter::new(out_buf);
     write!(
         writer,
-        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
         body_str.len(),
         body_str
     )
@@ -1656,7 +1772,7 @@ Upload Main Firmware:\n\
 }
 
 /// Helper to write an HTTP error response into `out_buf`.
-fn write_http_error<'a>(
+pub fn write_http_error<'a>(
     out_buf: &'a mut [u8],
     status_code: u16,
     reason: &str,
@@ -1667,7 +1783,7 @@ fn write_http_error<'a>(
     if include_cors {
         write!(
             writer,
-            "HTTP/1.1 {} {}\r\nContent-Type: text/plain\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
+            "HTTP/1.1 {} {}\r\nContent-Type: text/plain\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
             status_code,
             reason,
             message.len(),
@@ -1677,7 +1793,7 @@ fn write_http_error<'a>(
     } else {
         write!(
             writer,
-            "HTTP/1.1 {} {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+            "HTTP/1.1 {} {}\r\nContent-Type: text/plain\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
             status_code,
             reason,
             message.len(),
@@ -1691,7 +1807,7 @@ fn write_http_error<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ota::{EspImageHeader, OtaImgState};
+    use crate::ota::OtaImgState;
 
     /// Challenger Scenario 1: Port 80 `GET /status` returns `200 OK` `application/json`
     /// with the exact 7-key JSON telemetry schema (`uptime_ms`, `free_heap`, `free_psram`,
@@ -1997,17 +2113,18 @@ mod tests {
         );
 
         // 5. Valid token + valid 0xE9 ESP32 firmware image -> 200 OK, switches boot slot to ota_1
-        let valid_hdr = EspImageHeader::minimal_valid_header_bytes(4, 0x4008_0400);
-        let mut valid_req = [0u8; 256];
+        let valid_img = crate::ota::make_valid_esp_image(false);
+        let mut valid_req = [0u8; 512];
         let valid_req_bytes = {
             let mut w = SliceWriter::new(&mut valid_req);
             write!(
                 w,
-                "POST /update HTTP/1.1\r\nHost: 172.22.1.52\r\nX-OTA-Token: {}\r\nContent-Length: 24\r\n\r\n",
-                server.config.ota_token
+                "POST /update HTTP/1.1\r\nHost: 172.22.1.52\r\nX-OTA-Token: {}\r\nContent-Length: {}\r\n\r\n",
+                server.config.ota_token,
+                valid_img.len()
             )
             .expect("hdr");
-            w.write_bytes(&valid_hdr).expect("body");
+            w.write_bytes(&valid_img).expect("body");
             w.into_bytes()
         };
         let r_ok = server
@@ -2017,7 +2134,7 @@ mod tests {
         assert_eq!(v_ok.status_code, 200);
         assert_eq!(v_ok.body, b"Firmware update successful! Rebooting...\n");
         assert!(server.is_reboot_scheduled());
-        assert_eq!(server.last_ota_bytes_written(), 24);
+        assert_eq!(server.last_ota_bytes_written(), valid_img.len());
         assert_eq!(server.last_ota_target_slot(), Some(OtaSlot::Ota1));
         assert_eq!(server.ota_manager.active_slot(), OtaSlot::Ota1);
         assert_eq!(
@@ -2062,18 +2179,16 @@ mod tests {
         assert_eq!(snap_view.status_code, 200);
         assert_eq!(snap_view.body, &updated_frame);
 
-        // POST /update with flash persists 27-byte firmware (24-byte header + 3 trailing bytes) to ota_1
-        let mut fw_img = [0xA5u8; 27];
-        let hdr = EspImageHeader::minimal_valid_header_bytes(2, 0x4008_0400);
-        fw_img[..24].copy_from_slice(&hdr);
-
-        let mut ota_req = [0u8; 256];
+        // POST /update with flash persists firmware image to ota_1
+        let fw_img = crate::ota::make_valid_esp_image(false);
+        let mut ota_req = [0u8; 512];
         let ota_req_bytes = {
             let mut w = SliceWriter::new(&mut ota_req);
             write!(
                 w,
-                "POST /update HTTP/1.1\r\nHost: 172.22.1.52\r\nX-OTA-Token: {}\r\nContent-Length: 27\r\n\r\n",
-                server.config.ota_token
+                "POST /update HTTP/1.1\r\nHost: 172.22.1.52\r\nX-OTA-Token: {}\r\nContent-Length: {}\r\n\r\n",
+                server.config.ota_token,
+                fw_img.len()
             )
             .expect("hdr");
             w.write_bytes(&fw_img).expect("body");
@@ -2090,8 +2205,7 @@ mod tests {
             .expect("OTA POST with flash");
         let ota_view = HttpResponseView::parse(ota_resp).expect("parse 200");
         assert_eq!(ota_view.status_code, 200);
-        assert_eq!(&flash.ota_1[..27], &fw_img[..]);
-        assert_eq!(flash.ota_1[27], 0xFF);
+        assert_eq!(&flash.ota_1[..fw_img.len()], &fw_img[..]);
 
         // Confirm otadata sector 1 in flash has PendingVerify, then cancel rollback with flash
         let loaded = OtaDataManager::load_from_flash(&mut flash).expect("load from flash");
@@ -2181,11 +2295,13 @@ mod tests {
                 "\"contrast\":2",
             ),
             (
-                b"GET /control?var=saturation&val=-2 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+                b"GET /control?var=saturation&val=-2 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n"
+                    .as_slice(),
                 "\"saturation\":-2",
             ),
             (
-                b"GET /control?var=special_effect&val=3 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+                b"GET /control?var=special_effect&val=3 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n"
+                    .as_slice(),
                 "\"special_effect\":3",
             ),
             (
@@ -2209,7 +2325,8 @@ mod tests {
                 "\"ae_level\":1",
             ),
             (
-                b"GET /control?var=framesize&val=800 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+                b"GET /control?var=framesize&val=800 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n"
+                    .as_slice(),
                 "\"framesize\":9,\"framesize_label\":\"800x600\"",
             ),
         ] {
@@ -2219,7 +2336,12 @@ mod tests {
             let v = HttpResponseView::parse(r).expect("parse response");
             assert_eq!(v.status_code, 200);
             let s = core::str::from_utf8(v.body).expect("utf8");
-            assert!(s.contains(expected_substr), "expected {} in {}", expected_substr, s);
+            assert!(
+                s.contains(expected_substr),
+                "expected {} in {}",
+                expected_substr,
+                s
+            );
         }
 
         // Verify /status reflects updated framesize ("800x600")
@@ -2263,7 +2385,8 @@ mod tests {
             b"GET /control?var=brightness&val=3 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
             b"GET /control?var=contrast&val=-3 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
             b"GET /control?var=saturation&val=9 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
-            b"GET /control?var=special_effect&val=7 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+            b"GET /control?var=special_effect&val=7 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n"
+                .as_slice(),
             b"GET /control?var=hmirror&val=2 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
             b"GET /control?var=vflip&val=-1 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
             b"GET /control?var=ae_level&val=-5 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
@@ -2307,5 +2430,393 @@ mod tests {
         assert!(html.contains("/snapshot"));
         assert!(html.contains("fetch('/control?var='+k+'&val='+v)"));
         assert!(html.contains("fetch('/status')"));
+        assert!(html.contains("onerror="));
+        assert!(html.contains("recover()"));
+    }
+
+    #[test]
+    fn test_qa201_malformed_and_duplicate_headers() {
+        // Line without colon -> MalformedRequest
+        let no_colon = b"GET / HTTP/1.1\r\nInvalidHeaderWithoutColon\r\n\r\n";
+        assert_eq!(
+            parse_http_request(no_colon),
+            Err(HttpError::MalformedRequest)
+        );
+
+        // Header name with whitespace before colon -> MalformedRequest (RFC 9112 section 5.1)
+        let space_before_colon = b"GET / HTTP/1.1\r\nHost : 172.22.1.52\r\n\r\n";
+        assert_eq!(
+            parse_http_request(space_before_colon),
+            Err(HttpError::MalformedRequest)
+        );
+
+        let tab_before_colon = b"GET / HTTP/1.1\r\nHost\t: 172.22.1.52\r\n\r\n";
+        assert_eq!(
+            parse_http_request(tab_before_colon),
+            Err(HttpError::MalformedRequest)
+        );
+
+        // Duplicate Content-Length -> MalformedRequest
+        let dup_cl = b"POST /update HTTP/1.1\r\nHost: 172.22.1.52\r\nContent-Length: 10\r\nContent-Length: 10\r\n\r\n";
+        assert_eq!(parse_http_request(dup_cl), Err(HttpError::MalformedRequest));
+
+        // Malformed Content-Length -> MalformedRequest
+        let neg_cl = b"POST /update HTTP/1.1\r\nHost: 172.22.1.52\r\nContent-Length: -10\r\n\r\n";
+        assert_eq!(parse_http_request(neg_cl), Err(HttpError::MalformedRequest));
+
+        let non_num_cl =
+            b"POST /update HTTP/1.1\r\nHost: 172.22.1.52\r\nContent-Length: ten\r\n\r\n";
+        assert_eq!(
+            parse_http_request(non_num_cl),
+            Err(HttpError::MalformedRequest)
+        );
+
+        // Duplicate X-OTA-Token -> MalformedRequest
+        let dup_token = b"POST /update HTTP/1.1\r\nHost: 172.22.1.52\r\nX-OTA-Token: tok1\r\nX-OTA-Token: tok2\r\n\r\n";
+        assert_eq!(
+            parse_http_request(dup_token),
+            Err(HttpError::MalformedRequest)
+        );
+
+        // Transfer-Encoding header rejected per RFC 9112 §6.1 (SEC-001)
+        let te_chunked =
+            b"POST /update HTTP/1.1\r\nHost: 172.22.1.52\r\nTransfer-Encoding: chunked\r\n\r\n";
+        assert_eq!(
+            parse_http_request(te_chunked),
+            Err(HttpError::MalformedRequest)
+        );
+
+        // Content-Length exceeding isize::MAX rejected (LOGIC-010)
+        #[cfg(target_pointer_width = "32")]
+        {
+            let cl_overflow =
+                b"POST /update HTTP/1.1\r\nHost: 172.22.1.52\r\nContent-Length: 3000000000\r\n\r\n";
+            assert_eq!(
+                parse_http_request(cl_overflow),
+                Err(HttpError::MalformedRequest)
+            );
+        }
+        #[cfg(target_pointer_width = "64")]
+        {
+            let cl_overflow = b"POST /update HTTP/1.1\r\nHost: 172.22.1.52\r\nContent-Length: 9223372036854775808\r\n\r\n";
+            assert_eq!(
+                parse_http_request(cl_overflow),
+                Err(HttpError::MalformedRequest)
+            );
+        }
+    }
+
+    #[test]
+    fn test_qa201_request_line_invariants() {
+        // Extra tokens on request line -> MalformedRequest
+        let extra_tokens = b"GET / HTTP/1.1 EXTRA_TOKEN\r\nHost: 172.22.1.52\r\n\r\n";
+        assert_eq!(
+            parse_http_request(extra_tokens),
+            Err(HttpError::MalformedRequest)
+        );
+
+        // Invalid HTTP version -> MalformedRequest
+        let http2 = b"GET / HTTP/2.0\r\nHost: 172.22.1.52\r\n\r\n";
+        assert_eq!(parse_http_request(http2), Err(HttpError::MalformedRequest));
+
+        let http_bad = b"GET / HTTP/3.0\r\nHost: 172.22.1.52\r\n\r\n";
+        assert_eq!(
+            parse_http_request(http_bad),
+            Err(HttpError::MalformedRequest)
+        );
+
+        // Target without leading slash -> MalformedRequest
+        let no_leading_slash = b"GET status HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n";
+        assert_eq!(
+            parse_http_request(no_leading_slash),
+            Err(HttpError::MalformedRequest)
+        );
+
+        // Valid HTTP/1.0 and HTTP/1.1 accepted
+        let http10 = b"GET / HTTP/1.0\r\nHost: 172.22.1.52\r\n\r\n";
+        let req10 = parse_http_request(http10).expect("HTTP/1.0 valid");
+        assert_eq!(req10.version, "HTTP/1.0");
+
+        let http11 = b"GET / HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n";
+        let req11 = parse_http_request(http11).expect("HTTP/1.1 valid");
+        assert_eq!(req11.version, "HTTP/1.1");
+
+        // RFC 9112 §2.2: allow leading empty CRLF lines before request-line (CONC-005)
+        let leading_crlf = b"\r\nGET /status HTTP/1.1\r\n\r\n";
+        let req_leading = parse_http_request(leading_crlf).expect("leading CRLF accepted");
+        assert_eq!(req_leading.method, HttpMethod::Get);
+        assert_eq!(req_leading.path, "/status");
+        assert_eq!(req_leading.version, "HTTP/1.1");
+
+        let leading_crlf_headers = b"\r\nGET /status HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n";
+        let req_leading_headers =
+            parse_http_request(leading_crlf_headers).expect("leading CRLF with headers accepted");
+        assert_eq!(req_leading_headers.method, HttpMethod::Get);
+        assert_eq!(req_leading_headers.path, "/status");
+        assert_eq!(req_leading_headers.version, "HTTP/1.1");
+    }
+
+    #[test]
+    fn test_qa201_oversized_query_and_exact_match() {
+        let mut server = KlipperCamServer::new_default();
+        let mut resp_buf = [0u8; 1024];
+
+        // Query string > 256 bytes on GET / -> 400 Bad Request
+        let mut long_req = alloc::vec::Vec::new();
+        long_req.extend_from_slice(b"GET /?");
+        long_req.extend_from_slice(&[b'a'; 260]);
+        long_req.extend_from_slice(b" HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n");
+        let r_long = server
+            .handle_raw_request(ServerPort::Control, &long_req, &mut resp_buf)
+            .expect("handled");
+        let v_long = HttpResponseView::parse(r_long).expect("parse 400");
+        assert_eq!(v_long.status_code, 400);
+
+        // Substring query containing action=stream but not exact pair -> serves root status page
+        let unanchored_req = b"GET /?fooaction=stream HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n";
+        let r_unanchored = server
+            .handle_raw_request(ServerPort::Control, unanchored_req, &mut resp_buf)
+            .expect("handled");
+        let v_unanchored = HttpResponseView::parse(r_unanchored).expect("parse 200");
+        assert_eq!(v_unanchored.status_code, 200);
+
+        // Exact action=stream query -> 400 Bad Request
+        let exact_stream = b"GET /?action=stream HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n";
+        let r_stream = server
+            .handle_raw_request(ServerPort::Control, exact_stream, &mut resp_buf)
+            .expect("handled");
+        let v_stream = HttpResponseView::parse(r_stream).expect("parse 400");
+        assert_eq!(v_stream.status_code, 400);
+
+        // Exact action=snapshot in multi-param query -> delegates to snapshot
+        let exact_snap = b"GET /?foo=1&action=snapshot&bar=2 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n";
+        let r_snap = server
+            .handle_raw_request(ServerPort::Control, exact_snap, &mut resp_buf)
+            .expect("handled");
+        let v_snap = HttpResponseView::parse(r_snap).expect("parse snapshot");
+        assert_eq!(v_snap.status_code, 200);
+        assert_eq!(v_snap.content_type, Some("image/jpeg"));
+    }
+
+    #[test]
+    fn test_qa201_ota_post_failures_and_flash_error() {
+        use crate::ota::MockNorFlash;
+
+        let mut server = KlipperCamServer::new_default();
+        let mut resp_buf = [0u8; 1024];
+
+        // Missing Content-Length on POST /update -> 400 Bad Request
+        let mut buf_no_cl = [0u8; 256];
+        let req_no_cl = {
+            let mut w = SliceWriter::new(&mut buf_no_cl);
+            write!(
+                w,
+                "POST /update HTTP/1.1\r\nHost: 172.22.1.52\r\nX-OTA-Token: {}\r\n\r\n",
+                server.config.ota_token
+            )
+            .expect("w");
+            w.into_bytes()
+        };
+        let r_no_cl = server
+            .handle_raw_request(ServerPort::Control, req_no_cl, &mut resp_buf)
+            .expect("handled");
+        let v_no_cl = HttpResponseView::parse(r_no_cl).expect("parse 400");
+        assert_eq!(v_no_cl.status_code, 400);
+        assert_eq!(v_no_cl.body, b"Content-Length header required");
+
+        // Truncated OTA body (Content-Length declares 64 bytes, but body has only 20) -> 400 Bad Request
+        let mut buf_trunc = [0u8; 256];
+        let req_trunc = {
+            let mut w = SliceWriter::new(&mut buf_trunc);
+            write!(
+                w,
+                "POST /update HTTP/1.1\r\nHost: 172.22.1.52\r\nX-OTA-Token: {}\r\nContent-Length: 64\r\n\r\n",
+                server.config.ota_token
+            )
+            .expect("w");
+            w.write_bytes(&[0xE9u8; 20]).expect("body");
+            w.into_bytes()
+        };
+        let r_trunc = server
+            .handle_raw_request(ServerPort::Control, req_trunc, &mut resp_buf)
+            .expect("handled");
+        let v_trunc = HttpResponseView::parse(r_trunc).expect("parse 400");
+        assert_eq!(v_trunc.status_code, 400);
+
+        // Flash failure -> 500 Internal Server Error
+        let mut failing_flash: MockNorFlash<8192> = MockNorFlash::new_booted_ota0();
+        failing_flash.fail_writes = true;
+        let valid_img = crate::ota::make_valid_esp_image(false);
+        let mut buf_flash_err = [0u8; 512];
+        let req_flash_err = {
+            let mut w = SliceWriter::new(&mut buf_flash_err);
+            write!(
+                w,
+                "POST /update HTTP/1.1\r\nHost: 172.22.1.52\r\nX-OTA-Token: {}\r\nContent-Length: {}\r\n\r\n",
+                server.config.ota_token,
+                valid_img.len()
+            )
+            .expect("w");
+            w.write_bytes(&valid_img).expect("body");
+            w.into_bytes()
+        };
+        let r_flash_err = server
+            .handle_raw_request_with_flash(
+                ServerPort::Control,
+                req_flash_err,
+                &mut resp_buf,
+                &mut failing_flash,
+            )
+            .expect("handled");
+        let v_flash_err = HttpResponseView::parse(r_flash_err).expect("parse 500");
+        assert_eq!(v_flash_err.status_code, 500);
+        assert_eq!(v_flash_err.body, b"Failed to update boot partition");
+    }
+
+    #[test]
+    fn test_qa201_port81_404_and_format_ota_minimal_root() {
+        let mut server = KlipperCamServer::new_default();
+        let mut resp_buf = [0u8; 1024];
+
+        // Port 81 GET /snapshot -> 404 Not Found
+        let r_p81_snap = server
+            .handle_raw_request(
+                ServerPort::Stream,
+                b"GET /snapshot HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n",
+                &mut resp_buf,
+            )
+            .expect("handled");
+        let v_p81_snap = HttpResponseView::parse(r_p81_snap).expect("parse 404");
+        assert_eq!(v_p81_snap.status_code, 404);
+
+        // Port 81 GET /status -> 404 Not Found
+        let r_p81_stat = server
+            .handle_raw_request(
+                ServerPort::Stream,
+                b"GET /status HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n",
+                &mut resp_buf,
+            )
+            .expect("handled");
+        let v_p81_stat = HttpResponseView::parse(r_p81_stat).expect("parse 404");
+        assert_eq!(v_p81_stat.status_code, 404);
+
+        // format_ota_minimal_root helper
+        let mgr = OtaDataManager::new_booted_ota0();
+        let mut min_buf = [0u8; 1024];
+        let min_resp =
+            format_ota_minimal_root(&mgr, 250_000, &mut min_buf).expect("format min root");
+        let min_view = HttpResponseView::parse(min_resp).expect("parse min root view");
+        assert_eq!(min_view.status_code, 200);
+        assert_eq!(min_view.content_type, Some("text/plain"));
+        let min_body = core::str::from_utf8(min_view.body).expect("utf8");
+        assert!(min_body.contains("Klipper Cam OTA Minimal Intermediary"));
+        assert!(min_body.contains("Running Partition: ota_0"));
+        assert!(min_body.contains("Next Target:      ota_1"));
+        assert!(min_body.contains("250000 bytes"));
+
+        // HttpError::BufferTooSmall when buffer is tiny
+        let mut tiny_buf = [0u8; 10];
+        assert_eq!(
+            format_ota_minimal_root(&mgr, 250_000, &mut tiny_buf),
+            Err(HttpError::BufferTooSmall)
+        );
+    }
+
+    #[test]
+    fn test_qa201_control_edge_cases_and_dirty_flag_transitions() {
+        let mut server = KlipperCamServer::new_default();
+        let mut resp_buf = [0u8; 1024];
+
+        // isize::MIN and isize::MAX on /control -> 400 Bad Request
+        let min_req = b"GET /control?var=quality&val=-9223372036854775808 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n";
+        let r_min = server
+            .handle_raw_request(ServerPort::Control, min_req, &mut resp_buf)
+            .expect("handled");
+        let v_min = HttpResponseView::parse(r_min).expect("parse 400");
+        assert_eq!(v_min.status_code, 400);
+
+        let max_req = b"GET /control?var=quality&val=9223372036854775807 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n";
+        let r_max = server
+            .handle_raw_request(ServerPort::Control, max_req, &mut resp_buf)
+            .expect("handled");
+        let v_max = HttpResponseView::parse(r_max).expect("parse 400");
+        assert_eq!(v_max.status_code, 400);
+
+        // Duplicate var parameter -> 400 Bad Request
+        let dup_var =
+            b"GET /control?var=quality&val=10&var=brightness HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n";
+        let r_dup_var = server
+            .handle_raw_request(ServerPort::Control, dup_var, &mut resp_buf)
+            .expect("handled");
+        let v_dup_var = HttpResponseView::parse(r_dup_var).expect("parse 400");
+        assert_eq!(v_dup_var.status_code, 400);
+        assert!(core::str::from_utf8(v_dup_var.body)
+            .expect("utf8")
+            .contains("Duplicate 'var' parameter"));
+
+        // Duplicate val parameter -> 400 Bad Request
+        let dup_val =
+            b"GET /control?var=quality&val=10&val=20 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n";
+        let r_dup_val = server
+            .handle_raw_request(ServerPort::Control, dup_val, &mut resp_buf)
+            .expect("handled");
+        let v_dup_val = HttpResponseView::parse(r_dup_val).expect("parse 400");
+        assert_eq!(v_dup_val.status_code, 400);
+        assert!(core::str::from_utf8(v_dup_val.body)
+            .expect("utf8")
+            .contains("Duplicate 'val' parameter"));
+
+        // FrameSize parameter update updates camera frame_size and dirty flag
+        assert_eq!(server.camera.frame_size(), FrameSize::Hd);
+        assert_eq!(server.take_pending_control_update(), None);
+
+        let fs_req = b"GET /control?var=framesize&val=8 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n";
+        let r_fs = server
+            .handle_raw_request(ServerPort::Control, fs_req, &mut resp_buf)
+            .expect("handled");
+        let v_fs = HttpResponseView::parse(r_fs).expect("parse 200");
+        assert_eq!(v_fs.status_code, 200);
+        assert_eq!(server.camera.frame_size(), FrameSize::Vga);
+
+        let pending = server
+            .take_pending_control_update()
+            .expect("dirty update pending");
+        assert_eq!(pending.framesize, FrameSize::Vga);
+        // Dirty flag cleared by take_pending_control_update
+        assert_eq!(server.take_pending_control_update(), None);
+    }
+
+    #[test]
+    fn test_port80_responses_emit_connection_close_header() {
+        let mut server = KlipperCamServer::new_default();
+        let mut resp_buf = [0u8; 4096];
+
+        for raw_req in [
+            b"GET / HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+            b"GET /snapshot HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+            b"GET /status HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+            b"GET /control HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+            b"GET /panel HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+            b"GET /update HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+            b"GET /nonexistent HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+            b"POST /update HTTP/1.1\r\nHost: 172.22.1.52\r\nContent-Length: 4\r\n\r\ntest"
+                .as_slice(),
+        ] {
+            let resp = server
+                .handle_raw_request(ServerPort::Control, raw_req, &mut resp_buf)
+                .expect("Port 80 request handled");
+            let view = HttpResponseView::parse(resp).expect("parse Port 80 response");
+            assert!(
+                view.headers_raw.contains("Connection: close"),
+                "Expected 'Connection: close' in headers: {}",
+                view.headers_raw
+            );
+        }
+
+        let mgr = OtaDataManager::new_booted_ota0();
+        let min_resp =
+            format_ota_minimal_root(&mgr, 180_000, &mut resp_buf).expect("format_ota_minimal_root");
+        let min_view = HttpResponseView::parse(min_resp).expect("parse minimal root");
+        assert!(min_view.headers_raw.contains("Connection: close"));
     }
 }

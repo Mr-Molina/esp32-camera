@@ -54,19 +54,30 @@ pub trait SccbBus {
 
     /// Reads a 16-bit big-endian value from a 16-bit register address (`SCCB_Read_Addr16_Val16`).
     fn read_reg16_val16(&mut self, slv_addr: u8, reg: u16) -> Result<u16, CameraError> {
+        if slv_addr == 0 || slv_addr >= 0x80 {
+            return Err(CameraError::InvalidArg);
+        }
+        let next_reg = reg.checked_add(1).ok_or(CameraError::InvalidArg)?;
         let hi = self.read_reg16(slv_addr, reg)? as u16;
-        let lo = self.read_reg16(slv_addr, reg.wrapping_add(1))? as u16;
+        let lo = self.read_reg16(slv_addr, next_reg)? as u16;
         Ok((hi << 8) | lo)
     }
 
     /// Writes a 16-bit big-endian value to a 16-bit register address (`SCCB_Write_Addr16_Val16`).
     fn write_reg16_val16(&mut self, slv_addr: u8, reg: u16, data: u16) -> Result<(), CameraError> {
+        if slv_addr == 0 || slv_addr >= 0x80 {
+            return Err(CameraError::InvalidArg);
+        }
+        let next_reg = reg.checked_add(1).ok_or(CameraError::InvalidArg)?;
         self.write_reg16(slv_addr, reg, (data >> 8) as u8)?;
-        self.write_reg16(slv_addr, reg.wrapping_add(1), (data & 0xFF) as u8)
+        self.write_reg16(slv_addr, next_reg, (data & 0xFF) as u8)
     }
 
     /// Probes whether a device responds at the 7-bit `slv_addr` (`SCCB_Probe`).
     fn probe(&mut self, slv_addr: u8) -> Result<(), CameraError> {
+        if slv_addr == 0 || slv_addr >= 0x80 {
+            return Err(CameraError::InvalidArg);
+        }
         let _ = self.read_reg8(slv_addr, 0x00)?;
         Ok(())
     }
@@ -113,6 +124,9 @@ where
     D: DelayNs,
 {
     fn read_reg8(&mut self, slv_addr: u8, reg: u8) -> Result<u8, CameraError> {
+        if slv_addr == 0 || slv_addr >= 0x80 {
+            return Err(CameraError::InvalidArg);
+        }
         let mut data = [0u8; 1];
         self.i2c
             .write(slv_addr, &[reg])
@@ -124,12 +138,18 @@ where
     }
 
     fn write_reg8(&mut self, slv_addr: u8, reg: u8, data: u8) -> Result<(), CameraError> {
+        if slv_addr == 0 || slv_addr >= 0x80 {
+            return Err(CameraError::InvalidArg);
+        }
         self.i2c
             .write(slv_addr, &[reg, data])
             .map_err(|_| CameraError::SccbError)
     }
 
     fn read_reg16(&mut self, slv_addr: u8, reg: u16) -> Result<u8, CameraError> {
+        if slv_addr == 0 || slv_addr >= 0x80 {
+            return Err(CameraError::InvalidArg);
+        }
         let reg_bytes = reg.to_be_bytes();
         let mut data = [0u8; 1];
         self.i2c
@@ -142,6 +162,9 @@ where
     }
 
     fn write_reg16(&mut self, slv_addr: u8, reg: u16, data: u8) -> Result<(), CameraError> {
+        if slv_addr == 0 || slv_addr >= 0x80 {
+            return Err(CameraError::InvalidArg);
+        }
         let reg_bytes = reg.to_be_bytes();
         self.i2c
             .write(slv_addr, &[reg_bytes[0], reg_bytes[1], data])
@@ -149,6 +172,9 @@ where
     }
 
     fn read_reg16_val16(&mut self, slv_addr: u8, reg: u16) -> Result<u16, CameraError> {
+        if slv_addr == 0 || slv_addr >= 0x80 {
+            return Err(CameraError::InvalidArg);
+        }
         let reg_bytes = reg.to_be_bytes();
         let mut data = [0u8; 2];
         self.i2c
@@ -161,6 +187,9 @@ where
     }
 
     fn write_reg16_val16(&mut self, slv_addr: u8, reg: u16, data: u16) -> Result<(), CameraError> {
+        if slv_addr == 0 || slv_addr >= 0x80 {
+            return Err(CameraError::InvalidArg);
+        }
         let reg_bytes = reg.to_be_bytes();
         let data_bytes = data.to_be_bytes();
         self.i2c
@@ -172,6 +201,9 @@ where
     }
 
     fn probe(&mut self, slv_addr: u8) -> Result<(), CameraError> {
+        if slv_addr == 0 || slv_addr >= 0x80 {
+            return Err(CameraError::InvalidArg);
+        }
         self.i2c
             .write(slv_addr, &[])
             .map_err(|_| CameraError::SccbError)
@@ -200,15 +232,38 @@ struct RegEntry {
     occupied: bool,
 }
 
+/// Maximum mock register store capacity for [`MockSccbBus`].
+pub const MAX_MOCK_REGS: usize = 1024;
+
+/// Detailed SCCB / I2C bus error conditions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SccbError {
+    /// Sensor/slave device did not acknowledge address or command (NACK / missing ACK).
+    AckMissing,
+}
+
+impl core::fmt::Display for SccbError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::AckMissing => write!(f, "SCCB acknowledge missing (NACK)"),
+        }
+    }
+}
+
+impl core::error::Error for SccbError {}
+
 /// Deterministic, zero-heap `#![no_std]` mock SCCB bus for unit testing sensor drivers.
 #[derive(Debug, Clone)]
-pub struct MockSccbBus<const CAP: usize = 512> {
+pub struct MockSccbBus<const CAP: usize = MAX_MOCK_REGS> {
     regs: [RegEntry; CAP],
     reg_len: usize,
     tx_log: [SccbTransaction; CAP],
     tx_len: usize,
     total_delay_ms: u32,
     forced_error: Option<CameraError>,
+    strict_ack: bool,
+    device_addrs: [u8; 16],
+    device_addrs_len: usize,
 }
 
 impl<const CAP: usize> Default for MockSccbBus<CAP> {
@@ -232,6 +287,9 @@ impl<const CAP: usize> MockSccbBus<CAP> {
             tx_len: 0,
             total_delay_ms: 0,
             forced_error: None,
+            strict_ack: false,
+            device_addrs: [0; 16],
+            device_addrs_len: 0,
         }
     }
 
@@ -249,24 +307,89 @@ impl<const CAP: usize> MockSccbBus<CAP> {
         };
     }
 
+    /// Sets strict ACK verification mode on `probe`.
+    ///
+    /// When `strict_ack` is enabled (or when [`Self::register_device_addr`] has been used),
+    /// [`SccbBus::probe`] will return [`CameraError::SccbError`] if no registers or registered
+    /// device addresses exist for `addr`.
+    pub fn set_strict_ack(&mut self, strict: bool) {
+        self.strict_ack = strict;
+    }
+
+    /// Builder method to enable or disable strict ACK mode.
+    pub const fn with_strict_ack(mut self, strict: bool) -> Self {
+        self.strict_ack = strict;
+        self
+    }
+
+    /// Returns whether strict ACK mode is active.
+    pub const fn strict_ack(&self) -> bool {
+        self.strict_ack
+    }
+
+    /// Explicitly registers a 7-bit slave device address as active on the mock bus.
+    pub fn register_device_addr(&mut self, addr: u8) {
+        if addr > 0 && addr < 0x80 {
+            let mut i = 0;
+            while i < self.device_addrs_len {
+                if self.device_addrs[i] == addr {
+                    return;
+                }
+                i += 1;
+            }
+            if self.device_addrs_len < self.device_addrs.len() {
+                self.device_addrs[self.device_addrs_len] = addr;
+                self.device_addrs_len += 1;
+            }
+        }
+    }
+
+    /// Checks if any register or explicit device registration exists for `slv_addr`.
+    pub fn has_device(&self, slv_addr: u8) -> bool {
+        let mut i = 0;
+        while i < self.device_addrs_len {
+            if self.device_addrs[i] == slv_addr {
+                return true;
+            }
+            i += 1;
+        }
+        let mut i = 0;
+        while i < self.reg_len {
+            let entry = &self.regs[i];
+            if entry.occupied && entry.slv_addr == slv_addr {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// Probes whether a device responds at `slv_addr` returning a detailed [`SccbError`].
+    pub fn probe_strict(&mut self, slv_addr: u8) -> Result<(), SccbError> {
+        if slv_addr == 0 || slv_addr >= 0x80 || !self.has_device(slv_addr) || self.forced_error.is_some() {
+            return Err(SccbError::AckMissing);
+        }
+        Ok(())
+    }
+
     /// Pre-populates an 8-bit register value without recording a bus transaction.
     pub fn preset_reg8(&mut self, slv_addr: u8, reg: u8, val: u8) {
-        self.store_reg(slv_addr, reg as u16, val);
+        let _ = self.store_reg(slv_addr, reg as u16, val);
     }
 
     /// Pre-populates a 16-bit register value without recording a bus transaction.
     pub fn preset_reg16(&mut self, slv_addr: u8, reg: u16, val: u8) {
-        self.store_reg(slv_addr, reg, val);
+        let _ = self.store_reg(slv_addr, reg, val);
     }
 
     /// Alias for [`Self::preset_reg8`].
     pub fn set_reg8(&mut self, slv_addr: u8, reg: u8, val: u8) {
-        self.store_reg(slv_addr, reg as u16, val);
+        let _ = self.store_reg(slv_addr, reg as u16, val);
     }
 
     /// Alias for [`Self::preset_reg16`].
     pub fn set_reg16(&mut self, slv_addr: u8, reg: u16, val: u8) {
-        self.store_reg(slv_addr, reg, val);
+        let _ = self.store_reg(slv_addr, reg, val);
     }
 
     /// Inspects the current value of an 8-bit register (`0` if never written).
@@ -321,16 +444,16 @@ impl<const CAP: usize> MockSccbBus<CAP> {
         None
     }
 
-    fn store_reg(&mut self, slv_addr: u8, reg: u16, val: u8) {
+    fn store_reg(&mut self, slv_addr: u8, reg: u16, val: u8) -> Result<(), CameraError> {
         if CAP == 0 {
-            return;
+            return Err(CameraError::SccbError);
         }
         let mut i = 0;
         while i < self.reg_len {
             if self.regs[i].occupied && self.regs[i].slv_addr == slv_addr && self.regs[i].reg == reg
             {
                 self.regs[i].val = val;
-                return;
+                return Ok(());
             }
             i += 1;
         }
@@ -342,15 +465,9 @@ impl<const CAP: usize> MockSccbBus<CAP> {
                 occupied: true,
             };
             self.reg_len += 1;
+            Ok(())
         } else {
-            // Evict the oldest non-ID slot to ensure large sensor init tables succeed even with small CAP.
-            self.regs.copy_within(1..CAP, 0);
-            self.regs[CAP - 1] = RegEntry {
-                slv_addr,
-                reg,
-                val,
-                occupied: true,
-            };
+            Err(CameraError::SccbError)
         }
     }
 
@@ -370,6 +487,9 @@ impl<const CAP: usize> MockSccbBus<CAP> {
 
 impl<const CAP: usize> SccbBus for MockSccbBus<CAP> {
     fn read_reg8(&mut self, slv_addr: u8, reg: u8) -> Result<u8, CameraError> {
+        if slv_addr == 0 || slv_addr >= 0x80 {
+            return Err(CameraError::InvalidArg);
+        }
         if let Some(err) = self.forced_error {
             return Err(err);
         }
@@ -379,10 +499,13 @@ impl<const CAP: usize> SccbBus for MockSccbBus<CAP> {
     }
 
     fn write_reg8(&mut self, slv_addr: u8, reg: u8, data: u8) -> Result<(), CameraError> {
+        if slv_addr == 0 || slv_addr >= 0x80 {
+            return Err(CameraError::InvalidArg);
+        }
         if let Some(err) = self.forced_error {
             return Err(err);
         }
-        self.store_reg(slv_addr, reg as u16, data);
+        self.store_reg(slv_addr, reg as u16, data)?;
         self.push_tx(SccbTransaction::Write8 {
             slv_addr,
             reg,
@@ -392,6 +515,9 @@ impl<const CAP: usize> SccbBus for MockSccbBus<CAP> {
     }
 
     fn read_reg16(&mut self, slv_addr: u8, reg: u16) -> Result<u8, CameraError> {
+        if slv_addr == 0 || slv_addr >= 0x80 {
+            return Err(CameraError::InvalidArg);
+        }
         if let Some(err) = self.forced_error {
             return Err(err);
         }
@@ -401,15 +527,31 @@ impl<const CAP: usize> SccbBus for MockSccbBus<CAP> {
     }
 
     fn write_reg16(&mut self, slv_addr: u8, reg: u16, data: u8) -> Result<(), CameraError> {
+        if slv_addr == 0 || slv_addr >= 0x80 {
+            return Err(CameraError::InvalidArg);
+        }
         if let Some(err) = self.forced_error {
             return Err(err);
         }
-        self.store_reg(slv_addr, reg, data);
+        self.store_reg(slv_addr, reg, data)?;
         self.push_tx(SccbTransaction::Write16 {
             slv_addr,
             reg,
             val: data,
         });
+        Ok(())
+    }
+
+    fn probe(&mut self, slv_addr: u8) -> Result<(), CameraError> {
+        if slv_addr == 0 || slv_addr >= 0x80 {
+            return Err(CameraError::InvalidArg);
+        }
+        if let Some(err) = self.forced_error {
+            return Err(err);
+        }
+        if (self.strict_ack || self.device_addrs_len > 0) && !self.has_device(slv_addr) {
+            return Err(CameraError::SccbError);
+        }
         Ok(())
     }
 
@@ -475,5 +617,70 @@ mod tests {
         );
         bus.set_fail(false);
         assert_eq!(bus.write_reg8(CameraSccbAddr::OV2640, 0xFF, 0x01), Ok(()));
+    }
+
+    #[test]
+    fn test_mock_sccb_address_validation_and_overflow() {
+        let mut bus: MockSccbBus<2> = MockSccbBus::new();
+
+        // 7-bit slave address validation: 0 and >= 0x80 must fail
+        assert_eq!(bus.probe(0x00), Err(CameraError::InvalidArg));
+        assert_eq!(bus.probe(0x80), Err(CameraError::InvalidArg));
+        assert_eq!(bus.probe(0xFF), Err(CameraError::InvalidArg));
+        assert_eq!(bus.probe(0x30), Ok(()));
+
+        assert_eq!(bus.read_reg8(0x00, 0x00), Err(CameraError::InvalidArg));
+        assert_eq!(bus.read_reg8(0x80, 0x00), Err(CameraError::InvalidArg));
+        assert_eq!(bus.write_reg8(0x00, 0x00, 0x12), Err(CameraError::InvalidArg));
+        assert_eq!(bus.write_reg8(0x80, 0x00, 0x12), Err(CameraError::InvalidArg));
+
+        assert_eq!(bus.read_reg16(0x00, 0x3000), Err(CameraError::InvalidArg));
+        assert_eq!(bus.read_reg16(0x80, 0x3000), Err(CameraError::InvalidArg));
+        assert_eq!(bus.write_reg16(0x00, 0x3000, 0x12), Err(CameraError::InvalidArg));
+        assert_eq!(bus.write_reg16(0x80, 0x3000, 0x12), Err(CameraError::InvalidArg));
+
+        // 16-bit register address checked_add overflow
+        assert_eq!(
+            bus.read_reg16_val16(CameraSccbAddr::OV5640, 0xFFFF),
+            Err(CameraError::InvalidArg)
+        );
+        assert_eq!(
+            bus.write_reg16_val16(CameraSccbAddr::OV5640, 0xFFFF, 0x1234),
+            Err(CameraError::InvalidArg)
+        );
+
+        // Capacity overflow returns Err(CameraError::SccbError) when full
+        assert_eq!(bus.write_reg8(0x30, 0x01, 0xAA), Ok(()));
+        assert_eq!(bus.write_reg8(0x30, 0x02, 0xBB), Ok(()));
+        assert_eq!(bus.write_reg8(0x30, 0x03, 0xCC), Err(CameraError::SccbError));
+        // Overwriting existing slot succeeds
+        assert_eq!(bus.write_reg8(0x30, 0x01, 0xFF), Ok(()));
+        assert_eq!(bus.read_reg8(0x30, 0x01), Ok(0xFF));
+    }
+
+    #[test]
+    fn test_mock_sccb_strict_ack_missing() {
+        let mut bus: MockSccbBus<64> = MockSccbBus::new();
+        bus.set_strict_ack(true);
+        bus.preset_reg8(CameraSccbAddr::OV2640, 0x0A, 0x26);
+
+        // Populated address succeeds probe
+        assert_eq!(bus.probe(CameraSccbAddr::OV2640), Ok(()));
+
+        // Unpopulated slave address returns SccbError in strict mode
+        assert_eq!(bus.probe(CameraSccbAddr::OV7725), Err(CameraError::SccbError));
+        assert_eq!(
+            bus.probe_strict(CameraSccbAddr::OV7725),
+            Err(SccbError::AckMissing)
+        );
+
+        // After registering device address, probe succeeds
+        bus.register_device_addr(CameraSccbAddr::OV7725);
+        assert_eq!(bus.probe(CameraSccbAddr::OV7725), Ok(()));
+        assert_eq!(bus.probe_strict(CameraSccbAddr::OV7725), Ok(()));
+
+        // With strict_ack disabled and no registered devices, unpopulated probe succeeds for backward compat
+        let mut loose_bus: MockSccbBus<64> = MockSccbBus::new();
+        assert_eq!(loose_bus.probe(CameraSccbAddr::OV7725), Ok(()));
     }
 }

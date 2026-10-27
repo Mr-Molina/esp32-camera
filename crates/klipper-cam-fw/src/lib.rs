@@ -10,6 +10,9 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+extern crate alloc;
+
 pub mod config;
 pub mod http;
 pub mod ota;
@@ -69,7 +72,7 @@ impl<S> SensorHalAdapter<S> {
     }
 }
 
-impl<B: SccbBus, S: CameraSensor<B>> HalCameraSensor<B> for SensorHalAdapter<S> {
+impl<B: SccbBus, S: CameraSensor<B>> CameraSensor<B> for SensorHalAdapter<S> {
     #[inline]
     fn model(&self) -> CameraModel {
         self.0.model()
@@ -150,7 +153,7 @@ pub use http::{
     framesize_control_code, framesize_label, parse_framesize_val, parse_http_request,
     CameraControlState, CameraDriver, FrameGuard, HttpError, HttpMethod, HttpRequest,
     HttpResponseView, KlipperCamServer, ServerPort, SliceWriter, StreamSessionGuard,
-    TelemetrySnapshot, CONTROL_JSON_BUF_LEN, KLIPPER_CONTROL_PANEL_HTML, KLIPPER_ROOT_STATUS_PAGE,
+    TelemetrySnapshot, write_http_error, CONTROL_JSON_BUF_LEN, KLIPPER_CONTROL_PANEL_HTML, KLIPPER_ROOT_STATUS_PAGE,
     MJPEG_BOUNDARY, MJPEG_CONTENT_TYPE, SYNTHETIC_HD_JFIF_FRAME,
 };
 pub use ota::{
@@ -172,14 +175,20 @@ pub enum WifiStaState {
     Uninitialized,
     /// `WIFI_EVENT_STA_START` fired; connecting to AP.
     Connecting,
+    /// `WIFI_EVENT_STA_CONNECTED` fired; associated with AP, waiting for DHCP/static IP.
+    ConnectedWaitingIp,
     /// `WIFI_EVENT_STA_DISCONNECTED` fired; non-blocking 2000ms reconnect timer scheduled (`APP-009`).
     DisconnectedReconnectScheduled { delay_ms: u32 },
     /// `IP_EVENT_STA_GOT_IP` fired; IP acquired, rollback cancelled, and HTTP servers active.
     ConnectedGotIp { ip: Ipv4Addr },
 }
 
+/// Compatibility alias for [`WifiStaState`].
+pub type WifiLifecycleState = WifiStaState;
+
 /// Top-level firmware lifecycle coordinator (`app_main` in `klipper_cam.c`).
 pub struct FirmwareRuntime<'a> {
+    pub config: KlipperCamConfig,
     pub server: KlipperCamServer<'a>,
     pub wifi_state: WifiStaState,
     pub webservers_started: bool,
@@ -192,6 +201,7 @@ impl<'a> FirmwareRuntime<'a> {
     pub const fn new(config: KlipperCamConfig, camera: CameraDriver<'a>) -> Self {
         let gpio4_low = config.board.has_gpio4_flash_led();
         Self {
+            config,
             server: KlipperCamServer::new(config, camera),
             wifi_state: WifiStaState::Uninitialized,
             webservers_started: false,
@@ -208,6 +218,11 @@ impl<'a> FirmwareRuntime<'a> {
     /// Handles `WIFI_EVENT_STA_START`: transitions station to [`WifiStaState::Connecting`].
     pub fn on_wifi_sta_start(&mut self) {
         self.wifi_state = WifiStaState::Connecting;
+    }
+
+    /// Handles `WIFI_EVENT_STA_CONNECTED`: transitions station to [`WifiLifecycleState::ConnectedWaitingIp`].
+    pub fn on_wifi_sta_connected(&mut self) {
+        self.wifi_state = WifiLifecycleState::ConnectedWaitingIp;
     }
 
     /// Handles `WIFI_EVENT_STA_DISCONNECTED`: schedules the non-blocking 2-second reconnect timer (`APP-009`).
@@ -235,8 +250,8 @@ impl<'a> FirmwareRuntime<'a> {
         ip: Ipv4Addr,
         flash: &mut F,
     ) -> Result<(), OtaError> {
+        let _cancelled = self.server.on_wifi_got_ip_with_flash(flash)?;
         self.wifi_state = WifiStaState::ConnectedGotIp { ip };
-        let _ = self.server.on_wifi_got_ip_with_flash(flash)?;
         self.rollback_cancelled = true;
         self.webservers_started = true;
         Ok(())
@@ -414,6 +429,7 @@ impl<'a> PingPongFrameBuffer<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::fmt::Write;
 
     #[test]
     fn test_firmware_runtime_boot_and_wifi_lifecycle() {
@@ -424,6 +440,9 @@ mod tests {
 
         rt.on_wifi_sta_start();
         assert_eq!(rt.wifi_state, WifiStaState::Connecting);
+
+        rt.on_wifi_sta_connected();
+        assert_eq!(rt.wifi_state, WifiStaState::ConnectedWaitingIp);
 
         rt.on_wifi_sta_disconnected();
         assert_eq!(
@@ -647,13 +666,13 @@ mod tests {
         assert!(status_json.contains("\"active_partition\":\"ota_0\""));
 
         // 8. Port 80 POST /update authenticated OTA upload
-        let ota_payload = EspImageHeader::minimal_valid_header_bytes(4, 0x4008_0400);
+        let ota_payload = crate::ota::make_valid_esp_image(false);
         let mut ota_req = [0u8; 512];
         let req_len = {
             let mut w = SliceWriter::new(&mut ota_req);
             let _ = w.write_str_checked("POST /update HTTP/1.1\r\nHost: 172.22.1.52\r\nX-OTA-Token: ");
             let _ = w.write_str_checked(DEFAULT_OTA_TOKEN);
-            let _ = w.write_str_checked("\r\nContent-Length: 24\r\n\r\n");
+            let _ = write!(w, "\r\nContent-Length: {}\r\n\r\n", ota_payload.len());
             let _ = w.write_bytes(&ota_payload);
             w.written_len()
         };
@@ -665,7 +684,7 @@ mod tests {
         assert_eq!(ota_view.status_code, 200);
         assert!(runtime.server.is_reboot_scheduled());
         assert_eq!(runtime.server.last_ota_target_slot(), Some(OtaSlot::Ota1));
-        assert_eq!(runtime.server.last_ota_bytes_written(), 24);
+        assert_eq!(runtime.server.last_ota_bytes_written(), ota_payload.len());
 
         let _ = streaming_hal.deinit().expect("deinit HAL camera driver");
     }

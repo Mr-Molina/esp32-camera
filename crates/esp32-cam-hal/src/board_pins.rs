@@ -37,6 +37,24 @@ impl TargetChip {
             Self::Esp32S3 => false,
         }
     }
+
+    /// Returns `true` if `gpio` is a non-existent physical silicon pad on this chip.
+    #[inline]
+    pub const fn is_non_existent(self, gpio: u8) -> bool {
+        match self {
+            Self::Esp32 => gpio == 20 || gpio == 24 || (gpio >= 28 && gpio <= 31),
+            Self::Esp32S2 | Self::Esp32S3 => gpio >= 22 && gpio <= 25,
+        }
+    }
+
+    /// Returns `true` if `gpio` is reserved for integrated SPI flash/PSRAM bus.
+    #[inline]
+    pub const fn is_reserved_flash(self, gpio: u8) -> bool {
+        match self {
+            Self::Esp32 => gpio >= 6 && gpio <= 11,
+            Self::Esp32S2 | Self::Esp32S3 => gpio >= 26 && gpio <= 32,
+        }
+    }
 }
 
 /// Complete camera pinout profile matching `camera_config_t` and `camera_pinout.h`.
@@ -97,38 +115,56 @@ impl CameraPins {
     /// 1. Every assigned GPIO index is within `0..=self.chip.max_gpio()`.
     /// 2. Output-capable pins (`xclk`, `siod`, `sioc`, `pwdn`, `reset`, `flash_led`) are not
     ///    assigned to input-only GPIOs (`34..=39` on ESP32, `46` on ESP32-S2).
-    /// 3. No two camera signals share the same physical GPIO pin (`FW-001` / `DMA-102`).
+    /// 3. No pin is assigned to non-existent silicon GPIOs (`20, 24, 28..=31` on ESP32; `22..=25` on ESP32-S2/S3)
+    ///    or reserved SPI Flash GPIOs (`6..=11` on ESP32; `26..=32` on ESP32-S2/S3).
+    /// 4. No two camera signals share the same physical GPIO pin (`FW-001` / `DMA-102`).
     pub const fn validate_pins(&self) -> Result<(), CameraError> {
         let max_gpio = self.chip.max_gpio();
 
-        // Check output-capable signals against range and input-only constraints
+        // Check output-capable signals against range, input-only, non-existent, and reserved flash constraints
         let output_pins = [self.xclk, self.siod, self.sioc];
         let mut i = 0;
         while i < output_pins.len() {
             let p = output_pins[i];
-            if p > max_gpio || self.chip.is_input_only(p) {
+            if p > max_gpio
+                || self.chip.is_input_only(p)
+                || self.chip.is_non_existent(p)
+                || self.chip.is_reserved_flash(p)
+            {
                 return Err(CameraError::InvalidArg);
             }
             i += 1;
         }
 
         if let Some(p) = self.pwdn {
-            if p > max_gpio || self.chip.is_input_only(p) {
+            if p > max_gpio
+                || self.chip.is_input_only(p)
+                || self.chip.is_non_existent(p)
+                || self.chip.is_reserved_flash(p)
+            {
                 return Err(CameraError::InvalidArg);
             }
         }
         if let Some(p) = self.reset {
-            if p > max_gpio || self.chip.is_input_only(p) {
+            if p > max_gpio
+                || self.chip.is_input_only(p)
+                || self.chip.is_non_existent(p)
+                || self.chip.is_reserved_flash(p)
+            {
                 return Err(CameraError::InvalidArg);
             }
         }
         if let Some(p) = self.flash_led {
-            if p > max_gpio || self.chip.is_input_only(p) {
+            if p > max_gpio
+                || self.chip.is_input_only(p)
+                || self.chip.is_non_existent(p)
+                || self.chip.is_reserved_flash(p)
+            {
                 return Err(CameraError::InvalidArg);
             }
         }
 
-        // Collect all active pins and verify range + uniqueness
+        // Collect all active pins and verify range + uniqueness + existence + flash reservations
         let mut active = [0xFFu8; 17];
         active[0] = self.xclk;
         active[1] = self.siod;
@@ -161,7 +197,11 @@ impl CameraPins {
 
         let mut a = 0;
         while a < count {
-            if active[a] > max_gpio {
+            let p = active[a];
+            if p > max_gpio
+                || self.chip.is_non_existent(p)
+                || self.chip.is_reserved_flash(p)
+            {
                 return Err(CameraError::InvalidArg);
             }
             let mut b = a + 1;
@@ -275,6 +315,54 @@ impl AiThinkerPins {
 
 impl BoardPins for AiThinkerPins {
     const NAME: &'static str = "BOARD_ESP32CAM_AITHINKER";
+    const PINS: CameraPins = CameraPins {
+        chip: TargetChip::Esp32,
+        pwdn: Self::PWDN,
+        reset: Self::RESET,
+        xclk: Self::XCLK,
+        siod: Self::SIOD,
+        sioc: Self::SIOC,
+        d7: Self::D7,
+        d6: Self::D6,
+        d5: Self::D5,
+        d4: Self::D4,
+        d3: Self::D3,
+        d2: Self::D2,
+        d1: Self::D1,
+        d0: Self::D0,
+        vsync: Self::VSYNC,
+        href: Self::HREF,
+        pclk: Self::PCLK,
+        flash_led: Self::FLASH_LED,
+    };
+}
+
+/// ESP-EYE camera pinout (`BOARD_ESP_EYE` in `camera_pinout.h`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+pub struct EspEyePins;
+
+impl EspEyePins {
+    pub const PWDN: Option<u8> = None;
+    pub const RESET: Option<u8> = None;
+    pub const XCLK: u8 = 4;
+    pub const SIOD: u8 = 18;
+    pub const SIOC: u8 = 23;
+    pub const D7: u8 = 36;
+    pub const D6: u8 = 37;
+    pub const D5: u8 = 38;
+    pub const D4: u8 = 39;
+    pub const D3: u8 = 35;
+    pub const D2: u8 = 14;
+    pub const D1: u8 = 13;
+    pub const D0: u8 = 34;
+    pub const VSYNC: u8 = 5;
+    pub const HREF: u8 = 27;
+    pub const PCLK: u8 = 25;
+    pub const FLASH_LED: Option<u8> = None;
+}
+
+impl BoardPins for EspEyePins {
+    const NAME: &'static str = "BOARD_ESP_EYE";
     const PINS: CameraPins = CameraPins {
         chip: TargetChip::Esp32,
         pwdn: Self::PWDN,
@@ -472,6 +560,7 @@ mod tests {
     fn test_all_five_board_pinouts_match_c_header_and_validate() {
         assert_eq!(WroverKitPins.validate_pins(), Ok(()));
         assert_eq!(AiThinkerPins.validate_pins(), Ok(()));
+        assert_eq!(EspEyePins.validate_pins(), Ok(()));
         assert_eq!(Esp32S3WroomPins.validate_pins(), Ok(()));
         assert_eq!(Esp32S3GoouuuPins.validate_pins(), Ok(()));
         assert_eq!(Esp32S3XiaoPins.validate_pins(), Ok(()));
@@ -485,6 +574,12 @@ mod tests {
         assert_eq!(AiThinkerPins::XCLK, 0);
         assert_eq!(AiThinkerPins::D0, 5);
         assert_eq!(AiThinkerPins::FLASH_LED, Some(4));
+
+        assert_eq!(EspEyePins::PWDN, None);
+        assert_eq!(EspEyePins::RESET, None);
+        assert_eq!(EspEyePins::XCLK, 4);
+        assert_eq!(EspEyePins::D0, 34);
+        assert_eq!(EspEyePins::D7, 36);
 
         assert_eq!(Esp32S3WroomPins::PWDN, Some(38));
         assert_eq!(Esp32S3GoouuuPins::PWDN, None);
@@ -508,5 +603,33 @@ mod tests {
         let mut dup = AiThinkerPins::PINS;
         dup.d1 = dup.d0;
         assert_eq!(dup.validate_pins(), Err(CameraError::InvalidArg));
+
+        // HAL-006: Non-existent silicon GPIOs on ESP32 (20, 24, 28..=31)
+        for &gpio in &[20, 24, 28, 29, 30, 31] {
+            let mut bad_silicon = WroverKitPins::PINS;
+            bad_silicon.d0 = gpio;
+            assert_eq!(bad_silicon.validate_pins(), Err(CameraError::InvalidArg));
+        }
+
+        // HAL-006: Reserved SPI flash GPIOs on ESP32 (6..=11)
+        for gpio in 6..=11 {
+            let mut bad_flash = WroverKitPins::PINS;
+            bad_flash.d0 = gpio;
+            assert_eq!(bad_flash.validate_pins(), Err(CameraError::InvalidArg));
+        }
+
+        // HAL-006: Non-existent silicon GPIOs on ESP32-S3 (22..=25)
+        for gpio in 22..=25 {
+            let mut bad_s3 = Esp32S3WroomPins::PINS;
+            bad_s3.d0 = gpio;
+            assert_eq!(bad_s3.validate_pins(), Err(CameraError::InvalidArg));
+        }
+
+        // HAL-006: Reserved SPI flash GPIOs on ESP32-S3 (26..=32)
+        for gpio in 26..=32 {
+            let mut bad_flash_s3 = Esp32S3WroomPins::PINS;
+            bad_flash_s3.d0 = gpio;
+            assert_eq!(bad_flash_s3.validate_pins(), Err(CameraError::InvalidArg));
+        }
     }
 }
