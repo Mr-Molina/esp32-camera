@@ -595,7 +595,12 @@ fn set_reg_bits<B: SccbBus>(
 }
 
 #[inline]
-fn check_reg_mask<B: SccbBus>(bus: &mut B, slv_addr: u8, reg: u16, mask: u8) -> Result<u8, CameraError> {
+fn check_reg_mask<B: SccbBus>(
+    bus: &mut B,
+    slv_addr: u8,
+    reg: u16,
+    mask: u8,
+) -> Result<u8, CameraError> {
     let val = bus.read_reg16(slv_addr, reg)?;
     Ok(u8::from((val & mask) == mask))
 }
@@ -642,7 +647,8 @@ impl Default for Hm0360 {
 }
 
 impl Hm0360 {
-    /// Creates a new [`Hm0360`] instance with default SCCB address (`0x12`) and PID (`0x0360`).
+    /// Creates a new [`Hm0360`] instance with default SCCB address (`0x12`)
+    /// and PID (`0x0360`).
     pub const fn new() -> Self {
         Self {
             id: SensorId {
@@ -696,7 +702,8 @@ impl Hm0360 {
         }
     }
 
-    /// Probes the SCCB bus at `slv_addr` (`0x12` or `0x24`) and verifies `HM0360_PID` (`0x0360`).
+    /// Probes the SCCB bus at `slv_addr` (`0x12` or `0x24`) and verifies
+    /// `HM0360_PID` (`0x0360`).
     pub fn detect<B: SccbBus>(bus: &mut B, slv_addr: u8) -> Result<SensorId, CameraError> {
         if slv_addr != CameraSccbAddr::HM0360 && slv_addr != CameraSccbAddr::HM1055 {
             return Err(CameraError::NotDetected);
@@ -897,13 +904,7 @@ impl<B: SccbBus> CameraSensor<B> for Hm0360 {
         Ok(val & mask)
     }
 
-    fn set_reg(
-        &mut self,
-        bus: &mut B,
-        reg: i32,
-        mask: i32,
-        value: i32,
-    ) -> Result<(), CameraError> {
+    fn set_reg(&mut self, bus: &mut B, reg: i32, mask: i32, value: i32) -> Result<(), CameraError> {
         if !(0..=0xFFFF).contains(&reg) || mask < 0 {
             return Err(CameraError::InvalidArg);
         }

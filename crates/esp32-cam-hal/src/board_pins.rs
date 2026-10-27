@@ -1,12 +1,14 @@
-//! Compile-time board pinout profiles (`examples/camera_example/main/camera_pinout.h`)
-//! and GPIO conflict / range validation (`FW-001`, `DMA-102`).
+//! Compile-time board pinout profiles
+//! (`examples/camera_example/main/camera_pinout.h`) and GPIO conflict / range
+//! validation (`FW-001`, `DMA-102`).
 
 #![forbid(unsafe_code)]
 
 use esp32_cam_ll::CamPinConfig;
 use esp32_cam_types::CameraError;
 
-/// Target ESP32 family chip discriminant used for GPIO range and input-only pin validation.
+/// Target ESP32 family chip discriminant used for GPIO range and input-only pin
+/// validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TargetChip {
     /// Original ESP32 (`GPIO 0..=39`, `34..=39` are input-only).
@@ -28,7 +30,8 @@ impl TargetChip {
         }
     }
 
-    /// Returns `true` if `gpio` is an input-only pin on this chip and cannot drive output signals.
+    /// Returns `true` if `gpio` is an input-only pin on this chip and cannot
+    /// drive output signals.
     #[inline]
     pub const fn is_input_only(self, gpio: u8) -> bool {
         match self {
@@ -38,7 +41,8 @@ impl TargetChip {
         }
     }
 
-    /// Returns `true` if `gpio` is a non-existent physical silicon pad on this chip.
+    /// Returns `true` if `gpio` is a non-existent physical silicon pad on this
+    /// chip.
     #[inline]
     pub const fn is_non_existent(self, gpio: u8) -> bool {
         match self {
@@ -57,7 +61,8 @@ impl TargetChip {
     }
 }
 
-/// Complete camera pinout profile matching `camera_config_t` and `camera_pinout.h`.
+/// Complete camera pinout profile matching `camera_config_t` and
+/// `camera_pinout.h`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CameraPins {
     pub chip: TargetChip,
@@ -89,7 +94,8 @@ impl CameraPins {
         ]
     }
 
-    /// Converts this pin profile into a low-level [`CamPinConfig`] for `esp32-cam-ll`.
+    /// Converts this pin profile into a low-level [`CamPinConfig`] for
+    /// `esp32-cam-ll`.
     #[inline]
     pub const fn to_ll_pin_config(&self, vsync_invert: bool) -> CamPinConfig {
         CamPinConfig {
@@ -113,15 +119,19 @@ impl CameraPins {
 
     /// Validates that:
     /// 1. Every assigned GPIO index is within `0..=self.chip.max_gpio()`.
-    /// 2. Output-capable pins (`xclk`, `siod`, `sioc`, `pwdn`, `reset`, `flash_led`) are not
-    ///    assigned to input-only GPIOs (`34..=39` on ESP32, `46` on ESP32-S2).
-    /// 3. No pin is assigned to non-existent silicon GPIOs (`20, 24, 28..=31` on ESP32; `22..=25` on ESP32-S2/S3)
-    ///    or reserved SPI Flash GPIOs (`6..=11` on ESP32; `26..=32` on ESP32-S2/S3).
-    /// 4. No two camera signals share the same physical GPIO pin (`FW-001` / `DMA-102`).
+    /// 2. Output-capable pins (`xclk`, `siod`, `sioc`, `pwdn`, `reset`,
+    ///    `flash_led`) are not assigned to input-only GPIOs (`34..=39` on
+    ///    ESP32, `46` on ESP32-S2).
+    /// 3. No pin is assigned to non-existent silicon GPIOs (`20, 24, 28..=31`
+    ///    on ESP32; `22..=25` on ESP32-S2/S3) or reserved SPI Flash GPIOs
+    ///    (`6..=11` on ESP32; `26..=32` on ESP32-S2/S3).
+    /// 4. No two camera signals share the same physical GPIO pin (`FW-001` /
+    ///    `DMA-102`).
     pub const fn validate_pins(&self) -> Result<(), CameraError> {
         let max_gpio = self.chip.max_gpio();
 
-        // Check output-capable signals against range, input-only, non-existent, and reserved flash constraints
+        // Check output-capable signals against range, input-only, non-existent,
+        // and reserved flash constraints
         let output_pins = [self.xclk, self.siod, self.sioc];
         let mut i = 0;
         while i < output_pins.len() {
@@ -164,7 +174,8 @@ impl CameraPins {
             }
         }
 
-        // Collect all active pins and verify range + uniqueness + existence + flash reservations
+        // Collect all active pins and verify range + uniqueness + existence +
+        // flash reservations
         let mut active = [0xFFu8; 17];
         active[0] = self.xclk;
         active[1] = self.siod;
@@ -198,10 +209,7 @@ impl CameraPins {
         let mut a = 0;
         while a < count {
             let p = active[a];
-            if p > max_gpio
-                || self.chip.is_non_existent(p)
-                || self.chip.is_reserved_flash(p)
-            {
+            if p > max_gpio || self.chip.is_non_existent(p) || self.chip.is_reserved_flash(p) {
                 return Err(CameraError::InvalidArg);
             }
             let mut b = a + 1;
@@ -286,10 +294,11 @@ impl BoardPins for WroverKitPins {
     };
 }
 
-/// AI-Thinker ESP32-CAM pinout (`BOARD_ESP32CAM_AITHINKER` in `camera_pinout.h:26-45`).
+/// AI-Thinker ESP32-CAM pinout (`BOARD_ESP32CAM_AITHINKER` in
+/// `camera_pinout.h:26-45`).
 ///
-/// Includes `FLASH_LED = Some(4)` on GPIO 4 (shared only with SD 1-bit/4-bit data when SD is unused,
-/// distinct from `D0 = 5`).
+/// Includes `FLASH_LED = Some(4)` on GPIO 4 (shared only with SD 1-bit/4-bit
+/// data when SD is unused, distinct from `D0 = 5`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub struct AiThinkerPins;
 
@@ -385,7 +394,8 @@ impl BoardPins for EspEyePins {
     };
 }
 
-/// ESP32-S3 WROOM CAM pinout (`BOARD_ESP32S3_WROOM` in `camera_pinout.h:47-64`).
+/// ESP32-S3 WROOM CAM pinout (`BOARD_ESP32S3_WROOM` in
+/// `camera_pinout.h:47-64`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub struct Esp32S3WroomPins;
 
@@ -433,7 +443,8 @@ impl BoardPins for Esp32S3WroomPins {
     };
 }
 
-/// ESP32-S3 GOOUUU TECH CAM pinout (`BOARD_ESP32S3_GOOUUU` in `camera_pinout.h:66-83`).
+/// ESP32-S3 GOOUUU TECH CAM pinout (`BOARD_ESP32S3_GOOUUU` in
+/// `camera_pinout.h:66-83`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub struct Esp32S3GoouuuPins;
 
@@ -481,7 +492,8 @@ impl BoardPins for Esp32S3GoouuuPins {
     };
 }
 
-/// Seeed Studio XIAO ESP32S3 Sense camera pinout (`BOARD_ESP32S3_XIAO` in `camera_pinout.h:85-102`).
+/// Seeed Studio XIAO ESP32S3 Sense camera pinout (`BOARD_ESP32S3_XIAO` in
+/// `camera_pinout.h:85-102`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub struct Esp32S3XiaoPins;
 
@@ -536,7 +548,8 @@ impl Default for CameraPins {
     }
 }
 
-/// Allows runtime/custom [`CameraPins`] configurations to be used wherever a [`BoardPins`] is expected.
+/// Allows runtime/custom [`CameraPins`] configurations to be used wherever a
+/// [`BoardPins`] is expected.
 impl BoardPins for CameraPins {
     const NAME: &'static str = "CUSTOM_PINS";
     const PINS: CameraPins = WroverKitPins::PINS;

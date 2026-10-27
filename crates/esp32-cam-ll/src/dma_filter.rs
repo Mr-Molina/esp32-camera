@@ -1,19 +1,24 @@
-//! Pure-Rust `#![forbid(unsafe_code)]` I2S0 DMA element unpacking filters and sampling mode
+//! Pure-Rust `#![forbid(unsafe_code)]` I2S0 DMA element unpacking filters and
+//! sampling mode
 //! selection logic, replacing `target/esp32/ll_cam.c:63-224` and `571-619`.
 
 #![forbid(unsafe_code)]
 
 use esp32_cam_types::{CameraError, CameraPid, PixelFormat};
 
-/// ESP32 I2S0 camera FIFO sampling mode (`i2s_sampling_mode_t` in `target/esp32/ll_cam.c`).
+/// ESP32 I2S0 camera FIFO sampling mode (`i2s_sampling_mode_t` in
+/// `target/esp32/ll_cam.c`).
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum I2sSamplingMode {
-    /// Camera sends `s1, s2, s3, s4, ...`; FIFO receives `00 s1 00 s2, 00 s2 00 s3, ...` (`SM_0A0B_0B0C = 0`).
+    /// Camera sends `s1, s2, s3, s4, ...`; FIFO receives `00 s1 00 s2, 00 s2 00 s3,
+    /// ...` (`SM_0A0B_0B0C = 0`).
     Sm0A0B0B0C = 0,
-    /// Camera sends `s1, s2, s3, s4, ...`; FIFO receives `00 s1 00 s2, 00 s3 00 s4, ...` (`SM_0A0B_0C0D = 1`).
+    /// Camera sends `s1, s2, s3, s4, ...`; FIFO receives `00 s1 00 s2, 00 s3 00 s4,
+    /// ...` (`SM_0A0B_0C0D = 1`).
     Sm0A0B0C0D = 1,
-    /// Camera sends `s1, s2, s3, s4, ...`; FIFO receives `00 s1 00 00, 00 s2 00 00, ...` (`SM_0A00_0B00 = 3`).
+    /// Camera sends `s1, s2, s3, s4, ...`; FIFO receives `00 s1 00 00, 00 s2 00 00,
+    /// ...` (`SM_0A00_0B00 = 3`).
     Sm0A000B00 = 3,
 }
 
@@ -23,7 +28,8 @@ impl I2sSamplingMode {
     pub const SM_0A0B_0C0D: Self = Self::Sm0A0B0C0D;
     pub const SM_0A00_0B00: Self = Self::Sm0A000B00;
 
-    /// Returns the number of DMA buffer bytes consumed per camera sample (`ll_cam_bytes_per_sample`).
+    /// Returns the number of DMA buffer bytes consumed per camera sample
+    /// (`ll_cam_bytes_per_sample`).
     #[inline]
     pub const fn bytes_per_sample(self) -> usize {
         match self {
@@ -34,7 +40,8 @@ impl I2sSamplingMode {
     }
 }
 
-/// 32-bit I2S0 DMA FIFO element (`dma_elem_t` in `target/esp32/ll_cam.c:63-71`).
+/// 32-bit I2S0 DMA FIFO element (`dma_elem_t` in
+/// `target/esp32/ll_cam.c:63-71`).
 ///
 /// On little-endian targets (Xtensa ESP32 and x86_64 host):
 /// - byte `0`: `sample2`
@@ -95,7 +102,8 @@ impl DmaElement {
     }
 }
 
-/// Function pointer signature for DMA buffer unpacking filters (`dma_filter_t`).
+/// Function pointer signature for DMA buffer unpacking filters
+/// (`dma_filter_t`).
 pub type DmaFilterFn = fn(&mut [u8], &[u8]) -> usize;
 
 /// Discriminant identifying the active DMA unpacking filter.
@@ -128,7 +136,8 @@ impl DmaFilterKind {
     }
 }
 
-/// Computed I2S0 sampling mode and pixel byte ratios (`ll_cam_set_sample_mode`).
+/// Computed I2S0 sampling mode and pixel byte ratios
+/// (`ll_cam_set_sample_mode`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SampleModeConfig {
     pub sampling_mode: I2sSamplingMode,
@@ -137,7 +146,8 @@ pub struct SampleModeConfig {
     pub fb_bytes_per_pixel: u8,
 }
 
-/// Unpacks JPEG DMA elements by extracting `sample1` from each 4-byte word (`ll_cam_dma_filter_jpeg`).
+/// Unpacks JPEG DMA elements by extracting `sample1` from each 4-byte word
+/// (`ll_cam_dma_filter_jpeg`).
 ///
 /// Unrolls 4 elements per iteration matching `target/esp32/ll_cam.c:107-122`.
 #[inline]
@@ -160,7 +170,8 @@ pub fn filter_jpeg(dst: &mut [u8], src: &[u8]) -> usize {
     elements
 }
 
-/// Unpacks standard-speed grayscale DMA elements by extracting `sample1` (`ll_cam_dma_filter_grayscale`).
+/// Unpacks standard-speed grayscale DMA elements by extracting `sample1`
+/// (`ll_cam_dma_filter_grayscale`).
 ///
 /// Matches `target/esp32/ll_cam.c:124-139`.
 #[inline]
@@ -168,10 +179,13 @@ pub fn filter_grayscale(dst: &mut [u8], src: &[u8]) -> usize {
     filter_jpeg(dst, src)
 }
 
-/// Unpacks high-speed grayscale DMA elements (`ll_cam_dma_filter_grayscale_highspeed`).
+/// Unpacks high-speed grayscale DMA elements
+/// (`ll_cam_dma_filter_grayscale_highspeed`).
 ///
-/// Extracts `sample1` from every even-indexed [`DmaElement`] (`0, 2, 4, 6`), with special
-/// handling for line remainders (`rem > 0`, `rem >= 3`, `rem >= 5`, and `rem >= 7`),
+/// Extracts `sample1` from every even-indexed [`DmaElement`] (`0, 2, 4, 6`),
+/// with special
+/// handling for line remainders (`rem > 0`, `rem >= 3`, `rem >= 5`, and `rem >=
+/// 7`),
 /// matching `target/esp32/ll_cam.c:141-167`.
 #[inline]
 pub fn filter_grayscale_highspeed(dst: &mut [u8], src: &[u8]) -> usize {
@@ -215,9 +229,11 @@ pub fn filter_grayscale_highspeed(dst: &mut [u8], src: &[u8]) -> usize {
     out_bytes
 }
 
-/// Unpacks standard-speed YUYV / RGB565 DMA elements (`ll_cam_dma_filter_yuyv`).
+/// Unpacks standard-speed YUYV / RGB565 DMA elements
+/// (`ll_cam_dma_filter_yuyv`).
 ///
-/// Extracts `[sample1, sample2]` from each [`DmaElement`] (2 output bytes per 4-byte element),
+/// Extracts `[sample1, sample2]` from each [`DmaElement`] (2 output bytes per
+/// 4-byte element),
 /// matching `target/esp32/ll_cam.c:169-188`.
 #[inline]
 pub fn filter_yuyv(dst: &mut [u8], src: &[u8]) -> usize {
@@ -253,11 +269,15 @@ pub fn filter_yuyv(dst: &mut [u8], src: &[u8]) -> usize {
     elements * 2
 }
 
-/// Unpacks high-speed YUYV / RGB565 DMA elements (`ll_cam_dma_filter_yuyv_highspeed`).
+/// Unpacks high-speed YUYV / RGB565 DMA elements
+/// (`ll_cam_dma_filter_yuyv_highspeed`).
 ///
-/// Extracts `sample1` from each of 8 consecutive [`DmaElement`]s, with special remainder handling
-/// (`rem == 1`, `rem == 2`, `rem == 3` where `dst[3] = dma_el[2].sample2`, and `rem >= 4`
-/// where `dst[3] = dma_el[3].sample1`), matching `target/esp32/ll_cam.c:190-224`.
+/// Extracts `sample1` from each of 8 consecutive [`DmaElement`]s, with special
+/// remainder handling
+/// (`rem == 1`, `rem == 2`, `rem == 3` where `dst[3] = dma_el[2].sample2`, and
+/// `rem >= 4`
+/// where `dst[3] = dma_el[3].sample1`), matching
+/// `target/esp32/ll_cam.c:190-224`.
 #[inline]
 pub fn filter_yuyv_highspeed(dst: &mut [u8], src: &[u8]) -> usize {
     let elements = src.len() / 4;
@@ -328,7 +348,8 @@ pub fn filter_yuyv_highspeed(dst: &mut [u8], src: &[u8]) -> usize {
     out_bytes
 }
 
-/// Returns `true` if the sensor outputs native 1-byte Y8 in `PIXFORMAT_GRAYSCALE` mode on ESP32.
+/// Returns `true` if the sensor outputs native 1-byte Y8 in
+/// `PIXFORMAT_GRAYSCALE` mode on ESP32.
 #[inline]
 const fn is_native_y8_grayscale_sensor(sensor_pid: u16) -> bool {
     sensor_pid == CameraPid::OV3660.as_u16()
@@ -340,8 +361,10 @@ const fn is_native_y8_grayscale_sensor(sensor_pid: u16) -> bool {
         || sensor_pid == CameraPid::GC0308.as_u16()
 }
 
-/// Selects the I2S0 sampling mode, DMA filter, and bytes-per-pixel ratios for the given
-/// `pix_format`, `xclk_freq_hz`, and `sensor_pid`, matching `ll_cam_set_sample_mode`
+/// Selects the I2S0 sampling mode, DMA filter, and bytes-per-pixel ratios for
+/// the given
+/// `pix_format`, `xclk_freq_hz`, and `sensor_pid`, matching
+/// `ll_cam_set_sample_mode`
 /// in `target/esp32/ll_cam.c:571-619`.
 pub const fn select_sample_mode(
     pix_format: PixelFormat,
@@ -459,7 +482,8 @@ mod tests {
         assert_eq!(n, 6);
         assert_eq!(&dst[..6], &[3, 9, 15, 21, 27, 33]);
 
-        // Remainder 5 (indices 8, 10, 12) and Remainder 7 (indices 8, 10, 12, 14) (LL-009)
+        // Remainder 5 (indices 8, 10, 12) and Remainder 7 (indices 8, 10, 12, 14)
+        // (LL-009)
         let mut src15 = [0u8; 60]; // 15 elements = 8 + 7 remainder
         for i in 0..15 {
             let el = DmaElement::new((i as u8 + 1) * 2, 0xFF);
@@ -504,13 +528,12 @@ mod tests {
         let mut hs_dst = [0u8; 16];
         let hs_n = filter_yuyv_highspeed(&mut hs_dst, &hs_src);
         // First 8 elements -> sample1 of 0..8 -> 0x40..=0x47
-        // Remainder 3 elements -> el[8].sample1 (0x48), el[9].sample1 (0x49), el[10].sample1 (0x4A), el[10].sample2 (0x9A)
+        // Remainder 3 elements -> el[8].sample1 (0x48), el[9].sample1 (0x49),
+        // el[10].sample1 (0x4A), el[10].sample2 (0x9A)
         assert_eq!(hs_n, 12);
         assert_eq!(
             &hs_dst[..12],
-            &[
-                0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4A, 0x9A
-            ]
+            &[0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4A, 0x9A]
         );
 
         // High-speed YUYV: 12 elements (8 + 4 remainder) (LL-009)
@@ -525,9 +548,7 @@ mod tests {
         assert_eq!(hs_n12, 12);
         assert_eq!(
             &hs_dst12[..12],
-            &[
-                0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4A, 0x4B
-            ]
+            &[0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4A, 0x4B]
         );
 
         // Test loop break with partial dst buffer (LL-009)
@@ -543,31 +564,44 @@ mod tests {
     #[test]
     fn test_select_sample_mode_all_branches() {
         // Grayscale on native Y8 sensor (OV5640) at 20MHz vs 10MHz
-        let cfg = select_sample_mode(PixelFormat::Grayscale, 20_000_000, CameraPid::OV5640.as_u16())
-            .expect("valid sample mode");
+        let cfg = select_sample_mode(
+            PixelFormat::Grayscale,
+            20_000_000,
+            CameraPid::OV5640.as_u16(),
+        )
+        .expect("valid sample mode");
         assert_eq!(cfg.sampling_mode, I2sSamplingMode::Sm0A000B00);
         assert_eq!(cfg.filter, DmaFilterKind::YuyvHighspeed);
         assert_eq!(cfg.in_bytes_per_pixel, 1);
         assert_eq!(cfg.fb_bytes_per_pixel, 1);
 
-        let cfg_slow =
-            select_sample_mode(PixelFormat::Grayscale, 10_000_000, CameraPid::OV5640.as_u16())
-                .expect("valid sample mode");
+        let cfg_slow = select_sample_mode(
+            PixelFormat::Grayscale,
+            10_000_000,
+            CameraPid::OV5640.as_u16(),
+        )
+        .expect("valid sample mode");
         assert_eq!(cfg_slow.sampling_mode, I2sSamplingMode::Sm0A0B0C0D);
         assert_eq!(cfg_slow.filter, DmaFilterKind::Yuyv);
 
         // Grayscale on YU/YV sensor (OV2640 vs OV7725) at 20MHz
-        let cfg_ov2640 =
-            select_sample_mode(PixelFormat::Grayscale, 20_000_000, CameraPid::OV2640.as_u16())
-                .expect("valid sample mode");
+        let cfg_ov2640 = select_sample_mode(
+            PixelFormat::Grayscale,
+            20_000_000,
+            CameraPid::OV2640.as_u16(),
+        )
+        .expect("valid sample mode");
         assert_eq!(cfg_ov2640.sampling_mode, I2sSamplingMode::Sm0A000B00);
         assert_eq!(cfg_ov2640.filter, DmaFilterKind::GrayscaleHighspeed);
         assert_eq!(cfg_ov2640.in_bytes_per_pixel, 2);
         assert_eq!(cfg_ov2640.fb_bytes_per_pixel, 1);
 
-        let cfg_ov7725 =
-            select_sample_mode(PixelFormat::Grayscale, 20_000_000, CameraPid::OV7725.as_u16())
-                .expect("valid sample mode");
+        let cfg_ov7725 = select_sample_mode(
+            PixelFormat::Grayscale,
+            20_000_000,
+            CameraPid::OV7725.as_u16(),
+        )
+        .expect("valid sample mode");
         assert_eq!(cfg_ov7725.sampling_mode, I2sSamplingMode::Sm0A0B0C0D);
         assert_eq!(cfg_ov7725.filter, DmaFilterKind::Grayscale);
 
@@ -579,8 +613,9 @@ mod tests {
         assert_eq!(cfg_ov7670.filter, DmaFilterKind::YuyvHighspeed);
 
         // JPEG mode
-        let cfg_jpeg = select_sample_mode(PixelFormat::Jpeg, 20_000_000, CameraPid::OV2640.as_u16())
-            .expect("valid sample mode");
+        let cfg_jpeg =
+            select_sample_mode(PixelFormat::Jpeg, 20_000_000, CameraPid::OV2640.as_u16())
+                .expect("valid sample mode");
         assert_eq!(cfg_jpeg.sampling_mode, I2sSamplingMode::Sm0A000B00);
         assert_eq!(cfg_jpeg.filter, DmaFilterKind::Jpeg);
         assert_eq!(cfg_jpeg.in_bytes_per_pixel, 1);

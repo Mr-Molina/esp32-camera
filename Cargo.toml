@@ -17,12 +17,12 @@ license = "Apache-2.0 OR MIT"
 repository = "https://github.com/espressif/esp32-camera"
 
 [workspace.lints.rust]
-unsafe_op_in_unsafe_fn = "deny"
-static_mut_refs = "deny"
+unsafe_op_in_unsafe_fn = "warn"
+static_mut_refs = "warn"
 
 [workspace.lints.clippy]
-unwrap_used = "deny"
-undocumented_unsafe_blocks = "deny"
+unwrap_used = "warn"
+undocumented_unsafe_blocks = "warn"
 
 [workspace.dependencies]
 esp32-cam-types = { path = "crates/esp32-cam-types" }

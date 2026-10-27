@@ -29,7 +29,7 @@ import re
 import sys
 from pathlib import Path
 
-REPO_ROOT = Path("/home/console-admin/Github/esp32-camera")
+REPO_ROOT = Path(__file__).resolve().parent.parent
 ETC_UDEV_RULE = Path("/etc/udev/rules.d/99-esp32-wrover.rules")
 DOCS_UDEV_RULE = REPO_ROOT / "docs" / "99-esp32-wrover.rules"
 MAIN_RS = REPO_ROOT / "crates" / "klipper-cam-fw" / "src" / "main.rs"
@@ -102,15 +102,29 @@ def verify_mmio_registers(src: str) -> list[str]:
 def verify_udev_rules() -> list[str]:
     errors: list[str] = []
     forbidden_tokens = ("RUN+=", "TIOCMBIS", "TIOCMSET", "stty")
-    for path in (ETC_UDEV_RULE, DOCS_UDEV_RULE):
-        if not path.is_file():
-            errors.append(f"Missing udev rule file: {path}")
-            continue
-        text = path.read_text(encoding="utf-8")
+
+    # 1. Strictly verify repository template docs/99-esp32-wrover.rules
+    if not DOCS_UDEV_RULE.is_file():
+        errors.append(f"Missing udev rule template file: {DOCS_UDEV_RULE}")
+    else:
+        text = DOCS_UDEV_RULE.read_text(encoding="utf-8")
         for tok in forbidden_tokens:
             if tok in text:
-                errors.append(f"Forbidden token '{tok}' found in {path}")
+                errors.append(f"Forbidden token '{tok}' found in {DOCS_UDEV_RULE}")
+
+    # 2. Verify host udev rule if present; skip with informational note in non-hardware CI environments
+    if ETC_UDEV_RULE.is_file():
+        text = ETC_UDEV_RULE.read_text(encoding="utf-8")
+        for tok in forbidden_tokens:
+            if tok in text:
+                errors.append(f"Forbidden token '{tok}' found in {ETC_UDEV_RULE}")
+    else:
+        print(f"[INFO] Host udev rule {ETC_UDEV_RULE} not present (skipping host check in non-hardware environment)")
+
     return errors
+
+
+check_7_udev_rules = verify_udev_rules
 
 
 def verify_main_rs() -> list[str]:
@@ -189,6 +203,18 @@ def verify_main_rs() -> list[str]:
         errors.append(
             "main.rs: must detect active booted OTA slot from DPORT_PRO_FLASH_MMU_TABLE via `detect_booted_ota_manager_from_mmu()`"
         )
+
+    # 8. H3-CFG-003: hold_psram_cs_high_safe()
+    if "hold_psram_cs_high_safe()" not in src:
+        errors.append("main.rs: missing `hold_psram_cs_high_safe()`")
+
+    # 9. H3-CFG-003: SPI0_PIN_REG (CS1_DIS bit 1 << 1 gating before SPI1 PSRAM transactions)
+    if "SPI0_PIN_REG" not in src or not re.search(r"SPI0_PIN_REG.*?1(?:u32)?\s*<<\s*1", src, re.DOTALL):
+        errors.append("main.rs: missing `SPI0_PIN_REG` CS1_DIS bit (1 << 1) gating before SPI1 PSRAM transactions")
+
+    # 10. H3-CFG-003: 50 ms PSRAM power-up delay (50_000 / delay_millis(50))
+    if not (re.search(r"delay(?:_millis|_micros)?\s*\(\s*50(?:_000)?\s*\)", src) or "50_000" in src):
+        errors.append("main.rs: missing 50 ms PSRAM power-up delay (50_000 / delay_millis(50))")
 
     return errors
 

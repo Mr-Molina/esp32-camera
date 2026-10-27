@@ -1,4 +1,5 @@
-//! Safe `#![no_std]` OV7670 (VGA/QVGA/QQVGA RGB565/YUV422) camera sensor driver.
+//! Safe `#![no_std]` OV7670 (VGA/QVGA/QQVGA RGB565/YUV422) camera
+//! sensor driver.
 //!
 //! Ported from `sensors/ov7670.c` and `sensors/private_include/ov7670_regs.h`.
 
@@ -291,7 +292,8 @@ impl Default for Ov7670 {
 }
 
 impl Ov7670 {
-    /// Creates a new [`Ov7670`] instance with default SCCB address `0x21` and PID `0x76`.
+    /// Creates a new [`Ov7670`] instance with default SCCB address `0x21` and
+    /// PID `0x76`.
     pub const fn new() -> Self {
         Self {
             slv_addr: CameraSccbAddr::OV7670,
@@ -381,7 +383,8 @@ impl Ov7670 {
         })
     }
 
-    /// Returns the cached `CLKRC` register value retained across resolution/format transitions.
+    /// Returns the cached `CLKRC` register value retained across
+    /// resolution/format transitions.
     #[inline]
     pub const fn clkrc(&self) -> u8 {
         self.clkrc

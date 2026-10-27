@@ -1,13 +1,16 @@
-//! LEDC XCLK clock generator and PSRAM cache line alignment helpers (`target/xclk.c`, `driver/cam_hal.c:88-139`).
+//! LEDC XCLK clock generator and PSRAM cache line alignment helpers
+//! (`target/xclk.c`, `driver/cam_hal.c:88-139`).
 
 #![forbid(unsafe_code)]
 
 use esp32_cam_types::CameraError;
 
-/// Sentinel indicating no LEDC channel is currently active (`NO_CAMERA_LEDC_CHANNEL` in `target/xclk.c:16`).
+/// Sentinel indicating no LEDC channel is currently active
+/// (`NO_CAMERA_LEDC_CHANNEL` in `target/xclk.c:16`).
 pub const NO_CAMERA_LEDC_CHANNEL: u8 = 0xFF;
 
-/// Sentinel indicating no LEDC timer is currently active (`NO_CAMERA_LEDC_TIMER` in `target/xclk.c:17`).
+/// Sentinel indicating no LEDC timer is currently active
+/// (`NO_CAMERA_LEDC_TIMER` in `target/xclk.c:17`).
 pub const NO_CAMERA_LEDC_TIMER: u8 = 0xFF;
 
 /// LEDC 1-bit duty resolution (`LEDC_TIMER_1_BIT = 1`).
@@ -19,16 +22,20 @@ pub const LEDC_LOW_SPEED_MODE: u8 = 1;
 /// LEDC 50% duty value for 1-bit resolution (`duty = 1`, `hpoint = 0`).
 pub const LEDC_DUTY_50_PERCENT_1BIT: u32 = 1;
 
-/// Maximum supported XCLK output frequency in Hz (`40 MHz`, half of 80 MHz APB clock).
+/// Maximum supported XCLK output frequency in Hz (`40 MHz`, half of 80 MHz APB
+/// clock).
 pub const MAX_XCLK_FREQ_HZ: u32 = 40_000_000;
 
 /// Default ESP32/S2/S3 external memory DCache line size in bytes (`32` bytes).
 pub const DEFAULT_DCACHE_LINE_SIZE: usize = 32;
 
-/// Aligns a memory region `(addr, len)` outward to cache line boundaries (`line_size`),
-/// matching `cam_drop_psram_cache` and `cam_writeback_psram_cache` in `driver/cam_hal.c:108-139`.
+/// Aligns a memory region `(addr, len)` outward to cache line boundaries
+/// (`line_size`),
+/// matching `cam_drop_psram_cache` and `cam_writeback_psram_cache` in
+/// `driver/cam_hal.c:108-139`.
 ///
-/// If `line_size == 0` or is not a power of two, falls back to [`DEFAULT_DCACHE_LINE_SIZE`] (`32`).
+/// If `line_size == 0` or is not a power of two, falls back to
+/// [`DEFAULT_DCACHE_LINE_SIZE`] (`32`).
 #[inline]
 pub const fn align_cache_region(addr: usize, len: usize, line_size: usize) -> (usize, usize) {
     let line = if line_size == 0 || !line_size.is_power_of_two() {
@@ -47,7 +54,8 @@ pub const fn align_cache_region(addr: usize, len: usize, line_size: usize) -> (u
     (start, sync_len)
 }
 
-/// Configuration for the camera external clock (`XCLK`) generator (`target/xclk.c`).
+/// Configuration for the camera external clock (`XCLK`) generator
+/// (`target/xclk.c`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct XclkConfig {
     pub pin_xclk: u8,
@@ -67,8 +75,10 @@ impl Default for XclkConfig {
     }
 }
 
-/// Deterministic `#![no_std]` state machine tracking LEDC timer and channel configuration for `XCLK`
-/// (`xclk_timer_conf`, `camera_enable_out_clock`, `camera_disable_out_clock` in `target/xclk.c`).
+/// Deterministic `#![no_std]` state machine tracking LEDC timer and channel
+/// configuration for `XCLK`
+/// (`xclk_timer_conf`, `camera_enable_out_clock`, `camera_disable_out_clock` in
+/// `target/xclk.c`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct XclkController {
     active_channel: u8,
@@ -88,7 +98,8 @@ impl Default for XclkController {
 }
 
 impl XclkController {
-    /// Creates an unconfigured [`XclkController`] (`g_ledc_channel = 0xFF`, `g_ledc_timer = 0xFF`).
+    /// Creates an unconfigured [`XclkController`] (`g_ledc_channel = 0xFF`,
+    /// `g_ledc_timer = 0xFF`).
     #[inline]
     pub const fn new() -> Self {
         Self {
@@ -103,7 +114,8 @@ impl XclkController {
         }
     }
 
-    /// Configures the LEDC timer frequency (`xclk_timer_conf` in `target/xclk.c:21-41`).
+    /// Configures the LEDC timer frequency (`xclk_timer_conf` in
+    /// `target/xclk.c:21-41`).
     pub fn timer_conf(&mut self, ledc_timer: u8, xclk_freq_hz: u32) -> Result<(), CameraError> {
         if ledc_timer > 3 || xclk_freq_hz == 0 || xclk_freq_hz > MAX_XCLK_FREQ_HZ {
             return Err(CameraError::InvalidArg);
@@ -114,7 +126,8 @@ impl XclkController {
         Ok(())
     }
 
-    /// Enables the `XCLK` output clock on `config.pin_xclk` (`camera_enable_out_clock` in `target/xclk.c:43-75`).
+    /// Enables the `XCLK` output clock on `config.pin_xclk`
+    /// (`camera_enable_out_clock` in `target/xclk.c:43-75`).
     pub fn enable_out_clock(&mut self, config: &XclkConfig) -> Result<(), CameraError> {
         if config.pin_xclk > 48 || config.ledc_channel > 7 {
             return Err(CameraError::InvalidArg);
@@ -128,7 +141,8 @@ impl XclkController {
         Ok(())
     }
 
-    /// Disables the `XCLK` output clock and resets active LEDC channel/timer sentinels
+    /// Disables the `XCLK` output clock and resets active LEDC channel/timer
+    /// sentinels
     /// (`camera_disable_out_clock` in `target/xclk.c:77-94`).
     pub fn disable_out_clock(&mut self) {
         if self.active_channel != NO_CAMERA_LEDC_CHANNEL {
@@ -148,7 +162,8 @@ impl XclkController {
         self.enabled
     }
 
-    /// Returns the currently configured `XCLK` frequency in Hz (`0` if never configured).
+    /// Returns the currently configured `XCLK` frequency in Hz (`0` if never
+    /// configured).
     #[inline]
     pub const fn freq_hz(&self) -> u32 {
         self.freq_hz
@@ -188,10 +203,7 @@ mod tests {
         assert_eq!(len, 64);
 
         // Fallback when line_size == 0
-        assert_eq!(
-            align_cache_region(0x3F80_0004, 10, 0),
-            (0x3F80_0000, 32)
-        );
+        assert_eq!(align_cache_region(0x3F80_0004, 10, 0), (0x3F80_0000, 32));
     }
 
     #[test]

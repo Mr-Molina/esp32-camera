@@ -417,16 +417,17 @@ fn set_reg_bits<B: SccbBus>(
 }
 
 #[inline]
-fn check_reg_mask<B: SccbBus>(bus: &mut B, slv_addr: u8, reg: u8, mask: u8) -> Result<u8, CameraError> {
+fn check_reg_mask<B: SccbBus>(
+    bus: &mut B,
+    slv_addr: u8,
+    reg: u8,
+    mask: u8,
+) -> Result<u8, CameraError> {
     let val = bus.read_reg8(slv_addr, reg)?;
     Ok(u8::from((val & mask) == mask))
 }
 
-fn write_reg_list<B: SccbBus>(
-    bus: &mut B,
-    slv_addr: u8,
-    regs: &[Reg8],
-) -> Result<(), CameraError> {
+fn write_reg_list<B: SccbBus>(bus: &mut B, slv_addr: u8, regs: &[Reg8]) -> Result<(), CameraError> {
     for entry in regs {
         if entry.reg == REG_DLY {
             bus.delay_ms(entry.val as u32);
@@ -460,7 +461,8 @@ impl Default for Gc0308 {
 }
 
 impl Gc0308 {
-    /// Creates a new [`Gc0308`] instance with default SCCB address (`0x21`) and PID (`0x9B`).
+    /// Creates a new [`Gc0308`] instance with default SCCB address (`0x21`)
+    /// and PID (`0x9B`).
     pub const fn new() -> Self {
         Self {
             id: SensorId {
@@ -513,7 +515,8 @@ impl Gc0308 {
         }
     }
 
-    /// Probes the SCCB bus at `slv_addr` (`0x21`), selects page 0, and verifies `GC0308_PID` (`0x9B`).
+    /// Probes the SCCB bus at `slv_addr` (`0x21`), selects page 0, and verifies
+    /// `GC0308_PID` (`0x9B`).
     pub fn detect<B: SccbBus>(bus: &mut B, slv_addr: u8) -> Result<SensorId, CameraError> {
         if slv_addr != CameraSccbAddr::GC0308 {
             return Err(CameraError::NotDetected);
@@ -908,13 +911,7 @@ impl<B: SccbBus> CameraSensor<B> for Gc0308 {
         Ok(val & mask)
     }
 
-    fn set_reg(
-        &mut self,
-        bus: &mut B,
-        reg: i32,
-        mask: i32,
-        value: i32,
-    ) -> Result<(), CameraError> {
+    fn set_reg(&mut self, bus: &mut B, reg: i32, mask: i32, value: i32) -> Result<(), CameraError> {
         if !(0..=0xFF).contains(&reg) || !(0..=0xFF).contains(&mask) {
             return Err(CameraError::InvalidArg);
         }

@@ -1,8 +1,8 @@
-//! Safe `#![no_std]` JPEG SOI/EOI marker scanner (with 4-byte SWAR fast forward scan)
-//! and `SOF0`/`SOF2` frame dimension parser.
+//! Safe `#![no_std]` JPEG SOI/EOI marker scanner (with 4-byte SWAR fast
+//! forward scan) and `SOF0`/`SOF2` frame dimension parser.
 //!
-//! Replaces `cam_verify_jpeg_soi`, `cam_verify_jpeg_eoi`, and `eoi_probe_window`
-//! from `driver/cam_hal.c`.
+//! Replaces `cam_verify_jpeg_soi`, `cam_verify_jpeg_eoi`, and
+//! `eoi_probe_window` from `driver/cam_hal.c`.
 
 /// JPEG Start-Of-Image plus following marker prefix (`0xFF, 0xD8, 0xFF`).
 pub const JPEG_SOI_MARKER: [u8; 3] = [0xFF, 0xD8, 0xFF];
@@ -10,7 +10,8 @@ pub const JPEG_SOI_MARKER: [u8; 3] = [0xFF, 0xD8, 0xFF];
 /// JPEG End-Of-Image marker (`0xFF, 0xD9`).
 pub const JPEG_EOI_MARKER: [u8; 2] = [0xFF, 0xD9];
 
-/// Computes the PSRAM cache-invalidation and scan window for JPEG EOI detection.
+/// Computes the PSRAM cache-invalidation and scan window for JPEG EOI
+/// detection.
 ///
 /// Matches `eoi_probe_window` in `driver/cam_hal.c:167-171`, using saturating
 /// addition so `half + (JPEG_EOI_MARKER.len() - 1)` never overflows `usize`.
@@ -24,10 +25,12 @@ pub const fn eoi_probe_window(half: usize, frame_len: usize) -> usize {
     }
 }
 
-/// Scans `buf` forward for the 3-byte [`JPEG_SOI_MARKER`] (`[0xFF, 0xD8, 0xFF]`).
+/// Scans `buf` forward for the 3-byte [`JPEG_SOI_MARKER`]
+/// (`[0xFF, 0xD8, 0xFF]`).
 ///
-/// Returns `Some(offset)` of the first match, or `None` if `buf.len() < 3` or no
-/// SOI marker is present. Matches `cam_verify_jpeg_soi` in `driver/cam_hal.c:173-192`.
+/// Returns `Some(offset)` of the first match, or `None` if `buf.len() < 3` or
+/// no SOI marker is present. Matches `cam_verify_jpeg_soi` in
+/// `driver/cam_hal.c:173-192`.
 #[inline]
 pub fn verify_jpeg_soi(buf: &[u8]) -> Option<usize> {
     if buf.len() < JPEG_SOI_MARKER.len() {
@@ -39,11 +42,12 @@ pub fn verify_jpeg_soi(buf: &[u8]) -> Option<usize> {
 
 /// Scans `buf` for the 2-byte [`JPEG_EOI_MARKER`] (`[0xFF, 0xD9]`).
 ///
-/// - When `search_forward` is `true`, uses the 4-byte SWAR (`0x0101_0101` / `0x8080_8080`)
-///   candidate detector from `driver/cam_hal.c:200-233` via safe `u32::from_le_bytes`
-///   to locate the earliest `0xFF, 0xD9` marker in `buf`.
-/// - When `search_forward` is `false`, scans backward from the end of `buf` to find
-///   the last `0xFF, 0xD9` marker (`driver/cam_hal.c:235-245`).
+/// - When `search_forward` is `true`, uses the 4-byte SWAR
+///   (`0x0101_0101` / `0x8080_8080`) candidate detector from
+///   `driver/cam_hal.c:200-233` via safe `u32::from_le_bytes` to locate
+///   the earliest `0xFF, 0xD9` marker in `buf`.
+/// - When `search_forward` is `false`, scans backward from the end of `buf`
+///   to find the last `0xFF, 0xD9` marker (`driver/cam_hal.c:235-245`).
 pub fn verify_jpeg_eoi(buf: &[u8], search_forward: bool) -> Option<usize> {
     let length = buf.len();
     if length < JPEG_EOI_MARKER.len() {
@@ -96,11 +100,46 @@ pub fn verify_jpeg_eoi(buf: &[u8], search_forward: bool) -> Option<usize> {
     None
 }
 
-/// Parses the `(width, height)` dimensions from a JPEG `SOF0` (`0xFFC0`), `SOF1` (`0xFFC1`),
-/// or `SOF2` (`0xFFC2`) frame header in `buf`.
+/// Extracts the valid JPEG payload slice from `buf`, verifying that:
+/// 1. A valid SOI marker exists.
+/// 2. A valid EOI marker exists.
+/// 3. The SOI marker occurs strictly before EOI (`soi_offset + 2 <= eoi_end`).
 ///
-/// Returns `Some((width, height))` if a valid SOF header with non-zero dimensions is found,
-/// or `None` if `buf` is truncated or does not contain a valid SOF segment.
+/// Safely handles truncated or malformed buffers without panic or arithmetic
+/// underflow. Returns `Some(&buf[soi_offset..eoi_end])` on success, or `None`
+/// if markers are missing, inverted, or out of bounds.
+pub fn extract_jpeg_payload(buf: &[u8]) -> Option<&[u8]> {
+    if buf.len() < 4 {
+        return None;
+    }
+    let soi_offset = verify_jpeg_soi(buf)?;
+    let eoi_offset = verify_jpeg_eoi(buf, false)?;
+    let eoi_end = eoi_offset.checked_add(JPEG_EOI_MARKER.len())?;
+    let soi_min_end = soi_offset.checked_add(2)?;
+    if soi_min_end > eoi_end || eoi_end > buf.len() {
+        return None;
+    }
+    Some(&buf[soi_offset..eoi_end])
+}
+
+/// Validates that `buf` contains a complete JPEG frame with valid SOI/EOI
+/// boundaries and parses its `(width, height)` dimensions from `SOF0`/`SOF2`.
+///
+/// Verifies that `SOI` occurs strictly before `EOI`
+/// (`soi_offset + 2 <= eoi_end`) and handles malformed slices without
+/// underflow. Returns `Some((width, height))` on success, or `None` if
+/// the frame is invalid or truncated.
+pub fn validate_jpeg_frame(buf: &[u8]) -> Option<(u16, u16)> {
+    let payload = extract_jpeg_payload(buf)?;
+    parse_jpeg_dimensions(payload)
+}
+
+/// Parses the `(width, height)` dimensions from a JPEG `SOF0` (`0xFFC0`),
+/// `SOF1` (`0xFFC1`), or `SOF2` (`0xFFC2`) frame header in `buf`.
+///
+/// Returns `Some((width, height))` if a valid SOF header with non-zero
+/// dimensions is found, or `None` if `buf` is truncated or does not contain
+/// a valid SOF segment.
 pub fn parse_jpeg_dimensions(buf: &[u8]) -> Option<(u16, u16)> {
     if buf.len() < 9 {
         return None;
@@ -243,7 +282,8 @@ mod tests {
         let sof0_stream = [
             0xFF, 0xD8, // SOI
             0xFF, 0xE0, 0x00, 0x04, 0x00, 0x00, // APP0 (length 4)
-            0xFF, 0xC0, 0x00, 0x11, 0x08, 0x02, 0xD0, 0x05, 0x00, // SOF0: height=720, width=1280
+            0xFF, 0xC0, 0x00, 0x11, 0x08, 0x02, 0xD0, 0x05,
+            0x00, // SOF0: height=720, width=1280
             0x03, 0x01, 0x22, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01, 0xFF, 0xD9,
         ];
         assert_eq!(parse_jpeg_dimensions(&sof0_stream), Some((1280, 720)));
@@ -264,15 +304,44 @@ mod tests {
 
         // CONV-006: Return None immediately when SOI marker is missing
         let no_soi_stream = [
-            0x00, 0x00, 0xFF, 0xC0, 0x00, 0x11, 0x08, 0x02, 0xD0, 0x05, 0x00,
-            0x03, 0x01, 0x22, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01, 0xFF, 0xD9,
+            0x00, 0x00, 0xFF, 0xC0, 0x00, 0x11, 0x08, 0x02, 0xD0, 0x05, 0x00, 0x03, 0x01, 0x22,
+            0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01, 0xFF, 0xD9,
         ];
         assert_eq!(parse_jpeg_dimensions(&no_soi_stream), None);
 
-        // CONV-006: Reject SOF segment whose seg_len exceeds remaining buffer length
+        // CONV-006: Reject SOF segment whose seg_len exceeds remaining
+        // buffer length
         let truncated_sof_seg = [
             0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x64, 0x08, 0x00, 0xF0, 0x01, 0x40,
         ];
         assert_eq!(parse_jpeg_dimensions(&truncated_sof_seg), None);
+    }
+
+    #[test]
+    fn test_extract_jpeg_payload_and_validate_frame() {
+        assert_eq!(extract_jpeg_payload(&[]), None);
+        assert_eq!(extract_jpeg_payload(&[0xFF, 0xD8]), None);
+        assert_eq!(extract_jpeg_payload(&[0xFF, 0xD8, 0xFF]), None);
+
+        // Inverted: EOI before SOI
+        let inverted = [0xFF, 0xD9, 0x00, 0xFF, 0xD8, 0xFF, 0x00];
+        assert_eq!(extract_jpeg_payload(&inverted), None);
+        assert_eq!(validate_jpeg_frame(&inverted), None);
+
+        // Minimal valid payload without SOF
+        let minimal = [0xFF, 0xD8, 0xFF, 0xD9];
+        assert_eq!(extract_jpeg_payload(&minimal), Some(&minimal[..]));
+        assert_eq!(validate_jpeg_frame(&minimal), None);
+
+        // Frame with leading and trailing bytes + SOF0
+        let mut framed = [0x55u8; 32];
+        let valid_stream = [
+            0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0xF0, 0x01, 0x40, 0x01, 0x01, 0x11,
+            0x00, 0xFF, 0xD9,
+        ];
+        framed[4..4 + valid_stream.len()].copy_from_slice(&valid_stream);
+        let extracted = extract_jpeg_payload(&framed);
+        assert_eq!(extracted, Some(&valid_stream[..]));
+        assert_eq!(validate_jpeg_frame(&framed), Some((320, 240)));
     }
 }

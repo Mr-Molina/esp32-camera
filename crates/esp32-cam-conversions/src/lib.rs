@@ -1,4 +1,5 @@
-//! Safe `#![no_std]` image conversions, BMP serializer, and JPEG marker/codec utilities.
+//! Safe `#![no_std]` image conversions, BMP serializer, and JPEG marker/codec
+//! utilities.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -9,8 +10,8 @@ pub mod jpeg_scan;
 pub mod yuv;
 
 pub use bmp::{
-    BMP_GRAYSCALE_PALETTE_LEN, BMP_HEADER_LEN, frame_to_bmp, grayscale_to_bmp, rgb565_to_bmp,
-    rgb888_to_bmp, write_bmp_header, yuv422_to_bmp,
+    frame_to_bmp, grayscale_to_bmp, rgb565_to_bmp, rgb888_to_bmp, write_bmp_header, yuv422_to_bmp,
+    BMP_GRAYSCALE_PALETTE_LEN, BMP_HEADER_LEN,
 };
 pub use esp32_cam_types::{CameraError, FrameSize, PixelFormat};
 pub use jpeg_codec::{
@@ -18,12 +19,10 @@ pub use jpeg_codec::{
     encode_yuv422_to_jpeg,
 };
 pub use jpeg_scan::{
-    JPEG_EOI_MARKER, JPEG_SOI_MARKER, eoi_probe_window, parse_jpeg_dimensions, verify_jpeg_eoi,
-    verify_jpeg_soi,
+    eoi_probe_window, extract_jpeg_payload, parse_jpeg_dimensions, validate_jpeg_frame,
+    verify_jpeg_eoi, verify_jpeg_soi, JPEG_EOI_MARKER, JPEG_SOI_MARKER,
 };
-pub use yuv::{
-    rgb565_to_yuv422, yuv2rgb, yuv422_to_rgb565, yuv422_to_rgb888, yuv422_to_yuv420,
-};
+pub use yuv::{rgb565_to_yuv422, yuv2rgb, yuv422_to_rgb565, yuv422_to_rgb888, yuv422_to_yuv420};
 
 #[cfg(test)]
 mod tests {
@@ -81,4 +80,3 @@ mod tests {
         }
     }
 }
-

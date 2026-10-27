@@ -1,7 +1,8 @@
-//! OmniVision camera sensor driver family re-exports and comprehensive unit test suite.
+//! OmniVision camera sensor driver family re-exports and comprehensive
+//! unit test suite.
 //!
-//! Exposes all 6 OmniVision drivers (`OV2640`, `OV3660`, `OV3640`, `OV5640` + `OV5640-AF`,
-//! `OV7725`, and `OV7670`).
+//! Exposes all 6 OmniVision drivers (`OV2640`, `OV3660`, `OV3640`,
+//! `OV5640` + `OV5640-AF`, `OV7725`, and `OV7670`).
 
 pub use crate::ov2640::{self, Ov2640, Ov2640Bank};
 pub use crate::ov3640::{self, Ov3640};
@@ -40,30 +41,33 @@ mod tests {
         assert_eq!(sensor.reset(&mut bus), Ok(()));
         assert_eq!(sensor.init_status(&mut bus), Ok(()));
 
-        // Reset to load UXGA defaults (`HSIZE8 = 0xC8`, `VSIZE8 = 0x96`, `SIZEL = 0x00`)
-        // then configure `PixelFormat::Jpeg` and `FrameSize::Hd` (1280x720, 16:9 crop with `offset_y = 150`, `max_y = 900`).
+        // Reset to load UXGA defaults (`HSIZE8 = 0xC8`, `VSIZE8 = 0x96`,
+        // `SIZEL = 0x00`) then configure `PixelFormat::Jpeg` and
+        // `FrameSize::Hd` (1280x720, 16:9 crop with `offset_y = 150`,
+        // `max_y = 900`).
         assert_eq!(sensor.reset(&mut bus), Ok(()));
         assert_eq!(sensor.set_pixformat(&mut bus, PixelFormat::Jpeg), Ok(()));
         assert_eq!(sensor.set_framesize(&mut bus, FrameSize::Hd), Ok(()));
         assert_eq!(sensor.status().framesize, FrameSize::Hd);
 
         // Critical OV-105 Invariant verification:
-        // `HSIZE8` (0xC0), `VSIZE8` (0xC1), and `SIZEL` (0x8C) MUST preserve UXGA (1600x1200)
-        // and MUST NOT be overwritten with cropped `max_x`/`max_y` (1600x900 = 0xC8, 0x70, 0x04).
-        assert_eq!(bus.get_reg8(CameraSccbAddr::OV2640, ov2640::HSIZE8), 0xC8);
-        assert_eq!(bus.get_reg8(CameraSccbAddr::OV2640, ov2640::VSIZE8), 0x96);
-        assert_eq!(bus.get_reg8(CameraSccbAddr::OV2640, ov2640::SIZEL), 0x00);
+        // `HSIZE8` (0xC0), `VSIZE8` (0xC1), and `SIZEL` (0x8C) MUST preserve
+        // UXGA (1600x1200) and MUST NOT be overwritten with cropped
+        // `max_x`/`max_y` (1600x900 = 0xC8, 0x70, 0x04).
+        assert_eq!(bus.reg8(CameraSccbAddr::OV2640, ov2640::HSIZE8), 0xC8);
+        assert_eq!(bus.reg8(CameraSccbAddr::OV2640, ov2640::VSIZE8), 0x96);
+        assert_eq!(bus.reg8(CameraSccbAddr::OV2640, ov2640::SIZEL), 0x00);
 
         // Verify 1280x720 output scaling and 1600x900 sensor windowing registers:
         assert_eq!(
-            bus.get_reg8(CameraSccbAddr::OV2640, ov2640::ZMOW),
+            bus.reg8(CameraSccbAddr::OV2640, ov2640::ZMOW),
             (1280 >> 2) as u8
         );
         assert_eq!(
-            bus.get_reg8(CameraSccbAddr::OV2640, ov2640::ZMOH),
+            bus.reg8(CameraSccbAddr::OV2640, ov2640::ZMOH),
             (720 >> 2) as u8
         );
-        assert_eq!(bus.get_reg8(CameraSccbAddr::OV2640, ov2640::REG32), 0x36);
+        assert_eq!(bus.reg8(CameraSccbAddr::OV2640, ov2640::REG32), 0x36);
 
         // Verify controls and bounds
         assert_eq!(sensor.set_quality(&mut bus, 12), Ok(()));
@@ -88,7 +92,8 @@ mod tests {
         assert_eq!(sensor.set_agc_gain(&mut bus, 15), Ok(()));
         assert_eq!(sensor.set_aec_value(&mut bus, 600), Ok(()));
 
-        // FrameSize > Uxga returns FailedToSetFrameSize and preserves previous framesize
+        // FrameSize > Uxga returns FailedToSetFrameSize and preserves previous
+        // framesize
         assert_eq!(
             sensor.set_framesize(&mut bus, FrameSize::Fhd),
             Err(CameraError::FailedToSetFrameSize)
@@ -103,14 +108,29 @@ mod tests {
         assert_eq!(sensor.pixformat(), PixelFormat::Jpeg);
 
         // get_reg / set_reg bounds validation (0..=0x1FF)
-        assert_eq!(sensor.get_reg(&mut bus, -1, 0xFF), Err(CameraError::InvalidArg));
-        assert_eq!(sensor.get_reg(&mut bus, 0x200, 0xFF), Err(CameraError::InvalidArg));
-        assert_eq!(sensor.set_reg(&mut bus, -1, 0xFF, 0x12), Err(CameraError::InvalidArg));
-        assert_eq!(sensor.set_reg(&mut bus, 0x200, 0xFF, 0x12), Err(CameraError::InvalidArg));
+        assert_eq!(
+            sensor.get_reg(&mut bus, -1, 0xFF),
+            Err(CameraError::InvalidArg)
+        );
+        assert_eq!(
+            sensor.get_reg(&mut bus, 0x200, 0xFF),
+            Err(CameraError::InvalidArg)
+        );
+        assert_eq!(
+            sensor.set_reg(&mut bus, -1, 0xFF, 0x12),
+            Err(CameraError::InvalidArg)
+        );
+        assert_eq!(
+            sensor.set_reg(&mut bus, 0x200, 0xFF, 0x12),
+            Err(CameraError::InvalidArg)
+        );
 
         // Verify bus error propagation
         bus.set_fail(true);
-        assert_eq!(sensor.set_quality(&mut bus, 10), Err(CameraError::SccbError));
+        assert_eq!(
+            sensor.set_quality(&mut bus, 10),
+            Err(CameraError::SccbError)
+        );
     }
 
     #[test]
@@ -192,13 +212,17 @@ mod tests {
         );
 
         bus.set_fail(true);
-        assert_eq!(sensor.set_aec_value(&mut bus, 100), Err(CameraError::SccbError));
+        assert_eq!(
+            sensor.set_aec_value(&mut bus, 100),
+            Err(CameraError::SccbError)
+        );
     }
 
     #[test]
     fn test_ov3640_family_pid_regulator_bypass_and_mirror_flip() {
         let mut bus: MockSccbBus<512> = MockSccbBus::new();
-        // OV3640 family mask `(pid & 0xFFF0) == 0x3640` accepts 0x364C as well as 0x3640
+        // OV3640 family mask `(pid & 0xFFF0) == 0x3640` accepts 0x364C
+        // as well as 0x3640
         bus.preset_reg16(CameraSccbAddr::OV3640, 0x300A, 0x36);
         bus.preset_reg16(CameraSccbAddr::OV3640, 0x300B, 0x4C);
 
@@ -216,9 +240,10 @@ mod tests {
         let mut sensor = Ov3640::new();
         assert_eq!(sensor.model(), CameraModel::Ov3640);
         assert_eq!(sensor.reset(&mut bus), Ok(()));
-        // Regulator bypass register PWCOM1 (0x30A9) must have bit 3 (0x08) set and bank switch 0x00FF restored to 0x00
-        assert_eq!(bus.get_reg16(CameraSccbAddr::OV3640, ov3640::PWCOM1), 0x08);
-        assert_eq!(bus.get_reg16(CameraSccbAddr::OV3640, 0x00FF), 0x00);
+        // Regulator bypass register PWCOM1 (0x30A9) must have bit 3 (0x08)
+        // set and bank switch 0x00FF restored to 0x00
+        assert_eq!(bus.reg16(CameraSccbAddr::OV3640, ov3640::PWCOM1), 0x08);
+        assert_eq!(bus.reg16(CameraSccbAddr::OV3640, 0x00FF), 0x00);
 
         assert_eq!(sensor.set_pixformat(&mut bus, PixelFormat::Jpeg), Ok(()));
         assert_eq!(sensor.set_framesize(&mut bus, FrameSize::Uxga), Ok(()));
@@ -226,28 +251,20 @@ mod tests {
 
         // Verify mirror and flip update 0x307C, 0x3090, and 0x3023
         assert_eq!(sensor.set_hmirror(&mut bus, true), Ok(()));
-        assert_eq!(
-            bus.get_reg16(CameraSccbAddr::OV3640, 0x307C) & 0x02,
-            0x02
-        );
-        assert_eq!(
-            bus.get_reg16(CameraSccbAddr::OV3640, 0x3090) & 0x08,
-            0x08
-        );
+        assert_eq!(bus.reg16(CameraSccbAddr::OV3640, 0x307C) & 0x02, 0x02);
+        assert_eq!(bus.reg16(CameraSccbAddr::OV3640, 0x3090) & 0x08, 0x08);
 
         assert_eq!(sensor.set_vflip(&mut bus, true), Ok(()));
-        assert_eq!(
-            bus.get_reg16(CameraSccbAddr::OV3640, 0x307C) & 0x01,
-            0x01
-        );
-        assert_eq!(bus.get_reg16(CameraSccbAddr::OV3640, 0x3023), 0x09);
+        assert_eq!(bus.reg16(CameraSccbAddr::OV3640, 0x307C) & 0x01, 0x01);
+        assert_eq!(bus.reg16(CameraSccbAddr::OV3640, 0x3023), 0x09);
 
         assert_eq!(sensor.set_contrast(&mut bus, 2), Ok(()));
         assert_eq!(sensor.set_brightness(&mut bus, 1), Ok(()));
         assert_eq!(sensor.set_saturation(&mut bus, -2), Ok(()));
-        // SDE_ENABLE (0x3355) preserves both contrast/brightness bit (0x04) and saturation bit (0x02)
+        // SDE_ENABLE (0x3355) preserves both contrast/brightness bit (0x04)
+        // and saturation bit (0x02)
         assert_eq!(
-            bus.get_reg16(CameraSccbAddr::OV3640, ov3640::OV3640_SDE_ENABLE) & 0x06,
+            bus.reg16(CameraSccbAddr::OV3640, ov3640::OV3640_SDE_ENABLE) & 0x06,
             0x06
         );
 
@@ -267,7 +284,8 @@ mod tests {
         );
 
         // init_status sharpness and awb_gain decoding verification
-        bus.preset_reg16(CameraSccbAddr::OV3640, ov3640::OV3640_SHARPNESS, 0x45); // negative: -(0x05) = -5
+        // negative: -(0x05) = -5
+        bus.preset_reg16(CameraSccbAddr::OV3640, ov3640::OV3640_SHARPNESS, 0x45);
         bus.preset_reg16(CameraSccbAddr::OV3640, 0x3406, 0x00); // awb_gain = 1
         assert_eq!(sensor.init_status(&mut bus), Ok(()));
         assert_eq!(sensor.status().sharpness, -5);
@@ -361,7 +379,7 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            bus.get_reg16(CameraSccbAddr::OV5640, ov5640::OV5640_CMD_MAIN),
+            bus.reg16(CameraSccbAddr::OV5640, ov5640::OV5640_CMD_MAIN),
             0x00
         );
         assert_eq!(
@@ -373,23 +391,25 @@ mod tests {
             Err(CameraError::NotSupported)
         );
 
-        // When MCU does not transition 0x3029 from 0x7F to 0x70, `af_init` returns `CameraError::Timeout`
-        // after writing the 4077-byte firmware to 0x8000..=0x8FEC and setting 0x3029 = 0x7F.
+        // When MCU does not transition 0x3029 from 0x7F to 0x70, `af_init`
+        // returns `CameraError::Timeout` after writing the 4077-byte firmware
+        // to 0x8000..=0x8FEC and setting 0x3029 = 0x7F.
         assert_eq!(sensor.af_init(&mut bus, 10), Err(CameraError::Timeout));
         let fw_check_idx = ov5640::OV5640_AF_FIRMWARE.len() - 2;
         assert_eq!(
-            bus.get_reg16(
+            bus.reg16(
                 CameraSccbAddr::OV5640,
                 ov5640::OV5640_AF_FW_BASE_ADDR + (fw_check_idx as u16)
             ),
             ov5640::OV5640_AF_FIRMWARE[fw_check_idx]
         );
         assert_eq!(
-            bus.get_reg16(CameraSccbAddr::OV5640, ov5640::OV5640_CMD_FW_STATUS),
+            bus.reg16(CameraSccbAddr::OV5640, ov5640::OV5640_CMD_FW_STATUS),
             0x7F
         );
 
-        // When 0x3029 is `OV5640_FW_STATUS_IDLE` (0x70), `wait_fw_idle` succeeds immediately
+        // When 0x3029 is `OV5640_FW_STATUS_IDLE` (0x70), `wait_fw_idle`
+        // succeeds immediately
         bus.preset_reg16(
             CameraSccbAddr::OV5640,
             ov5640::OV5640_CMD_FW_STATUS,
@@ -421,18 +441,18 @@ mod tests {
 
         assert_eq!(sensor.set_framesize(&mut bus, FrameSize::Qvga), Ok(()));
         assert_eq!(
-            bus.get_reg8(CameraSccbAddr::OV7725, ov7725::HOUTSIZE),
+            bus.reg8(CameraSccbAddr::OV7725, ov7725::HOUTSIZE),
             (320 >> 2) as u8
         );
         assert_eq!(
-            bus.get_reg8(CameraSccbAddr::OV7725, ov7725::VOUTSIZE),
+            bus.reg8(CameraSccbAddr::OV7725, ov7725::VOUTSIZE),
             (240 >> 1) as u8
         );
         // EXHCH (0x2A) receives lower resolution bits (320 & 3 = 0, (240 & 1) << 2 = 0)
-        assert_eq!(bus.get_reg8(CameraSccbAddr::OV7725, ov7725::EXHCH), 0x00);
+        assert_eq!(bus.reg8(CameraSccbAddr::OV7725, ov7725::EXHCH), 0x00);
 
         assert_eq!(sensor.set_framesize(&mut bus, FrameSize::Vga), Ok(()));
-        assert_eq!(bus.get_reg8(CameraSccbAddr::OV7725, ov7725::DSPAUTO), 0xF3);
+        assert_eq!(bus.reg8(CameraSccbAddr::OV7725, ov7725::DSPAUTO), 0xF3);
         assert_eq!(
             sensor.set_framesize(&mut bus, FrameSize::Svga),
             Err(CameraError::InvalidArg)
@@ -454,15 +474,15 @@ mod tests {
 
         assert_eq!(sensor.set_dcw(&mut bus, true), Ok(()));
         assert_eq!(
-            bus.get_reg8(CameraSccbAddr::OV7725, ov7725::DSP_CTRL2) & 0x04,
+            bus.reg8(CameraSccbAddr::OV7725, ov7725::DSP_CTRL2) & 0x04,
             0x00
         );
         assert_eq!(sensor.set_colorbar(&mut bus, true), Ok(()));
         assert_eq!(sensor.set_hmirror(&mut bus, true), Ok(()));
         assert_eq!(sensor.set_vflip(&mut bus, true), Ok(()));
         assert_eq!(sensor.set_aec_value(&mut bus, 0x1234), Ok(()));
-        assert_eq!(bus.get_reg8(CameraSccbAddr::OV7725, ov7725::AEC), 0x34);
-        assert_eq!(bus.get_reg8(CameraSccbAddr::OV7725, ov7725::AECH), 0x12);
+        assert_eq!(bus.reg8(CameraSccbAddr::OV7725, ov7725::AEC), 0x34);
+        assert_eq!(bus.reg8(CameraSccbAddr::OV7725, ov7725::AECH), 0x12);
     }
 
     #[test]
@@ -480,14 +500,15 @@ mod tests {
         assert_eq!(sensor.reset(&mut bus), Ok(()));
         assert_eq!(sensor.init_status(&mut bus), Ok(()));
 
-        // Preset CLKRC to 0x07 before set_framesize, then verify set_pixformat(Rgb565) restores it
+        // Preset CLKRC to 0x07 before set_framesize, then verify
+        // set_pixformat(Rgb565) restores it
         bus.preset_reg8(CameraSccbAddr::OV7670, ov7670::CLKRC, 0x07);
         assert_eq!(sensor.set_framesize(&mut bus, FrameSize::Qvga), Ok(()));
         assert_eq!(sensor.clkrc(), 0x07);
 
         bus.preset_reg8(CameraSccbAddr::OV7670, ov7670::CLKRC, 0x00);
         assert_eq!(sensor.set_pixformat(&mut bus, PixelFormat::Rgb565), Ok(()));
-        assert_eq!(bus.get_reg8(CameraSccbAddr::OV7670, ov7670::CLKRC), 0x07);
+        assert_eq!(bus.reg8(CameraSccbAddr::OV7670, ov7670::CLKRC), 0x07);
 
         assert_eq!(sensor.set_framesize(&mut bus, FrameSize::Vga), Ok(()));
         assert_eq!(sensor.set_framesize(&mut bus, FrameSize::Qqvga), Ok(()));
@@ -502,7 +523,7 @@ mod tests {
 
         assert_eq!(sensor.set_colorbar(&mut bus, true), Ok(()));
         assert_eq!(
-            bus.get_reg8(CameraSccbAddr::OV7670, ov7670::SCALING_YSC) & 0x80,
+            bus.reg8(CameraSccbAddr::OV7670, ov7670::SCALING_YSC) & 0x80,
             0x80
         );
         assert_eq!(sensor.set_hmirror(&mut bus, true), Ok(()));
@@ -510,10 +531,7 @@ mod tests {
 
         // Format switch must preserve MVFP mirror (bit 5) and flip (bit 4) bits
         assert_eq!(sensor.set_pixformat(&mut bus, PixelFormat::Yuv422), Ok(()));
-        assert_eq!(
-            bus.get_reg8(CameraSccbAddr::OV7670, ov7670::MVFP) & 0x30,
-            0x30
-        );
+        assert_eq!(bus.reg8(CameraSccbAddr::OV7670, ov7670::MVFP) & 0x30, 0x30);
 
         // Hardware status init test
         bus.preset_reg8(CameraSccbAddr::OV7670, ov7670::COM8, 0b0000_0111); // aec=1, awb=1, agc=1

@@ -2,15 +2,16 @@
 //! for the bare-metal Klipper camera firmware (`klipper-cam-fw`).
 //!
 //! Replaces `examples/camera_example/main/camera_pinout.h`,
-//! `examples/camera_example/main/klipper_cam_config.h`, and configuration blocks
-//! from `klipper_cam.c` and `take_picture.c`.
+//! `examples/camera_example/main/klipper_cam_config.h`, and configuration
+//! blocks from `klipper_cam.c` and `take_picture.c`.
 
 #![forbid(unsafe_code)]
 
 use core::fmt;
 use esp32_cam_types::{CameraFbLocation, CameraGrabMode, FrameSize, PixelFormat};
 
-/// Default OTA authentication token when `WIFI_OTA_TOKEN` is not set at compile time.
+/// Default OTA authentication token when `WIFI_OTA_TOKEN` is unset at
+/// compile time.
 pub const DEFAULT_OTA_TOKEN: &str = "klipper-cam-ota-2026";
 
 /// Default Wi-Fi SSID when `WIFI_SSID` is not set at compile time.
@@ -37,10 +38,12 @@ pub const AITHINKER_FLASH_LED_GPIO: u8 = 4;
 /// Default XCLK frequency in Hz (`20 MHz`).
 pub const DEFAULT_XCLK_FREQ_HZ: u32 = 20_000_000;
 
-/// Default JPEG compression quality (`12`, range `0..=63`, lower is higher quality).
+/// Default JPEG compression quality (`12`, range `0..=63`, lower is higher
+/// quality).
 pub const DEFAULT_JPEG_QUALITY: u8 = 12;
 
-/// Default frame buffer count in PSRAM (`2` for double-buffered continuous capture).
+/// Default frame buffer count in PSRAM (`2` for double-buffered continuous
+/// capture).
 pub const DEFAULT_FB_COUNT: usize = 2;
 
 /// Default HTTP control port (`80`).
@@ -52,30 +55,62 @@ pub const DEFAULT_STREAM_PORT: u16 = 81;
 /// Default internal control socket port for the Port 80 server (`32768`).
 pub const DEFAULT_CONTROL_CTRL_PORT: u16 = 32768;
 
-/// Default internal control socket port for the Port 81 stream server (`32769`).
+/// Default internal control socket port for the Port 81 stream server
+/// (`32769`).
 pub const DEFAULT_STREAM_CTRL_PORT: u16 = 32769;
 
 /// Default socket pacing delay between MJPEG frames in milliseconds (`50 ms`).
 pub const DEFAULT_STREAM_PACING_MS: u32 = 50;
 
-/// Default non-blocking Wi-Fi reconnect timer interval in milliseconds (`2000 ms`, `APP-009`).
+/// Default non-blocking Wi-Fi reconnect timer interval in milliseconds
+/// (`2000 ms`, `APP-009`).
 pub const DEFAULT_WIFI_RECONNECT_MS: u32 = 2_000;
 
-/// Returns the active OTA token resolved at compile time via `option_env!("OTA_TOKEN")`
-/// or `option_env!("WIFI_OTA_TOKEN")`, falling back to [`DEFAULT_OTA_TOKEN`] if unset or empty.
+/// Active HTTP control server port (`80` by default).
+pub const HTTP_PORT: u16 = DEFAULT_CONTROL_PORT;
+
+/// Active MJPEG video stream server port (`81` by default).
+pub const STREAM_PORT: u16 = DEFAULT_STREAM_PORT;
+
+/// Active JPEG compression quality (`12` by default, range `1..=63`).
+pub const JPEG_QUALITY: u8 = DEFAULT_JPEG_QUALITY;
+
+/// Returns the active OTA token resolved at compile time via `option_env!`.
+///
+/// Checked in priority order:
+/// 1. `CAM_OTA_TOKEN`
+/// 2. `OTA_TOKEN`
+/// 3. `WIFI_OTA_TOKEN`
+/// 4. [`DEFAULT_OTA_TOKEN`] fallback if unset or empty.
 #[inline]
 pub const fn active_ota_token() -> &'static str {
-    match option_env!("OTA_TOKEN") {
+    match option_env!("CAM_OTA_TOKEN") {
         Some(token) if !token.is_empty() => token,
-        _ => match COMPILE_TIME_OTA_TOKEN {
+        _ => match option_env!("OTA_TOKEN") {
             Some(token) if !token.is_empty() => token,
-            _ => DEFAULT_OTA_TOKEN,
+            _ => match COMPILE_TIME_OTA_TOKEN {
+                Some(token) if !token.is_empty() => token,
+                _ => DEFAULT_OTA_TOKEN,
+            },
         },
     }
 }
 
-/// Returns the active Wi-Fi SSID resolved at compile time via `option_env!("WIFI_SSID")`,
-/// falling back to [`DEFAULT_WIFI_SSID`] if unset or empty.
+/// Active OTA authentication token resolved at compile time.
+///
+/// Overridden at build time by setting the `CAM_OTA_TOKEN` environment variable
+/// (with fallback checking `OTA_TOKEN` and `WIFI_OTA_TOKEN`). If none of these
+/// variables are set, defaults to [`DEFAULT_OTA_TOKEN`] so offline builds and
+/// tests compile cleanly without environment requirements.
+pub const OTA_TOKEN: &str = active_ota_token();
+
+const _: () = assert!(HTTP_PORT != STREAM_PORT);
+const _: () = assert!(JPEG_QUALITY >= 1 && JPEG_QUALITY <= 63);
+const _: () = assert!(!OTA_TOKEN.is_empty());
+
+/// Returns the active Wi-Fi SSID resolved at compile time via
+/// `option_env!("WIFI_SSID")`, falling back to [`DEFAULT_WIFI_SSID`] if unset
+/// or empty.
 #[inline]
 pub const fn active_wifi_ssid() -> &'static str {
     match COMPILE_TIME_WIFI_SSID {
@@ -84,8 +119,8 @@ pub const fn active_wifi_ssid() -> &'static str {
     }
 }
 
-/// Returns the active Wi-Fi password resolved at compile time via `option_env!("WIFI_PASS")`,
-/// falling back to [`DEFAULT_WIFI_PASS`] if unset.
+/// Returns the active Wi-Fi passphrase resolved at compile time via
+/// `option_env!("WIFI_PASS")`, falling back to [`DEFAULT_WIFI_PASS`] if unset.
 #[inline]
 pub const fn active_wifi_pass() -> &'static str {
     match COMPILE_TIME_WIFI_PASS {
@@ -94,11 +129,13 @@ pub const fn active_wifi_pass() -> &'static str {
     }
 }
 
-/// Supported ESP32 / ESP32-S3 camera carrier board variants (`camera_pinout.h`).
+/// Supported ESP32 / ESP32-S3 camera carrier board variants
+/// (`camera_pinout.h`).
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum BoardVariant {
-    /// Espressif `ESP32-WROVER-KIT` / `ESP32-WROVER-DEV` (default Klipper camera board).
+    /// Espressif `ESP32-WROVER-KIT` / `ESP32-WROVER-DEV` (default Klipper
+    /// camera board).
     #[default]
     WroverKit = 0,
     /// `ESP32-CAM` by AI-Thinker.
@@ -124,8 +161,9 @@ impl BoardVariant {
         }
     }
 
-    /// Returns `true` only if this board maps GPIO 4 to an external flash LED (`AiThinker`)
-    /// rather than `CAM_PIN_D0` (`WroverKit`) (`APP-004` / `FW-001`).
+    /// Returns `true` only if this board maps GPIO 4 to an external flash LED
+    /// (`AiThinker`) rather than `CAM_PIN_D0` (`WroverKit`) (`APP-004` /
+    /// `FW-001`).
     #[inline]
     pub const fn has_gpio4_flash_led(self) -> bool {
         matches!(self, Self::AiThinker)
@@ -278,14 +316,16 @@ impl Ipv4Addr {
         u32::from_be_bytes(self.0)
     }
 
-    /// Converts the IPv4 address to little-endian `u32` (matching LwIP `ip4_addr_t::addr` on Xtensa).
+    /// Converts the IPv4 address to little-endian `u32` (matching LwIP
+    /// `ip4_addr_t::addr` on Xtensa).
     #[inline]
     pub const fn to_u32_le(self) -> u32 {
         u32::from_le_bytes(self.0)
     }
 
-    /// Parses a dotted-quad ASCII string (e.g. `"172.22.1.52"`) into an [`Ipv4Addr`].
-    /// Rejects leading zeros on multi-digit octets (e.g. `"01"`, `"001"`).
+    /// Parses a dotted-quad ASCII string (e.g. `"172.22.1.52"`) into an
+    /// [`Ipv4Addr`]. Rejects leading zeros on multi-digit octets (e.g. `"01"`,
+    /// `"001"`).
     pub const fn parse_ascii(input: &str) -> Option<Self> {
         let bytes = input.as_bytes();
         if bytes.is_empty() {
@@ -360,7 +400,8 @@ pub struct StaticIpConfig {
 }
 
 impl StaticIpConfig {
-    /// Default Klipper camera static IP configuration (`172.22.1.52/24`, GW `172.22.1.1`).
+    /// Default Klipper camera static IP configuration (`172.22.1.52/24`,
+    /// GW `172.22.1.1`).
     pub const KLIPPER_DEFAULT: Self = Self {
         ip: Ipv4Addr::new(172, 22, 1, 52),
         netmask: Ipv4Addr::new(255, 255, 255, 0),
@@ -383,10 +424,7 @@ impl StaticIpConfig {
     pub const fn is_valid(&self) -> bool {
         self.prefix_len > 0
             && self.prefix_len <= 32
-            && (self.ip.0[0] != 0
-                || self.ip.0[1] != 0
-                || self.ip.0[2] != 0
-                || self.ip.0[3] != 0)
+            && (self.ip.0[0] != 0 || self.ip.0[1] != 0 || self.ip.0[2] != 0 || self.ip.0[3] != 0)
             && (self.gateway.0[0] != 0
                 || self.gateway.0[1] != 0
                 || self.gateway.0[2] != 0
@@ -419,7 +457,8 @@ pub struct NetworkConfig {
 }
 
 impl NetworkConfig {
-    /// Default network configuration with DHCP enabled and `172.22.1.52/24` static profile ready.
+    /// Default network configuration with DHCP enabled and `172.22.1.52/24`
+    /// static profile ready.
     pub const DEFAULT: Self = Self {
         use_dhcp: true,
         static_ip: StaticIpConfig::KLIPPER_DEFAULT,
@@ -429,7 +468,8 @@ impl NetworkConfig {
         reconnect_delay_ms: DEFAULT_WIFI_RECONNECT_MS,
     };
 
-    /// Returns a network configuration pinned to static IP `172.22.1.52/24` (GW `172.22.1.1`).
+    /// Returns a network configuration pinned to static IP `172.22.1.52/24`
+    /// (GW `172.22.1.1`).
     #[inline]
     pub const fn with_static_ip() -> Self {
         Self {
@@ -450,7 +490,8 @@ impl Default for NetworkConfig {
     }
 }
 
-/// Complete configuration for the Klipper 3D printer camera firmware (`klipper_cam.c`).
+/// Complete configuration for the Klipper 3D printer camera firmware
+/// (`klipper_cam.c`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct KlipperCamConfig {
     /// Target carrier board variant (`BoardVariant::WroverKit` by default).
@@ -497,7 +538,7 @@ pub struct KlipperCamConfig {
     pub target_fps: u8,
     /// Network and Wi-Fi configuration.
     pub network: NetworkConfig,
-    /// OTA shared secret token for `X-OTA-Token` authentication.
+    /// OTA authentication token for `X-OTA-Token` verification.
     pub ota_token: &'static str,
 }
 
@@ -529,7 +570,8 @@ impl KlipperCamConfig {
         ota_token: active_ota_token(),
     };
 
-    /// Creates a configuration for a specific [`BoardVariant`] while preserving HD Klipper defaults.
+    /// Creates a configuration for a specific [`BoardVariant`] while
+    /// preserving HD Klipper defaults.
     #[inline]
     pub const fn for_board(board: BoardVariant) -> Self {
         let mut cfg = Self::WROVER_KIT_HD;
@@ -600,9 +642,7 @@ impl KlipperCamConfig {
         if !self.network.static_ip.is_valid() {
             return false;
         }
-        if self.control_port == 0
-            || self.stream_port == 0
-            || self.control_port == self.stream_port
+        if self.control_port == 0 || self.stream_port == 0 || self.control_port == self.stream_port
         {
             return false;
         }
@@ -612,14 +652,7 @@ impl KlipperCamConfig {
     /// Resolves `KlipperCamConfig` from compile-time build environment variables.
     pub const fn from_build_env() -> Self {
         let mut cfg = Self::WROVER_KIT_HD;
-        let token = match option_env!("OTA_TOKEN") {
-            Some(tok) if !tok.is_empty() => tok,
-            _ => match option_env!("WIFI_OTA_TOKEN") {
-                Some(tok) if !tok.is_empty() => tok,
-                _ => Self::DEFAULT_OTA_TOKEN,
-            },
-        };
-        cfg.ota_token = token;
+        cfg.ota_token = active_ota_token();
         cfg
     }
 }
@@ -755,5 +788,12 @@ mod tests {
     fn test_ota_token_resolution() {
         let token = active_ota_token();
         assert!(!token.is_empty());
+    }
+
+    #[test]
+    fn test_compile_time_invariants_and_constants() {
+        assert_ne!(HTTP_PORT, STREAM_PORT);
+        assert!((1..=63).contains(&JPEG_QUALITY));
+        assert!(!OTA_TOKEN.is_empty());
     }
 }

@@ -203,7 +203,8 @@ impl Default for Bf20a6 {
 }
 
 impl Bf20a6 {
-    /// Creates a new [`Bf20a6`] instance with default SCCB address (`0x6E`) and PID (`0x20A6`).
+    /// Creates a new [`Bf20a6`] instance with default SCCB address (`0x6E`)
+    /// and PID (`0x20A6`).
     pub const fn new() -> Self {
         Self {
             id: SensorId {
@@ -256,7 +257,8 @@ impl Bf20a6 {
         }
     }
 
-    /// Probes the SCCB bus at `slv_addr` (`0x6E`) and verifies `BF20A6_PID` (`0x20A6`).
+    /// Probes the SCCB bus at `slv_addr` (`0x6E`) and verifies `BF20A6_PID`
+    /// (`0x20A6`).
     pub fn detect<B: SccbBus>(bus: &mut B, slv_addr: u8) -> Result<SensorId, CameraError> {
         if slv_addr != CameraSccbAddr::BF20A6 {
             return Err(CameraError::NotDetected);
@@ -444,13 +446,7 @@ impl<B: SccbBus> CameraSensor<B> for Bf20a6 {
         Ok(val & mask)
     }
 
-    fn set_reg(
-        &mut self,
-        bus: &mut B,
-        reg: i32,
-        mask: i32,
-        value: i32,
-    ) -> Result<(), CameraError> {
+    fn set_reg(&mut self, bus: &mut B, reg: i32, mask: i32, value: i32) -> Result<(), CameraError> {
         if !(0..=0xFF).contains(&reg) || !(0..=0xFF).contains(&mask) {
             return Err(CameraError::InvalidArg);
         }

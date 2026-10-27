@@ -4,11 +4,12 @@
 //! `sensors/private_include/ov2640_settings.h`.
 //!
 //! ### `OV-105` Engineering Invariant
-//! In [`Ov2640::set_window`], `HSIZE8` (`0xC0`), `VSIZE8` (`0xC1`), and `SIZEL` (`0x8C`)
-//! are **never** overwritten with cropped `max_x` / `max_y` dimensions (such as `1600x900`
-//! for 16:9 `FrameSize::Hd`). The underlying UXGA (`1600x1200`), SVGA (`800x600`), or
-//! CIF (`400x296`) DSP sensor input dimensions established by the mode table are preserved
-//! so that vertical cropping (`offset_y = 150`, `max_y = 900` -> `1050 <= 1200`) streams
+//! In [`Ov2640::set_window`], `HSIZE8` (`0xC0`), `VSIZE8` (`0xC1`), and
+//! `SIZEL` (`0x8C`) are **never** overwritten with cropped `max_x` / `max_y`
+//! dimensions (such as `1600x900` for 16:9 `FrameSize::Hd`). The underlying
+//! UXGA (`1600x1200`), SVGA (`800x600`), or CIF (`400x296`) DSP sensor input
+//! dimensions established by the mode table are preserved so that vertical
+//! cropping (`offset_y = 150`, `max_y = 900` -> `1050 <= 1200`) streams
 //! without DSP pipeline stalls.
 
 use crate::{
@@ -229,15 +230,60 @@ pub struct Ov2640RatioSettings {
 
 /// Aspect ratio crop table matching `ratio_table[]` in `ov2640_settings.h`.
 pub const RATIO_TABLE: [Ov2640RatioSettings; 9] = [
-    Ov2640RatioSettings { offset_x: 0, offset_y: 0, max_x: 1600, max_y: 1200 },   // 4x3
-    Ov2640RatioSettings { offset_x: 8, offset_y: 72, max_x: 1584, max_y: 1056 },  // 3x2
-    Ov2640RatioSettings { offset_x: 0, offset_y: 100, max_x: 1600, max_y: 1000 }, // 16x10
-    Ov2640RatioSettings { offset_x: 0, offset_y: 120, max_x: 1600, max_y: 960 },  // 5x3
-    Ov2640RatioSettings { offset_x: 0, offset_y: 150, max_x: 1600, max_y: 900 },  // 16x9
-    Ov2640RatioSettings { offset_x: 2, offset_y: 258, max_x: 1596, max_y: 684 },  // 21x9
-    Ov2640RatioSettings { offset_x: 50, offset_y: 0, max_x: 1500, max_y: 1200 },  // 5x4
-    Ov2640RatioSettings { offset_x: 200, offset_y: 0, max_x: 1200, max_y: 1200 }, // 1x1
-    Ov2640RatioSettings { offset_x: 462, offset_y: 0, max_x: 676, max_y: 1200 },  // 9x16
+    Ov2640RatioSettings {
+        offset_x: 0,
+        offset_y: 0,
+        max_x: 1600,
+        max_y: 1200,
+    }, // 4x3
+    Ov2640RatioSettings {
+        offset_x: 8,
+        offset_y: 72,
+        max_x: 1584,
+        max_y: 1056,
+    }, // 3x2
+    Ov2640RatioSettings {
+        offset_x: 0,
+        offset_y: 100,
+        max_x: 1600,
+        max_y: 1000,
+    }, // 16x10
+    Ov2640RatioSettings {
+        offset_x: 0,
+        offset_y: 120,
+        max_x: 1600,
+        max_y: 960,
+    }, // 5x3
+    Ov2640RatioSettings {
+        offset_x: 0,
+        offset_y: 150,
+        max_x: 1600,
+        max_y: 900,
+    }, // 16x9
+    Ov2640RatioSettings {
+        offset_x: 2,
+        offset_y: 258,
+        max_x: 1596,
+        max_y: 684,
+    }, // 21x9
+    Ov2640RatioSettings {
+        offset_x: 50,
+        offset_y: 0,
+        max_x: 1500,
+        max_y: 1200,
+    }, // 5x4
+    Ov2640RatioSettings {
+        offset_x: 200,
+        offset_y: 0,
+        max_x: 1200,
+        max_y: 1200,
+    }, // 1x1
+    Ov2640RatioSettings {
+        offset_x: 462,
+        offset_y: 0,
+        max_x: 676,
+        max_y: 1200,
+    }, // 9x16
 ];
 
 pub const OV2640_SETTINGS_CIF: [Reg8; 157] = [
@@ -249,7 +295,10 @@ pub const OV2640_SETTINGS_CIF: [Reg8; 157] = [
     Reg8::new(CLKRC, 0x01),
     Reg8::new(COM2, COM2_OUT_DRIVE_3X),
     Reg8::new(REG04, REG04_DEFAULT),
-    Reg8::new(COM8, COM8_DEFAULT | COM8_BNDF_EN | COM8_AGC_EN | COM8_AEC_EN),
+    Reg8::new(
+        COM8,
+        COM8_DEFAULT | COM8_BNDF_EN | COM8_AGC_EN | COM8_AEC_EN,
+    ),
     Reg8::new(COM9, COM9_DEFAULT | (COM9_AGC_GAIN_8X << 5)),
     Reg8::new(0x2c, 0x0c),
     Reg8::new(0x33, 0x78),
@@ -700,7 +749,8 @@ impl Ov2640 {
         }
     }
 
-    /// Probes and verifies the OV2640 sensor on `bus` at `slv_addr` (`esp32_camera_ov2640_detect`).
+    /// Probes and verifies the OV2640 sensor on `bus` at `slv_addr`
+    /// (`esp32_camera_ov2640_detect`).
     pub fn detect<B: SccbBus>(bus: &mut B, slv_addr: u8) -> Result<SensorId, CameraError> {
         if slv_addr != Self::SLV_ADDR {
             return Err(CameraError::NotDetected);
@@ -770,6 +820,9 @@ impl Ov2640 {
     }
 
     fn set_bank<B: SccbBus>(&mut self, bus: &mut B, bank: Ov2640Bank) -> Result<(), CameraError> {
+        if bank == Ov2640Bank::Max {
+            return Err(CameraError::InvalidArg);
+        }
         if self.reg_bank != bank {
             bus.write_reg8(self.slv_addr, BANK_SEL, bank as u8)?;
             self.reg_bank = bank;
@@ -856,10 +909,11 @@ impl Ov2640 {
     /// Configures the OV2640 DSP window, scaling, and pixel clock dividers.
     ///
     /// ### `OV-105` Invariant
-    /// `HSIZE8` (`0xC0`), `VSIZE8` (`0xC1`), and `SIZEL` (`0x8C`) are intentionally omitted
-    /// from `win_regs` so the base sensor mode input dimensions (`1600x1200` UXGA, `800x600`
-    /// SVGA, or `400x296` CIF) set by `OV2640_SETTINGS_TO_*` remain intact when a cropped
-    /// aspect ratio window (such as `16:9` `FrameSize::Hd`, `offset_y = 150`, `max_y = 900`)
+    /// `HSIZE8` (`0xC0`), `VSIZE8` (`0xC1`), and `SIZEL` (`0x8C`) are
+    /// intentionally omitted from `win_regs` so the base sensor mode input
+    /// dimensions (`1600x1200` UXGA, `800x600` SVGA, or `400x296` CIF) set by
+    /// `OV2640_SETTINGS_TO_*` remain intact when a cropped aspect ratio window
+    /// (such as `16:9` `FrameSize::Hd`, `offset_y = 150`, `max_y = 900`)
     /// is applied.
     #[allow(clippy::too_many_arguments)]
     pub fn set_window<B: SccbBus>(
@@ -899,11 +953,19 @@ impl Ov2640 {
 
         let (clk_2x, clk_div, pclk_auto, pclk_div): (u8, u8, u8, u8) =
             if self.pixformat == PixelFormat::Jpeg {
-                let div = if mode == Ov2640SensorMode::Uxga { 12 } else { 8 };
+                let div = if mode == Ov2640SensorMode::Uxga {
+                    12
+                } else {
+                    8
+                };
                 (0, 0, 0, div)
             } else {
                 let c_div = if mode == Ov2640SensorMode::Cif { 3 } else { 7 };
-                let p_div = if mode == Ov2640SensorMode::Uxga { 12 } else { 8 };
+                let p_div = if mode == Ov2640SensorMode::Uxga {
+                    12
+                } else {
+                    8
+                };
                 (0, c_div, 1, p_div)
             };
 
@@ -1266,13 +1328,7 @@ impl<B: SccbBus> CameraSensor<B> for Ov2640 {
         Ok(val & mask)
     }
 
-    fn set_reg(
-        &mut self,
-        bus: &mut B,
-        reg: i32,
-        mask: i32,
-        value: i32,
-    ) -> Result<(), CameraError> {
+    fn set_reg(&mut self, bus: &mut B, reg: i32, mask: i32, value: i32) -> Result<(), CameraError> {
         if !(0..=0x1FF).contains(&reg) {
             return Err(CameraError::InvalidArg);
         }
@@ -1299,7 +1355,13 @@ impl<B: SccbBus> CameraSensor<B> for Ov2640 {
         _scale: bool,
         _binning: bool,
     ) -> Result<(), CameraError> {
-        if offset_x < 0 || offset_y < 0 || total_x <= 0 || total_y <= 0 || output_x <= 0 || output_y <= 0 {
+        if offset_x < 0
+            || offset_y < 0
+            || total_x <= 0
+            || total_y <= 0
+            || output_x <= 0
+            || output_y <= 0
+        {
             return Err(CameraError::InvalidArg);
         }
         let mode = Ov2640SensorMode::from_i32(start_x);

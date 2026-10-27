@@ -1,3 +1,10 @@
+baudrate = 460800
+format = "EspIdf"
+
+[idf_format_args]
+bootloader = "firmware/bootloader_v554_gpio16.bin"
+partition_table = "partitions_rust_ota.csv"
+
 [flash]
 mode = "dio"
 size = "4MB"

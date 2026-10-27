@@ -1,5 +1,6 @@
-//! Multi-vendor sensor family re-exports (`nt99141`, `gc0308`, `gc2145`, `gc032a`, `bf3005`,
-//! `bf20a6`, `sc101iot`, `sc030iot`, `sc031gs`, `mega_ccm`, `hm1055`, `hm0360`).
+//! Multi-vendor sensor family re-exports (`nt99141`, `gc0308`, `gc2145`,
+//! `gc032a`, `bf3005`, `bf20a6`, `sc101iot`, `sc030iot`, `sc031gs`,
+//! `mega_ccm`, `hm1055`, `hm0360`).
 
 pub use crate::bf20a6::{Bf20A6, Bf20a6, BF20A6};
 pub use crate::bf3005::{Bf3005, BF3005};

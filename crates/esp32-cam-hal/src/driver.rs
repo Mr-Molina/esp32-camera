@@ -1,6 +1,7 @@
-//! Type-state [`CameraDriver`] (`Uninitialized` -> `Initialized` -> `Streaming`), JPEG SOI/EOI
-//! frame boundary verification, DMA half-buffer assembly, autofocus (`esp_camera_af.c`), and
-//! NVS configuration persistence (`driver/cam_hal.c`, `driver/esp_camera.c`).
+//! Type-state [`CameraDriver`] (`Uninitialized` -> `Initialized` ->
+//! `Streaming`), JPEG SOI/EOI frame boundary verification, DMA half-buffer
+//! assembly, autofocus (`esp_camera_af.c`), and NVS configuration persistence
+//! (`driver/cam_hal.c`, `driver/esp_camera.c`).
 
 #![forbid(unsafe_code)]
 
@@ -18,16 +19,20 @@ use esp32_cam_types::{
 use crate::board_pins::BoardPins;
 use crate::frame_pool::{FrameGuard, FramePool};
 
-/// JPEG Start-Of-Image (`SOI`) 3-byte marker (`0xFF, 0xD8, 0xFF` in `driver/cam_hal.c:161`).
+/// JPEG Start-Of-Image (`SOI`) 3-byte marker (`0xFF, 0xD8, 0xFF` in
+/// `driver/cam_hal.c:161`).
 pub const JPEG_SOI_MARKER: [u8; 3] = [0xFF, 0xD8, 0xFF];
 
-/// JPEG End-Of-Image (`EOI`) 2-byte marker (`0xFF, 0xD9` in `driver/cam_hal.c:163`).
+/// JPEG End-Of-Image (`EOI`) 2-byte marker (`0xFF, 0xD9` in
+/// `driver/cam_hal.c:163`).
 pub const JPEG_EOI_MARKER: [u8; 2] = [0xFF, 0xD9];
 
-/// Default byte count probed at the start of a PSRAM JPEG frame for `SOI` (`CAM_SOI_PROBE_BYTES`).
+/// Default byte count probed at the start of a PSRAM JPEG frame for `SOI`
+/// (`CAM_SOI_PROBE_BYTES`).
 pub const CAM_SOI_PROBE_BYTES: usize = 32;
 
-/// Computes the scan window for JPEG `EOI` detection in PSRAM (`eoi_probe_window` in `driver/cam_hal.c:167-171`).
+/// Computes the scan window for JPEG `EOI` detection in PSRAM
+/// (`eoi_probe_window` in `driver/cam_hal.c:167-171`).
 #[inline]
 pub const fn eoi_probe_window(half_buf_size: usize, frame_len: usize) -> usize {
     let w = half_buf_size.saturating_add(JPEG_EOI_MARKER.len() - 1);
@@ -38,8 +43,9 @@ pub const fn eoi_probe_window(half_buf_size: usize, frame_len: usize) -> usize {
     }
 }
 
-/// Searches `inbuf` for the 3-byte JPEG Start-Of-Image marker (`0xFF, 0xD8, 0xFF`), returning
-/// its byte offset (`cam_verify_jpeg_soi` in `driver/cam_hal.c:173-192`).
+/// Searches `inbuf` for the 3-byte JPEG Start-Of-Image marker
+/// (`0xFF, 0xD8, 0xFF`), returning its byte offset (`cam_verify_jpeg_soi` in
+/// `driver/cam_hal.c:173-192`).
 pub fn verify_jpeg_soi(inbuf: &[u8]) -> Option<usize> {
     if inbuf.len() < JPEG_SOI_MARKER.len() {
         return None;
@@ -58,11 +64,14 @@ pub fn verify_jpeg_soi(inbuf: &[u8]) -> Option<usize> {
     None
 }
 
-/// Searches `inbuf` for the 2-byte JPEG End-Of-Image marker (`0xFF, 0xD9`), returning its byte
-/// offset (`cam_verify_jpeg_eoi` in `driver/cam_hal.c:194-246`).
+/// Searches `inbuf` for the 2-byte JPEG End-Of-Image marker (`0xFF, 0xD9`),
+/// returning its byte offset (`cam_verify_jpeg_eoi` in
+/// `driver/cam_hal.c:194-246`).
 ///
-/// - When `search_forward == true` (PSRAM direct-DMA tail probe), returns the earliest `EOI` offset.
-/// - When `search_forward == false` (SRAM filtered buffer), scans backward from the end of `inbuf`.
+/// - When `search_forward == true` (PSRAM direct-DMA tail probe), returns the
+///   earliest `EOI` offset.
+/// - When `search_forward == false` (SRAM filtered buffer), scans backward from
+///   the end of `inbuf`.
 pub fn verify_jpeg_eoi(inbuf: &[u8], search_forward: bool) -> Option<usize> {
     if inbuf.len() < JPEG_EOI_MARKER.len() {
         return None;
@@ -94,8 +103,9 @@ pub fn verify_jpeg_eoi(inbuf: &[u8], search_forward: bool) -> Option<usize> {
 
 /// Hardware-agnostic sensor interface consumed by [`CameraDriver`].
 ///
-/// Automatically implemented for all `esp32_cam_sensors::CameraSensor<B>` drivers when the
-/// `sensors` feature is enabled, and implemented directly by [`HalOv2640Sensor`].
+/// Automatically implemented for all `esp32_cam_sensors::CameraSensor<B>`
+/// drivers when the `sensors` feature is enabled, and implemented directly by
+/// [`HalOv2640Sensor`].
 pub trait HalCameraSensor<B: SccbBus> {
     /// Returns the [`CameraModel`] discriminant for this sensor.
     fn model(&self) -> CameraModel;
@@ -112,7 +122,8 @@ pub trait HalCameraSensor<B: SccbBus> {
     /// Resets the sensor hardware (`sensor_t::reset`).
     fn reset(&mut self, bus: &mut B) -> Result<(), CameraError>;
 
-    /// Reads current sensor registers into [`CameraStatus`] (`sensor_t::init_status`).
+    /// Reads current sensor registers into [`CameraStatus`]
+    /// (`sensor_t::init_status`).
     fn init_status(&mut self, _bus: &mut B) -> Result<(), CameraError> {
         Ok(())
     }
@@ -206,7 +217,11 @@ impl<B: SccbBus, S: esp32_cam_sensors::CameraSensor<B>> HalCameraSensor<B> for S
     }
 
     #[inline]
-    fn set_gainceiling(&mut self, bus: &mut B, gainceiling: GainCeiling) -> Result<(), CameraError> {
+    fn set_gainceiling(
+        &mut self,
+        bus: &mut B,
+        gainceiling: GainCeiling,
+    ) -> Result<(), CameraError> {
         esp32_cam_sensors::CameraSensor::set_gainceiling(self, bus, gainceiling)
     }
 
@@ -241,7 +256,8 @@ impl<B: SccbBus, S: esp32_cam_sensors::CameraSensor<B>> HalCameraSensor<B> for S
     }
 }
 
-/// Built-in lightweight OV2640 HAL sensor handle for default [`CameraDriver`] instantiation.
+/// Built-in lightweight OV2640 HAL sensor handle for default [`CameraDriver`]
+/// builds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HalOv2640Sensor {
     slv_addr: u8,
@@ -257,7 +273,8 @@ impl Default for HalOv2640Sensor {
 }
 
 impl HalOv2640Sensor {
-    /// Creates a default [`HalOv2640Sensor`] bound to `CameraSccbAddr::OV2640` (`0x30`).
+    /// Creates a default [`HalOv2640Sensor`] bound to `CameraSccbAddr::OV2640`
+    /// (`0x30`).
     pub fn new() -> Self {
         Self {
             slv_addr: CameraSccbAddr::OV2640,
@@ -323,7 +340,10 @@ impl<B: SccbBus> HalCameraSensor<B> for HalOv2640Sensor {
 
     fn set_pixformat(&mut self, bus: &mut B, pixformat: PixelFormat) -> Result<(), CameraError> {
         match pixformat {
-            PixelFormat::Rgb565 | PixelFormat::Yuv422 | PixelFormat::Grayscale | PixelFormat::Jpeg => {
+            PixelFormat::Rgb565
+            | PixelFormat::Yuv422
+            | PixelFormat::Grayscale
+            | PixelFormat::Jpeg => {
                 bus.write_reg8(self.slv_addr, 0xFF, 0x00)?;
                 self.pixformat = pixformat;
                 Ok(())
@@ -341,7 +361,11 @@ impl<B: SccbBus> HalCameraSensor<B> for HalOv2640Sensor {
         Ok(())
     }
 
-    fn set_gainceiling(&mut self, bus: &mut B, gainceiling: GainCeiling) -> Result<(), CameraError> {
+    fn set_gainceiling(
+        &mut self,
+        bus: &mut B,
+        gainceiling: GainCeiling,
+    ) -> Result<(), CameraError> {
         bus.write_reg8(self.slv_addr, 0xFF, 0x01)?;
         self.status.gainceiling = gainceiling as u8;
         Ok(())
@@ -412,7 +436,10 @@ impl<B: SccbBus> esp32_cam_sensors::CameraSensor<B> for HalOv2640Sensor {
 
     fn set_pixformat(&mut self, bus: &mut B, pixformat: PixelFormat) -> Result<(), CameraError> {
         match pixformat {
-            PixelFormat::Rgb565 | PixelFormat::Yuv422 | PixelFormat::Grayscale | PixelFormat::Jpeg => {
+            PixelFormat::Rgb565
+            | PixelFormat::Yuv422
+            | PixelFormat::Grayscale
+            | PixelFormat::Jpeg => {
                 bus.write_reg8(self.slv_addr, 0xFF, 0x00)?;
                 self.pixformat = pixformat;
                 Ok(())
@@ -430,7 +457,11 @@ impl<B: SccbBus> esp32_cam_sensors::CameraSensor<B> for HalOv2640Sensor {
         Ok(())
     }
 
-    fn set_gainceiling(&mut self, bus: &mut B, gainceiling: GainCeiling) -> Result<(), CameraError> {
+    fn set_gainceiling(
+        &mut self,
+        bus: &mut B,
+        gainceiling: GainCeiling,
+    ) -> Result<(), CameraError> {
         bus.write_reg8(self.slv_addr, 0xFF, 0x01)?;
         self.status.gainceiling = gainceiling as u8;
         Ok(())
@@ -474,15 +505,18 @@ impl<B: SccbBus> esp32_cam_sensors::CameraSensor<B> for HalOv2640Sensor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Uninitialized;
 
-/// Type-state marker: camera pins, XCLK, I2S0/LCD_CAM, and sensor registers are initialized.
+/// Type-state marker: camera pins, XCLK, I2S0/LCD_CAM, and sensor registers
+/// are initialized.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Initialized;
 
-/// Type-state marker: VSYNC interrupt and DMA frame reception are actively streaming.
+/// Type-state marker: VSYNC interrupt and DMA frame reception are actively
+/// streaming.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Streaming;
 
-/// High-level camera configuration (`camera_config_t` from `driver/include/esp_camera.h`).
+/// High-level camera configuration (`camera_config_t` from
+/// `driver/include/esp_camera.h`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CameraConfig {
     pub xclk_freq_hz: u32,
@@ -516,14 +550,16 @@ impl Default for CameraConfig {
     }
 }
 
-/// Persisted camera state record (`esp_camera_save_to_nvs` / `esp_camera_load_from_nvs` in `driver/esp_camera.c`).
+/// Persisted camera state record (`esp_camera_save_to_nvs` /
+/// `esp_camera_load_from_nvs` in `driver/esp_camera.c`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SavedCameraSettings {
     pub status: CameraStatus,
     pub pixformat: PixelFormat,
 }
 
-/// Autofocus operating mode (`esp_camera_af_mode_t` in `driver/include/esp_camera_af.h`).
+/// Autofocus operating mode (`esp_camera_af_mode_t` in
+/// `driver/include/esp_camera_af.h`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub enum AfMode {
     #[default]
@@ -533,7 +569,8 @@ pub enum AfMode {
     Manual = 3,
 }
 
-/// Autofocus configuration (`esp_camera_af_config_t` in `driver/esp_camera_af.c`).
+/// Autofocus configuration (`esp_camera_af_config_t` in
+/// `driver/esp_camera_af.c`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AfConfig {
     pub mode: AfMode,
@@ -587,8 +624,9 @@ fn ignore_not_supported(res: Result<(), CameraError>) -> Result<(), CameraError>
     }
 }
 
-/// Type-state camera driver (`CameraDriver<Board, Sccb, State, Sensor, COUNT, BUF_CAP>`),
-/// replacing `driver/esp_camera.c` and `driver/cam_hal.c`.
+/// Type-state camera driver
+/// (`CameraDriver<Board, Sccb, State, Sensor, COUNT, BUF_CAP>`), replacing
+/// `driver/esp_camera.c` and `driver/cam_hal.c`.
 #[derive(Debug)]
 pub struct CameraDriver<
     Board: BoardPins,
@@ -641,9 +679,10 @@ impl<
         }
     }
 
-    /// Initializes the board pins, `XCLK` generator, `I2S0` peripheral, DMA sizing, and sensor
-    /// registers, transitioning the driver from [`Uninitialized`] to [`Initialized`]
-    /// (`esp_camera_init` in `driver/esp_camera.c:305-393`).
+    /// Initializes the board pins, `XCLK` generator, `I2S0` peripheral, DMA
+    /// sizing, and sensor registers, transitioning the driver from
+    /// [`Uninitialized`] to [`Initialized`] (`esp_camera_init` in
+    /// `driver/esp_camera.c:305-393`).
     pub fn init(
         mut self,
     ) -> Result<CameraDriver<Board, Sccb, Initialized, Sensor, COUNT, BUF_CAP>, CameraError> {
@@ -654,17 +693,6 @@ impl<
         // 1. Validate board pinout (FW-001 / DMA-102)
         self.board.validate_pins()?;
         let pins = self.board.pins();
-
-        if let Some(p) = pins.pwdn {
-            if p >= 40 {
-                return Err(CameraError::InvalidArg);
-            }
-        }
-        if let Some(p) = pins.reset {
-            if p >= 40 {
-                return Err(CameraError::InvalidArg);
-            }
-        }
         self.pwdn_pin = pins.pwdn;
         self.reset_pin = pins.reset;
 
@@ -677,14 +705,16 @@ impl<
         };
         self.xclk.enable_out_clock(&xclk_cfg)?;
 
-        // Execute subsequent setup; if any step fails, disable XCLK before returning Err(e) (HAL-003)
+        // Execute subsequent setup; if any step fails, disable XCLK before
+        // returning Err(e) (HAL-003)
         let setup_res = (|| -> Result<DmaSizeConfig, CameraError> {
             // 3. Configure low-level I2S0 pins unconditionally (HAL-003)
             let ll_pins = pins.to_ll_pin_config(true);
             self.i2s.set_pin(&ll_pins)?;
             self.i2s.config()?;
 
-            // 4. Check sensor capabilities against requested format and resolution (`esp_camera.c:337-346`)
+            // 4. Check sensor capabilities against requested format and
+            // resolution (`esp_camera.c:337-346`)
             let model_info = self.sensor.model().info();
             if self.config.pixel_format == PixelFormat::Jpeg && !model_info.support_jpeg {
                 return Err(CameraError::NotSupported);
@@ -697,7 +727,8 @@ impl<
             }
             self.max_frame_size = self.config.frame_size;
 
-            // 5. Configure sampling mode and DMA sizes (`cam_config` in `driver/cam_hal.c:595-666`)
+            // 5. Configure sampling mode and DMA sizes (`cam_config` in
+            // `driver/cam_hal.c:595-666`)
             let sensor_pid = self.sensor.id().pid;
             let sample_cfg = self.i2s.set_sample_mode(
                 self.config.pixel_format,
@@ -721,14 +752,20 @@ impl<
             self.sensor.set_framesize(&mut self.bus, frame_size)?;
 
             if sensor_pid == CameraPid::OV2640.as_u16() {
-                ignore_not_supported(self.sensor.set_gainceiling(&mut self.bus, GainCeiling::Gain2x))?;
+                ignore_not_supported(
+                    self.sensor
+                        .set_gainceiling(&mut self.bus, GainCeiling::Gain2x),
+                )?;
                 ignore_not_supported(self.sensor.set_bpc(&mut self.bus, false))?;
                 ignore_not_supported(self.sensor.set_wpc(&mut self.bus, true))?;
                 ignore_not_supported(self.sensor.set_lenc(&mut self.bus, true))?;
             }
 
             if self.config.pixel_format == PixelFormat::Jpeg {
-                ignore_not_supported(self.sensor.set_quality(&mut self.bus, self.config.jpeg_quality as i32))?;
+                ignore_not_supported(
+                    self.sensor
+                        .set_quality(&mut self.bus, self.config.jpeg_quality as i32),
+                )?;
             }
             ignore_not_supported(self.sensor.init_status(&mut self.bus))?;
 
@@ -744,7 +781,8 @@ impl<
         };
 
         self.dma_cfg = Some(dma_cfg);
-        // HAL-003: Do NOT enable vsync_intr_enable(true) inside init(); deferred to start_streaming()
+        // HAL-003: Do NOT enable vsync_intr_enable(true) inside init();
+        // deferred to start_streaming()
 
         Ok(CameraDriver {
             board: self.board,
@@ -779,7 +817,8 @@ impl<
         &self.sensor
     }
 
-    /// Returns a mutable reference to the underlying camera sensor (`esp_camera_sensor_get`).
+    /// Returns a mutable reference to the underlying camera sensor
+    /// (`esp_camera_sensor_get`).
     #[inline]
     pub fn sensor_mut(&mut self) -> &mut Sensor {
         &mut self.sensor
@@ -797,7 +836,8 @@ impl<
         &mut self.bus
     }
 
-    /// Allows mutating sensor settings with simultaneous mutable access to both `Sensor` and `Sccb`.
+    /// Allows mutating sensor settings with simultaneous mutable access to both
+    /// `Sensor` and `Sccb`.
     #[inline]
     pub fn with_sensor_and_bus<F, R>(&mut self, f: F) -> R
     where
@@ -857,7 +897,8 @@ impl<
         const BUF_CAP: usize,
     > CameraDriver<Board, Sccb, Initialized, Sensor, COUNT, BUF_CAP>
 {
-    /// Transitions the driver from [`Initialized`] into the [`Streaming`] type-state (`cam_start`).
+    /// Transitions the driver from [`Initialized`] into the [`Streaming`]
+    /// type-state (`cam_start`).
     pub fn start_streaming(
         mut self,
     ) -> Result<CameraDriver<Board, Sccb, Streaming, Sensor, COUNT, BUF_CAP>, CameraError> {
@@ -884,8 +925,9 @@ impl<
         })
     }
 
-    /// Assembles a frame from DMA half-buffers, performs JPEG `SOI`/`EOI` verification and trimming,
-    /// stores it in [`FramePool`], and returns an RAII [`FrameGuard`].
+    /// Assembles a frame from DMA half-buffers, performs JPEG `SOI`/`EOI`
+    /// verification and trimming, stores it in [`FramePool`], and returns an
+    /// RAII [`FrameGuard`].
     pub fn capture_frame(
         &mut self,
         dma_half_buffers: &[&[u8]],
@@ -901,7 +943,8 @@ impl<
         )
     }
 
-    /// Exports the current sensor status and pixel format for NVS persistence (`esp_camera_save_to_nvs`).
+    /// Exports the current sensor status and pixel format for NVS persistence
+    /// (`esp_camera_save_to_nvs`).
     pub fn save_settings(&self) -> SavedCameraSettings {
         SavedCameraSettings {
             status: *self.sensor.status(),
@@ -909,8 +952,9 @@ impl<
         }
     }
 
-    /// Restores sensor settings from a [`SavedCameraSettings`] snapshot, enforcing the DMA overflow
-    /// and pixel format compatibility guards from `driver/esp_camera.c:514-548`.
+    /// Restores sensor settings from a [`SavedCameraSettings`] snapshot,
+    /// enforcing the DMA overflow and pixel format compatibility guards from
+    /// `driver/esp_camera.c:514-548`.
     pub fn load_settings(&mut self, saved: &SavedCameraSettings) -> Result<(), CameraError> {
         let target_fs = saved.status.framesize;
         if target_fs > self.max_frame_size {
@@ -926,14 +970,23 @@ impl<
             ignore_not_supported(self.sensor.set_pixformat(&mut self.bus, saved.pixformat))?;
             self.config.pixel_format = saved.pixformat;
         }
-        ignore_not_supported(self.sensor.set_quality(&mut self.bus, saved.status.quality as i32))?;
-        ignore_not_supported(self.sensor.set_hmirror(&mut self.bus, saved.status.hmirror != 0))?;
-        ignore_not_supported(self.sensor.set_vflip(&mut self.bus, saved.status.vflip != 0))?;
+        ignore_not_supported(
+            self.sensor
+                .set_quality(&mut self.bus, saved.status.quality as i32),
+        )?;
+        ignore_not_supported(
+            self.sensor
+                .set_hmirror(&mut self.bus, saved.status.hmirror != 0),
+        )?;
+        ignore_not_supported(
+            self.sensor
+                .set_vflip(&mut self.bus, saved.status.vflip != 0),
+        )?;
         Ok(())
     }
 
-    /// Stops DMA capture, disables XCLK, and returns the driver to the [`Uninitialized`] type-state
-    /// (`esp_camera_deinit`).
+    /// Stops DMA capture, disables XCLK, and returns the driver to the
+    /// [`Uninitialized`] type-state (`esp_camera_deinit`).
     pub fn deinit(
         mut self,
     ) -> Result<CameraDriver<Board, Sccb, Uninitialized, Sensor, COUNT, BUF_CAP>, CameraError> {
@@ -978,9 +1031,10 @@ impl<
         const BUF_CAP: usize,
     > CameraDriver<Board, Sccb, Streaming, Sensor, COUNT, BUF_CAP>
 {
-    /// Assembles a frame from DMA half-buffers while in [`Streaming`] state, performs JPEG
-    /// `SOI`/`EOI` verification and trimming, and returns an RAII [`FrameGuard`]
-    /// (`esp_camera_fb_get` / `cam_take` in `driver/cam_hal.c:320-458, 730-837`).
+    /// Assembles a frame from DMA half-buffers while in [`Streaming`] state,
+    /// performs JPEG `SOI`/`EOI` verification and trimming, and returns an RAII
+    /// [`FrameGuard`] (`esp_camera_fb_get` / `cam_take` in
+    /// `driver/cam_hal.c:320-458, 730-837`).
     pub fn capture_frame(
         &mut self,
         dma_half_buffers: &[&[u8]],
@@ -996,7 +1050,8 @@ impl<
         )
     }
 
-    /// Stops active DMA streaming and transitions back to [`Initialized`] (`cam_stop`).
+    /// Stops active DMA streaming and transitions back to [`Initialized`]
+    /// (`cam_stop`).
     pub fn stop_streaming(
         mut self,
     ) -> CameraDriver<Board, Sccb, Initialized, Sensor, COUNT, BUF_CAP> {
@@ -1019,8 +1074,8 @@ impl<
         }
     }
 
-    /// Stops DMA capture, disables XCLK, and returns the driver to the [`Uninitialized`] type-state
-    /// (`esp_camera_deinit`).
+    /// Stops DMA capture, disables XCLK, and returns the driver to the
+    /// [`Uninitialized`] type-state (`esp_camera_deinit`).
     pub fn deinit(
         self,
     ) -> Result<CameraDriver<Board, Sccb, Uninitialized, Sensor, COUNT, BUF_CAP>, CameraError> {
@@ -1048,7 +1103,8 @@ fn assemble_and_lease_frame<
     }
     let dma_cfg = dma_cfg_opt.ok_or(CameraError::InvalidState)?;
 
-    // HAL-004: only start if !i2s.is_running(), and only stop if it was not running before
+    // HAL-004: only start if !i2s.is_running(), and only stop if it was not
+    // running before
     let was_running = i2s.is_running();
     if !was_running && !i2s.start(&dma_cfg, 0) {
         return Err(CameraError::HardwareError);
@@ -1078,9 +1134,8 @@ fn assemble_and_lease_frame<
             } else {
                 let rem_cap = fb_buf.len().saturating_sub(total_written);
                 let expected_out = match filter {
-                    esp32_cam_ll::DmaFilterKind::Jpeg | esp32_cam_ll::DmaFilterKind::YuyvHighspeed => {
-                        half_buf.len() / 4
-                    }
+                    esp32_cam_ll::DmaFilterKind::Jpeg
+                    | esp32_cam_ll::DmaFilterKind::YuyvHighspeed => half_buf.len() / 4,
                     esp32_cam_ll::DmaFilterKind::Grayscale | esp32_cam_ll::DmaFilterKind::Yuyv => {
                         half_buf.len() / 2
                     }
@@ -1113,7 +1168,8 @@ fn assemble_and_lease_frame<
         }
 
         if is_jpeg {
-            // Locate JPEG EOI marker (`0xFF, 0xD9`) and trim trailing padding bytes (`cam_hal.c:787-817`)
+            // Locate JPEG EOI marker (`0xFF, 0xD9`) and trim trailing padding bytes
+            // (DMA-101 / PSRAM garbage, `cam_hal.c:787-817`)
             let offset_e = if psram_mode {
                 let last_half_len = dma_half_buffers
                     .last()
@@ -1163,12 +1219,15 @@ mod tests {
 
     #[test]
     fn test_verify_jpeg_soi_and_eoi() {
-        let valid_jpeg = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x11, 0x22, 0xFF, 0xD9, 0x00, 0x00];
+        let valid_jpeg = [
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x11, 0x22, 0xFF, 0xD9, 0x00, 0x00,
+        ];
         assert_eq!(verify_jpeg_soi(&valid_jpeg), Some(0));
         assert_eq!(verify_jpeg_eoi(&valid_jpeg, false), Some(8));
         assert_eq!(verify_jpeg_eoi(&valid_jpeg, true), Some(8));
 
-        // Forward vs backward EOI search when two EOI markers exist (stale tail in PSRAM)
+        // Forward vs backward EOI search when two EOI markers exist
+        // (stale tail in PSRAM)
         let double_eoi = [
             0xFF, 0xD8, 0xFF, 0xAA, 0xFF, 0xD9, 0x99, 0x88, 0xFF, 0xD9, 0x00,
         ];
@@ -1202,7 +1261,8 @@ mod tests {
         let init_driver = uninit_driver.init().expect("driver init");
         let mut streaming_driver = init_driver.start_streaming().expect("start streaming");
 
-        // 2. Capture valid JPEG across 2 DMA half-buffers with trailing garbage after EOI
+        // 2. Capture valid JPEG across 2 DMA half-buffers with trailing
+        // garbage after EOI
         let half1_raw = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
         let half2_raw = [0x49, 0x46, 0x00, 0x01, 0xFF, 0xD9, 0xAA, 0xBB];
         let dma_half1: [u8; 32] = pack_dma_elements(&half1_raw);
@@ -1264,15 +1324,16 @@ mod tests {
         bus.preset_reg8(CameraSccbAddr::OV2640, 0x1C, 0x7F);
         bus.preset_reg8(CameraSccbAddr::OV2640, 0x1D, 0xA2);
 
-        let sensor = HalOv2640Sensor::detect(&mut bus, CameraSccbAddr::OV2640)
-            .expect("detect ov2640");
+        let sensor =
+            HalOv2640Sensor::detect(&mut bus, CameraSccbAddr::OV2640).expect("detect ov2640");
         let cfg = CameraConfig {
             pixel_format: PixelFormat::Jpeg,
             frame_size: FrameSize::Qvga,
             ..CameraConfig::default()
         };
 
-        // Frame pool buffer capacity is only 4 bytes, but unpacked JPEG half-buffer is 8 bytes
+        // Frame pool buffer capacity is only 4 bytes, but unpacked JPEG
+        // half-buffer is 8 bytes
         let driver: CameraDriver<WroverKitPins, _, Uninitialized, HalOv2640Sensor, 2, 4> =
             CameraDriver::new(WroverKitPins, bus, sensor, cfg);
         let mut init_driver = driver.init().expect("driver init");
@@ -1293,8 +1354,8 @@ mod tests {
         bus.preset_reg8(CameraSccbAddr::OV2640, 0x1C, 0x7F);
         bus.preset_reg8(CameraSccbAddr::OV2640, 0x1D, 0xA2);
 
-        let sensor = HalOv2640Sensor::detect(&mut bus, CameraSccbAddr::OV2640)
-            .expect("detect ov2640");
+        let sensor =
+            HalOv2640Sensor::detect(&mut bus, CameraSccbAddr::OV2640).expect("detect ov2640");
         let cfg = CameraConfig {
             pixel_format: PixelFormat::Jpeg,
             frame_size: FrameSize::Qvga,
@@ -1308,10 +1369,13 @@ mod tests {
         // 1. In Initialized state, i2s is not yet running (HAL-003)
         assert!(!init_driver.i2s.is_running());
 
-        // 2. One-shot capture from Initialized state starts and then stops i2s (HAL-004)
+        // 2. One-shot capture from Initialized state starts and then stops i2s
+        // (HAL-004)
         let half1 = pack_dma_elements::<32>(&[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0xFF, 0xD9]);
         {
-            let frame = init_driver.capture_frame(&[&half1]).expect("one-shot capture");
+            let frame = init_driver
+                .capture_frame(&[&half1])
+                .expect("one-shot capture");
             assert_eq!(frame.len(), 8);
         }
         // After one-shot capture, i2s is stopped
@@ -1323,7 +1387,9 @@ mod tests {
 
         // 4. Capture while streaming: i2s remains active throughout! (HAL-004)
         {
-            let frame = streaming.capture_frame(&[&half1]).expect("streaming capture");
+            let frame = streaming
+                .capture_frame(&[&half1])
+                .expect("streaming capture");
             assert_eq!(frame.len(), 8);
         }
         assert!(streaming.i2s.is_running());
@@ -1342,8 +1408,8 @@ mod tests {
         bus.preset_reg8(CameraSccbAddr::OV2640, 0x1C, 0x7F);
         bus.preset_reg8(CameraSccbAddr::OV2640, 0x1D, 0xA2);
 
-        let sensor = HalOv2640Sensor::detect(&mut bus, CameraSccbAddr::OV2640)
-            .expect("detect ov2640");
+        let sensor =
+            HalOv2640Sensor::detect(&mut bus, CameraSccbAddr::OV2640).expect("detect ov2640");
         let cfg = CameraConfig {
             pixel_format: PixelFormat::Jpeg,
             frame_size: FrameSize::Vga,
@@ -1385,10 +1451,11 @@ mod tests {
             CameraDriver::new(WroverKitPins, bus, sensor, cfg);
         let init_driver = driver.init().expect("driver init");
 
-        // Confirming CLKRC 0x11 is 0x00 and R_DVP_SP 0xD3 is 12 (0x0C) rather than 0x8C
+        // Confirming CLKRC 0x11 is 0x00 and R_DVP_SP 0xD3 is 12 (0x0C) rather
+        // than 0x8C
         let bus = init_driver.bus();
-        assert_eq!(bus.get_reg8(CameraSccbAddr::OV2640, 0x11), 0x00);
-        assert_eq!(bus.get_reg8(CameraSccbAddr::OV2640, 0xD3), 12);
+        assert_eq!(bus.reg8(CameraSccbAddr::OV2640, 0x11), 0x00);
+        assert_eq!(bus.reg8(CameraSccbAddr::OV2640, 0xD3), 12);
     }
 
     #[test]
@@ -1399,30 +1466,81 @@ mod tests {
         bus.preset_reg8(CameraSccbAddr::OV2640, 0x1C, 0x7F);
         bus.preset_reg8(CameraSccbAddr::OV2640, 0x1D, 0xA2);
 
-        let sensor = HalOv2640Sensor::detect(&mut bus, CameraSccbAddr::OV2640)
-            .expect("detect ov2640");
+        let sensor =
+            HalOv2640Sensor::detect(&mut bus, CameraSccbAddr::OV2640).expect("detect ov2640");
         let cfg = CameraConfig::default();
 
         let mut bad_pwdn_pins = WroverKitPins::PINS;
         bad_pwdn_pins.pwdn = Some(40);
-        let bad_pwdn_driver: CameraDriver<crate::board_pins::CameraPins, _, Uninitialized, HalOv2640Sensor, 2, 256> =
-            CameraDriver::new(bad_pwdn_pins, bus.clone(), sensor.clone(), cfg);
+        let bad_pwdn_driver: CameraDriver<
+            crate::board_pins::CameraPins,
+            _,
+            Uninitialized,
+            HalOv2640Sensor,
+            2,
+            256,
+        > = CameraDriver::new(bad_pwdn_pins, bus.clone(), sensor.clone(), cfg);
         assert_eq!(bad_pwdn_driver.init().err(), Some(CameraError::InvalidArg));
 
         let mut bad_reset_pins = WroverKitPins::PINS;
         bad_reset_pins.reset = Some(40);
-        let bad_reset_driver: CameraDriver<crate::board_pins::CameraPins, _, Uninitialized, HalOv2640Sensor, 2, 256> =
-            CameraDriver::new(bad_reset_pins, bus.clone(), sensor.clone(), cfg);
+        let bad_reset_driver: CameraDriver<
+            crate::board_pins::CameraPins,
+            _,
+            Uninitialized,
+            HalOv2640Sensor,
+            2,
+            256,
+        > = CameraDriver::new(bad_reset_pins, bus.clone(), sensor.clone(), cfg);
         assert_eq!(bad_reset_driver.init().err(), Some(CameraError::InvalidArg));
 
         let mut valid_pins = WroverKitPins::PINS;
         valid_pins.pwdn = Some(32);
         valid_pins.reset = Some(33);
-        let valid_driver: CameraDriver<crate::board_pins::CameraPins, _, Uninitialized, HalOv2640Sensor, 2, 256> =
-            CameraDriver::new(valid_pins, bus, sensor, cfg);
+        let valid_driver: CameraDriver<
+            crate::board_pins::CameraPins,
+            _,
+            Uninitialized,
+            HalOv2640Sensor,
+            2,
+            256,
+        > = CameraDriver::new(valid_pins, bus, sensor, cfg);
         let init = valid_driver.init().expect("valid driver init");
         assert_eq!(init.pwdn_pin(), Some(32));
         assert_eq!(init.reset_pin(), Some(33));
+    }
+
+    #[test]
+    fn test_driver_init_delegates_pin_validation_allowing_s3_pins() {
+        use crate::board_pins::Esp32S3GoouuuPins;
+
+        let mut bus: MockSccbBus<512> = MockSccbBus::new();
+        bus.preset_reg8(CameraSccbAddr::OV2640, 0x0A, 0x26);
+        bus.preset_reg8(CameraSccbAddr::OV2640, 0x0B, 0x42);
+        bus.preset_reg8(CameraSccbAddr::OV2640, 0x1C, 0x7F);
+        bus.preset_reg8(CameraSccbAddr::OV2640, 0x1D, 0xA2);
+
+        let sensor =
+            HalOv2640Sensor::detect(&mut bus, CameraSccbAddr::OV2640).expect("detect ov2640");
+        let cfg = CameraConfig::default();
+
+        // ESP32-S3 allows GPIO 40..=48 for PWDN and RESET
+        let mut s3_pins = Esp32S3GoouuuPins::PINS;
+        s3_pins.pwdn = Some(41);
+        s3_pins.reset = Some(42);
+        let s3_driver: CameraDriver<
+            crate::board_pins::CameraPins,
+            _,
+            Uninitialized,
+            HalOv2640Sensor,
+            2,
+            256,
+        > = CameraDriver::new(s3_pins, bus, sensor, cfg);
+        let init = s3_driver
+            .init()
+            .expect("valid s3 driver init with pins >= 40");
+        assert_eq!(init.pwdn_pin(), Some(41));
+        assert_eq!(init.reset_pin(), Some(42));
     }
 
     #[test]
@@ -1433,8 +1551,8 @@ mod tests {
         bus.preset_reg8(CameraSccbAddr::OV2640, 0x1C, 0x7F);
         bus.preset_reg8(CameraSccbAddr::OV2640, 0x1D, 0xA2);
 
-        let sensor = HalOv2640Sensor::detect(&mut bus, CameraSccbAddr::OV2640)
-            .expect("detect ov2640");
+        let sensor =
+            HalOv2640Sensor::detect(&mut bus, CameraSccbAddr::OV2640).expect("detect ov2640");
         let cfg = CameraConfig {
             pixel_format: PixelFormat::Jpeg,
             frame_size: FrameSize::Hd,
@@ -1450,7 +1568,8 @@ mod tests {
         // Step down to Qvga
         let mut qvga_settings = init.save_settings();
         qvga_settings.status.framesize = FrameSize::Qvga;
-        init.load_settings(&qvga_settings).expect("load qvga settings");
+        init.load_settings(&qvga_settings)
+            .expect("load qvga settings");
         assert_eq!(init.config.frame_size, FrameSize::Qvga);
         // max_frame_size must not shrink
         assert_eq!(init.max_frame_size(), FrameSize::Hd);
@@ -1458,7 +1577,8 @@ mod tests {
         // Restore back to Hd (<= max_frame_size)
         let mut hd_settings = init.save_settings();
         hd_settings.status.framesize = FrameSize::Hd;
-        init.load_settings(&hd_settings).expect("restore hd settings");
+        init.load_settings(&hd_settings)
+            .expect("restore hd settings");
         assert_eq!(init.config.frame_size, FrameSize::Hd);
 
         // Frame size exceeding max_frame_size must be rejected with InvalidArg

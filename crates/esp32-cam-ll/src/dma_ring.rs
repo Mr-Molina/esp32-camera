@@ -1,21 +1,27 @@
-//! ESP32 ROM `lldesc_t` DMA descriptor layout, circular ring initialization, and RGB/JPEG
-//! DMA buffer sizing algorithms (`target/esp32/ll_cam.c:470-559`, `driver/cam_hal.c:465-482`).
+//! ESP32 ROM `lldesc_t` DMA descriptor layout, circular ring initialization,
+//! and RGB/JPEG
+//! DMA buffer sizing algorithms (`target/esp32/ll_cam.c:470-559`,
+//! `driver/cam_hal.c:465-482`).
 
 use core::ptr;
 use esp32_cam_types::CameraError;
 
 use crate::dma_filter::I2sSamplingMode;
 
-/// Maximum buffer capacity per single ESP32/S2/S3 DMA descriptor node (`LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE`).
+/// Maximum buffer capacity per single ESP32/S2/S3 DMA descriptor node
+/// (`LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE`).
 pub const LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE: usize = 4092;
 
-/// Default maximum DMA ping-pong buffer size in bytes (`CONFIG_CAMERA_DMA_BUFFER_SIZE_MAX`).
+/// Default maximum DMA ping-pong buffer size in bytes
+/// (`CONFIG_CAMERA_DMA_BUFFER_SIZE_MAX`).
 pub const DEFAULT_CAMERA_DMA_BUFFER_SIZE_MAX: usize = 32768;
 
-/// Maximum supported uncompressed image size in bytes (`4 MiB`, `ll_cam.c:481`).
+/// Maximum supported uncompressed image size in bytes (`4 MiB`,
+/// `ll_cam.c:481`).
 pub const MAX_DMA_IMAGE_SIZE: usize = 4 * 1024 * 1024;
 
-/// Hardware DMA linked-list descriptor matching ESP32/ESP32-S2/ESP32-S3 ROM `lldesc_t`.
+/// Hardware DMA linked-list descriptor matching ESP32/ESP32-S2/ESP32-S3 ROM
+/// `lldesc_t`.
 ///
 /// Bitfield packing within `size_length_flags` (little-endian 32-bit word):
 /// - bits `0..=11` (`12` bits): `size` (buffer capacity, max `4095`)
@@ -56,7 +62,8 @@ impl Lldesc {
     /// Bit flag for `owner` (`bit 31`, `1` = DMA hardware).
     pub const OWNER_BIT: u32 = 1 << 31;
 
-    /// Packs `size`, `length`, `offset`, `sosf`, `eof`, and `owner` into the 32-bit header word.
+    /// Packs `size`, `length`, `offset`, `sosf`, `eof`, and `owner` into the 32-bit
+    /// header word.
     #[inline]
     pub const fn pack_flags(
         size: u16,
@@ -67,7 +74,11 @@ impl Lldesc {
         owner: bool,
     ) -> u32 {
         let s = if size > 0x0FFF { 0x0FFF } else { size as u32 };
-        let l = (if length > 0x0FFF { 0x0FFF } else { length as u32 }) << Self::LENGTH_SHIFT;
+        let l = (if length > 0x0FFF {
+            0x0FFF
+        } else {
+            length as u32
+        }) << Self::LENGTH_SHIFT;
         let o = (if offset > 0x1F { 0x1F } else { offset as u32 }) << Self::OFFSET_SHIFT;
         let sf = if sosf { Self::SOSF_BIT } else { 0 };
         let ef = if eof { Self::EOF_BIT } else { 0 };
@@ -172,7 +183,8 @@ impl Lldesc {
         }
     }
 
-    /// Returns the 20-bit physical descriptor address mask (`addr & 0xFFFFF`) used by `I2S0.in_link.addr`
+    /// Returns the 20-bit physical descriptor address mask (`addr & 0xFFFFF`) used
+    /// by `I2S0.in_link.addr`
     /// and `GDMA.channel[n].in.link.addr`.
     #[inline]
     pub fn link_addr_20bit(&self) -> u32 {
@@ -180,7 +192,8 @@ impl Lldesc {
     }
 }
 
-/// Computed DMA buffer, half-buffer, and descriptor node dimensions (`cam_obj_t` DMA fields).
+/// Computed DMA buffer, half-buffer, and descriptor node dimensions
+/// (`cam_obj_t` DMA fields).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DmaSizeConfig {
     pub dma_bytes_per_item: usize,
@@ -195,8 +208,10 @@ pub struct DmaSizeConfig {
     pub image_size: usize,
 }
 
-/// Computes RGB/YUV/Grayscale DMA node, half-buffer, and full-buffer sizes (`ll_cam_calc_rgb_dma`
-/// in `target/esp32/ll_cam.c:470-545`), enforcing zero-division and 4 MiB bounds (`DMA-101`..`105`).
+/// Computes RGB/YUV/Grayscale DMA node, half-buffer, and full-buffer sizes
+/// (`ll_cam_calc_rgb_dma`
+/// in `target/esp32/ll_cam.c:470-545`), enforcing zero-division and 4 MiB
+/// bounds (`DMA-101`..`105`).
 pub fn calc_rgb_dma_sizes(
     width: u16,
     height: u16,
@@ -219,7 +234,12 @@ pub fn calc_rgb_dma_sizes(
 
     let dma_half_buffer_max = dma_buffer_size_max / 2 / dma_bytes_per_item;
     let dma_buffer_max = 2 * dma_half_buffer_max;
-    let node_max = LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE / dma_bytes_per_item;
+    let node_cap = if dma_buffer_size_max < 4096 {
+        (dma_buffer_size_max.clamp(512, 4092) & !3).min(LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE)
+    } else {
+        LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE
+    };
+    let node_max = node_cap / dma_bytes_per_item;
 
     if dma_half_buffer_max == 0 || node_max == 0 {
         return Err(CameraError::InvalidArg);
@@ -332,7 +352,8 @@ pub fn calc_rgb_dma_sizes(
     })
 }
 
-/// Computes DMA buffer geometry for either JPEG or uncompressed modes on ESP32 (`ll_cam_dma_sizes`
+/// Computes DMA buffer geometry for either JPEG or uncompressed modes on ESP32
+/// (`ll_cam_dma_sizes`
 /// in `target/esp32/ll_cam.c:547-559`).
 pub fn calc_dma_sizes(
     jpeg_mode: bool,
@@ -342,16 +363,23 @@ pub fn calc_dma_sizes(
     in_bytes_per_pixel: u8,
     dma_buffer_size_max: usize,
 ) -> Result<DmaSizeConfig, CameraError> {
-    if width == 0 || height == 0 || dma_buffer_size_max < 4096 {
+    if width == 0 || height == 0 || dma_buffer_size_max < 512 {
         return Err(CameraError::InvalidArg);
     }
     let dma_bytes_per_item = sampling_mode.bytes_per_sample();
     if jpeg_mode {
+        let max_node_cap = if dma_buffer_size_max < 4096 {
+            dma_buffer_size_max.clamp(512, 4092) & !3
+        } else {
+            2048
+        };
         let dma_half_buffer_cnt = 8;
-        let dma_node_buffer_size = 2048;
+        let dma_node_buffer_size = 2048.min(max_node_cap);
         let dma_half_buffer_size = (dma_node_buffer_size * 2).min(dma_buffer_size_max / 2);
         let dma_buffer_size = dma_half_buffer_cnt * dma_half_buffer_size;
-        let dma_node_cnt = dma_buffer_size / dma_node_buffer_size;
+        let dma_node_cnt = dma_buffer_size
+            .checked_div(dma_node_buffer_size)
+            .ok_or(CameraError::InvalidArg)?;
         let image_size = (width as usize).saturating_mul(height as usize) / 5;
         Ok(DmaSizeConfig {
             dma_bytes_per_item,
@@ -376,12 +404,14 @@ pub fn calc_dma_sizes(
     }
 }
 
-/// Initializes a circular linked-list ring of [`Lldesc`] descriptors over `buffer`, matching
+/// Initializes a circular linked-list ring of [`Lldesc`] descriptors over
+/// `buffer`, matching
 /// `allocate_dma_descriptors` in `driver/cam_hal.c:465-482`.
 ///
 /// Validates that:
 /// - `descriptors` is non-empty,
-/// - `node_size` is non-zero, `<= LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE` (`4092`), and 4-byte aligned,
+/// - `node_size` is non-zero, `<= LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE` (`4092`),
+///   and 4-byte aligned,
 /// - `buffer.len() >= descriptors.len() * node_size`.
 pub fn build_circular_ring(
     descriptors: &mut [Lldesc],
@@ -397,31 +427,47 @@ pub fn build_circular_ring(
         return Err(CameraError::InvalidArg);
     }
 
+    let buf_base = buffer.as_ptr();
+    let desc_base = descriptors.as_ptr();
+
+    if ((buf_base as usize) & 0x3 != 0) || ((desc_base as usize) & 0x3 != 0) {
+        return Err(CameraError::InvalidArg);
+    }
+
     let required_bytes = count.checked_mul(node_size).ok_or(CameraError::Overflow)?;
     if buffer.len() < required_bytes {
         return Err(CameraError::BufferTooSmall);
     }
-
-    let buf_base = buffer.as_ptr();
-    let desc_base = descriptors.as_ptr();
 
     let mut x = 0;
     while x < count {
         let next_idx = (x + 1) % count;
         let byte_offset = x * node_size;
 
+        let chunk_ptr: *mut u8;
+        let next_desc_ptr: *mut Lldesc;
+
+        // JUSTIFICATION: Initializing descriptor linked list and slice offsets.
         // SAFETY:
-        // 1. Alignment & Non-null: `buf_base` is derived from a valid slice `buffer: &[u8]` (1-byte aligned)
-        //    and `desc_base` is derived from `descriptors: &mut [Lldesc]` (4-byte aligned via `#[repr(C, align(4))]`).
-        // 2. Memory layout: `Lldesc` is `#[repr(C, align(4))]` matching hardware `lldesc_t`.
-        // 3. Provenance & Bounds: `byte_offset = x * node_size < count * node_size <= buffer.len()`, and
-        //    `next_idx < count == descriptors.len()`, so both `.add(...)` operations stay strictly within
+        // 1. Alignment & Non-null: `buf_base` is derived from a valid slice `buffer:
+        //    &[u8]` (1-byte aligned)
+        // and `desc_base` is derived from `descriptors: &mut [Lldesc]` (4-byte aligned
+        // via `#[repr(C, align(4))]`).
+        // 2. Memory layout: `Lldesc` is `#[repr(C, align(4))]` matching hardware
+        //    `lldesc_t`.
+        // 3. Provenance & Bounds: `byte_offset = x * node_size < count * node_size <=
+        //    buffer.len()`, and
+        // `next_idx < count == descriptors.len()`, so both `.add(...)` operations stay
+        // strictly within
         //    their respective allocated objects.
-        // 4. Aliasing: Raw pointers `chunk_ptr` and `next_desc_ptr` are stored passively in `Lldesc` fields
-        //    for hardware DMA consumption and are not dereferenced while `descriptors` is mutably borrowed.
-        let (chunk_ptr, next_desc_ptr) = unsafe {
-            (buf_base.add(byte_offset), desc_base.add(next_idx))
-        };
+        // 4. Aliasing: Raw pointers `chunk_ptr` and `next_desc_ptr` are stored
+        //    passively in `Lldesc` fields
+        // for hardware DMA consumption and are not dereferenced while `descriptors` is
+        // mutably borrowed.
+        unsafe {
+            chunk_ptr = buf_base.add(byte_offset) as *mut u8;
+            next_desc_ptr = desc_base.add(next_idx) as *mut Lldesc;
+        }
 
         descriptors[x] = Lldesc {
             size_length_flags: Lldesc::pack_flags(node_size as u16, 0, 0, false, false, true),
@@ -434,8 +480,10 @@ pub fn build_circular_ring(
     Ok(())
 }
 
-/// Verifies that a slice of [`Lldesc`] descriptors forms a valid circular ring over `buffer`
-/// with each node having `size == expected_node_size`, `length == 0`, `owner == true`, `eof == false`,
+/// Verifies that a slice of [`Lldesc`] descriptors forms a valid circular ring
+/// over `buffer`
+/// with each node having `size == expected_node_size`, `length == 0`, `owner ==
+/// true`, `eof == false`,
 /// `sosf == false`, and `offset == 0`.
 pub fn verify_circular_ring(
     descriptors: &[Lldesc],
@@ -450,15 +498,19 @@ pub fn verify_circular_ring(
     {
         return Err(CameraError::InvalidArg);
     }
+    let buf_base = buffer.as_ptr();
+    let desc_base = descriptors.as_ptr();
+
+    if ((buf_base as usize) & 0x3 != 0) || ((desc_base as usize) & 0x3 != 0) {
+        return Err(CameraError::DmaRingCorrupted);
+    }
+
     let required = count
         .checked_mul(expected_node_size)
         .ok_or(CameraError::Overflow)?;
     if buffer.len() < required {
         return Err(CameraError::BufferTooSmall);
     }
-
-    let buf_base = buffer.as_ptr();
-    let desc_base = descriptors.as_ptr();
 
     let mut x = 0;
     while x < count {
@@ -472,11 +524,17 @@ pub fn verify_circular_ring(
         {
             return Err(CameraError::InvalidState);
         }
+        if ((d.buf as usize) & 0x3 != 0) || ((d.qe_stqe_next as usize) & 0x3 != 0) {
+            return Err(CameraError::DmaRingCorrupted);
+        }
         let next_idx = (x + 1) % count;
 
+        // JUSTIFICATION: Verifying descriptor pointer continuity and alignment.
         // SAFETY:
-        // 1. Alignment & Non-null: `buf_base` and `desc_base` come from live slice references.
-        // 2. Provenance & Bounds: `x * expected_node_size < required <= buffer.len()` and `next_idx < count`,
+        // 1. Alignment & Non-null: `buf_base` and `desc_base` come from live slice
+        //    references.
+        // 2. Provenance & Bounds: `x * expected_node_size < required <= buffer.len()`
+        //    and `next_idx < count`,
         //    so pointer arithmetic remains within the allocated slice bounds.
         let (expected_buf, expected_next) = unsafe {
             (
@@ -542,57 +600,70 @@ mod tests {
         );
     }
 
+    #[repr(C, align(4))]
+    struct AlignedBuffer<const N: usize>([u8; N]);
+
     #[test]
     fn test_circular_ring_builder_and_verifier() {
-        let buf = [0u8; 4096];
+        let buf = AlignedBuffer([0u8; 4096]);
         let mut ring = [Lldesc::empty(); 4];
 
-        assert_eq!(build_circular_ring(&mut ring, &buf, 1024), Ok(()));
-        assert_eq!(verify_circular_ring(&ring, &buf, 1024), Ok(()));
+        assert_eq!(build_circular_ring(&mut ring, &buf.0, 1024), Ok(()));
+        assert_eq!(verify_circular_ring(&ring, &buf.0, 1024), Ok(()));
 
         // Verify circular wrap-around from last descriptor back to index 0
         assert!(ptr::eq(ring[3].qe_stqe_next, &ring[0]));
-        assert!(ptr::eq(ring[0].buf, buf.as_ptr()));
+        assert!(ptr::eq(ring[0].buf, buf.0.as_ptr()));
 
-        // Reject invalid parameters (LL-007)
+        // Misaligned buffer tests
         assert_eq!(
-            build_circular_ring(&mut ring, &buf, 0),
+            build_circular_ring(&mut ring, &buf.0[1..], 1024),
             Err(CameraError::InvalidArg)
         );
         assert_eq!(
-            build_circular_ring(&mut ring, &buf, 4093),
+            verify_circular_ring(&ring, &buf.0[1..], 1024),
+            Err(CameraError::DmaRingCorrupted)
+        );
+
+        // Reject invalid parameters (LL-007)
+        assert_eq!(
+            build_circular_ring(&mut ring, &buf.0, 0),
+            Err(CameraError::InvalidArg)
+        );
+        assert_eq!(
+            build_circular_ring(&mut ring, &buf.0, 4093),
             Err(CameraError::InvalidArg)
         );
         // Reject non-multiple of 4
         assert_eq!(
-            build_circular_ring(&mut ring, &buf, 1023),
+            build_circular_ring(&mut ring, &buf.0, 1023),
             Err(CameraError::InvalidArg)
         );
         assert_eq!(
-            verify_circular_ring(&ring, &buf, 1023),
+            verify_circular_ring(&ring, &buf.0, 1023),
             Err(CameraError::InvalidArg)
         );
         assert_eq!(
-            build_circular_ring(&mut ring, &buf[..2048], 1024),
+            build_circular_ring(&mut ring, &buf.0[..2048], 1024),
             Err(CameraError::BufferTooSmall)
         );
 
         // Reject corrupt descriptor flags in verifier
         ring[1].set_eof(true);
         assert_eq!(
-            verify_circular_ring(&ring, &buf, 1024),
+            verify_circular_ring(&ring, &buf.0, 1024),
             Err(CameraError::InvalidState)
         );
         ring[1].set_eof(false);
         ring[2].set_sosf(true);
         assert_eq!(
-            verify_circular_ring(&ring, &buf, 1024),
+            verify_circular_ring(&ring, &buf.0, 1024),
             Err(CameraError::InvalidState)
         );
         ring[2].set_sosf(false);
         ring[0].set_offset(1);
         assert_eq!(
-            verify_circular_ring(&ring, &buf, 1024),
+            verify_circular_ring(&ring, &buf.0, 1024),
             Err(CameraError::InvalidState)
         );
     }
@@ -616,19 +687,12 @@ mod tests {
         assert_eq!(jpeg_cfg.dma_node_cnt, 16);
 
         // JPEG clamping to dma_buffer_size_max / 2 (LL-008)
-        let jpeg_clamped = calc_dma_sizes(
-            true,
-            I2sSamplingMode::Sm0A000B00,
-            640,
-            480,
-            1,
-            4096,
-        )
-        .expect("valid clamped jpeg config");
+        let jpeg_clamped = calc_dma_sizes(true, I2sSamplingMode::Sm0A000B00, 640, 480, 1, 4096)
+            .expect("valid clamped jpeg config");
         assert_eq!(jpeg_clamped.dma_half_buffer_size, 2048);
         assert_eq!(jpeg_clamped.dma_buffer_size, 8 * 2048);
 
-        // Reject width == 0, height == 0, or dma_buffer_size_max < 4096 in JPEG mode
+        // Reject width == 0, height == 0, or dma_buffer_size_max < 512 in JPEG mode
         assert_eq!(
             calc_dma_sizes(true, I2sSamplingMode::Sm0A000B00, 0, 480, 1, 32768),
             Err(CameraError::InvalidArg)
@@ -638,9 +702,13 @@ mod tests {
             Err(CameraError::InvalidArg)
         );
         assert_eq!(
-            calc_dma_sizes(true, I2sSamplingMode::Sm0A000B00, 640, 480, 1, 4095),
+            calc_dma_sizes(true, I2sSamplingMode::Sm0A000B00, 640, 480, 1, 511),
             Err(CameraError::InvalidArg)
         );
+
+        let sub_4k_cfg = calc_dma_sizes(true, I2sSamplingMode::Sm0A000B00, 640, 480, 1, 2048)
+            .expect("valid sub-4k jpeg config");
+        assert!(sub_4k_cfg.dma_node_buffer_size <= 2048);
 
         // QVGA RGB565 (320x240, 2 bpp, 2 bytes per item in Sm0A0B0C0D)
         let qvga_cfg = calc_dma_sizes(
@@ -685,8 +753,10 @@ mod tests {
     #[test]
     fn test_calc_rgb_dma_sizes_enforces_4_byte_aligned_node_buffer() {
         // When width * bpp and height cannot form any 4-byte-aligned DMA node buffer,
-        // calc_rgb_dma_sizes must reject with InvalidArg instead of producing an unaligned node_size (LOGIC-008).
-        // e.g. width = 3, height = 1, in_bytes_per_pixel = 1, dma_bytes_per_item = 1 (line_width = 3, height = 1)
+        // calc_rgb_dma_sizes must reject with InvalidArg instead of producing an
+        // unaligned node_size (LOGIC-008).
+        // e.g. width = 3, height = 1, in_bytes_per_pixel = 1, dma_bytes_per_item = 1
+        // (line_width = 3, height = 1)
         assert_eq!(
             calc_rgb_dma_sizes(3, 1, 1, 1, 8192),
             Err(CameraError::InvalidArg)
@@ -698,17 +768,18 @@ mod tests {
             Err(CameraError::InvalidArg)
         );
 
-        // When a valid 4-byte-aligned configuration is provided, dma_node_buffer_size must be a multiple of 4
+        // When a valid 4-byte-aligned configuration is provided, dma_node_buffer_size
+        // must be a multiple of 4
         // and build_circular_ring must accept it.
         let cfg = calc_rgb_dma_sizes(4, 1, 1, 1, 8192).expect("valid aligned rgb dma config");
         assert_eq!(cfg.dma_node_buffer_size % 4, 0);
 
         let mut ring = [Lldesc::empty(); 2];
-        let buf = [0u8; 8192];
+        let buf = AlignedBuffer([0u8; 8192]);
         assert_eq!(
             build_circular_ring(
                 &mut ring,
-                &buf[..2 * cfg.dma_node_buffer_size],
+                &buf.0[..2 * cfg.dma_node_buffer_size],
                 cfg.dma_node_buffer_size
             ),
             Ok(())

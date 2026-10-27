@@ -1,7 +1,9 @@
 //! SC030IOT VGA YUV422 CMOS image sensor driver.
 //!
-//! Ported from `sensors/sc030iot.c` and `sensors/private_include/sc030iot_settings.h`.
-//! Preserves remediated signed error propagation on SCCB page-select and register accesses.
+//! Ported from `sensors/sc030iot.c` and
+//! `sensors/private_include/sc030iot_settings.h`.
+//! Preserves remediated signed error propagation on SCCB page-select
+//! and register accesses.
 
 use crate::{
     write_regs8, CameraError, CameraModel, CameraPid, CameraSccbAddr, CameraSensor, CameraStatus,
@@ -243,7 +245,8 @@ impl Default for Sc030Iot {
 }
 
 impl Sc030Iot {
-    /// Creates a new [`Sc030Iot`] instance with default SCCB address (`0x68`) and PID (`0x9A46`).
+    /// Creates a new [`Sc030Iot`] instance with default SCCB address (`0x68`)
+    /// and PID (`0x9A46`).
     pub const fn new() -> Self {
         Self {
             id: SensorId {
@@ -297,7 +300,8 @@ impl Sc030Iot {
         }
     }
 
-    /// Probes the SCCB bus at `slv_addr` (`0x68`) and verifies `SC030IOT_PID` (`0x9A46`).
+    /// Probes the SCCB bus at `slv_addr` (`0x68`) and verifies `SC030IOT_PID`
+    /// (`0x9A46`).
     pub fn detect<B: SccbBus>(bus: &mut B, slv_addr: u8) -> Result<SensorId, CameraError> {
         if slv_addr != CameraSccbAddr::SC030IOT {
             return Err(CameraError::NotDetected);
@@ -530,13 +534,7 @@ impl<B: SccbBus> CameraSensor<B> for Sc030Iot {
         Ok(val & mask)
     }
 
-    fn set_reg(
-        &mut self,
-        bus: &mut B,
-        reg: i32,
-        mask: i32,
-        value: i32,
-    ) -> Result<(), CameraError> {
+    fn set_reg(&mut self, bus: &mut B, reg: i32, mask: i32, value: i32) -> Result<(), CameraError> {
         if !(0..=0xFFFF).contains(&reg) || mask < 0 {
             return Err(CameraError::InvalidArg);
         }

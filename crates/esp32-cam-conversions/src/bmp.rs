@@ -1,12 +1,14 @@
-//! Safe `#![no_std]` little-endian BMP serializer with checked arithmetic overflow guards.
+//! Safe `#![no_std]` little-endian BMP serializer with checked arithmetic
+//! overflow guards.
 //!
-//! Replaces `conversions/to_bmp.c` (`CONV-101`..`CONV-105`), eliminating unaligned
-//! packed struct pointer casts and integer overflow vulnerabilities.
+//! Replaces `conversions/to_bmp.c` (`CONV-101`..`CONV-105`), eliminating
+//! unaligned packed struct pointer casts and integer overflow vulnerabilities.
 
 use crate::yuv::yuv2rgb;
 use esp32_cam_types::{CameraError, PixelFormat};
 
-/// Standard Windows BITMAPFILEHEADER (14 bytes) + BITMAPINFOHEADER (40 bytes) length.
+/// Standard Windows BITMAPFILEHEADER (14 bytes) + BITMAPINFOHEADER (40 bytes)
+/// length.
 pub const BMP_HEADER_LEN: usize = 54;
 
 /// Size of the 256-entry BGRA palette required for 8-bit grayscale BMP images.
@@ -22,7 +24,8 @@ struct BmpLayout {
     total_size: usize,
 }
 
-/// Computes and validates BMP buffer layout using checked 32-bit arithmetic (`CONV-101`..`CONV-105`).
+/// Computes and validates BMP buffer layout using checked 32-bit arithmetic
+/// (`CONV-101`..`CONV-105`).
 fn compute_bmp_layout(
     width: u16,
     height: u16,
@@ -41,17 +44,15 @@ fn compute_bmp_layout(
     let src_req32 = pixels32.checked_mul(in_bpp).ok_or(CameraError::Overflow)?;
 
     let row_bytes32 = w32.checked_mul(out_bpp).ok_or(CameraError::Overflow)?;
-    let row_stride32 = row_bytes32
-        .checked_add(3)
-        .ok_or(CameraError::Overflow)?
-        & !3u32;
+    let row_stride32 = row_bytes32.checked_add(3).ok_or(CameraError::Overflow)? & !3u32;
     let image_size32 = row_stride32.checked_mul(h32).ok_or(CameraError::Overflow)?;
     let total_size32 = (BMP_HEADER_LEN as u32)
         .checked_add(palette_size)
         .and_then(|v| v.checked_add(image_size32))
         .ok_or(CameraError::Overflow)?;
 
-    // Reject sizes exceeding signed 32-bit max to prevent signed offset overflow in BMP readers.
+    // Reject sizes exceeding signed 32-bit max to prevent signed offset
+    // overflow in BMP readers.
     if total_size32 > i32::MAX as u32 || src_req32 > i32::MAX as u32 {
         return Err(CameraError::Overflow);
     }
@@ -71,11 +72,11 @@ fn compute_bmp_layout(
     })
 }
 
-/// Serializes the 54-byte Windows BMP header (`BM` magic + 12-byte file header + 40-byte DIB header)
-/// in little-endian byte order into `dst[..54]`.
+/// Serializes the 54-byte Windows BMP header (`BM` magic + 12-byte file
+/// header + 40-byte DIB header) in little-endian byte order into `dst[..54]`.
 ///
-/// The height field is written as `-height` to specify top-to-bottom scanline order,
-/// matching `conversions/to_bmp.c`.
+/// The height field is written as `-height` to specify top-to-bottom
+/// scanline order, matching `conversions/to_bmp.c`.
 pub fn write_bmp_header(
     dst: &mut [u8],
     width: u16,
@@ -209,8 +210,8 @@ pub fn rgb565_to_bmp(
     Ok(layout.total_size)
 }
 
-/// Converts an 8-bit grayscale buffer into an 8-bit indexed BMP image with a 256-entry
-/// palette (`1024` bytes) in `dst`.
+/// Converts an 8-bit grayscale buffer into an 8-bit indexed BMP image with a
+/// 256-entry palette (`1024` bytes) in `dst`.
 ///
 /// Matches `conversions/to_bmp.c:277-321` and `387-395`.
 pub fn grayscale_to_bmp(
@@ -262,7 +263,8 @@ pub fn grayscale_to_bmp(
     Ok(layout.total_size)
 }
 
-/// Converts a packed YUV422 (YUYV: `[Y0, U, Y1, V]`) buffer into a 24-bit BMP image in `dst`.
+/// Converts a packed YUV422 (YUYV: `[Y0, U, Y1, V]`) buffer into a 24-bit
+/// BMP image in `dst`.
 ///
 /// Matches `conversions/to_bmp.c:342-362` and `396-428`.
 pub fn yuv422_to_bmp(
@@ -317,10 +319,12 @@ pub fn yuv422_to_bmp(
     Ok(layout.total_size)
 }
 
-/// Converts a camera frame buffer of the given [`PixelFormat`] into a BMP image in `dst`.
+/// Converts a camera frame buffer of the given [`PixelFormat`] into a BMP
+/// image in `dst`.
 ///
-/// Supports [`PixelFormat::Rgb888`], [`PixelFormat::Rgb565`], [`PixelFormat::Grayscale`],
-/// [`PixelFormat::Yuv422`], and [`PixelFormat::Jpeg`].
+/// Supports [`PixelFormat::Rgb888`], [`PixelFormat::Rgb565`],
+/// [`PixelFormat::Grayscale`], [`PixelFormat::Yuv422`], and
+/// [`PixelFormat::Jpeg`].
 pub fn frame_to_bmp(
     src: &[u8],
     dst: &mut [u8],
@@ -355,11 +359,13 @@ mod tests {
 
     #[test]
     fn test_rgb888_to_bmp_with_padding() {
-        // 3x2 image: row_bytes = 9, row_stride = 12 (3 bytes padding per row), image_size = 24
-        // CONV-002: Provide distinct [R, G, B] pixels to verify little-endian [B, G, R] output
+        // 3x2 image: row_bytes = 9, row_stride = 12 (3 bytes padding per row),
+        // image_size = 24
+        // CONV-002: Provide distinct [R, G, B] pixels to verify little-endian
+        // [B, G, R] output
         let mut src = [0u8; 18];
         for i in 0..6 {
-            src[i * 3] = 0x11;     // R
+            src[i * 3] = 0x11; // R
             src[i * 3 + 1] = 0x22; // G
             src[i * 3 + 2] = 0x33; // B
         }
@@ -372,7 +378,8 @@ mod tests {
         assert_eq!(i32::from_le_bytes([dst[18], dst[19], dst[20], dst[21]]), 3);
         assert_eq!(i32::from_le_bytes([dst[22], dst[23], dst[24], dst[25]]), -2);
         assert_eq!(u16::from_le_bytes([dst[28], dst[29]]), 24);
-        // Verify CONV-002: little-endian BMP pixel byte order is [B, G, R] = [0x33, 0x22, 0x11]
+        // Verify CONV-002: little-endian BMP pixel byte order is
+        // [B, G, R] = [0x33, 0x22, 0x11]
         assert_eq!(&dst[54..57], &[0x33, 0x22, 0x11]);
         assert_eq!(&dst[57..60], &[0x33, 0x22, 0x11]);
         assert_eq!(&dst[60..63], &[0x33, 0x22, 0x11]);

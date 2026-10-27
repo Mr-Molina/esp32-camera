@@ -1,4 +1,5 @@
-//! Safe `#![no_std]` OV3640 (3MP QXGA JPEG/RGB565/YUV422/RAW) camera sensor driver.
+//! Safe `#![no_std]` OV3640 (3MP QXGA JPEG/RGB565/YUV422/RAW) camera
+//! sensor driver.
 //!
 //! Ported from `sensors/ov3640.c`, `sensors/private_include/ov3640_regs.h`, and
 //! `sensors/private_include/ov3640_settings.h`.
@@ -212,11 +213,31 @@ pub struct Ov3640WbPreset {
 }
 
 pub const OV3640_WB_PRESETS: [Ov3640WbPreset; 5] = [
-    Ov3640WbPreset { awb_r: 0x00, awb_g: 0x00, awb_b: 0x00 }, // 0: auto
-    Ov3640WbPreset { awb_r: 0x5e, awb_g: 0x40, awb_b: 0x46 }, // 1: sunny
-    Ov3640WbPreset { awb_r: 0x68, awb_g: 0x40, awb_b: 0x4e }, // 2: cloudy
-    Ov3640WbPreset { awb_r: 0x44, awb_g: 0x40, awb_b: 0x70 }, // 3: office
-    Ov3640WbPreset { awb_r: 0x52, awb_g: 0x40, awb_b: 0x58 }, // 4: home
+    Ov3640WbPreset {
+        awb_r: 0x00,
+        awb_g: 0x00,
+        awb_b: 0x00,
+    }, // 0: auto
+    Ov3640WbPreset {
+        awb_r: 0x5e,
+        awb_g: 0x40,
+        awb_b: 0x46,
+    }, // 1: sunny
+    Ov3640WbPreset {
+        awb_r: 0x68,
+        awb_g: 0x40,
+        awb_b: 0x4e,
+    }, // 2: cloudy
+    Ov3640WbPreset {
+        awb_r: 0x44,
+        awb_g: 0x40,
+        awb_b: 0x70,
+    }, // 3: office
+    Ov3640WbPreset {
+        awb_r: 0x52,
+        awb_g: 0x40,
+        awb_b: 0x58,
+    }, // 4: home
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -226,13 +247,34 @@ pub struct Ov3640BrightnessEntry {
 }
 
 pub const OV3640_BRIGHTNESS_LEVELS: [Ov3640BrightnessEntry; 7] = [
-    Ov3640BrightnessEntry { reg3354: 0x09, reg335e: 0x30 }, // -3
-    Ov3640BrightnessEntry { reg3354: 0x09, reg335e: 0x20 }, // -2
-    Ov3640BrightnessEntry { reg3354: 0x09, reg335e: 0x10 }, // -1
-    Ov3640BrightnessEntry { reg3354: 0x01, reg335e: 0x00 }, //  0
-    Ov3640BrightnessEntry { reg3354: 0x01, reg335e: 0x10 }, // +1
-    Ov3640BrightnessEntry { reg3354: 0x01, reg335e: 0x20 }, // +2
-    Ov3640BrightnessEntry { reg3354: 0x01, reg335e: 0x30 }, // +3
+    Ov3640BrightnessEntry {
+        reg3354: 0x09,
+        reg335e: 0x30,
+    }, // -3
+    Ov3640BrightnessEntry {
+        reg3354: 0x09,
+        reg335e: 0x20,
+    }, // -2
+    Ov3640BrightnessEntry {
+        reg3354: 0x09,
+        reg335e: 0x10,
+    }, // -1
+    Ov3640BrightnessEntry {
+        reg3354: 0x01,
+        reg335e: 0x00,
+    }, //  0
+    Ov3640BrightnessEntry {
+        reg3354: 0x01,
+        reg335e: 0x10,
+    }, // +1
+    Ov3640BrightnessEntry {
+        reg3354: 0x01,
+        reg335e: 0x20,
+    }, // +2
+    Ov3640BrightnessEntry {
+        reg3354: 0x01,
+        reg335e: 0x30,
+    }, // +3
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -267,13 +309,41 @@ pub struct Ov3640EffectEntry {
 }
 
 pub const OV3640_SPECIAL_EFFECTS: [Ov3640EffectEntry; 7] = [
-    Ov3640EffectEntry { reg3355: 0x00, reg335a: 0x00, reg335b: 0x00 }, // 0: normal
-    Ov3640EffectEntry { reg3355: 0x40, reg335a: 0x00, reg335b: 0x00 }, // 1: negative
-    Ov3640EffectEntry { reg3355: 0x18, reg335a: 0x80, reg335b: 0x80 }, // 2: grayscale
-    Ov3640EffectEntry { reg3355: 0x18, reg335a: 0x80, reg335b: 0xc0 }, // 3: red
-    Ov3640EffectEntry { reg3355: 0x18, reg335a: 0x60, reg335b: 0x60 }, // 4: green
-    Ov3640EffectEntry { reg3355: 0x18, reg335a: 0xa0, reg335b: 0x40 }, // 5: blue
-    Ov3640EffectEntry { reg3355: 0x18, reg335a: 0x40, reg335b: 0xa6 }, // 6: sepia
+    Ov3640EffectEntry {
+        reg3355: 0x00,
+        reg335a: 0x00,
+        reg335b: 0x00,
+    }, // 0: normal
+    Ov3640EffectEntry {
+        reg3355: 0x40,
+        reg335a: 0x00,
+        reg335b: 0x00,
+    }, // 1: negative
+    Ov3640EffectEntry {
+        reg3355: 0x18,
+        reg335a: 0x80,
+        reg335b: 0x80,
+    }, // 2: grayscale
+    Ov3640EffectEntry {
+        reg3355: 0x18,
+        reg335a: 0x80,
+        reg335b: 0xc0,
+    }, // 3: red
+    Ov3640EffectEntry {
+        reg3355: 0x18,
+        reg335a: 0x60,
+        reg335b: 0x60,
+    }, // 4: green
+    Ov3640EffectEntry {
+        reg3355: 0x18,
+        reg335a: 0xa0,
+        reg335b: 0x40,
+    }, // 5: blue
+    Ov3640EffectEntry {
+        reg3355: 0x18,
+        reg335a: 0x40,
+        reg335b: 0xa6,
+    }, // 6: sepia
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -284,17 +354,61 @@ pub struct Ov3640AeEntry {
 }
 
 pub const OV3640_AE_LEVELS: [Ov3640AeEntry; 11] = [
-    Ov3640AeEntry { reg3018: 0x18, reg3019: 0x10, reg301a: 0x31 }, // -5
-    Ov3640AeEntry { reg3018: 0x18, reg3019: 0x10, reg301a: 0x31 }, // -4
-    Ov3640AeEntry { reg3018: 0x20, reg3019: 0x18, reg301a: 0x41 }, // -3
-    Ov3640AeEntry { reg3018: 0x28, reg3019: 0x20, reg301a: 0x51 }, // -2
-    Ov3640AeEntry { reg3018: 0x30, reg3019: 0x28, reg301a: 0x61 }, // -1
-    Ov3640AeEntry { reg3018: 0x38, reg3019: 0x30, reg301a: 0x61 }, //  0
-    Ov3640AeEntry { reg3018: 0x40, reg3019: 0x38, reg301a: 0x71 }, // +1
-    Ov3640AeEntry { reg3018: 0x48, reg3019: 0x40, reg301a: 0x81 }, // +2
-    Ov3640AeEntry { reg3018: 0x50, reg3019: 0x48, reg301a: 0x91 }, // +3
-    Ov3640AeEntry { reg3018: 0x58, reg3019: 0x50, reg301a: 0x91 }, // +4
-    Ov3640AeEntry { reg3018: 0x60, reg3019: 0x58, reg301a: 0xa1 }, // +5
+    Ov3640AeEntry {
+        reg3018: 0x18,
+        reg3019: 0x10,
+        reg301a: 0x31,
+    }, // -5
+    Ov3640AeEntry {
+        reg3018: 0x18,
+        reg3019: 0x10,
+        reg301a: 0x31,
+    }, // -4
+    Ov3640AeEntry {
+        reg3018: 0x20,
+        reg3019: 0x18,
+        reg301a: 0x41,
+    }, // -3
+    Ov3640AeEntry {
+        reg3018: 0x28,
+        reg3019: 0x20,
+        reg301a: 0x51,
+    }, // -2
+    Ov3640AeEntry {
+        reg3018: 0x30,
+        reg3019: 0x28,
+        reg301a: 0x61,
+    }, // -1
+    Ov3640AeEntry {
+        reg3018: 0x38,
+        reg3019: 0x30,
+        reg301a: 0x61,
+    }, //  0
+    Ov3640AeEntry {
+        reg3018: 0x40,
+        reg3019: 0x38,
+        reg301a: 0x71,
+    }, // +1
+    Ov3640AeEntry {
+        reg3018: 0x48,
+        reg3019: 0x40,
+        reg301a: 0x81,
+    }, // +2
+    Ov3640AeEntry {
+        reg3018: 0x50,
+        reg3019: 0x48,
+        reg301a: 0x91,
+    }, // +3
+    Ov3640AeEntry {
+        reg3018: 0x58,
+        reg3019: 0x50,
+        reg301a: 0x91,
+    }, // +4
+    Ov3640AeEntry {
+        reg3018: 0x60,
+        reg3019: 0x58,
+        reg301a: 0xa1,
+    }, // +5
 ];
 
 pub const OV3640_SHARPNESS_LEVELS: [u8; 7] = [0x41, 0x42, 0x43, 0x60, 0x44, 0x45, 0x46];
@@ -379,10 +493,11 @@ impl Ov3640 {
         }
     }
 
-    /// Probes and verifies the OV3640 family sensor on `bus` at `slv_addr` (`esp32_camera_ov3640_detect`).
+    /// Probes and verifies the OV3640 family sensor on `bus` at `slv_addr`
+    /// (`esp32_camera_ov3640_detect`).
     ///
-    /// Matches any OV3640 family PID where `(pid & 0xFFF0) == 0x3640` (e.g. `0x3640`, `0x364C`)
-    /// and normalizes `SensorId::pid` to `0x3640`.
+    /// Matches any OV3640 family PID where `(pid & 0xFFF0) == 0x3640`
+    /// (e.g. `0x3640`, `0x364C`) and normalizes `SensorId::pid` to `0x3640`.
     pub fn detect<B: SccbBus>(bus: &mut B, slv_addr: u8) -> Result<SensorId, CameraError> {
         if slv_addr != Self::SLV_ADDR {
             return Err(CameraError::NotDetected);
@@ -504,7 +619,11 @@ impl Ov3640 {
             return Err(CameraError::InvalidArg);
         }
 
-        bus.write_reg16(self.slv_addr, SC_PLLS_CTRL0, if bypass { 0x80 } else { 0x00 })?;
+        bus.write_reg16(
+            self.slv_addr,
+            SC_PLLS_CTRL0,
+            if bypass { 0x80 } else { 0x00 },
+        )?;
         bus.write_reg16(self.slv_addr, SC_PLLS_CTRL1, multiplier & 0x1F)?;
         bus.write_reg16(self.slv_addr, SC_PLLS_CTRL2, 0x10 | (sys_div & 0x0F))?;
         bus.write_reg16(
@@ -521,13 +640,12 @@ impl Ov3640 {
     }
 
     fn apply_mirror_flip<B: SccbBus>(&self, bus: &mut B) -> Result<(), CameraError> {
-        let (reg307c, reg3023, reg3090) =
-            match (self.status.vflip != 0, self.status.hmirror != 0) {
-                (true, true) => (0x13u8, 0x09u8, 0xC8u8),
-                (true, false) => (0x11u8, 0x09u8, 0xC0u8),
-                (false, true) => (0x12u8, 0x0Au8, 0xC8u8),
-                (false, false) => (0x10u8, 0x0Au8, 0xC0u8),
-            };
+        let (reg307c, reg3023, reg3090) = match (self.status.vflip != 0, self.status.hmirror != 0) {
+            (true, true) => (0x13u8, 0x09u8, 0xC8u8),
+            (true, false) => (0x11u8, 0x09u8, 0xC0u8),
+            (false, true) => (0x12u8, 0x0Au8, 0xC8u8),
+            (false, false) => (0x10u8, 0x0Au8, 0xC0u8),
+        };
         bus.write_reg16(self.slv_addr, OV3640_TIMING_CTRL, reg307c)?;
         bus.write_reg16(self.slv_addr, OV3640_ARRAY_CTRL, reg3090)?;
         bus.write_reg16(self.slv_addr, OV3640_ARRAY_VSTART, reg3023)
@@ -1091,13 +1209,7 @@ impl<B: SccbBus> CameraSensor<B> for Ov3640 {
         Ok(ret)
     }
 
-    fn set_reg(
-        &mut self,
-        bus: &mut B,
-        reg: i32,
-        mask: i32,
-        value: i32,
-    ) -> Result<(), CameraError> {
+    fn set_reg(&mut self, bus: &mut B, reg: i32, mask: i32, value: i32) -> Result<(), CameraError> {
         if !(0..=0xFFFF).contains(&reg) || mask < 0 {
             return Err(CameraError::InvalidArg);
         }

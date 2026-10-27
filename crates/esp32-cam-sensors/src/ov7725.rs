@@ -271,7 +271,8 @@ impl Default for Ov7725 {
 }
 
 impl Ov7725 {
-    /// Creates a new [`Ov7725`] instance with default SCCB address `0x21` and PID `0x77`.
+    /// Creates a new [`Ov7725`] instance with default SCCB address `0x21` and
+    /// PID `0x77`.
     pub const fn new() -> Self {
         Self {
             slv_addr: CameraSccbAddr::OV7725,
@@ -656,13 +657,7 @@ impl<B: SccbBus> CameraSensor<B> for Ov7725 {
         Ok(ret)
     }
 
-    fn set_reg(
-        &mut self,
-        bus: &mut B,
-        reg: i32,
-        mask: i32,
-        value: i32,
-    ) -> Result<(), CameraError> {
+    fn set_reg(&mut self, bus: &mut B, reg: i32, mask: i32, value: i32) -> Result<(), CameraError> {
         if !(0..=0xFF).contains(&reg) || mask < 0 {
             return Err(CameraError::InvalidArg);
         }

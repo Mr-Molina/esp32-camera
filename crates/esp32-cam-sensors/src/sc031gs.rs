@@ -1,6 +1,7 @@
 //! SC031GS VGA Global-Shutter Grayscale CMOS image sensor driver.
 //!
-//! Ported from `sensors/sc031gs.c` and `sensors/private_include/sc031gs_settings.h`.
+//! Ported from `sensors/sc031gs.c` and
+//! `sensors/private_include/sc031gs_settings.h`.
 
 use crate::{
     CameraError, CameraModel, CameraPid, CameraSccbAddr, CameraSensor, CameraStatus, FrameSize,
@@ -294,7 +295,8 @@ pub fn detect<B: SccbBus>(bus: &mut B, slv_addr: u8) -> Result<SensorId, CameraE
     Sc031Gs::detect(bus, slv_addr)
 }
 
-/// Safe `#![no_std]` driver for the SmartSens SC031GS global-shutter VGA camera sensor.
+/// Safe `#![no_std]` driver for the SmartSens SC031GS global-shutter VGA
+/// camera sensor.
 #[derive(Debug, Clone)]
 pub struct Sc031Gs {
     id: SensorId,
@@ -314,7 +316,8 @@ impl Default for Sc031Gs {
 }
 
 impl Sc031Gs {
-    /// Creates a new [`Sc031Gs`] instance with default SCCB address (`0x30`) and PID (`0x0031`).
+    /// Creates a new [`Sc031Gs`] instance with default SCCB address (`0x30`)
+    /// and PID (`0x0031`).
     pub const fn new() -> Self {
         Self {
             id: SensorId {
@@ -368,7 +371,8 @@ impl Sc031Gs {
         }
     }
 
-    /// Probes the SCCB bus at `slv_addr` (`0x30`) and verifies `SC031GS_PID` (`0x0031`).
+    /// Probes the SCCB bus at `slv_addr` (`0x30`) and verifies `SC031GS_PID`
+    /// (`0x0031`).
     pub fn detect<B: SccbBus>(bus: &mut B, slv_addr: u8) -> Result<SensorId, CameraError> {
         if slv_addr != CameraSccbAddr::SC031GS {
             return Err(CameraError::NotDetected);
@@ -631,13 +635,7 @@ impl<B: SccbBus> CameraSensor<B> for Sc031Gs {
         Ok(val & mask)
     }
 
-    fn set_reg(
-        &mut self,
-        bus: &mut B,
-        reg: i32,
-        mask: i32,
-        value: i32,
-    ) -> Result<(), CameraError> {
+    fn set_reg(&mut self, bus: &mut B, reg: i32, mask: i32, value: i32) -> Result<(), CameraError> {
         if !(0..=0xFFFF).contains(&reg) || !(0..=0xFF).contains(&mask) {
             return Err(CameraError::InvalidArg);
         }

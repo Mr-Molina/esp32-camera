@@ -1,11 +1,13 @@
 //! Entrypoint for `klipper-cam-fw`.
 //!
-//! When compiled for host (`x86_64` / `aarch64`), runs a self-verification check of the
-//! partition table, OTA CRC32 state machine, and dual-port HTTP/MJPEG handlers.
-//! When compiled for Xtensa bare-metal (`target_arch = "xtensa"`), initializes the ESP32
-//! at `240 MHz`, drives `20 MHz` `XCLK` on `GPIO 21`, probes `I2C0` (`GPIO 26` SDA / `GPIO 27` SCL)
-//! for a live `OV2640` sensor, and executes the complete 7-crate hardware-in-the-loop (HIL)
-//! verification suite over UART0 (`115200` baud).
+//! When compiled for host (`x86_64` / `aarch64`), runs a self-verification
+//! check of the partition table, OTA CRC32 state machine, and dual-port
+//! HTTP/MJPEG handlers.
+//! When compiled for Xtensa bare-metal (`target_arch = "xtensa"`), initializes
+//! the ESP32 at `240 MHz`, drives `20 MHz` `XCLK` on `GPIO 21`, probes `I2C0`
+//! (`GPIO 26` SDA / `GPIO 27` SCL) for a live `OV2640` sensor, and executes
+//! the complete 7-crate hardware-in-the-loop (HIL) verification suite over
+//! UART0 (`115200` baud).
 
 #![cfg_attr(target_arch = "xtensa", no_std)]
 #![cfg_attr(target_arch = "xtensa", no_main)]
@@ -30,7 +32,9 @@ use esp_backtrace as _;
 #[cfg(target_arch = "xtensa")]
 esp_bootloader_esp_idf::esp_app_desc!();
 
-use esp32_cam_ll::{build_circular_ring, verify_circular_ring, Lldesc, DEFAULT_CAMERA_DMA_BUFFER_SIZE_MAX};
+use esp32_cam_ll::{
+    build_circular_ring, verify_circular_ring, Lldesc, DEFAULT_CAMERA_DMA_BUFFER_SIZE_MAX,
+};
 use klipper_cam_fw::{
     calc_dma_sizes, decode_jpeg_to_rgb888, encode_rgb888_to_jpeg, parse_jpeg_dimensions,
     verify_jpeg_eoi, verify_jpeg_soi, verify_partition_table_integrity, BoardPins, CameraDriver,
@@ -109,9 +113,9 @@ fn hil_check_sccb_and_ov2640_hd() -> bool {
         return false;
     }
 
-    let hsize8 = sccb_bus.get_reg8(Ov2640::SLV_ADDR, esp32_cam_sensors::ov2640::HSIZE8);
-    let vsize8 = sccb_bus.get_reg8(Ov2640::SLV_ADDR, esp32_cam_sensors::ov2640::VSIZE8);
-    let yoffl = sccb_bus.get_reg8(Ov2640::SLV_ADDR, esp32_cam_sensors::ov2640::YOFFL);
+    let hsize8 = sccb_bus.reg8(Ov2640::SLV_ADDR, esp32_cam_sensors::ov2640::HSIZE8);
+    let vsize8 = sccb_bus.reg8(Ov2640::SLV_ADDR, esp32_cam_sensors::ov2640::VSIZE8);
+    let yoffl = sccb_bus.reg8(Ov2640::SLV_ADDR, esp32_cam_sensors::ov2640::YOFFL);
 
     hsize8 == 0xC8 && vsize8 == 0x96 && yoffl == 150
 }
@@ -240,7 +244,9 @@ fn hil_check_jpeg_pool_and_http_ota() -> bool {
         Ok(p) => p,
         Err(_) => return false,
     };
-    if pp.write_and_commit_inactive(&jpeg_encoded[..jpeg_len]).is_err()
+    if pp
+        .write_and_commit_inactive(&jpeg_encoded[..jpeg_len])
+        .is_err()
         || pp.frame_seq() != 2
         || pp.active_slot_index() != 1
         || pp.active_frame() != &jpeg_encoded[..jpeg_len]
@@ -353,9 +359,12 @@ static mut I2S_DMA_BUF: AlignedDmaBuf = AlignedDmaBuf([0u8; 32768]);
 #[esp_hal::ram]
 fn ensure_spi1_flash_cs0_only() {
     const SPI1_PIN_REG: *mut u32 = 0x3FF4_2034 as *mut u32;
+    // JUSTIFICATION: Hardware MMIO register access for SPI1 CS pin config.
+    // SAFETY: SPI1_PIN_REG is a valid MMIO register mapped in peripheral space.
     unsafe {
         let pin = core::ptr::read_volatile(SPI1_PIN_REG);
-        // Enforce CS1_DIS = 1 (bit 1, PSRAM CS# disabled) and CS0_DIS = 0 (bit 0, Flash CS# enabled)
+        // Enforce CS1_DIS = 1 (bit 1, PSRAM CS# disabled) and CS0_DIS = 0
+        // (bit 0, Flash CS# enabled)
         core::ptr::write_volatile(SPI1_PIN_REG, (pin | (1u32 << 1)) & !1u32);
     }
 }
@@ -365,7 +374,11 @@ struct EspFlashAdapter<'d>(esp_storage::FlashStorage<'d>);
 
 #[cfg(target_arch = "xtensa")]
 impl klipper_cam_fw::OtaFlashStorage for EspFlashAdapter<'_> {
-    fn read_aligned(&mut self, offset: u32, buf: &mut [u8]) -> Result<(), klipper_cam_fw::OtaError> {
+    fn read_aligned(
+        &mut self,
+        offset: u32,
+        buf: &mut [u8],
+    ) -> Result<(), klipper_cam_fw::OtaError> {
         ensure_spi1_flash_cs0_only();
         feed_rtc_wdt();
         let res = self
@@ -408,6 +421,8 @@ impl klipper_cam_fw::OtaFlashStorage for EspFlashAdapter<'_> {
 #[esp_hal::ram]
 fn detect_booted_ota_manager_from_mmu() -> klipper_cam_fw::OtaDataManager {
     const DPORT_PRO_FLASH_MMU_TABLE: *const u32 = 0x3FF1_0000 as *const u32;
+    // JUSTIFICATION: Hardware MMU table read to detect active OTA flash mapping.
+    // SAFETY: DPORT_PRO_FLASH_MMU_TABLE entries 1 and 2 are valid MMIO addresses.
     let (drom_entry, irom_entry) = unsafe {
         (
             core::ptr::read_volatile(DPORT_PRO_FLASH_MMU_TABLE),
@@ -435,7 +450,8 @@ const RTC_BREADCRUMB_MAGIC_HI: u32 = 0xA5A5_0000;
 const RTC_CNTL_STORE6_REG: *mut u32 = 0x3FF4_80B8 as *mut u32;
 
 /// ESP32 `RTC_CNTL_STORE7_REG` (`DR_REG_RTCCNTL_BASE + 0xBC`):
-/// Bits `[31:24]` = `0xA5` magic, bits `[23:16]` = `aid`, bits `[15:8]` = `channel`, bits `[7:0]` = `stage`.
+/// Bits `[31:24]` = `0xA5` magic, bits `[23:16]` = `aid`,
+/// bits `[15:8]` = `channel`, bits `[7:0]` = `stage`.
 #[cfg(target_arch = "xtensa")]
 const RTC_CNTL_STORE7_REG: *mut u32 = 0x3FF4_80BC as *mut u32;
 
@@ -445,6 +461,8 @@ fn feed_rtc_wdt() {
     const RTC_CNTL_WDTFEED_REG: *mut u32 = 0x3FF4_80A0 as *mut u32;
     const RTC_CNTL_WDTWPROTECT_REG: *mut u32 = 0x3FF4_80A4 as *mut u32;
     const RTC_CNTL_WDT_WKEY: u32 = 0x50D8_3AA1;
+    // JUSTIFICATION: Hardware RTC watchdog timer register feed operation.
+    // SAFETY: RTC_CNTL_WDT registers are valid MMIO addresses.
     unsafe {
         core::ptr::write_volatile(RTC_CNTL_WDTWPROTECT_REG, RTC_CNTL_WDT_WKEY);
         core::ptr::write_volatile(RTC_CNTL_WDTFEED_REG, 1u32 << 31);
@@ -460,10 +478,13 @@ fn arm_rtc_wdt_15s() {
     const RTC_CNTL_WDTFEED_REG: *mut u32 = 0x3FF4_80A0 as *mut u32;
     const RTC_CNTL_WDTWPROTECT_REG: *mut u32 = 0x3FF4_80A4 as *mut u32;
     const RTC_CNTL_WDT_WKEY: u32 = 0x50D8_3AA1;
-    // WDT_EN (bit 31) | WDT_STG0 = 4 (RESET_RTC, bits 28..=30) | WDT_CPU_RESET_LENGTH = 7 (bits 14..=16)
-    // | WDT_SYS_RESET_LENGTH = 7 (bits 11..=13) | WDT_FLASHBOOT_MOD_EN (bit 10)
+    // WDT_EN (bit 31) | WDT_STG0 = 4 (RESET_RTC, bits 28..=30) |
+    // WDT_CPU_RESET_LENGTH = 7 (bits 14..=16) | WDT_SYS_RESET_LENGTH = 7
+    // (bits 11..=13) | WDT_FLASHBOOT_MOD_EN (bit 10)
     const WDT_CFG0_VAL: u32 =
         (1u32 << 31) | (4u32 << 28) | (7u32 << 14) | (7u32 << 11) | (1u32 << 10);
+    // JUSTIFICATION: Hardware RTC watchdog timer 15-second arming configuration.
+    // SAFETY: RTC_CNTL_WDT registers are valid MMIO addresses.
     unsafe {
         core::ptr::write_volatile(RTC_CNTL_WDTWPROTECT_REG, RTC_CNTL_WDT_WKEY);
         core::ptr::write_volatile(RTC_CNTL_WDTCONFIG1_REG, 15 * 150_000);
@@ -473,8 +494,9 @@ fn arm_rtc_wdt_15s() {
     }
 }
 
-/// Applies `ESP-IDF v5.5.4` (`rtc_init.c:30-31, 102-107`) Wi-Fi/RF modem force power-down
-/// and isolation during early peripheral initialization, and releases any latched RTC pad holds.
+/// Applies `ESP-IDF v5.5.4` (`rtc_init.c:30-31, 102-107`) Wi-Fi/RF modem force
+/// power-down and isolation during early peripheral initialization, and
+/// releases any latched RTC pad holds.
 #[cfg(target_arch = "xtensa")]
 #[esp_hal::ram]
 fn esp_rtc_wifi_force_pd(enable_pd: bool) {
@@ -494,6 +516,8 @@ fn esp_rtc_wifi_force_pd(enable_pd: bool) {
         | RTC_CNTL_DG_PAD_FORCE_NOISO
         | RTC_CNTL_DG_PAD_AUTOHOLD_EN;
 
+    // JUSTIFICATION: Hardware RTC power control and Wi-Fi modem isolation.
+    // SAFETY: RTC_CNTL power registers are valid MMIO addresses.
     unsafe {
         core::ptr::write_volatile(RTC_CNTL_HOLD_FORCE_REG, 0);
         let iso = core::ptr::read_volatile(RTC_CNTL_DIG_ISO_REG) & !RTC_CNTL_DG_PAD_MASK;
@@ -522,7 +546,11 @@ struct BreadcrumbPrevSummary {
 #[cfg(target_arch = "xtensa")]
 #[esp_hal::ram]
 fn record_boot_breadcrumb_rtc_init(reset_reason: u32) -> BreadcrumbPrevSummary {
+    // JUSTIFICATION: Hardware RTC store register read for boot breadcrumb.
+    // SAFETY: RTC_CNTL_STORE6_REG is a valid MMIO register address.
     let raw6 = unsafe { core::ptr::read_volatile(RTC_CNTL_STORE6_REG) };
+    // JUSTIFICATION: Hardware RTC store register read for boot breadcrumb.
+    // SAFETY: RTC_CNTL_STORE7_REG is a valid MMIO register address.
     let raw7 = unsafe { core::ptr::read_volatile(RTC_CNTL_STORE7_REG) };
 
     let prev_magic = raw6 & 0xFFFF_0000;
@@ -538,6 +566,8 @@ fn record_boot_breadcrumb_rtc_init(reset_reason: u32) -> BreadcrumbPrevSummary {
     };
 
     let new_boots = (prev_boots.wrapping_add(1)) & 0xFFFF;
+    // JUSTIFICATION: Hardware RTC store register write for boot breadcrumb.
+    // SAFETY: RTC_CNTL_STORE6/7 registers are valid MMIO addresses.
     unsafe {
         core::ptr::write_volatile(RTC_CNTL_STORE6_REG, RTC_BREADCRUMB_MAGIC_HI | new_boots);
         core::ptr::write_volatile(
@@ -560,10 +590,10 @@ fn record_boot_breadcrumb_rtc_init(reset_reason: u32) -> BreadcrumbPrevSummary {
 #[cfg(target_arch = "xtensa")]
 #[esp_hal::ram]
 fn record_boot_breadcrumb_post_wifi(stage: u32, ch: u8, aid: u16) {
-    let val = (0xA5u32 << 24)
-        | ((aid as u32 & 0xFF) << 16)
-        | ((ch as u32 & 0xFF) << 8)
-        | (stage & 0xFF);
+    let val =
+        (0xA5u32 << 24) | ((aid as u32 & 0xFF) << 16) | ((ch as u32 & 0xFF) << 8) | (stage & 0xFF);
+    // JUSTIFICATION: Hardware RTC store register write for Wi-Fi breadcrumb.
+    // SAFETY: RTC_CNTL_STORE7_REG is a valid MMIO register address.
     unsafe {
         core::ptr::write_volatile(RTC_CNTL_STORE7_REG, val);
     }
@@ -595,14 +625,21 @@ impl smoltcp::phy::TxToken for SmoltcpTxToken {
         F: FnOnce(&mut [u8]) -> R,
     {
         let copy_len = len.min(1480);
-        self.0.consume_token(copy_len, |tx_buf| f(&mut tx_buf[..copy_len]))
+        self.0
+            .consume_token(copy_len, |tx_buf| f(&mut tx_buf[..copy_len]))
     }
 }
 
 #[cfg(target_arch = "xtensa")]
 impl smoltcp::phy::Device for SmoltcpWifiDevice {
-    type RxToken<'a> = SmoltcpRxToken where Self: 'a;
-    type TxToken<'a> = SmoltcpTxToken where Self: 'a;
+    type RxToken<'a>
+        = SmoltcpRxToken
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = SmoltcpTxToken
+    where
+        Self: 'a;
 
     fn receive(
         &mut self,
@@ -620,8 +657,9 @@ impl smoltcp::phy::Device for SmoltcpWifiDevice {
     fn capabilities(&self) -> smoltcp::phy::DeviceCapabilities {
         let mut caps = smoltcp::phy::DeviceCapabilities::default();
         caps.medium = smoltcp::phy::Medium::Ethernet;
-        // Must be <= esp-radio's `ESP_RADIO_CONFIG_WIFI_MTU` (1492) so `WifiTxToken::consume_token`
-        // stack buffer `[u8; 1492]` never panics on slice indexing `&mut buffer[..len]`.
+        // Must be <= esp-radio's `ESP_RADIO_CONFIG_WIFI_MTU` (1492) so
+        // `WifiTxToken::consume_token` stack buffer `[u8; 1492]` never
+        // panics on slice indexing `&mut buffer[..len]`.
         caps.max_transmission_unit = 1480;
         caps.max_burst_size = Some(10);
         caps
@@ -645,18 +683,16 @@ fn block_on_with_timeout<F: core::future::Future>(
     mut fut: F,
     timeout_ms: u64,
 ) -> Option<F::Output> {
-    use core::{
-        pin::Pin,
-        task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
-    };
-    const VTABLE: RawWakerVTable = RawWakerVTable::new(
-        |p| RawWaker::new(p, &VTABLE),
-        |_| {},
-        |_| {},
-        |_| {},
-    );
+    use core::pin::Pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    const VTABLE: RawWakerVTable =
+        RawWakerVTable::new(|p| RawWaker::new(p, &VTABLE), |_| {}, |_| {}, |_| {});
+    // JUSTIFICATION: Constructing synchronous no-op waker for block_on polling.
+    // SAFETY: VTABLE is a valid static RawWakerVTable.
     let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
     let mut cx = Context::from_waker(&waker);
+    // JUSTIFICATION: Stack pinning future for synchronous polling loop.
+    // SAFETY: `fut` is not moved before it is dropped.
     let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
     let start_ms = now_millis();
     loop {
@@ -694,7 +730,8 @@ fn send_arp_announce(
             // Sender Hardware Address (MAC) + Sender Protocol Address (src_ip)
             buf[22..28].copy_from_slice(&mac);
             buf[28..32].copy_from_slice(&src_ip);
-            // Target Hardware Address (00:00:00:00:00:00) + Target Protocol Address (target_ip)
+            // Target Hardware Address (00:00:00:00:00:00) +
+            // Target Protocol Address (target_ip)
             buf[32..38].copy_from_slice(&[0x00; 6]);
             buf[38..42].copy_from_slice(&target_ip);
         });
@@ -760,9 +797,12 @@ fn hold_psram_cs_high_safe() {
     const GPIO_FUNC16_OUT_SEL_CFG_REG: *mut u32 = 0x3FF4_4570 as *mut u32;
     const IO_MUX_GPIO16_REG: *mut u32 = 0x3FF4_904C as *mut u32;
     const SIG_GPIO_OUT_IDX: u32 = 0x100;
-    // MCU_SEL = Function 2 (GPIO = 2 << 12), FUN_IE = 1 << 9, FUN_WPU = 1 << 8, FUN_DRV = 2 << 10
+    // MCU_SEL = Function 2 (GPIO = 2 << 12), FUN_IE = 1 << 9,
+    // FUN_WPU = 1 << 8, FUN_DRV = 2 << 10
     const IO_MUX_GPIO16_WPU_GPIO: u32 = (2 << 12) | (2 << 10) | (1 << 9) | (1 << 8);
 
+    // JUSTIFICATION: Direct GPIO MMIO configuration to hold PSRAM CS# HIGH.
+    // SAFETY: GPIO MMIO registers are valid addresses in peripheral space.
     unsafe {
         core::ptr::write_volatile(GPIO_OUT_W1TS_REG, 1 << 16);
         core::ptr::write_volatile(GPIO_FUNC16_OUT_SEL_CFG_REG, SIG_GPIO_OUT_IDX);
@@ -771,8 +811,9 @@ fn hold_psram_cs_high_safe() {
     }
 }
 
-/// Sends an 8-bit PSRAM command (`0xF5` in 4-bit QPI mode when `qpi_mode == true`, or
-/// `0x35` in 1-bit SPI mode when `qpi_mode == false`) over the hardware `SPI1` controller
+/// Sends an 8-bit PSRAM command (`0xF5` in 4-bit QPI mode when
+/// `qpi_mode == true`, or `0x35` in 1-bit SPI mode when `qpi_mode == false`)
+/// over the hardware `SPI1` controller
 /// using `SPI1_CS1` (`GPIO 16`) and `SPICLK` (`GPIO 17`), ported directly from
 /// `ESP-IDF v5.5.4` `esp_psram_impl_quad.c:250-535`.
 ///
@@ -820,6 +861,8 @@ fn psram_spi1_cmd(qpi_mode: bool, cmd_byte: u8) {
     const SPI_USR_MOSI: u32 = 1u32 << 27;
     const SPI_USR_ADDR: u32 = 1u32 << 30;
 
+    // JUSTIFICATION: Hardware SPI1 peripheral registers for PSRAM QPI command.
+    // SAFETY: Disables interrupts during SPI1 bus transaction and restores PS.
     unsafe {
         let saved_ps: u32;
         core::arch::asm!("rsil {0}, 15", out(reg) saved_ps);
@@ -847,10 +890,12 @@ fn psram_spi1_cmd(qpi_mode: bool, cmd_byte: u8) {
         let saved_outsel17 = core::ptr::read_volatile(GPIO_FUNC17_OUT_SEL_CFG_REG);
         let saved_iomux17 = core::ptr::read_volatile(IO_MUX_GPIO17_REG);
 
-        // Temporarily disable CS1 on SPI0 (SPI_CS1_DIS = 1 << 1) before routing GPIO 16 to SPI1 SPICS1_OUT_IDX (6)
+        // Temporarily disable CS1 on SPI0 (SPI_CS1_DIS = 1 << 1) before
+        // routing GPIO 16 to SPI1 SPICS1_OUT_IDX (6)
         core::ptr::write_volatile(SPI0_PIN_REG, saved_spi0_pin | (1u32 << 1));
 
-        // Route GPIO 16 -> SPICS1_OUT_IDX (6) with pull-up (0x2B00) and GPIO 17 -> SPICLK_OUT_IDX (0)
+        // Route GPIO 16 -> SPICS1_OUT_IDX (6) with pull-up (0x2B00)
+        // and GPIO 17 -> SPICLK_OUT_IDX (0)
         core::ptr::write_volatile(GPIO_FUNC16_OUT_SEL_CFG_REG, SPICS1_OUT_IDX);
         core::ptr::write_volatile(IO_MUX_GPIO16_REG, 0x2B00);
         core::ptr::write_volatile(GPIO_FUNC17_OUT_SEL_CFG_REG, SPICLK_OUT_IDX);
@@ -882,10 +927,7 @@ fn psram_spi1_cmd(qpi_mode: bool, cmd_byte: u8) {
             );
             core::ptr::write_volatile(SPI1_ADDR_REG, (cmd_byte as u32) << 24);
             core::ptr::write_volatile(SPI1_USER1_REG, (7u32 & 0x3F) << 26);
-            core::ptr::write_volatile(
-                SPI1_USER_REG,
-                SPI_USR_ADDR | SPI_CS_SETUP | SPI_CS_HOLD,
-            );
+            core::ptr::write_volatile(SPI1_USER_REG, SPI_USR_ADDR | SPI_CS_SETUP | SPI_CS_HOLD);
         }
 
         let mut wait0 = 0u32;
@@ -918,7 +960,8 @@ fn psram_spi1_cmd(qpi_mode: bool, cmd_byte: u8) {
         core::ptr::write_volatile(SPI1_USER2_REG, saved_user2);
         core::ptr::write_volatile(SPI1_MOSI_DLEN_REG, saved_mosi_dlen);
         core::ptr::write_volatile(SPI1_W0_REG, saved_w0);
-        // Enforce CS1_DIS = 1 (bit 1) and CS0_DIS = 0 (bit 0) on restore (esp_psram_impl_quad.c:327-328)
+        // Enforce CS1_DIS = 1 (bit 1) and CS0_DIS = 0 (bit 0) on
+        // restore (esp_psram_impl_quad.c:327-328)
         core::ptr::write_volatile(SPI1_PIN_REG, (saved_pin | (1u32 << 1)) & !1u32);
         core::ptr::write_volatile(SPI1_ADDR_REG, saved_addr);
         core::ptr::write_volatile(GPIO_FUNC16_OUT_SEL_CFG_REG, saved_outsel16);
@@ -940,11 +983,12 @@ fn release_psram_cs_and_exit_qpi() {
 
 /// Ensures external PSRAM enters 4-bit QPI mode cleanly after `Psram::new()`.
 ///
-/// `esp-hal-1.2.2`'s `psram_enable_qio_mode_spi1` (`esp32.rs:753`) erroneously sends `0x35`
-/// (`PSRAM_ENTER_QMODE`) in `PsramCmdQpi` mode instead of 1-bit `PSRAM_CMD_SPI` mode
-/// (`esp_psram_impl_quad.c:519`). Calling `psram_spi1_cmd(true, 0xF5)` followed by
-/// `psram_spi1_cmd(false, 0x35)` guarantees PSRAM enters QPI mode on both cold `0V -> 3.3V`
-/// power-on resets and warm reboots.
+/// `esp-hal-1.2.2`'s `psram_enable_qio_mode_spi1` (`esp32.rs:753`) erroneously
+/// sends `0x35` (`PSRAM_ENTER_QMODE`) in `PsramCmdQpi` mode instead of 1-bit
+/// `PSRAM_CMD_SPI` mode (`esp_psram_impl_quad.c:519`). Calling
+/// `psram_spi1_cmd(true, 0xF5)` followed by `psram_spi1_cmd(false, 0x35)`
+/// guarantees PSRAM enters QPI mode on both cold `0V -> 3.3V` power-on resets
+/// and warm reboots.
 #[cfg(target_arch = "xtensa")]
 #[esp_hal::ram]
 fn ensure_psram_qpi_mode_spi1() {
@@ -954,6 +998,8 @@ fn ensure_psram_qpi_mode_spi1() {
 
     psram_spi1_cmd(true, 0xF5);
     psram_spi1_cmd(false, 0x35);
+    // JUSTIFICATION: Route GPIO 16 to hardware SPI1 CS1 after mode transition.
+    // SAFETY: GPIO_FUNC16_OUT_SEL_CFG_REG and IO_MUX_GPIO16_REG are valid MMIO.
     unsafe {
         core::ptr::write_volatile(GPIO_FUNC16_OUT_SEL_CFG_REG, SPICS1_OUT_IDX);
         core::ptr::write_volatile(
@@ -967,6 +1013,8 @@ fn ensure_psram_qpi_mode_spi1() {
 #[esp_hal::ram]
 fn quiesce_psram_and_software_reset() -> ! {
     release_psram_cs_and_exit_qpi();
+    // JUSTIFICATION: Mask interrupts at CPU level 15 prior to software reset.
+    // SAFETY: Inline assembly modifies only processor interrupt priority.
     unsafe {
         core::arch::asm!("rsil {0}, 15", out(reg) _);
     }
@@ -980,7 +1028,7 @@ pub extern "C" fn custom_halt() -> ! {
 }
 
 #[cfg(target_arch = "xtensa")]
-const WIFI_MAX_TX_POWER_QDBM: i8 = 60;
+pub const WIFI_MAX_TX_POWER_QDBM: i8 = 78;
 
 #[cfg(target_arch = "xtensa")]
 #[inline(never)]
@@ -992,17 +1040,16 @@ fn connect_strongest_ap(
 ) -> Option<esp_radio::wifi::sta::ConnectedInfo> {
     use esp_hal::time::Duration;
     use esp_println::println;
-    use esp_radio::wifi::{
-        scan::{ScanConfig, ScanTypeConfig},
-        sta::ScanMethod,
-        Config as WifiConfig, PowerSaveMode,
-    };
+    use esp_radio::wifi::scan::{ScanConfig, ScanTypeConfig};
+    use esp_radio::wifi::sta::ScanMethod;
+    use esp_radio::wifi::{Config as WifiConfig, PowerSaveMode};
 
     let wait_ms = timeout_ms.max(15_000);
     let _ = wifi_controller.set_power_saving(PowerSaveMode::None);
     let _ = wifi_controller.set_max_tx_power(WIFI_MAX_TX_POWER_QDBM);
 
-    // 1. Active scan (60..100 ms per channel, with a second pass if best RSSI < -62 dBm)
+    // 1. Active scan (60..100 ms per channel, with a second pass if best
+    //    RSSI < -62 dBm)
     //    to pick the strongest AP at the camera's current physical location.
     let mut scan_cfg = ScanConfig::default()
         .with_max(16)
@@ -1048,7 +1095,10 @@ fn connect_strongest_ap(
     if scan_completed {
         if let Some((target_ch, target_rssi, target_bssid)) = best_target {
             println!(
-                "[KLIPPER-CAM-RS] [WIFI] Strongest '{}' AP: ch={} rssi={}dBm bssid={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                concat!(
+                    "[KLIPPER-CAM-RS] [WIFI] Strongest '{}' AP: ch={} ",
+                    "rssi={}dBm bssid={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}"
+                ),
                 ssid_str,
                 target_ch,
                 target_rssi,
@@ -1087,9 +1137,10 @@ fn connect_strongest_ap(
                             wifi_controller.set_config(&WifiConfig::Station(base_sta_cfg.clone()));
                     }
                     None => {
-                        println!(
-                            "[KLIPPER-CAM-RS] [WIFI] BSSID-locked connect_async timed out (10000 ms)"
-                        );
+                        println!(concat!(
+                            "[KLIPPER-CAM-RS] [WIFI] BSSID-locked ",
+                            "connect_async timed out (10000 ms)"
+                        ));
                         let _ = block_on_with_timeout(wifi_controller.disconnect_async(), 2000);
                         esp_hal::delay::Delay::new().delay_millis(100);
                         let _ =
@@ -1102,8 +1153,9 @@ fn connect_strongest_ap(
         }
     }
 
-    // 2. Unlocked fallback (or primary path if scan found no target): full 15,000 ms timeout
-    //    across all channels with WIFI_CONNECT_AP_BY_SIGNAL and failure_retry_cnt(2).
+    // 2. Unlocked fallback (or primary path if scan found no target): full
+    //    15,000 ms timeout across all channels with WIFI_CONNECT_AP_BY_SIGNAL
+    //    and failure_retry_cnt(2).
     let _ = wifi_controller.set_max_tx_power(WIFI_MAX_TX_POWER_QDBM);
     match block_on_with_timeout(wifi_controller.connect_async(), wait_ms) {
         Some(Ok(info)) => {
@@ -1205,6 +1257,8 @@ fn capture_live_hd_jpeg_with_diag(
     const I2S_IN_SUC_EOF_BIT: u32 = 1 << 9;
 
     feed_rtc_wdt();
+    // JUSTIFICATION: Static DMA descriptor ring and buffer for I2S0 DMA.
+    // SAFETY: Exclusively accessed from single-threaded capture routine.
     let (desc_slice, dma_slice) = unsafe {
         (
             &mut *core::ptr::addr_of_mut!(I2S_DMA_DESC),
@@ -1228,10 +1282,13 @@ fn capture_live_hd_jpeg_with_diag(
     };
 
     let read_vsync = || -> bool {
+        // JUSTIFICATION: Direct GPIO register read to sample camera VSYNC pin.
+        // SAFETY: GPIO_IN_REG is a valid MMIO register address.
         ((unsafe { core::ptr::read_volatile(GPIO_IN_REG) } >> 25) & 1) != 0
     };
 
-    // Service network once prior to VSYNC edge alignment so in-flight packets are flushed
+    // Service network once prior to VSYNC edge alignment so in-flight
+    // packets are flushed
     poll_net();
 
     let first_desc_addr = (core::ptr::from_ref(&desc_slice[0]) as usize as u32) & 0x000F_FFFF;
@@ -1243,8 +1300,10 @@ fn capture_live_hd_jpeg_with_diag(
         feed_rtc_wdt();
         let mut spin = 0u32;
         if sync_pass == 0 {
-            // Fast path: if currently inside an active frame (VSYNC HIGH), wait for blanking (VSYNC LOW).
-            // If already in vertical blanking (VSYNC LOW), arm DMA immediately without skipping a frame!
+            // Fast path: if currently inside an active frame (VSYNC HIGH), wait
+            // for blanking (VSYNC LOW).
+            // If already in vertical blanking (VSYNC LOW), arm DMA immediately
+            // without skipping a frame!
             if read_vsync() {
                 let active_wait_start_ms = now_millis();
                 while read_vsync() && (now_millis().saturating_sub(active_wait_start_ms) < 110) {
@@ -1256,7 +1315,8 @@ fn capture_live_hd_jpeg_with_diag(
                 }
             }
         } else {
-            // Fallback path (only if sync_pass == 0 entered at the final microsecond of blanking):
+            // Fallback path (only if sync_pass == 0 entered at the final
+            // microsecond of blanking):
             // align cleanly to the next HIGH -> LOW blanking transition.
             let _ = build_circular_ring(desc_slice, dma_slice, 2048);
             let sync_start_ms = now_millis();
@@ -1303,10 +1363,14 @@ fn capture_live_hd_jpeg_with_diag(
                     }
                 }
 
+                // JUSTIFICATION: Direct I2S0 interrupt register poll for DMA completion.
+                // SAFETY: I2S_INT_RAW_REG is a valid MMIO register address.
                 let int_raw = unsafe { core::ptr::read_volatile(I2S_INT_RAW_REG) };
                 last_int_raw |= int_raw;
 
                 if (int_raw & I2S_IN_SUC_EOF_BIT) != 0 {
+                    // JUSTIFICATION: Clear I2S0 DMA EOF interrupt status bit in hardware.
+                    // SAFETY: I2S_INT_CLR_REG is a valid MMIO register address.
                     unsafe {
                         core::ptr::write_volatile(I2S_INT_CLR_REG, I2S_IN_SUC_EOF_BIT);
                         core::arch::asm!("memw");
@@ -1323,6 +1387,8 @@ fn capture_live_hd_jpeg_with_diag(
                             &dma_slice[half_offset..half_offset + 4096],
                         );
                         let flags = Lldesc::pack_flags(2048, 0, 0, false, false, true);
+                        // JUSTIFICATION: Write DMA descriptor ownership flags in ring.
+                        // SAFETY: half_idx is masked & 7, indexing within desc_slice.
                         unsafe {
                             core::ptr::write_volatile(
                                 &mut desc_slice[2 * half_idx].size_length_flags,
@@ -1358,6 +1424,8 @@ fn capture_live_hd_jpeg_with_diag(
                         && !read_vsync();
                     if vsync_ended || now_millis().saturating_sub(last_eof_ms) >= 5 {
                         let _ = i2s_cam.stop();
+                        // JUSTIFICATION: Ensure memory writes complete after stopping camera.
+                        // SAFETY: memw instruction enforces write ordering on Xtensa.
                         unsafe {
                             core::arch::asm!("memw");
                         }
@@ -1435,6 +1503,8 @@ fn capture_live_hd_jpeg_with_diag(
 #[inline]
 fn active_ping_pong_static_slice(pp: &PingPongFrameBuffer<'_>) -> &'static [u8] {
     let active = pp.active_frame();
+    // JUSTIFICATION: View initialized frame buffer slice as immutable slice.
+    // SAFETY: `active` slice bounds are guaranteed valid by PingPongBuffers.
     unsafe { core::slice::from_raw_parts(active.as_ptr(), active.len()) }
 }
 
@@ -1461,9 +1531,8 @@ fn write_active_stream_frame_chunk<'b>(
     camera: &CameraDriver<'_>,
     out_buf: &'b mut [u8],
 ) -> Result<&'b [u8], klipper_cam_fw::HttpError> {
-    use klipper_cam_fw::{
-        format_mjpeg_part_header, http::MJPEG_PART_HDR_BUF_LEN, CameraError, HttpError, SliceWriter,
-    };
+    use klipper_cam_fw::http::MJPEG_PART_HDR_BUF_LEN;
+    use klipper_cam_fw::{format_mjpeg_part_header, CameraError, HttpError, SliceWriter};
     let guard = match camera.acquire_frame() {
         Ok(g) => g,
         Err(CameraError::InvalidState) => return Err(HttpError::CameraBusy),
@@ -1541,8 +1610,9 @@ fn program_ov2640_over_sccb<B: klipper_cam_fw::SccbBus>(hw_sccb: &mut B) -> (boo
     match Ov2640::detect(hw_sccb, Ov2640::SLV_ADDR) {
         Ok(id) => {
             let mut ov = Ov2640::from_id(Ov2640::SLV_ADDR, id);
-            // Program PixelFormat::Jpeg BEFORE set_framesize(FrameSize::Hd) so set_window
-            // selects the JPEG CLKRC/PCLK dividers (`div = 12`), then apply OV2640 ISP settings
+            // Program PixelFormat::Jpeg BEFORE set_framesize(FrameSize::Hd) so
+            // set_window selects the JPEG CLKRC/PCLK dividers (`div = 12`),
+            // then apply OV2640 ISP settings
             let prog_ok = ov.reset(hw_sccb).is_ok()
                 && ov.set_pixformat(hw_sccb, PixelFormat::Jpeg).is_ok()
                 && ov.set_framesize(hw_sccb, FrameSize::Hd).is_ok()
@@ -1553,15 +1623,19 @@ fn program_ov2640_over_sccb<B: klipper_cam_fw::SccbBus>(hw_sccb: &mut B) -> (boo
                 && ov.set_quality(hw_sccb, DEFAULT_JPEG_QUALITY as i32).is_ok()
                 && ov.init_status(hw_sccb).is_ok();
             println!(
-                "[KLIPPER-CAM-RS] [HW-2] I2C0 SCCB (0x30) OV2640 DETECTED: PID=0x{:02X} VER=0x{:02X} MIDH=0x{:02X} MIDL=0x{:02X} HD_PROG={}",
+                concat!(
+                    "[KLIPPER-CAM-RS] [HW-2] I2C0 SCCB (0x30) OV2640 DETECTED: ",
+                    "PID=0x{:02X} VER=0x{:02X} MIDH=0x{:02X} MIDL=0x{:02X} HD_PROG={}"
+                ),
                 id.pid, id.ver, id.midh, id.midl, prog_ok
             );
             (prog_ok, Some(ov))
         }
         Err(_) => {
-            println!(
-                "[KLIPPER-CAM-RS] [HW-2] I2C0 SCCB (GPIO26/GPIO27 @ 100kHz): Bus active (no external OV2640 ribbon sensor ACK at 0x30)"
-            );
+            println!(concat!(
+                "[KLIPPER-CAM-RS] [HW-2] I2C0 SCCB (GPIO26/GPIO27 @ 100kHz): ",
+                "Bus active (no external OV2640 ribbon sensor ACK at 0x30)"
+            ));
             (false, None)
         }
     }
@@ -1574,6 +1648,8 @@ fn init_psram_and_run_hil(psram_ptr: *mut u8, psram_len: usize, xclk_hw_ok: bool
     use klipper_cam_fw::SYNTHETIC_HD_JFIF_FRAME;
 
     let psram_rw_ok = if !psram_ptr.is_null() && psram_len >= 128 * 1024 + 512 * 1024 + 2_097_152 {
+        // JUSTIFICATION: Volatile write/read to verify PSRAM memory bus.
+        // SAFETY: psram_ptr is verified non-null and within PSRAM bounds.
         unsafe {
             let p32 = psram_ptr as *mut u32;
             core::ptr::write_volatile(p32, 0x55AA_55AA);
@@ -1602,8 +1678,12 @@ fn init_psram_and_run_hil(psram_ptr: *mut u8, psram_len: usize, xclk_hw_ok: bool
     );
     println!("============================================================");
 
-    let psram_all: &'static mut [u8] =
-        unsafe { core::slice::from_raw_parts_mut(psram_ptr, psram_len) };
+    let psram_all: &'static mut [u8];
+    // JUSTIFICATION: Obtain mutable slice of mapped PSRAM memory region.
+    // SAFETY: psram_ptr points to valid, allocated PSRAM heap memory.
+    unsafe {
+        psram_all = core::slice::from_raw_parts_mut(psram_ptr, psram_len);
+    }
     let (jpeg_slot_a, rem) = psram_all.split_at_mut(128 * 1024);
     let (jpeg_slot_b, rem) = rem.split_at_mut(128 * 1024);
 
@@ -1633,13 +1713,11 @@ fn init_psram_and_run_hil(psram_ptr: *mut u8, psram_len: usize, xclk_hw_ok: bool
     let (http80_ota_accum, psram_heap_rem) = rem.split_at_mut(1800 * 1024);
     let free_psram_bytes = psram_heap_rem.len() as u32;
 
-    let ping_pong = PingPongFrameBuffer::new(
-        jpeg_slot_a,
-        jpeg_slot_b,
-        &SYNTHETIC_HD_JFIF_FRAME,
-    )
-    .expect("PingPongFrameBuffer::new");
+    let ping_pong = PingPongFrameBuffer::new(jpeg_slot_a, jpeg_slot_b, &SYNTHETIC_HD_JFIF_FRAME)
+        .expect("PingPongFrameBuffer::new");
 
+    // JUSTIFICATION: Initialize static PSRAM_BUFFERS singleton.
+    // SAFETY: Single-threaded bare-metal init before server loop starts.
     unsafe {
         PSRAM_BUFFERS = Some(PsramBuffers {
             ping_pong,
@@ -1676,7 +1754,10 @@ fn init_psram_and_run_hil(psram_ptr: *mut u8, psram_len: usize, xclk_hw_ok: bool
     let check2 = hil_check_sccb_and_ov2640_hd();
     feed_rtc_wdt();
     println!(
-        "[KLIPPER-CAM-RS] [HIL-2] Ov2640 1280x720 HD (OV-105 HSIZE8=0xC8 VSIZE8=0x96 YOFFL=150): {}",
+        concat!(
+            "[KLIPPER-CAM-RS] [HIL-2] Ov2640 1280x720 HD ",
+            "(OV-105 HSIZE8=0xC8 VSIZE8=0x96 YOFFL=150): {}"
+        ),
         if check2 { "PASS" } else { "FAIL" }
     );
 
@@ -1705,6 +1786,8 @@ fn init_psram_and_run_hil(psram_ptr: *mut u8, psram_len: usize, xclk_hw_ok: bool
     let _ = hw_i2s_cam.set_pin(&ll_pins);
     let _ = hw_i2s_cam.config();
     let _ = hw_i2s_cam.set_sample_mode(PixelFormat::Jpeg, DEFAULT_XCLK_FREQ_HZ, 0x26);
+    // JUSTIFICATION: Initialize static HW_I2S_CAM global singleton.
+    // SAFETY: Single-threaded bare-metal init before server loop starts.
     unsafe {
         HW_I2S_CAM = Some(hw_i2s_cam);
     }
@@ -1721,7 +1804,11 @@ fn capture_boot_dma_and_init_runtime(
     use esp_println::println;
 
     let delay = Delay::new();
+    // JUSTIFICATION: Access mutable static PSRAM_BUFFERS singleton.
+    // SAFETY: Exclusively accessed from single-threaded initialization.
     let psram_bufs = unsafe { PSRAM_BUFFERS.as_mut().expect("PSRAM_BUFFERS") };
+    // JUSTIFICATION: Access mutable static HW_I2S_CAM singleton.
+    // SAFETY: Exclusively accessed from single-threaded initialization.
     let hw_i2s_cam = unsafe { HW_I2S_CAM.as_mut().expect("HW_I2S_CAM") };
 
     let ov2640_dma_ok = ov2640_hw_ok;
@@ -1730,22 +1817,26 @@ fn capture_boot_dma_and_init_runtime(
     if ov2640_hw_ok {
         for attempt in 1..=3u8 {
             feed_rtc_wdt();
-            match capture_live_hd_jpeg_with_diag(
-                hw_i2s_cam,
-                &mut psram_bufs.ping_pong,
-                &mut || {},
-            ) {
+            match capture_live_hd_jpeg_with_diag(hw_i2s_cam, &mut psram_bufs.ping_pong, &mut || {})
+            {
                 Ok(captured_len) => {
                     boot_dma_ok = true;
                     println!(
-                        "[KLIPPER-CAM-RS] [HW-3] Live OV2640 I2S0 DMA 1280x720 JPEG Capture: PASS ({} bytes, attempt {}, inv=false)",
+                        concat!(
+                            "[KLIPPER-CAM-RS] [HW-3] Live OV2640 I2S0 DMA 1280x720 ",
+                            "JPEG Capture: PASS ({} bytes, attempt {}, inv=false)"
+                        ),
                         captured_len, attempt
                     );
                     break;
                 }
                 Err((eof_cnt, fb_len, b0, b1, b2, int_raw)) => {
                     println!(
-                        "[KLIPPER-CAM-RS] [HW-3] Attempt {} (inv=false): eof_cnt={} fb_len={} head=[0x{:02X},0x{:02X},0x{:02X}] int_raw=0x{:08X}",
+                        concat!(
+                            "[KLIPPER-CAM-RS] [HW-3] Attempt {} (inv=false): ",
+                            "eof_cnt={} fb_len={} ",
+                            "head=[0x{:02X},0x{:02X},0x{:02X}] int_raw=0x{:08X}"
+                        ),
                         attempt, eof_cnt, fb_len, b0, b1, b2, int_raw
                     );
                     delay.delay_millis(25);
@@ -1755,7 +1846,10 @@ fn capture_boot_dma_and_init_runtime(
     }
     if !boot_dma_ok {
         println!(
-            "[KLIPPER-CAM-RS] [HW-3] Live OV2640 I2S0 DMA Capture fallback: using synthetic 1280x720 JFIF ({} bytes)",
+            concat!(
+                "[KLIPPER-CAM-RS] [HW-3] Live OV2640 I2S0 DMA Capture fallback: ",
+                "using synthetic 1280x720 JFIF ({} bytes)"
+            ),
             psram_bufs.ping_pong.active_len()
         );
     }
@@ -1764,7 +1858,10 @@ fn capture_boot_dma_and_init_runtime(
     feed_rtc_wdt();
     record_boot_breadcrumb_post_wifi(4, u8::from(boot_dma_ok), 0);
     println!(
-        "[KLIPPER-CAM-RS] [BREADCRUMB] prev_magic=0x{:08X} prev_boots={} prev_reset=0x{:08X} prev_stage={} prev_ch={} prev_aid={} cur_boots={}",
+        concat!(
+            "[KLIPPER-CAM-RS] [BREADCRUMB] prev_magic=0x{:08X} prev_boots={} ",
+            "prev_reset=0x{:08X} prev_stage={} prev_ch={} prev_aid={} cur_boots={}"
+        ),
         bc_prev.prev_magic,
         bc_prev.prev_boots,
         bc_prev.prev_reset,
@@ -1780,6 +1877,8 @@ fn capture_boot_dma_and_init_runtime(
         CameraDriver::new(initial_slice, FrameSize::Hd),
     );
     runtime.server.ota_manager = ota_manager;
+    // JUSTIFICATION: Initialize static FIRMWARE_RUNTIME global singleton.
+    // SAFETY: Single-threaded bare-metal init before server loop starts.
     unsafe {
         FIRMWARE_RUNTIME = Some(runtime);
     }
@@ -1793,10 +1892,8 @@ fn build_wifi_station_configs() -> (
     esp_radio::wifi::ControllerConfig,
     &'static str,
 ) {
-    use esp_radio::wifi::{
-        sta::{ScanMethod, StationConfig},
-        AuthenticationMethodConfig, Config as WifiConfig, ControllerConfig,
-    };
+    use esp_radio::wifi::sta::{ScanMethod, StationConfig};
+    use esp_radio::wifi::{AuthenticationMethodConfig, Config as WifiConfig, ControllerConfig};
     use klipper_cam_fw::{active_wifi_pass, active_wifi_ssid};
 
     let ssid = active_wifi_ssid();
@@ -1842,18 +1939,22 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
     use klipper_cam_fw::{
         parse_http_request, HttpMethod, OtaDataManager, StreamSessionGuard, OTA_PARTITION_MAX_SIZE,
     };
-    use smoltcp::{
-        iface::{Config as IfaceConfig, Interface as NetInterface, SocketSet},
-        socket::{
-            dhcpv4,
-            tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State as TcpState},
-        },
-        wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address},
+    use smoltcp::iface::{Config as IfaceConfig, Interface as NetInterface, SocketSet};
+    use smoltcp::socket::dhcpv4;
+    use smoltcp::socket::tcp::{
+        Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State as TcpState,
     };
+    use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 
     let delay = Delay::new();
+    // JUSTIFICATION: Access mutable static PSRAM_BUFFERS singleton.
+    // SAFETY: Exclusively accessed from single-threaded server execution.
     let psram_bufs = unsafe { PSRAM_BUFFERS.as_mut().expect("PSRAM_BUFFERS") };
+    // JUSTIFICATION: Access mutable static FIRMWARE_RUNTIME singleton.
+    // SAFETY: Exclusively accessed from single-threaded server execution.
     let runtime = unsafe { FIRMWARE_RUNTIME.as_mut().expect("FIRMWARE_RUNTIME") };
+    // JUSTIFICATION: Access mutable static HW_I2S_CAM singleton.
+    // SAFETY: Exclusively accessed from single-threaded server execution.
     let hw_i2s_cam = unsafe { HW_I2S_CAM.as_mut().expect("HW_I2S_CAM") };
     let ping_pong = &mut psram_bufs.ping_pong;
     let p80_hdr_bufs = &mut psram_bufs.p80_hdr_bufs;
@@ -1869,7 +1970,10 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
     let wifi_iface = WifiInterface::station();
     let mac = wifi_iface.mac_address();
     println!(
-        "[KLIPPER-CAM-RS] [WIFI] Connecting to SSID '{}' (MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})...",
+        concat!(
+            "[KLIPPER-CAM-RS] [WIFI] Connecting to SSID '{}' ",
+            "(MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})..."
+        ),
         ssid, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     );
     runtime.on_wifi_sta_start();
@@ -1890,20 +1994,24 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
         }
         None => {
             record_boot_breadcrumb_post_wifi(7, 0, 0);
-            println!(
-                "[KLIPPER-CAM-RS] [WIFI] Initial connect warning/timeout; will retry in loop"
-            );
+            println!("[KLIPPER-CAM-RS] [WIFI] Initial connect warning/timeout; will retry in loop");
             runtime.on_wifi_sta_disconnected();
         }
     }
 
-    // 7. Configure smoltcp Ethernet Interface + DHCPv4 + Static IP (172.22.1.52/24, GW 172.22.1.1)
-    //    + 4-socket Port 80 pool + 2-socket Port 81 pool (7 sockets total)
+    // 7. Configure smoltcp Ethernet Interface + DHCPv4 + Static IP
+    //    (172.22.1.52/24, GW 172.22.1.1) + 4-socket Port 80 pool +
+    //    2-socket Port 81 pool (7 sockets total)
     let mut net_device = SmoltcpWifiDevice(wifi_iface);
     let mut iface_cfg = IfaceConfig::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
-    // WDEV_RND_REG (`wdev_reg.h:19`: 0x6003_5144 APB / 0x3FF7_5144 DPORT peripheral bus alias)
+    // WDEV_RND_REG (`wdev_reg.h:19`: 0x6003_5144 APB /
+    // 0x3FF7_5144 DPORT peripheral bus alias)
     const RNG_DATA_REG: *const u32 = 0x3FF7_5144 as *const u32;
+    // JUSTIFICATION: Read hardware random number generator for smoltcp seed.
+    // SAFETY: RNG_DATA_REG is a valid MMIO register mapped to APB bus.
     let hw_rng_lo = unsafe { core::ptr::read_volatile(RNG_DATA_REG) } as u64;
+    // JUSTIFICATION: Read hardware random number generator for smoltcp seed.
+    // SAFETY: RNG_DATA_REG is a valid MMIO register mapped to APB bus.
     let hw_rng_hi = unsafe { core::ptr::read_volatile(RNG_DATA_REG) } as u64;
     let boot_us = esp_hal::time::Instant::now()
         .duration_since_epoch()
@@ -1911,33 +2019,83 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
     iface_cfg.random_seed = ((hw_rng_hi << 32) | hw_rng_lo) ^ boot_us ^ 0x9E37_79B9_7F4A_7C15;
     let mut iface = NetInterface::new(iface_cfg, &mut net_device, smol_now());
 
+    // JUSTIFICATION: Mutable borrow of static SOCKET_STORAGE array.
+    // SAFETY: Single-threaded smoltcp socket set initialization.
     let socket_storage = unsafe { &mut *core::ptr::addr_of_mut!(SOCKET_STORAGE) };
     let mut sockets = SocketSet::new(&mut socket_storage[..]);
 
-    let p80_rx0: &'static mut [u8] =
-        unsafe { core::slice::from_raw_parts_mut(psram_bufs.p80_rx0.as_mut_ptr(), psram_bufs.p80_rx0.len()) };
-    let p80_tx0: &'static mut [u8] =
-        unsafe { core::slice::from_raw_parts_mut(psram_bufs.p80_tx0.as_mut_ptr(), psram_bufs.p80_tx0.len()) };
-    let p80_rx1: &'static mut [u8] =
-        unsafe { core::slice::from_raw_parts_mut(psram_bufs.p80_rx1.as_mut_ptr(), psram_bufs.p80_rx1.len()) };
-    let p80_tx1: &'static mut [u8] =
-        unsafe { core::slice::from_raw_parts_mut(psram_bufs.p80_tx1.as_mut_ptr(), psram_bufs.p80_tx1.len()) };
-    let p80_rx2: &'static mut [u8] =
-        unsafe { core::slice::from_raw_parts_mut(psram_bufs.p80_rx2.as_mut_ptr(), psram_bufs.p80_rx2.len()) };
-    let p80_tx2: &'static mut [u8] =
-        unsafe { core::slice::from_raw_parts_mut(psram_bufs.p80_tx2.as_mut_ptr(), psram_bufs.p80_tx2.len()) };
-    let p80_rx3: &'static mut [u8] =
-        unsafe { core::slice::from_raw_parts_mut(psram_bufs.p80_rx3.as_mut_ptr(), psram_bufs.p80_rx3.len()) };
-    let p80_tx3: &'static mut [u8] =
-        unsafe { core::slice::from_raw_parts_mut(psram_bufs.p80_tx3.as_mut_ptr(), psram_bufs.p80_tx3.len()) };
-    let tcp81_rx0: &'static mut [u8] =
-        unsafe { core::slice::from_raw_parts_mut(psram_bufs.tcp81_rx0.as_mut_ptr(), psram_bufs.tcp81_rx0.len()) };
-    let tcp81_tx0: &'static mut [u8] =
-        unsafe { core::slice::from_raw_parts_mut(psram_bufs.tcp81_tx0.as_mut_ptr(), psram_bufs.tcp81_tx0.len()) };
-    let tcp81_rx1: &'static mut [u8] =
-        unsafe { core::slice::from_raw_parts_mut(psram_bufs.tcp81_rx1.as_mut_ptr(), psram_bufs.tcp81_rx1.len()) };
-    let tcp81_tx1: &'static mut [u8] =
-        unsafe { core::slice::from_raw_parts_mut(psram_bufs.tcp81_tx1.as_mut_ptr(), psram_bufs.tcp81_tx1.len()) };
+    // JUSTIFICATION: Extend lifetime to static for smoltcp socket buffer.
+    // SAFETY: psram_bufs lives for the entire firmware execution lifetime.
+    let p80_rx0: &'static mut [u8] = unsafe {
+        core::slice::from_raw_parts_mut(psram_bufs.p80_rx0.as_mut_ptr(), psram_bufs.p80_rx0.len())
+    };
+    // JUSTIFICATION: Extend lifetime to static for smoltcp socket buffer.
+    // SAFETY: psram_bufs lives for the entire firmware execution lifetime.
+    let p80_tx0: &'static mut [u8] = unsafe {
+        core::slice::from_raw_parts_mut(psram_bufs.p80_tx0.as_mut_ptr(), psram_bufs.p80_tx0.len())
+    };
+    // JUSTIFICATION: Extend lifetime to static for smoltcp socket buffer.
+    // SAFETY: psram_bufs lives for the entire firmware execution lifetime.
+    let p80_rx1: &'static mut [u8] = unsafe {
+        core::slice::from_raw_parts_mut(psram_bufs.p80_rx1.as_mut_ptr(), psram_bufs.p80_rx1.len())
+    };
+    // JUSTIFICATION: Extend lifetime to static for smoltcp socket buffer.
+    // SAFETY: psram_bufs lives for the entire firmware execution lifetime.
+    let p80_tx1: &'static mut [u8] = unsafe {
+        core::slice::from_raw_parts_mut(psram_bufs.p80_tx1.as_mut_ptr(), psram_bufs.p80_tx1.len())
+    };
+    // JUSTIFICATION: Extend lifetime to static for smoltcp socket buffer.
+    // SAFETY: psram_bufs lives for the entire firmware execution lifetime.
+    let p80_rx2: &'static mut [u8] = unsafe {
+        core::slice::from_raw_parts_mut(psram_bufs.p80_rx2.as_mut_ptr(), psram_bufs.p80_rx2.len())
+    };
+    // JUSTIFICATION: Extend lifetime to static for smoltcp socket buffer.
+    // SAFETY: psram_bufs lives for the entire firmware execution lifetime.
+    let p80_tx2: &'static mut [u8] = unsafe {
+        core::slice::from_raw_parts_mut(psram_bufs.p80_tx2.as_mut_ptr(), psram_bufs.p80_tx2.len())
+    };
+    // JUSTIFICATION: Extend lifetime to static for smoltcp socket buffer.
+    // SAFETY: psram_bufs lives for the entire firmware execution lifetime.
+    let p80_rx3: &'static mut [u8] = unsafe {
+        core::slice::from_raw_parts_mut(psram_bufs.p80_rx3.as_mut_ptr(), psram_bufs.p80_rx3.len())
+    };
+    // JUSTIFICATION: Extend lifetime to static for smoltcp socket buffer.
+    // SAFETY: psram_bufs lives for the entire firmware execution lifetime.
+    let p80_tx3: &'static mut [u8] = unsafe {
+        core::slice::from_raw_parts_mut(psram_bufs.p80_tx3.as_mut_ptr(), psram_bufs.p80_tx3.len())
+    };
+    // JUSTIFICATION: Extend lifetime to static for smoltcp socket buffer.
+    // SAFETY: psram_bufs lives for the entire firmware execution lifetime.
+    let tcp81_rx0: &'static mut [u8] = unsafe {
+        core::slice::from_raw_parts_mut(
+            psram_bufs.tcp81_rx0.as_mut_ptr(),
+            psram_bufs.tcp81_rx0.len(),
+        )
+    };
+    // JUSTIFICATION: Extend lifetime to static for smoltcp socket buffer.
+    // SAFETY: psram_bufs lives for the entire firmware execution lifetime.
+    let tcp81_tx0: &'static mut [u8] = unsafe {
+        core::slice::from_raw_parts_mut(
+            psram_bufs.tcp81_tx0.as_mut_ptr(),
+            psram_bufs.tcp81_tx0.len(),
+        )
+    };
+    // JUSTIFICATION: Extend lifetime to static for smoltcp socket buffer.
+    // SAFETY: psram_bufs lives for the entire firmware execution lifetime.
+    let tcp81_rx1: &'static mut [u8] = unsafe {
+        core::slice::from_raw_parts_mut(
+            psram_bufs.tcp81_rx1.as_mut_ptr(),
+            psram_bufs.tcp81_rx1.len(),
+        )
+    };
+    // JUSTIFICATION: Extend lifetime to static for smoltcp socket buffer.
+    // SAFETY: psram_bufs lives for the entire firmware execution lifetime.
+    let tcp81_tx1: &'static mut [u8] = unsafe {
+        core::slice::from_raw_parts_mut(
+            psram_bufs.tcp81_tx1.as_mut_ptr(),
+            psram_bufs.tcp81_tx1.len(),
+        )
+    };
 
     let dhcp_handle = sockets.add(dhcpv4::Socket::new());
     let tcp80_handles: [smoltcp::iface::SocketHandle; PORT80_SOCKET_COUNT] = [
@@ -1965,6 +2123,8 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
         s80.set_keep_alive(Some(smoltcp::time::Duration::from_millis(2_000)));
         let _ = s80.listen(80);
     }
+    // JUSTIFICATION: Mutable borrow of static P80_STATES worker state array.
+    // SAFETY: Single-threaded network loop owns exclusive access to P80_STATES.
     let p80_states = unsafe { &mut *core::ptr::addr_of_mut!(P80_STATES) };
     let mut ota_accum_owner: Option<usize> = None;
 
@@ -1985,7 +2145,11 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
         s81.set_keep_alive(Some(smoltcp::time::Duration::from_millis(2_000)));
         let _ = s81.listen(81);
     }
+    // JUSTIFICATION: Mutable borrow of static P81_REQ_BUFS request array.
+    // SAFETY: Single-threaded network loop owns exclusive access to P81_REQ_BUFS.
     let p81_req_bufs = unsafe { &mut *core::ptr::addr_of_mut!(P81_REQ_BUFS) };
+    // JUSTIFICATION: Mutable borrow of static P81_STATES worker state array.
+    // SAFETY: Single-threaded network loop owns exclusive access to P81_STATES.
     let p81_states = unsafe { &mut *core::ptr::addr_of_mut!(P81_STATES) };
     let mut p81_stream_owner: Option<usize> = None;
     let mut p81_last_tx_progress_ms: i64 = 0;
@@ -2016,16 +2180,20 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                 && ota_accum_owner.is_none()
                 && !runtime.server.is_reboot_scheduled()
             {
-                println!(
-                    "[KLIPPER-CAM-RS] [WATCHDOG] Wi-Fi disconnected > 90s; deasserting PSRAM CS# and rebooting..."
-                );
+                println!(concat!(
+                    "[KLIPPER-CAM-RS] [WATCHDOG] Wi-Fi disconnected > 90s; ",
+                    "deasserting PSRAM CS# and rebooting..."
+                ));
                 let _ = hw_i2s_cam.stop();
                 quiesce_psram_and_software_reset();
             }
             if now_ms - last_reconnect_attempt_ms >= 5000 {
                 runtime.on_wifi_sta_disconnected();
                 println!(
-                    "[KLIPPER-CAM-RS] [WIFI] Attempting reconnect to SSID '{}' (disconnected {}ms)...",
+                    concat!(
+                        "[KLIPPER-CAM-RS] [WIFI] Attempting reconnect to SSID ",
+                        "'{}' (disconnected {}ms)..."
+                    ),
                     ssid,
                     now_ms - last_wifi_connected_ms
                 );
@@ -2040,18 +2208,15 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                     connect_ms = smol_now().total_millis();
                     last_wifi_connected_ms = connect_ms;
                     runtime.on_wifi_sta_connected();
+                    let _ = wifi_controller.set_power_saving(esp_radio::wifi::PowerSaveMode::None);
+                    let _ = wifi_controller.set_max_tx_power(WIFI_MAX_TX_POWER_QDBM);
                     handle_wifi_got_ip_rollback(
                         runtime,
                         &mut flash_adapter,
                         Ipv4Addr::new(172, 22, 1, 52),
                     );
                     if ip_configured {
-                        send_arp_announce(
-                            &mut net_device,
-                            mac,
-                            [172, 22, 1, 52],
-                            [172, 22, 1, 1],
-                        );
+                        send_arp_announce(&mut net_device, mac, [172, 22, 1, 52], [172, 22, 1, 1]);
                         last_arp_announce_ms = connect_ms;
                     }
                 }
@@ -2060,7 +2225,8 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
 
         let _ = iface.poll(now, &mut net_device, &mut sockets);
 
-        // Check DHCPv4 events or configure static IP (172.22.1.52/24, GW 172.22.1.1) unconditionally
+        // Check DHCPv4 events or configure static IP (172.22.1.52/24,
+        // GW 172.22.1.1) unconditionally
         {
             let dhcp_sock = sockets.get_mut::<dhcpv4::Socket>(dhcp_handle);
             match dhcp_sock.poll() {
@@ -2088,10 +2254,15 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                     runtime.on_wifi_sta_connected();
                     handle_wifi_got_ip_rollback(runtime, &mut flash_adapter, fw_ip);
                     ip_configured = true;
+                    let _ = wifi_controller.set_power_saving(esp_radio::wifi::PowerSaveMode::None);
+                    let _ = wifi_controller.set_max_tx_power(WIFI_MAX_TX_POWER_QDBM);
                     send_arp_announce(&mut net_device, mac, [172, 22, 1, 52], [172, 22, 1, 1]);
                     last_arp_announce_ms = now_ms;
                     println!(
-                        "[KLIPPER-CAM-RS] [NET] IP Configured: 172.22.1.52/{} + DHCP {}.{}.{}.{}/{} (Port 80 x4 & Port 81 x2 Ready)",
+                        concat!(
+                            "[KLIPPER-CAM-RS] [NET] IP Configured: 172.22.1.52/{} + ",
+                            "DHCP {}.{}.{}.{}/{} (Port 80 x4 & Port 81 x2 Ready)"
+                        ),
                         prefix_len, octets[0], octets[1], octets[2], octets[3], prefix_len
                     );
                 }
@@ -2130,13 +2301,16 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
             }
             handle_wifi_got_ip_rollback(runtime, &mut flash_adapter, fw_ip);
             ip_configured = true;
+            let _ = wifi_controller.set_power_saving(esp_radio::wifi::PowerSaveMode::None);
+            let _ = wifi_controller.set_max_tx_power(WIFI_MAX_TX_POWER_QDBM);
             if wifi_controller.is_connected() {
                 send_arp_announce(&mut net_device, mac, [172, 22, 1, 52], [172, 22, 1, 1]);
                 last_arp_announce_ms = now_ms;
             }
-            println!(
-                "[KLIPPER-CAM-RS] [NET] Static IP Configured: 172.22.1.52/24 GW 172.22.1.1 (Port 80 x4 & Port 81 x2 Ready)"
-            );
+            println!(concat!(
+                "[KLIPPER-CAM-RS] [NET] Static IP Configured: 172.22.1.52/24 ",
+                "GW 172.22.1.1 (Port 80 x4 & Port 81 x2 Ready)"
+            ));
         }
 
         let arp_interval_ms = if now_ms - connect_ms < 3000 {
@@ -2171,20 +2345,16 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
         {
             post_snapshot_refresh_at_ms = None;
             last_capture_ms = now_ms;
-            if capture_live_hd_jpeg_with_diag(
-                hw_i2s_cam,
-                ping_pong,
-                &mut || {
-                    poll_net_burst(&mut iface, &mut net_device, &mut sockets);
-                },
-            )
+            if capture_live_hd_jpeg_with_diag(hw_i2s_cam, ping_pong, &mut || {
+                poll_net_burst(&mut iface, &mut net_device, &mut sockets);
+            })
             .is_ok()
             {
                 let fresh_slice = active_ping_pong_static_slice(ping_pong);
-                runtime.server.camera.set_frame(
-                    fresh_slice,
-                    runtime.server.control_state.framesize,
-                );
+                runtime
+                    .server
+                    .camera
+                    .set_frame(fresh_slice, runtime.server.control_state.framesize);
                 last_capture_ms = smol_now().total_millis();
             }
         }
@@ -2216,11 +2386,13 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
             }
 
             if st.closing {
-                let finished_cleanly = matches!(
-                    sock80.state(),
-                    TcpState::TimeWait | TcpState::Closed
-                );
+                let finished_cleanly =
+                    matches!(sock80.state(), TcpState::TimeWait | TcpState::Closed);
                 if !sock80.is_active() || finished_cleanly || now_ms >= st.close_deadline_ms {
+                    let was_snapshot = st.is_snapshot;
+                    if was_snapshot && post_snapshot_refresh_at_ms.is_none() {
+                        post_snapshot_refresh_at_ms = Some(now_ms.saturating_add(50));
+                    }
                     sock80.abort();
                     if ota_accum_owner == Some(idx) {
                         ota_accum_owner = None;
@@ -2244,6 +2416,10 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                     )
                     || (st.close_deadline_ms > 0 && now_ms >= st.close_deadline_ms);
                 if peer_disconnected {
+                    let was_snapshot = st.is_snapshot;
+                    if was_snapshot && post_snapshot_refresh_at_ms.is_none() {
+                        post_snapshot_refresh_at_ms = Some(now_ms.saturating_add(50));
+                    }
                     sock80.abort();
                     if ota_accum_owner == Some(idx) {
                         ota_accum_owner = None;
@@ -2287,7 +2463,8 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                             }
                         }
 
-                        // SEC-102 & LOGIC-101: Buffer capacity check & auth-first promotion into shared http80_ota_accum
+                        // SEC-102 & LOGIC-101: Buffer capacity check &
+                        // auth-first promotion into shared http80_ota_accum
                         if let Ok(parsed) = parse_http_request(&p80_hdr_bufs[idx][..st.req_len]) {
                             let needed_body = match parsed.content_length {
                                 Some(cl) if cl > 0 => cl as usize,
@@ -2423,8 +2600,7 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                                 };
                                 if parsed.body.len() >= needed_body || peer_closed_rx {
                                     req_complete = true;
-                                    if parsed.method == HttpMethod::Post
-                                        && parsed.path == "/update"
+                                    if parsed.method == HttpMethod::Post && parsed.path == "/update"
                                     {
                                         is_ota_post = true;
                                     }
@@ -2439,8 +2615,7 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                                         is_snapshot_req = true;
                                     }
                                 }
-                            } else if (!st.using_ota_accum
-                                && st.req_len >= p80_hdr_bufs[idx].len())
+                            } else if (!st.using_ota_accum && st.req_len >= p80_hdr_bufs[idx].len())
                                 || peer_closed_rx
                             {
                                 req_complete = true;
@@ -2451,7 +2626,9 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                             if is_ota_post {
                                 let _ = hw_i2s_cam.stop();
                                 let booted_slot = runtime.server.ota_manager.active_slot();
-                                if let Ok(loaded) = OtaDataManager::load_from_flash(&mut flash_adapter) {
+                                if let Ok(loaded) =
+                                    OtaDataManager::load_from_flash(&mut flash_adapter)
+                                {
                                     if loaded.active_slot() == booted_slot {
                                         runtime.server.ota_manager = loaded;
                                     }
@@ -2536,7 +2713,8 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
             }
         }
 
-        // Apply any pending live camera control updates from GET /control?var=...&val=...
+        // Apply any pending live camera control updates from
+        // GET /control?var=...&val=...
         // only after all active Port 80 HTTP responses have finished flushing.
         let p80_tx_active = p80_states.iter().any(|s| s.tx_len > 0 && !s.closing);
         if p80_tx_active {
@@ -2585,7 +2763,8 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
             post_snapshot_refresh_at_ms = Some(now_ms + 150);
         }
 
-        // Reboot if OTA firmware update completed and all Port 80 TX buffers have flushed
+        // Reboot if OTA firmware update completed and all Port 80
+        // TX buffers have flushed
         if runtime.server.is_reboot_scheduled() {
             let all_flushed = tcp80_handles
                 .iter()
@@ -2593,9 +2772,10 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
             if all_flushed {
                 let _ = iface.poll(smol_now(), &mut net_device, &mut sockets);
                 delay.delay_millis(250);
-                println!(
-                    "[KLIPPER-CAM-RS] [OTA] Flash complete, deasserting PSRAM CS# and rebooting into updated slot..."
-                );
+                println!(concat!(
+                    "[KLIPPER-CAM-RS] [OTA] Flash complete, deasserting ",
+                    "PSRAM CS# and rebooting into updated slot..."
+                ));
                 let _ = hw_i2s_cam.stop();
                 quiesce_psram_and_software_reset();
             }
@@ -2646,6 +2826,8 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                 let all_enqueued = {
                     let sock81 = sockets.get_mut::<TcpSocket>(tcp81_handles[idx]);
                     if sock81.can_recv() {
+                        // JUSTIFICATION: Mutable borrow of static drain buffer.
+                        // SAFETY: Single-threaded loop has exclusive access.
                         let drain = unsafe { &mut *core::ptr::addr_of_mut!(P81_DRAIN_BUF) };
                         let _ = sock81.recv_slice(drain);
                     }
@@ -2670,8 +2852,9 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                     poll_net_burst(&mut iface, &mut net_device, &mut sockets);
                 }
 
-                // Pipeline capture of Frame N+1 as soon as the final TCP batch of Frame N has been
-                // enqueued into smoltcp (while the Wi-Fi radio transmits that final <= 14.2 KB batch
+                // Pipeline capture of Frame N+1 as soon as the final TCP
+                // batch of Frame N has been enqueued into smoltcp (while the
+                // Wi-Fi radio transmits that final <= 14.2 KB batch
                 // in the background and `poll_net_burst` services ACKs during VSYNC alignment).
                 if all_enqueued && !p81_next_frame_captured {
                     let p80_actively_sending_now = p80_states.iter().any(|s| {
@@ -2685,20 +2868,16 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                         && !runtime.server.is_reboot_scheduled()
                     {
                         last_capture_ms = now_ms;
-                        if capture_live_hd_jpeg_with_diag(
-                            hw_i2s_cam,
-                            ping_pong,
-                            &mut || {
-                                poll_net_burst(&mut iface, &mut net_device, &mut sockets);
-                            },
-                        )
+                        if capture_live_hd_jpeg_with_diag(hw_i2s_cam, ping_pong, &mut || {
+                            poll_net_burst(&mut iface, &mut net_device, &mut sockets);
+                        })
                         .is_ok()
                         {
                             let fresh_slice = active_ping_pong_static_slice(ping_pong);
-                            runtime.server.camera.set_frame(
-                                fresh_slice,
-                                runtime.server.control_state.framesize,
-                            );
+                            runtime
+                                .server
+                                .camera
+                                .set_frame(fresh_slice, runtime.server.control_state.framesize);
                             let after_ms = smol_now().total_millis();
                             last_capture_ms = after_ms;
                             p81_last_tx_progress_ms = after_ms;
@@ -2756,10 +2935,8 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                         }
 
                         if st.closing {
-                            let finished_cleanly = matches!(
-                                sock81.state(),
-                                TcpState::TimeWait | TcpState::Closed
-                            );
+                            let finished_cleanly =
+                                matches!(sock81.state(), TcpState::TimeWait | TcpState::Closed);
                             if !sock81.is_active()
                                 || finished_cleanly
                                 || now_ms >= st.close_deadline_ms
@@ -2788,8 +2965,12 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                                     if is_stream_get {
                                         preempt_and_start = true;
                                     } else {
-                                        let err_buf =
-                                            unsafe { &mut *core::ptr::addr_of_mut!(P81_ERR_BUF) };
+                                        let err_buf: &mut [u8];
+                                        // JUSTIFICATION: Mutable borrow of static error buffer.
+                                        // SAFETY: Single-threaded loop has exclusive access.
+                                        unsafe {
+                                            err_buf = &mut *core::ptr::addr_of_mut!(P81_ERR_BUF);
+                                        }
                                         if let Ok(resp) = runtime.server.handle_raw_request(
                                             ServerPort::Stream,
                                             &p81_req_bufs[idx][..st.req_len],
@@ -2889,7 +3070,10 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
         if now_ms - last_heartbeat_ms >= 30_000 {
             last_heartbeat_ms = now_ms;
             println!(
-                "[KLIPPER-CAM-RS] Heartbeat: uptime={}ms connected={} stream_active={} frame_seq={} last_jpeg={}B",
+                concat!(
+                    "[KLIPPER-CAM-RS] Heartbeat: uptime={}ms connected={} ",
+                    "stream_active={} frame_seq={} last_jpeg={}B"
+                ),
                 now_ms,
                 wifi_controller.is_connected(),
                 p81_stream_owner.is_some(),
@@ -2906,15 +3090,11 @@ fn configure_xclk(
     ledc_periph: esp_hal::peripherals::LEDC<'static>,
     gpio21: esp_hal::peripherals::GPIO21<'static>,
 ) -> bool {
-    use esp_hal::{
-        gpio::DriveMode,
-        ledc::{
-            channel::{self, ChannelIFace},
-            timer::{self, TimerIFace},
-            LSGlobalClkSource, Ledc, LowSpeed,
-        },
-        time::Rate,
-    };
+    use esp_hal::gpio::DriveMode;
+    use esp_hal::ledc::channel::{self, ChannelIFace};
+    use esp_hal::ledc::timer::{self, TimerIFace};
+    use esp_hal::ledc::{LSGlobalClkSource, Ledc, LowSpeed};
+    use esp_hal::time::Rate;
     static LEDC_CELL: static_cell::StaticCell<Ledc<'static>> = static_cell::StaticCell::new();
     static LSTIMER0_CELL: static_cell::StaticCell<timer::Timer<'static, LowSpeed>> =
         static_cell::StaticCell::new();
@@ -2952,13 +3132,16 @@ fn configure_i2c0_and_ov2640(
 ) -> (
     bool,
     Option<Ov2640>,
-    Option<klipper_cam_fw::EmbeddedHalSccb<esp_hal::i2c::master::I2c<'static, esp_hal::Blocking>, esp_hal::delay::Delay>>,
+    Option<
+        klipper_cam_fw::EmbeddedHalSccb<
+            esp_hal::i2c::master::I2c<'static, esp_hal::Blocking>,
+            esp_hal::delay::Delay,
+        >,
+    >,
 ) {
-    use esp_hal::{
-        delay::Delay,
-        i2c::master::{Config as I2cConfig, I2c},
-        time::Rate,
-    };
+    use esp_hal::delay::Delay;
+    use esp_hal::i2c::master::{Config as I2cConfig, I2c};
+    use esp_hal::time::Rate;
     use esp_println::println;
     use klipper_cam_fw::EmbeddedHalSccb;
 
@@ -3015,21 +3198,23 @@ fn configure_camera_inputs(
 #[cfg(target_arch = "xtensa")]
 #[esp_hal::main]
 fn main() -> ! {
-    use esp_hal::{
-        clock::CpuClock,
-        delay::Delay,
-        psram::{Psram, PsramCacheSpeed, PsramConfig, PsramSize, PsramVaddrMode},
-    };
+    use esp_hal::clock::CpuClock;
+    use esp_hal::delay::Delay;
+    use esp_hal::psram::{Psram, PsramCacheSpeed, PsramConfig, PsramSize, PsramVaddrMode};
     use esp_println::println;
 
     // 0. Exact ESP-IDF v5.5.4 + klipper_cam.c Startup Sequence:
-    //    1) Read reset_reason, hold GPIO 16 (PSRAM CS#) HIGH from IRAM, initialize clocks (240 MHz),
-    //       and immediately re-arm the 15s hardware RTC_WDT.
-    //    2) Power down/isolate the Wi-Fi/RF domain during early peripheral init (matching esp_rtc_init()).
-    //    3) Never drive GPIO 4 as an output on ESP32-WROVER-DEV (`GPIO 4` is `CAM_PIN_D0` / `OV2640` `Y2`).
-    //    4) Record boot breadcrumb in RTC_CNTL_STORE6/7_REG and detect booted OTA slot from MMU
-    //       with ZERO boot-time NOR flash operations.
+    //    1) Read reset_reason, hold GPIO 16 (PSRAM CS#) HIGH from IRAM,
+    //       initialize clocks (240 MHz), and immediately re-arm the 15s RTC_WDT.
+    //    2) Power down/isolate the Wi-Fi/RF domain during early peripheral init
+    //       (matching esp_rtc_init()).
+    //    3) Never drive GPIO 4 as an output on ESP32-WROVER-DEV (`GPIO 4` is
+    //       `CAM_PIN_D0` / `OV2640` `Y2`).
+    //    4) Record boot breadcrumb in RTC_CNTL_STORE6/7_REG and detect booted
+    //       OTA slot from MMU with ZERO boot-time NOR flash operations.
     const RTC_CNTL_RESET_STATE_REG: *const u32 = 0x3FF4_8034 as *const u32;
+    // JUSTIFICATION: Read RTC controller reset state register during cold boot.
+    // SAFETY: RTC_CNTL_RESET_STATE_REG is a valid MMIO register address.
     let reset_reason = unsafe { core::ptr::read_volatile(RTC_CNTL_RESET_STATE_REG) };
     hold_psram_cs_high_safe();
 
@@ -3044,16 +3229,20 @@ fn main() -> ! {
     let flash_adapter = EspFlashAdapter(esp_storage::FlashStorage::new(peripherals.FLASH));
     feed_rtc_wdt();
 
-    // Initialize internal DRAM heap for esp-rtos and esp-radio Wi-Fi STA (~112 KB strictly internal)
+    // Initialize internal DRAM heap for esp-rtos and esp-radio Wi-Fi STA
+    // (~112 KB strictly internal)
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 64 * 1024);
     esp_alloc::heap_allocator!(size: 48 * 1024);
 
-    // Initialize 4 MB external PSRAM at 40 MHz Flash / 40 MHz PSRAM (matching a364a6a^:sdkconfig.defaults
-    // CONFIG_ESPTOOLPY_FLASHFREQ_40M=y + CONFIG_SPIRAM_SPEED_40M=y) and send 0xF5 (QPI exit) + 0x35 (1-bit SPI
-    // QPI enter) via hardware SPI1_CS1 (ensure_psram_qpi_mode_spi1) without ever bit-banging SD0..SD3!
-    // On cold power-on reset (`(reset_reason & 0x0F) == 1`), wait 50 ms while GPIO 16 (PSRAM CS#) is held HIGH
-    // so VDD_SDIO and the PSRAM chip's internal POR stabilize cleanly at 240 MHz before Psram::new().
-    if (reset_reason & 0x0F) == 1 {
+    // Initialize 4 MB external PSRAM at 40 MHz Flash / 40 MHz PSRAM
+    // (matching a364a6a^:sdkconfig.defaults CONFIG_ESPTOOLPY_FLASHFREQ_40M=y
+    // + CONFIG_SPIRAM_SPEED_40M=y) and send 0xF5 (QPI exit) + 0x35 (1-bit SPI
+    // QPI enter) via hardware SPI1_CS1 (ensure_psram_qpi_mode_spi1) without
+    // ever bit-banging SD0..SD3!
+    // On cold power-on reset (`(reset_reason & 0x3F) == 1`), wait 50 ms while
+    // GPIO 16 (PSRAM CS#) is held HIGH so VDD_SDIO and the PSRAM chip's internal
+    // POR stabilize cleanly at 240 MHz before Psram::new().
+    if (reset_reason & 0x3F) == 1 {
         delay.delay_millis(50);
         feed_rtc_wdt();
     }
@@ -3070,7 +3259,8 @@ fn main() -> ! {
 
     let (psram_ptr, psram_len) = psram.raw_parts();
 
-    // 1. Configure physical 20 MHz XCLK on GPIO 21 via LEDC LowSpeed Timer0 / Channel0
+    // 1. Configure physical 20 MHz XCLK on GPIO 21 via LEDC LowSpeed
+    //    Timer0 / Channel0
     let xclk_hw_ok = configure_xclk(peripherals.LEDC, peripherals.GPIO21);
     println!(
         "[KLIPPER-CAM-RS] [HW-1] LEDC 20 MHz XCLK on GPIO 21: {}",
@@ -3079,12 +3269,14 @@ fn main() -> ! {
     delay.delay_millis(25);
     feed_rtc_wdt();
 
-    // 2. Configure physical I2C0 on GPIO 26 (SDA) / GPIO 27 (SCL) at 200 kHz and program OV2640
+    // 2. Configure physical I2C0 on GPIO 26 (SDA) / GPIO 27 (SCL) at 200 kHz
+    //    and program OV2640
     let (ov2640_hw_ok, live_ov2640, kept_sccb) =
         configure_i2c0_and_ov2640(peripherals.I2C0, peripherals.GPIO26, peripherals.GPIO27);
     feed_rtc_wdt();
 
-    // 3. Carve PSRAM buffers, run 7-crate HIL verification suite, and configure I2S0 camera
+    // 3. Carve PSRAM buffers, run 7-crate HIL verification suite, and
+    //    configure I2S0 camera
     init_psram_and_run_hil(psram_ptr, psram_len, xclk_hw_ok);
 
     // 4. Configure physical camera input pads via esp-hal AFTER `set_pin`
@@ -3106,7 +3298,8 @@ fn main() -> ! {
     // 5. Capture initial 1280x720 JPEG frame and initialize FirmwareRuntime
     let ov2640_dma_ok = capture_boot_dma_and_init_runtime(ov2640_hw_ok, bc_prev, ota_manager);
 
-    // 6. Release Wi-Fi/RF force power-down, start esp-rtos scheduler, and initialize esp-radio Wi-Fi Station
+    // 6. Release Wi-Fi/RF force power-down, start esp-rtos scheduler,
+    //    and initialize esp-radio Wi-Fi Station
     esp_rtc_wifi_force_pd(false);
     let timg0 = esp_hal::timer::timg::TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
@@ -3114,8 +3307,8 @@ fn main() -> ! {
 
     let (sta_cfg, ctrl_cfg, ssid) = build_wifi_station_configs();
     feed_rtc_wdt();
-    let wifi_controller =
-        esp_radio::wifi::WifiController::new(peripherals.WIFI, ctrl_cfg).expect("WifiController::new");
+    let wifi_controller = esp_radio::wifi::WifiController::new(peripherals.WIFI, ctrl_cfg)
+        .expect("WifiController::new");
     feed_rtc_wdt();
 
     run_post_wifi_server_loop(

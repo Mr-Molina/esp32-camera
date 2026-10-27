@@ -1,8 +1,12 @@
-//! ESP32 I2S0 camera parallel interface low-level driver (`target/esp32/ll_cam.c`).
+//! ESP32 I2S0 camera parallel interface low-level driver
+//! (`target/esp32/ll_cam.c`).
 //!
-//! Provides MMIO register constants, `IO_MUX` pad address lookup, GPIO matrix signal indices,
-//! and the [`Esp32I2sCamera`] controller implementing `config`, `set_pin`, `start`, `stop`,
-//! `deinit`, `vsync_intr_enable`, `set_sample_mode`, and `capture_jpeg_frame_polled`.
+//! Provides MMIO register constants, `IO_MUX` pad address lookup, GPIO matrix
+//! signal indices,
+//! and the [`Esp32I2sCamera`] controller implementing `config`, `set_pin`,
+//! `start`, `stop`,
+//! `deinit`, `vsync_intr_enable`, `set_sample_mode`, and
+//! `capture_jpeg_frame_polled`.
 
 use core::ptr;
 use esp32_cam_types::{CameraError, PixelFormat};
@@ -28,43 +32,55 @@ pub const DPORT_I2S0_RST: u32 = 1 << 4;
 /// Physical base address of the `GPIO` peripheral on ESP32 (`0x3FF4_4000`).
 pub const GPIO_BASE_ADDR: usize = 0x3FF4_4000;
 
-/// Physical address of `GPIO_ENABLE_W1TC_REG` (`0x3FF4_4028`, clears output enable for GPIO `0..=31`).
+/// Physical address of `GPIO_ENABLE_W1TC_REG` (`0x3FF4_4028`, clears output
+/// enable for GPIO `0..=31`).
 pub const GPIO_ENABLE_W1TC_REG: usize = 0x3FF4_4028;
 
-/// Physical address of `GPIO_ENABLE1_W1TC_REG` (`0x3FF4_4034`, clears output enable for GPIO `32..=39`).
+/// Physical address of `GPIO_ENABLE1_W1TC_REG` (`0x3FF4_4034`, clears output
+/// enable for GPIO `32..=39`).
 pub const GPIO_ENABLE1_W1TC_REG: usize = 0x3FF4_4034;
 
-/// Physical address of `GPIO_IN_REG` (`0x3FF4_403C`, reads input level for GPIO `0..=31`).
+/// Physical address of `GPIO_IN_REG` (`0x3FF4_403C`, reads input level for GPIO
+/// `0..=31`).
 pub const GPIO_IN_REG: usize = 0x3FF4_403C;
 
-/// Physical address of `GPIO_IN1_REG` (`0x3FF4_4040`, reads input level for GPIO `32..=39`).
+/// Physical address of `GPIO_IN1_REG` (`0x3FF4_4040`, reads input level for
+/// GPIO `32..=39`).
 pub const GPIO_IN1_REG: usize = 0x3FF4_4040;
 
-/// Physical address of `GPIO_PIN0_REG` (`0x3FF4_4088`, stride `4` bytes per GPIO `0..=39`).
+/// Physical address of `GPIO_PIN0_REG` (`0x3FF4_4088`, stride `4` bytes per
+/// GPIO `0..=39`).
 pub const GPIO_PIN0_REG: usize = 0x3FF4_4088;
 
-/// Physical address of `GPIO_FUNC0_IN_SEL_CFG_REG` (`0x3FF4_4130`, stride `4` bytes per signal index `0..=255`).
+/// Physical address of `GPIO_FUNC0_IN_SEL_CFG_REG` (`0x3FF4_4130`, stride `4`
+/// bytes per signal index `0..=255`).
 pub const GPIO_FUNC0_IN_SEL_CFG_REG: usize = 0x3FF4_4130;
 
-/// Physical address of `GPIO_FUNC0_OUT_SEL_CFG_REG` (`0x3FF4_4530`, stride `4` bytes per GPIO `0..=33`).
+/// Physical address of `GPIO_FUNC0_OUT_SEL_CFG_REG` (`0x3FF4_4530`, stride `4`
+/// bytes per GPIO `0..=33`).
 pub const GPIO_FUNC0_OUT_SEL_CFG_REG: usize = 0x3FF4_4530;
 
 /// Physical base address of the `RTC_IO` peripheral on ESP32 (`0x3FF4_8400`).
 pub const RTC_IO_BASE_ADDR: usize = 0x3FF4_8400;
 
-/// Physical address of `RTC_IO_SENSOR_PADS_REG` (`0x3FF4_847C`, controls digital/RTC mux for GPIO `36..=39`).
+/// Physical address of `RTC_IO_SENSOR_PADS_REG` (`0x3FF4_847C`, controls
+/// digital/RTC mux for GPIO `36..=39`).
 pub const RTC_IO_SENSOR_PADS_REG: usize = 0x3FF4_847C;
 
-/// Physical address of `RTC_IO_ADC_PAD_REG` (`0x3FF4_8480`, controls digital/RTC mux for GPIO `34..=35`).
+/// Physical address of `RTC_IO_ADC_PAD_REG` (`0x3FF4_8480`, controls
+/// digital/RTC mux for GPIO `34..=35`).
 pub const RTC_IO_ADC_PAD_REG: usize = 0x3FF4_8480;
 
-/// Physical address of `RTC_IO_PAD_DAC1_REG` (`0x3FF4_8484`, controls digital/RTC mux and pull-up for GPIO `25`).
+/// Physical address of `RTC_IO_PAD_DAC1_REG` (`0x3FF4_8484`, controls
+/// digital/RTC mux and pull-up for GPIO `25`).
 pub const RTC_IO_PAD_DAC1_REG: usize = 0x3FF4_8484;
 
-/// Physical address of `RTC_IO_PAD_DAC2_REG` (`0x3FF4_8488`, controls digital/RTC mux for GPIO `26`).
+/// Physical address of `RTC_IO_PAD_DAC2_REG` (`0x3FF4_8488`, controls
+/// digital/RTC mux for GPIO `26`).
 pub const RTC_IO_PAD_DAC2_REG: usize = 0x3FF4_8488;
 
-/// Physical address of `RTC_IO_TOUCH_PAD0_REG` (`0x3FF4_8494`, controls digital/RTC mux for GPIO `4`).
+/// Physical address of `RTC_IO_TOUCH_PAD0_REG` (`0x3FF4_8494`, controls
+/// digital/RTC mux for GPIO `4`).
 pub const RTC_IO_TOUCH_PAD0_REG: usize = 0x3FF4_8494;
 
 /// Physical base address of the `IO_MUX` peripheral on ESP32 (`0x3FF4_9000`).
@@ -73,10 +89,12 @@ pub const IO_MUX_BASE_ADDR: usize = 0x3FF4_9000;
 /// Physical base address of the `I2S0` peripheral on ESP32 (`0x3FF4_F000`).
 pub const I2S0_BASE_ADDR: usize = 0x3FF4_F000;
 
-/// Maximum valid GPIO number on ESP32 (`GPIO_NUM_MAX = 40`, valid indices `0..=39`).
+/// Maximum valid GPIO number on ESP32 (`GPIO_NUM_MAX = 40`, valid indices
+/// `0..=39`).
 pub const ESP32_GPIO_NUM_MAX: u8 = 40;
 
-/// GPIO matrix input signal index for `I2S0I_DATA_IN0_IDX` (`140`, `D0..D7` = `140..=147`).
+/// GPIO matrix input signal index for `I2S0I_DATA_IN0_IDX` (`140`, `D0..D7` =
+/// `140..=147`).
 pub const I2S0I_DATA_IN0_IDX: u8 = 140;
 /// GPIO matrix input signal index for `I2S0I_DATA_IN1_IDX` (`141`).
 pub const I2S0I_DATA_IN1_IDX: u8 = 141;
@@ -93,7 +111,8 @@ pub const I2S0I_DATA_IN6_IDX: u8 = 146;
 /// GPIO matrix input signal index for `I2S0I_DATA_IN7_IDX` (`147`).
 pub const I2S0I_DATA_IN7_IDX: u8 = 147;
 
-/// GPIO matrix input signal index for `I2S0I_WS_IN_IDX` (`PCLK`, `28`, ESP32 TRM Table 4-2).
+/// GPIO matrix input signal index for `I2S0I_WS_IN_IDX` (`PCLK`, `28`, ESP32
+/// TRM Table 4-2).
 pub const I2S0I_WS_IN_IDX: u8 = 28;
 
 /// GPIO matrix input signal index for `I2S0I_H_SYNC_IDX` (`HREF`, `190`).
@@ -105,7 +124,8 @@ pub const I2S0I_V_SYNC_IDX: u8 = 191;
 /// GPIO matrix input signal index for `I2S0I_H_ENABLE_IDX` (`192`).
 pub const I2S0I_H_ENABLE_IDX: u8 = 192;
 
-/// Constant logic-high (`1`) virtual GPIO matrix source (`0x38` in `ll_cam.c:452`).
+/// Constant logic-high (`1`) virtual GPIO matrix source (`0x38` in
+/// `ll_cam.c:452`).
 pub const GPIO_MATRIX_CONST_ONE_INPUT: u8 = 0x38;
 
 /// `I2S0.conf` register offset (`0x08`) and bit definitions.
@@ -115,14 +135,20 @@ pub const I2S_RX_FIFO_RESET_BIT: u32 = 1 << 3;
 pub const I2S_RX_START_BIT: u32 = 1 << 5;
 pub const I2S_RX_SLAVE_MOD_BIT: u32 = 1 << 7;
 
-/// `I2S0.int_raw` (`0x0C`), `I2S0.int_st` (`0x10`), `I2S0.int_ena` (`0x14`), and `I2S0.int_clr` (`0x18`).
+/// `I2S0.int_raw` (`0x0C`), `I2S0.int_st` (`0x10`), `I2S0.int_ena` (`0x14`),
+/// and `I2S0.int_clr` (`0x18`).
 pub const I2S_INT_RAW_REG_OFFSET: usize = 0x0C;
 pub const I2S_INT_ST_REG_OFFSET: usize = 0x10;
 pub const I2S_INT_ENA_REG_OFFSET: usize = 0x14;
 pub const I2S_INT_CLR_REG_OFFSET: usize = 0x18;
 pub const I2S_IN_SUC_EOF_INT_BIT: u32 = 1 << 9;
+/// Raw interrupt flag for RX descriptor error (`BIT(13)` in `I2S_INT_RAW_REG`).
+pub const I2S_IN_DSCR_ERR_INT_RAW: u32 = 1 << 13;
+/// Raw interrupt flag for RX descriptor empty (`BIT(15)` in `I2S_INT_RAW_REG`).
+pub const I2S_IN_DSCR_EMPTY_INT_RAW: u32 = 1 << 15;
 
-/// `I2S0.timing` (`0x1C`), `I2S0.fifo_conf` (`0x20`), `I2S0.rx_eof_num` (`0x24`), and `I2S0.conf_chan` (`0x2C`).
+/// `I2S0.timing` (`0x1C`), `I2S0.fifo_conf` (`0x20`), `I2S0.rx_eof_num`
+/// (`0x24`), and `I2S0.conf_chan` (`0x2C`).
 pub const I2S_TIMING_REG_OFFSET: usize = 0x1C;
 pub const I2S_FIFO_CONF_REG_OFFSET: usize = 0x20;
 pub const I2S_RXEOF_NUM_REG_OFFSET: usize = 0x24;
@@ -141,7 +167,8 @@ pub const I2S_LC_IN_RST_BIT: u32 = 1 << 0;
 pub const I2S_LC_AHBM_FIFO_RST_BIT: u32 = 1 << 2;
 pub const I2S_LC_AHBM_RST_BIT: u32 = 1 << 3;
 
-/// `I2S0.pd_conf` (`0xA4`), `I2S0.conf2` (`0xA8`), `I2S0.clkm_conf` (`0xAC`), and `I2S0.sample_rate_conf` (`0xB0`) offsets.
+/// `I2S0.pd_conf` (`0xA4`), `I2S0.conf2` (`0xA8`), `I2S0.clkm_conf` (`0xAC`),
+/// and `I2S0.sample_rate_conf` (`0xB0`) offsets.
 pub const I2S_PD_CONF_REG_OFFSET: usize = 0xA4;
 pub const I2S_PD_FIFO_MEM_FORCE_PU: u32 = 0x0A;
 pub const I2S_CONF2_REG_OFFSET: usize = 0xA8;
@@ -153,16 +180,20 @@ pub const I2S_LCD_EN_BIT: u32 = 1 << 5;
 /// Standard JPEG DMA descriptor node buffer size (`2048` bytes).
 pub const JPEG_DMA_NODE_SIZE: usize = 2048;
 
-/// Standard JPEG DMA half-buffer size (`4096` bytes = `2` nodes of `2048` bytes).
+/// Standard JPEG DMA half-buffer size (`4096` bytes = `2` nodes of `2048`
+/// bytes).
 pub const JPEG_DMA_HALF_BUFFER_SIZE: usize = 4096;
 
-/// Unpacked JPEG byte count per `4096`-byte DMA half-buffer (`1024` bytes, 1 byte per 4-byte `DmaElement`).
+/// Unpacked JPEG byte count per `4096`-byte DMA half-buffer (`1024` bytes, 1
+/// byte per 4-byte `DmaElement`).
 pub const JPEG_UNPACKED_HALF_BUFFER_SIZE: usize = 1024;
 
-/// Maps an ESP32 GPIO number (`0..=39`) to its physical `IO_MUX` pad register address
+/// Maps an ESP32 GPIO number (`0..=39`) to its physical `IO_MUX` pad register
+/// address
 /// (`0x3FF4_9004..=0x3FF4_908C`, ESP32 Technical Reference Manual Table 4-3).
 ///
-/// Returns `None` for unbonded/reserved GPIO indices (`20`, `24`, `28..=31`, or `>= 40`).
+/// Returns `None` for unbonded/reserved GPIO indices (`20`, `24`, `28..=31`, or
+/// `>= 40`).
 #[inline]
 pub const fn io_mux_reg_addr(gpio_num: u8) -> Option<usize> {
     let offset = match gpio_num {
@@ -205,7 +236,8 @@ pub const fn io_mux_reg_addr(gpio_num: u8) -> Option<usize> {
     Some(IO_MUX_BASE_ADDR + offset)
 }
 
-/// Pin routing configuration passed to `set_pin` (`ll_cam_set_pin` in `target/esp32/ll_cam.c:387-454`).
+/// Pin routing configuration passed to `set_pin` (`ll_cam_set_pin` in
+/// `target/esp32/ll_cam.c:387-454`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CamPinConfig {
     pub pin_vsync: i8,
@@ -216,7 +248,8 @@ pub struct CamPinConfig {
     pub vsync_invert: bool,
 }
 
-/// Recorded GPIO matrix input routing entry (`gpio_matrix_in(pin, signal_idx, inv)`).
+/// Recorded GPIO matrix input routing entry (`gpio_matrix_in(pin, signal_idx,
+/// inv)`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GpioMatrixBinding {
     pub gpio_num: u8,
@@ -250,13 +283,19 @@ pub struct I2s0RegisterBlock {
 #[inline]
 fn volatile_write_u32(reg: &mut u32, val: u32) {
     let ptr = ptr::from_mut(reg);
+    // JUSTIFICATION: Direct register write requires unsafe raw pointer dereference.
     // SAFETY:
-    // 1. Alignment & Non-null: `ptr` is obtained via `ptr::from_mut` from a valid `&mut u32` reference,
+    // 1. Alignment & Non-null: `ptr` is obtained via `ptr::from_mut` from a valid
+    //    `&mut u32` reference,
     //    guaranteeing non-null and 4-byte alignment.
-    // 2. Memory layout: `u32` is a 4-byte primitive register word inside `#[repr(C, align(4))]`.
-    // 3. Provenance & Lifetime: `ptr` has valid mutable provenance for the duration of this call.
-    // 4. Exclusive aliasing: `reg: &mut u32` holds unique access to the target word.
-    // 5. Volatile semantics: `write_volatile` ensures the compiler does not elide or reorder register updates.
+    // 2. Memory layout: `u32` is a 4-byte primitive register word inside `#[repr(C,
+    //    align(4))]`.
+    // 3. Provenance & Lifetime: `ptr` has valid mutable provenance for the duration
+    //    of this call.
+    // 4. Exclusive aliasing: `reg: &mut u32` holds unique access to the target
+    //    word.
+    // 5. Volatile semantics: `write_volatile` ensures the compiler does not elide
+    //    or reorder register updates.
     // 6. Panic safety: `write_volatile` on a stack/struct `u32` cannot unwind.
     unsafe {
         ptr::write_volatile(ptr, val);
@@ -266,11 +305,15 @@ fn volatile_write_u32(reg: &mut u32, val: u32) {
 #[inline]
 fn volatile_read_u32(reg: &u32) -> u32 {
     let ptr = ptr::from_ref(reg);
+    // JUSTIFICATION: Direct register read requires unsafe raw pointer dereference.
     // SAFETY:
-    // 1. Alignment & Non-null: `ptr` is obtained via `ptr::from_ref` from a valid `&u32` reference,
+    // 1. Alignment & Non-null: `ptr` is obtained via `ptr::from_ref` from a valid
+    //    `&u32` reference,
     //    guaranteeing non-null and 4-byte alignment.
-    // 2. Memory layout: `u32` is a 4-byte primitive register word inside `#[repr(C, align(4))]`.
-    // 3. Provenance & Lifetime: `ptr` has valid shared provenance for the duration of this call.
+    // 2. Memory layout: `u32` is a 4-byte primitive register word inside `#[repr(C,
+    //    align(4))]`.
+    // 3. Provenance & Lifetime: `ptr` has valid shared provenance for the duration
+    //    of this call.
     // 4. Aliasing: No concurrent mutable reference exists during this read.
     // 5. Volatile semantics: `read_volatile` prevents compiler read elision.
     // 6. Panic safety: `read_volatile` on a valid `u32` cannot unwind.
@@ -281,12 +324,17 @@ fn volatile_read_u32(reg: &u32) -> u32 {
 #[inline]
 fn xtensa_mmio_write(addr: usize, val: u32) {
     let ptr = addr as *mut u32;
+    // JUSTIFICATION: ESP32 MMIO register write requires unsafe raw pointer
+    // dereference.
     // SAFETY:
-    // 1. Alignment & Non-null: Caller passes 4-byte aligned ESP32 MMIO register addresses in `0x3FF0_0000..0x3FF7_FFFF`.
-    // 2. Memory layout: ESP32 DPORT, GPIO, RTC_IO, IO_MUX, and I2S0 peripheral registers are 32-bit memory-mapped words.
+    // 1. Alignment & Non-null: Caller passes 4-byte aligned ESP32 MMIO register
+    //    addresses in `0x3FF0_0000..0x3FF7_FFFF`.
+    // 2. Memory layout: ESP32 DPORT, GPIO, RTC_IO, IO_MUX, and I2S0 peripheral
+    //    registers are 32-bit memory-mapped words.
     // 3. Provenance: Hardware peripheral address space on Xtensa ESP32 target.
     // 4. Aliasing: Executed under peripheral ownership of `Esp32I2sCamera`.
-    // 5. Volatile semantics: `write_volatile` is required for hardware MMIO side effects.
+    // 5. Volatile semantics: `write_volatile` is required for hardware MMIO side
+    //    effects.
     // 6. Panic safety: Hardware MMIO store does not unwind.
     unsafe {
         ptr::write_volatile(ptr, val);
@@ -297,12 +345,18 @@ fn xtensa_mmio_write(addr: usize, val: u32) {
 #[inline]
 fn xtensa_mmio_read(addr: usize) -> u32 {
     let ptr = addr as *const u32;
+    // JUSTIFICATION: ESP32 MMIO register read requires unsafe raw pointer
+    // dereference.
     // SAFETY:
-    // 1. Alignment & Non-null: Caller passes 4-byte aligned ESP32 MMIO register addresses in `0x3FF0_0000..0x3FF7_FFFF`.
-    // 2. Memory layout: ESP32 DPORT, GPIO, RTC_IO, IO_MUX, and I2S0 peripheral registers are 32-bit memory-mapped words.
+    // 1. Alignment & Non-null: Caller passes 4-byte aligned ESP32 MMIO register
+    //    addresses in `0x3FF0_0000..0x3FF7_FFFF`.
+    // 2. Memory layout: ESP32 DPORT, GPIO, RTC_IO, IO_MUX, and I2S0 peripheral
+    //    registers are 32-bit memory-mapped words.
     // 3. Provenance: Hardware peripheral address space on Xtensa ESP32 target.
-    // 4. Aliasing: Volatile hardware register read does not alias Rust stack or heap references.
-    // 5. Volatile semantics: `read_volatile` prevents compiler elision or reordering of hardware status reads.
+    // 4. Aliasing: Volatile hardware register read does not alias Rust stack or
+    //    heap references.
+    // 5. Volatile semantics: `read_volatile` prevents compiler elision or
+    //    reordering of hardware status reads.
     // 6. Panic safety: Hardware MMIO load does not unwind.
     unsafe { ptr::read_volatile(ptr) }
 }
@@ -310,10 +364,11 @@ fn xtensa_mmio_read(addr: usize) -> u32 {
 #[cfg(target_arch = "xtensa")]
 #[inline]
 fn xtensa_configure_input_pad(gpio_num: u8, enable_pullup: bool) {
-    // Route RTC_IO-capable pads to the digital IO_MUX before configuring IO_MUX and GPIO matrix
+    // Route RTC_IO-capable pads to the digital IO_MUX before configuring IO_MUX and
+    // GPIO matrix
     match gpio_num {
         36..=39 => {
-            let bit = 30 - (gpio_num - 36);
+            let bit = 27 - (gpio_num - 36);
             let v = xtensa_mmio_read(RTC_IO_SENSOR_PADS_REG) & !(1u32 << bit);
             xtensa_mmio_write(RTC_IO_SENSOR_PADS_REG, v);
         }
@@ -344,7 +399,8 @@ fn xtensa_configure_input_pad(gpio_num: u8, enable_pullup: bool) {
         _ => {}
     }
 
-    // Configure IO_MUX: MCU_SEL = 2 (GPIO function, bits 12..14), FUN_DRV = 2 (bits 10..11),
+    // Configure IO_MUX: MCU_SEL = 2 (GPIO function, bits 12..14), FUN_DRV = 2 (bits
+    // 10..11),
     // FUN_IE = 1 (bit 9), and optional FUN_WPU = 1 (bit 8).
     if let Some(mux_addr) = io_mux_reg_addr(gpio_num) {
         let mux_val = if enable_pullup { 0x2B00 } else { 0x2A00 };
@@ -361,7 +417,8 @@ fn xtensa_configure_input_pad(gpio_num: u8, enable_pullup: bool) {
     // Clear open-drain / interrupt bits in GPIO_PINn_REG
     xtensa_mmio_write(GPIO_PIN0_REG + 4 * (gpio_num as usize), 0);
 
-    // Disconnect output matrix for output-capable pads (0..=33) using SIG_GPIO_OUT_IDX (0x100)
+    // Disconnect output matrix for output-capable pads (0..=33) using
+    // SIG_GPIO_OUT_IDX (0x100)
     if gpio_num < 34 {
         xtensa_mmio_write(GPIO_FUNC0_OUT_SEL_CFG_REG + 4 * (gpio_num as usize), 0x100);
     }
@@ -409,8 +466,10 @@ fn find_jpeg_eoi(buf: &[u8]) -> Option<usize> {
     None
 }
 
-/// Appends an unpacked `1024`-byte DMA chunk into `jpeg_out`, handling `SOI` (`0xFF, 0xD8, 0xFF`)
-/// alignment (including cross-chunk straddling) and returning `Ok(Some(total_len))` as soon as
+/// Appends an unpacked `1024`-byte DMA chunk into `jpeg_out`, handling `SOI`
+/// (`0xFF, 0xD8, 0xFF`)
+/// alignment (including cross-chunk straddling) and returning
+/// `Ok(Some(total_len))` as soon as
 /// `EOI` (`0xFF, 0xD9`) is encountered after `SOI`.
 fn append_unpacked_jpeg_chunk(
     chunk: &[u8],
@@ -565,6 +624,29 @@ impl Esp32I2sCamera {
 
     /// Returns a shared reference to the underlying register block for inspection.
     #[inline]
+    /// Checks for DMA descriptor errors (`IN_DSCR_ERR` or `IN_DSCR_EMPTY`),
+    /// clears the interrupt flags in `int_clr`, and returns `true` if an error
+    /// was detected.
+    pub fn check_and_clear_dma_err(&mut self) -> bool {
+        let err_mask = I2S_IN_DSCR_ERR_INT_RAW | I2S_IN_DSCR_EMPTY_INT_RAW;
+        #[cfg(target_arch = "xtensa")]
+        {
+            let raw = xtensa_mmio_read(I2S0_BASE_ADDR + I2S_INT_RAW_REG_OFFSET);
+            if (raw & err_mask) != 0 {
+                xtensa_mmio_write(I2S0_BASE_ADDR + I2S_INT_CLR_REG_OFFSET, raw & err_mask);
+                return true;
+            }
+        }
+        let raw = volatile_read_u32(&self.regs.int_raw);
+        if (raw & err_mask) != 0 {
+            volatile_write_u32(&mut self.regs.int_clr, raw & err_mask);
+            volatile_write_u32(&mut self.regs.int_raw, raw & !err_mask);
+            true
+        } else {
+            false
+        }
+    }
+
     pub const fn regs(&self) -> &I2s0RegisterBlock {
         &self.regs
     }
@@ -581,7 +663,8 @@ impl Esp32I2sCamera {
         self.filter
     }
 
-    /// Returns the configured GPIO matrix bindings (`PCLK`, `VSYNC`, `HREF`, `D0..D7`, `H_ENABLE`).
+    /// Returns the configured GPIO matrix bindings (`PCLK`, `VSYNC`, `HREF`,
+    /// `D0..D7`, `H_ENABLE`).
     #[inline]
     pub fn gpio_bindings(&self) -> &[GpioMatrixBinding] {
         &self.gpio_bindings[..self.gpio_binding_count]
@@ -605,14 +688,17 @@ impl Esp32I2sCamera {
         self.running
     }
 
-    /// Returns the DMA alignment requirement on ESP32 (`0`, matching `ll_cam_get_dma_align` in `ll_cam.c:465-468`).
+    /// Returns the DMA alignment requirement on ESP32 (`0`, matching
+    /// `ll_cam_get_dma_align` in `ll_cam.c:465-468`).
     #[inline]
     pub const fn dma_align(&self) -> u8 {
         0
     }
 
-    /// Configures GPIO matrix routing for `PCLK`, `VSYNC`, `HREF`, `D0..D7`, and `0x38 -> H_ENABLE`,
-    /// rejecting any pin `< 0` or `>= 40` (`ll_cam_set_pin` in `target/esp32/ll_cam.c:387-454`).
+    /// Configures GPIO matrix routing for `PCLK`, `VSYNC`, `HREF`, `D0..D7`, and
+    /// `0x38 -> H_ENABLE`,
+    /// rejecting any pin `< 0` or `>= 40` (`ll_cam_set_pin` in
+    /// `target/esp32/ll_cam.c:387-454`).
     pub fn set_pin(&mut self, cfg: &CamPinConfig) -> Result<(), CameraError> {
         if cfg.pin_vsync < 0
             || (cfg.pin_vsync as u8) >= ESP32_GPIO_NUM_MAX
@@ -630,9 +716,7 @@ impl Esp32I2sCamera {
         let mut i = 0;
         while i < 8 {
             let pin = cfg.data_pins[i];
-            if pin < 0
-                || (pin as u8) >= ESP32_GPIO_NUM_MAX
-                || io_mux_reg_addr(pin as u8).is_none()
+            if pin < 0 || (pin as u8) >= ESP32_GPIO_NUM_MAX || io_mux_reg_addr(pin as u8).is_none()
             {
                 return Err(CameraError::InvalidArg);
             }
@@ -708,7 +792,8 @@ impl Esp32I2sCamera {
         Ok(())
     }
 
-    /// Enables and configures the `I2S0` peripheral in parallel camera slave mode (`ll_cam_config`
+    /// Enables and configures the `I2S0` peripheral in parallel camera slave mode
+    /// (`ll_cam_config`
     /// in `target/esp32/ll_cam.c:330-376`).
     pub fn config(&mut self) -> Result<(), CameraError> {
         let clk = volatile_read_u32(&self.regs.dport_clk_en) | DPORT_I2S0_CLK_EN;
@@ -733,7 +818,8 @@ impl Esp32I2sCamera {
         // Clock divider `clkm_div_num = 2, clkm_div_a = 0, clkm_div_b = 0`
         volatile_write_u32(&mut self.regs.clkm_conf, 2);
 
-        // FIFO config: `dscr_en = 1 (bit 12), rx_fifo_mod_force_en = 1 (bit 20), rx_fifo_mod = sampling_mode (bits 16..18)`
+        // FIFO config: `dscr_en = 1 (bit 12), rx_fifo_mod_force_en = 1 (bit 20),
+        // rx_fifo_mod = sampling_mode (bits 16..18)`
         let fifo_val = (1 << 12) | (1 << 20) | ((self.sampling_mode as u32) << 16);
         volatile_write_u32(&mut self.regs.fifo_conf, fifo_val);
 
@@ -781,13 +867,15 @@ impl Esp32I2sCamera {
             // Configure I2S0 clock divider (`CLK_EN = 1 << 20`, `CLKM_DIV_NUM = 2`)
             xtensa_mmio_write(I2S0_BASE_ADDR + I2S_CLKM_CONF_REG_OFFSET, (1 << 20) | 2);
 
-            // Configure FIFO (`rx_fifo_mod_force_en = 1`, `rx_fifo_mod = sampling_mode`, `dscr_en = 1`)
+            // Configure FIFO (`rx_fifo_mod_force_en = 1`, `rx_fifo_mod = sampling_mode`,
+            // `dscr_en = 1`)
             xtensa_mmio_write(I2S0_BASE_ADDR + I2S_FIFO_CONF_REG_OFFSET, fifo_val);
 
-            // Configure single RX channel (`rx_chan_mod = 1`), `rx_bits_mod = 0`, `rx_dsync_sw = 1`
+            // Configure single RX channel (`rx_chan_mod = 1`), `rx_bits_mod = 0`,
+            // `rx_dsync_sw = 1`
             xtensa_mmio_write(I2S0_BASE_ADDR + I2S_CONF_CHAN_REG_OFFSET, 1 << 3);
-            let sr = xtensa_mmio_read(I2S0_BASE_ADDR + I2S_SAMPLE_RATE_CONF_REG_OFFSET)
-                & !(0x3F << 18);
+            let sr =
+                xtensa_mmio_read(I2S0_BASE_ADDR + I2S_SAMPLE_RATE_CONF_REG_OFFSET) & !(0x3F << 18);
             xtensa_mmio_write(I2S0_BASE_ADDR + I2S_SAMPLE_RATE_CONF_REG_OFFSET, sr);
             xtensa_mmio_write(I2S0_BASE_ADDR + I2S_TIMING_REG_OFFSET, 1 << 21);
         }
@@ -795,7 +883,8 @@ impl Esp32I2sCamera {
         Ok(())
     }
 
-    /// Configures sampling mode and FIFO mode for the requested pixel format, XCLK frequency, and sensor PID
+    /// Configures sampling mode and FIFO mode for the requested pixel format, XCLK
+    /// frequency, and sensor PID
     /// (`ll_cam_set_sample_mode` in `target/esp32/ll_cam.c:571-619`).
     pub fn set_sample_mode(
         &mut self,
@@ -828,7 +917,8 @@ impl Esp32I2sCamera {
         self.vsync_intr_enabled = en;
     }
 
-    /// Starts I2S0 DMA reception for a frame (`ll_cam_start` in `target/esp32/ll_cam.c:305-328`).
+    /// Starts I2S0 DMA reception for a frame (`ll_cam_start` in
+    /// `target/esp32/ll_cam.c:305-328`).
     pub fn start(&mut self, dma_cfg: &DmaSizeConfig, first_desc_addr: u32) -> bool {
         if dma_cfg.dma_half_buffer_size == 0 {
             return false;
@@ -854,17 +944,17 @@ impl Esp32I2sCamera {
 
         #[cfg(target_arch = "xtensa")]
         {
-            let conf_base =
-                (xtensa_mmio_read(I2S0_BASE_ADDR + I2S_CONF_REG_OFFSET) & !I2S_RX_START_BIT)
-                    | I2S_RX_SLAVE_MOD_BIT;
+            let conf_base = (xtensa_mmio_read(I2S0_BASE_ADDR + I2S_CONF_REG_OFFSET)
+                & !I2S_RX_START_BIT)
+                | I2S_RX_SLAVE_MOD_BIT;
             xtensa_mmio_write(I2S0_BASE_ADDR + I2S_CONF_REG_OFFSET, conf_base);
 
             xtensa_mmio_write(
                 I2S0_BASE_ADDR + I2S_INT_CLR_REG_OFFSET,
                 I2S_IN_SUC_EOF_INT_BIT,
             );
-            let hw_int_ena = xtensa_mmio_read(I2S0_BASE_ADDR + I2S_INT_ENA_REG_OFFSET)
-                | I2S_IN_SUC_EOF_INT_BIT;
+            let hw_int_ena =
+                xtensa_mmio_read(I2S0_BASE_ADDR + I2S_INT_ENA_REG_OFFSET) | I2S_IN_SUC_EOF_INT_BIT;
             xtensa_mmio_write(I2S0_BASE_ADDR + I2S_INT_ENA_REG_OFFSET, hw_int_ena);
 
             // Pulse RX reset and RX FIFO reset
@@ -890,7 +980,8 @@ impl Esp32I2sCamera {
             xtensa_mmio_write(I2S0_BASE_ADDR + I2S_LC_CONF_REG_OFFSET, I2S_LC_AHBM_RST_BIT);
             xtensa_mmio_write(I2S0_BASE_ADDR + I2S_LC_CONF_REG_OFFSET, 0);
 
-            // Ensure I2S0 FIFO memory remains powered up and GPIO matrix input bindings stay latched
+            // Ensure I2S0 FIFO memory remains powered up and GPIO matrix input bindings
+            // stay latched
             xtensa_mmio_write(
                 I2S0_BASE_ADDR + I2S_PD_CONF_REG_OFFSET,
                 I2S_PD_FIFO_MEM_FORCE_PU,
@@ -932,17 +1023,18 @@ impl Esp32I2sCamera {
         volatile_write_u32(&mut self.regs.int_ena, int_ena);
         volatile_write_u32(&mut self.regs.int_clr, I2S_IN_SUC_EOF_INT_BIT);
 
-        let in_link = (volatile_read_u32(&self.regs.in_link) & !I2S_INLINK_START_BIT)
-            | I2S_INLINK_STOP_BIT;
+        let in_link =
+            (volatile_read_u32(&self.regs.in_link) & !I2S_INLINK_START_BIT) | I2S_INLINK_STOP_BIT;
         volatile_write_u32(&mut self.regs.in_link, in_link);
 
         #[cfg(target_arch = "xtensa")]
         {
-            let hw_conf = xtensa_mmio_read(I2S0_BASE_ADDR + I2S_CONF_REG_OFFSET) & !I2S_RX_START_BIT;
+            let hw_conf =
+                xtensa_mmio_read(I2S0_BASE_ADDR + I2S_CONF_REG_OFFSET) & !I2S_RX_START_BIT;
             xtensa_mmio_write(I2S0_BASE_ADDR + I2S_CONF_REG_OFFSET, hw_conf);
 
-            let hw_int_ena = xtensa_mmio_read(I2S0_BASE_ADDR + I2S_INT_ENA_REG_OFFSET)
-                & !I2S_IN_SUC_EOF_INT_BIT;
+            let hw_int_ena =
+                xtensa_mmio_read(I2S0_BASE_ADDR + I2S_INT_ENA_REG_OFFSET) & !I2S_IN_SUC_EOF_INT_BIT;
             xtensa_mmio_write(I2S0_BASE_ADDR + I2S_INT_ENA_REG_OFFSET, hw_int_ena);
             xtensa_mmio_write(
                 I2S0_BASE_ADDR + I2S_INT_CLR_REG_OFFSET,
@@ -959,7 +1051,8 @@ impl Esp32I2sCamera {
         true
     }
 
-    /// Deinitializes the I2S0 camera peripheral and gates its DPORT clock (`ll_cam_deinit`
+    /// Deinitializes the I2S0 camera peripheral and gates its DPORT clock
+    /// (`ll_cam_deinit`
     /// in `target/esp32/ll_cam.c:272-303`).
     pub fn deinit(&mut self) -> Result<(), CameraError> {
         let _ = self.stop();
@@ -983,21 +1076,27 @@ impl Esp32I2sCamera {
         Ok(())
     }
 
-    /// Unpacks a raw DMA half-buffer `src` into `dst` using the active DMA filter (`ll_cam_memcpy`).
+    /// Unpacks a raw DMA half-buffer `src` into `dst` using the active DMA filter
+    /// (`ll_cam_memcpy`).
     #[inline]
     pub fn memcpy_filtered(&self, dst: &mut [u8], src: &[u8]) -> usize {
         self.filter.apply(dst, src)
     }
 
-    /// Captures a complete JPEG frame (`0xFF, 0xD8, 0xFF` .. `0xFF, 0xD9`) using a circular
-    /// [`Lldesc`] DMA ring over `dma_buf`, unpacking `4096`-byte DMA half-buffers into `1024`-byte
+    /// Captures a complete JPEG frame (`0xFF, 0xD8, 0xFF` .. `0xFF, 0xD9`) using a
+    /// circular
+    /// [`Lldesc`] DMA ring over `dma_buf`, unpacking `4096`-byte DMA half-buffers
+    /// into `1024`-byte
     /// JPEG chunks in `jpeg_out` and returning the exact `SOI..=EOI` byte length.
     ///
-    /// - On `#[cfg(target_arch = "xtensa")]`, synchronizes with `VSYNC` (`GPIO_IN_REG`), starts
-    ///   `I2S0` DMA, polls `I2S_INT_RAW_REG` (`IN_SUC_EOF`), unpacks and re-arms completed
-    ///   half-buffers, and unpacks the final partial half-buffer when `VSYNC` asserts at end of frame.
-    /// - On `#[cfg(not(target_arch = "xtensa"))]`, builds the circular ring and unpacks the
-    ///   pre-populated DMA half-buffers in `dma_buf` for deterministic host unit and Miri verification.
+    /// - On `#[cfg(target_arch = "xtensa")]`, synchronizes with `VSYNC`
+    ///   (`GPIO_IN_REG`), starts `I2S0` DMA, polls `I2S_INT_RAW_REG`
+    ///   (`IN_SUC_EOF`), unpacks and re-arms completed half-buffers,
+    ///   and unpacks the final partial half-buffer when `VSYNC` asserts
+    ///   at end of frame.
+    /// - On `#[cfg(not(target_arch = "xtensa"))]`, builds circular ring
+    ///   and unpacks the pre-populated DMA half-buffers in `dma_buf`
+    ///   for deterministic host unit and Miri verification.
     pub fn capture_jpeg_frame_polled(
         &mut self,
         descriptors: &mut [Lldesc],
@@ -1041,9 +1140,8 @@ impl Esp32I2sCamera {
             let buf_start = dma_buf.as_ptr() as usize;
             let buf_end = buf_start.saturating_add(required_dma_bytes.saturating_sub(1));
             let desc_start = descriptors.as_ptr() as usize;
-            let desc_end = desc_start.saturating_add(
-                core::mem::size_of_val(descriptors).saturating_sub(1),
-            );
+            let desc_end =
+                desc_start.saturating_add(core::mem::size_of_val(descriptors).saturating_sub(1));
             if buf_start < 0x3FFA_E000
                 || buf_end > 0x3FFF_FFFF
                 || desc_start < 0x3FFA_E000
@@ -1053,9 +1151,13 @@ impl Esp32I2sCamera {
             }
 
             dma_buf[..required_dma_bytes].fill(0);
-            build_circular_ring(descriptors, &dma_buf[..required_dma_bytes], JPEG_DMA_NODE_SIZE)?;
-            let first_desc_addr = (core::ptr::from_ref(&descriptors[0]) as usize as u32)
-                & I2S_INLINK_ADDR_MASK;
+            build_circular_ring(
+                descriptors,
+                &dma_buf[..required_dma_bytes],
+                JPEG_DMA_NODE_SIZE,
+            )?;
+            let first_desc_addr =
+                (core::ptr::from_ref(&descriptors[0]) as usize as u32) & I2S_INLINK_ADDR_MASK;
             let vsync_pin = self.vsync_pin.unwrap_or(25);
             let vsync_sync_level = !self.vsync_invert;
 
@@ -1100,6 +1202,12 @@ impl Esp32I2sCamera {
                 }
 
                 let int_raw = xtensa_mmio_read(I2S0_BASE_ADDR + I2S_INT_RAW_REG_OFFSET);
+                if (int_raw & (I2S_IN_DSCR_ERR_INT_RAW | I2S_IN_DSCR_EMPTY_INT_RAW)) != 0 {
+                    xtensa_mmio_write(
+                        I2S0_BASE_ADDR + I2S_INT_CLR_REG_OFFSET,
+                        int_raw & (I2S_IN_DSCR_ERR_INT_RAW | I2S_IN_DSCR_EMPTY_INT_RAW),
+                    );
+                }
                 if (int_raw & I2S_IN_SUC_EOF_INT_BIT) != 0 {
                     xtensa_mmio_write(
                         I2S0_BASE_ADDR + I2S_INT_CLR_REG_OFFSET,
@@ -1108,7 +1216,9 @@ impl Esp32I2sCamera {
                     idle_since_eof = 0;
 
                     #[cfg(target_arch = "xtensa")]
-                    // SAFETY: `memw` orders preceding volatile MMIO status reads before subsequent SRAM DMA buffer reads on Xtensa.
+                    // JUSTIFICATION: Memory synchronization barrier between MMIO and DMA.
+                    // SAFETY: `memw` orders preceding volatile MMIO status reads
+                    // before subsequent SRAM DMA buffer reads on Xtensa.
                     unsafe {
                         core::arch::asm!("memw");
                     }
@@ -1120,7 +1230,8 @@ impl Esp32I2sCamera {
                     let mut target_half = None;
                     let mut h = 0usize;
                     while h < half_buf_cnt {
-                        let desc1_addr = (core::ptr::from_ref(&descriptors[2 * h + 1]) as usize as u32)
+                        let desc1_addr = (core::ptr::from_ref(&descriptors[2 * h + 1]) as usize
+                            as u32)
                             & I2S_INLINK_ADDR_MASK;
                         let desc0_addr = (core::ptr::from_ref(&descriptors[2 * h]) as usize as u32)
                             & I2S_INLINK_ADDR_MASK;
@@ -1176,8 +1287,10 @@ impl Esp32I2sCamera {
                     continue;
                 }
 
-                // If SOI has been found, check if the final partial half-buffer (< 4096 DMA bytes)
-                // already contains EOI (`0xFF, 0xD9`) on VSYNC end-of-frame or idle window (`cam_hal.c:408-411`).
+                // If SOI has been found, check if the final partial half-buffer (< 4096 DMA
+                // bytes)
+                // already contains EOI (`0xFF, 0xD9`) on VSYNC end-of-frame or idle window
+                // (`cam_hal.c:408-411`).
                 if soi_found {
                     idle_since_eof = idle_since_eof.saturating_add(1);
                     let vsync_eof = seen_active_video
@@ -1192,7 +1305,11 @@ impl Esp32I2sCamera {
                             &mut unpacked_chunk,
                             &dma_buf[half_offset..half_offset + JPEG_DMA_HALF_BUFFER_SIZE],
                         );
-                        let prev_byte = if written > 0 { jpeg_out[written - 1] } else { 0 };
+                        let prev_byte = if written > 0 {
+                            jpeg_out[written - 1]
+                        } else {
+                            0
+                        };
                         let boundary_eoi = prev_byte == 0xFF && unpacked_chunk[0] == 0xD9;
                         if boundary_eoi || find_jpeg_eoi(&unpacked_chunk).is_some() {
                             let _ = self.stop();
@@ -1217,8 +1334,9 @@ impl Esp32I2sCamera {
                                 &mut next_chunk,
                                 &dma_buf[next_offset..next_offset + JPEG_DMA_HALF_BUFFER_SIZE],
                             );
-                            let cross_chunk_eoi = unpacked_chunk[JPEG_UNPACKED_HALF_BUFFER_SIZE - 1] == 0xFF
-                                && next_chunk[0] == 0xD9;
+                            let cross_chunk_eoi =
+                                unpacked_chunk[JPEG_UNPACKED_HALF_BUFFER_SIZE - 1] == 0xFF
+                                    && next_chunk[0] == 0xD9;
                             if cross_chunk_eoi || find_jpeg_eoi(&next_chunk).is_some() {
                                 let _ = self.stop();
                                 let _ = append_unpacked_jpeg_chunk(
@@ -1254,9 +1372,13 @@ impl Esp32I2sCamera {
 
         #[cfg(not(target_arch = "xtensa"))]
         {
-            build_circular_ring(descriptors, &dma_buf[..required_dma_bytes], JPEG_DMA_NODE_SIZE)?;
-            let first_desc_addr = (core::ptr::from_ref(&descriptors[0]) as usize as u32)
-                & I2S_INLINK_ADDR_MASK;
+            build_circular_ring(
+                descriptors,
+                &dma_buf[..required_dma_bytes],
+                JPEG_DMA_NODE_SIZE,
+            )?;
+            let first_desc_addr =
+                (core::ptr::from_ref(&descriptors[0]) as usize as u32) & I2S_INLINK_ADDR_MASK;
             if !self.start(&dma_cfg, first_desc_addr) {
                 return Err(CameraError::HardwareError);
             }
@@ -1327,8 +1449,8 @@ mod tests {
         assert_eq!(io_mux_reg_addr(25), Some(0x3FF4_9024)); // VSYNC
         assert_eq!(io_mux_reg_addr(26), Some(0x3FF4_9028)); // SIOD
         assert_eq!(io_mux_reg_addr(27), Some(0x3FF4_902C)); // SIOC
-        assert_eq!(io_mux_reg_addr(4), Some(0x3FF4_9048));  // D0
-        assert_eq!(io_mux_reg_addr(5), Some(0x3FF4_906C));  // D1
+        assert_eq!(io_mux_reg_addr(4), Some(0x3FF4_9048)); // D0
+        assert_eq!(io_mux_reg_addr(5), Some(0x3FF4_906C)); // D1
         assert_eq!(io_mux_reg_addr(18), Some(0x3FF4_9070)); // D2
         assert_eq!(io_mux_reg_addr(19), Some(0x3FF4_9074)); // D3
         assert_eq!(io_mux_reg_addr(36), Some(0x3FF4_9004)); // D4
@@ -1341,6 +1463,21 @@ mod tests {
         assert_eq!(io_mux_reg_addr(24), None);
         assert_eq!(io_mux_reg_addr(28), None);
         assert_eq!(io_mux_reg_addr(40), None);
+    }
+
+    #[test]
+    fn test_check_and_clear_dma_err() {
+        let mut cam = Esp32I2sCamera::new();
+        assert!(!cam.check_and_clear_dma_err());
+        cam.regs.int_raw = I2S_IN_DSCR_ERR_INT_RAW;
+        assert!(cam.check_and_clear_dma_err());
+        assert_eq!(cam.regs().int_clr, I2S_IN_DSCR_ERR_INT_RAW);
+        assert_eq!(cam.regs().int_raw & I2S_IN_DSCR_ERR_INT_RAW, 0);
+
+        cam.regs.int_raw = I2S_IN_DSCR_EMPTY_INT_RAW;
+        assert!(cam.check_and_clear_dma_err());
+        assert_eq!(cam.regs().int_clr, I2S_IN_DSCR_EMPTY_INT_RAW);
+        assert_eq!(cam.regs().int_raw & I2S_IN_DSCR_EMPTY_INT_RAW, 0);
     }
 
     #[test]
@@ -1395,7 +1532,10 @@ mod tests {
     fn test_esp32_i2s_state_transitions() {
         let mut cam = Esp32I2sCamera::new();
         assert_eq!(cam.config(), Ok(()));
-        assert_eq!(cam.regs().dport_clk_en & DPORT_I2S0_CLK_EN, DPORT_I2S0_CLK_EN);
+        assert_eq!(
+            cam.regs().dport_clk_en & DPORT_I2S0_CLK_EN,
+            DPORT_I2S0_CLK_EN
+        );
         assert_eq!(cam.regs().dport_rst_en & DPORT_I2S0_RST, 0);
         assert_eq!(cam.regs().pd_conf, I2S_PD_FIFO_MEM_FORCE_PU);
         assert_eq!(I2S_PD_CONF_REG_OFFSET, 0xA4);
@@ -1423,7 +1563,10 @@ mod tests {
         assert!(cam.start(&dma_cfg, 0x3FFB_1234));
         assert!(cam.is_running());
         assert_eq!(cam.regs().rx_eof_num, 1024); // 4096 / 4
-        assert_eq!(cam.regs().in_link & I2S_INLINK_ADDR_MASK, 0xFB_1234 & 0xF_FFFF);
+        assert_eq!(
+            cam.regs().in_link & I2S_INLINK_ADDR_MASK,
+            0xFB_1234 & 0xF_FFFF
+        );
         assert_ne!(cam.regs().in_link & I2S_INLINK_START_BIT, 0);
         assert_ne!(cam.regs().conf & I2S_RX_START_BIT, 0);
 
@@ -1473,8 +1616,10 @@ mod tests {
         let dma_buf = &mut dma_storage.0;
         let mut jpeg_out = [0u8; 2048];
 
-        // Embed 4 leading padding bytes, followed by a 1030-byte JPEG frame spanning across
-        // half-buffer 0 (1024 unpacked bytes) and half-buffer 1 (partial unpacked bytes),
+        // Embed 4 leading padding bytes, followed by a 1030-byte JPEG frame spanning
+        // across
+        // half-buffer 0 (1024 unpacked bytes) and half-buffer 1 (partial unpacked
+        // bytes),
         // followed by trailing padding bytes.
         let mut synthetic_stream = [0x55u8; 1100];
         synthetic_stream[0] = 0x00;
@@ -1506,7 +1651,10 @@ mod tests {
         // Verify descriptor 0 address was programmed into in_link (LL-001)
         let expected_desc_addr =
             (core::ptr::from_ref(&descriptors[0]) as usize as u32) & I2S_INLINK_ADDR_MASK;
-        assert_eq!(cam.regs().in_link & I2S_INLINK_ADDR_MASK, expected_desc_addr);
+        assert_eq!(
+            cam.regs().in_link & I2S_INLINK_ADDR_MASK,
+            expected_desc_addr
+        );
     }
 
     #[test]

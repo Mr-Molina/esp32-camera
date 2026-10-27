@@ -1,7 +1,9 @@
-//! Safe `#![no_std]` OV5640 (5MP QSXGA JPEG/RGB565/YUV422/RAW + Autofocus) camera sensor driver.
+//! Safe `#![no_std]` OV5640 (5MP QSXGA JPEG/RGB565/YUV422/RAW + Autofocus)
+//! camera sensor driver.
 //!
 //! Ported from `sensors/ov5640.c`, `sensors/ov5640_af.c`,
-//! `sensors/private_include/ov5640_regs.h`, `sensors/private_include/ov5640_settings.h`,
+//! `sensors/private_include/ov5640_regs.h`,
+//! `sensors/private_include/ov5640_settings.h`,
 //! and `sensors/private_include/ov5640_af_firmware.h`.
 
 use crate::{
@@ -385,15 +387,33 @@ pub const SENSOR_FMT_RGB565: [Reg16; 2] = [
 ];
 
 pub const SENSOR_SATURATION_LEVELS: [[u8; 11]; 9] = [
-    [0x1d, 0x60, 0x03, 0x07, 0x48, 0x4f, 0x4b, 0x40, 0x0b, 0x01, 0x98], // -4
-    [0x1d, 0x60, 0x03, 0x08, 0x54, 0x5c, 0x58, 0x4b, 0x0d, 0x01, 0x98], // -3
-    [0x1d, 0x60, 0x03, 0x0a, 0x60, 0x6a, 0x64, 0x56, 0x0e, 0x01, 0x98], // -2
-    [0x1d, 0x60, 0x03, 0x0b, 0x6c, 0x77, 0x70, 0x60, 0x10, 0x01, 0x98], // -1
-    [0x1d, 0x60, 0x03, 0x0c, 0x78, 0x84, 0x7d, 0x6b, 0x12, 0x01, 0x98], // 0
-    [0x1d, 0x60, 0x03, 0x0d, 0x84, 0x91, 0x8a, 0x76, 0x14, 0x01, 0x98], // +1
-    [0x1d, 0x60, 0x03, 0x0e, 0x90, 0x9e, 0x96, 0x80, 0x16, 0x01, 0x98], // +2
-    [0x1d, 0x60, 0x03, 0x10, 0x9c, 0xac, 0xa2, 0x8b, 0x17, 0x01, 0x98], // +3
-    [0x1d, 0x60, 0x03, 0x11, 0xa8, 0xb9, 0xaf, 0x96, 0x19, 0x01, 0x98], // +4
+    [
+        0x1d, 0x60, 0x03, 0x07, 0x48, 0x4f, 0x4b, 0x40, 0x0b, 0x01, 0x98,
+    ], // -4
+    [
+        0x1d, 0x60, 0x03, 0x08, 0x54, 0x5c, 0x58, 0x4b, 0x0d, 0x01, 0x98,
+    ], // -3
+    [
+        0x1d, 0x60, 0x03, 0x0a, 0x60, 0x6a, 0x64, 0x56, 0x0e, 0x01, 0x98,
+    ], // -2
+    [
+        0x1d, 0x60, 0x03, 0x0b, 0x6c, 0x77, 0x70, 0x60, 0x10, 0x01, 0x98,
+    ], // -1
+    [
+        0x1d, 0x60, 0x03, 0x0c, 0x78, 0x84, 0x7d, 0x6b, 0x12, 0x01, 0x98,
+    ], // 0
+    [
+        0x1d, 0x60, 0x03, 0x0d, 0x84, 0x91, 0x8a, 0x76, 0x14, 0x01, 0x98,
+    ], // +1
+    [
+        0x1d, 0x60, 0x03, 0x0e, 0x90, 0x9e, 0x96, 0x80, 0x16, 0x01, 0x98,
+    ], // +2
+    [
+        0x1d, 0x60, 0x03, 0x10, 0x9c, 0xac, 0xa2, 0x8b, 0x17, 0x01, 0x98,
+    ], // +3
+    [
+        0x1d, 0x60, 0x03, 0x11, 0xa8, 0xb9, 0xaf, 0x96, 0x19, 0x01, 0x98,
+    ], // +4
 ];
 
 pub const SENSOR_SPECIAL_EFFECTS: [[u8; 4]; 7] = [
@@ -480,7 +500,8 @@ pub const SENSOR_REGS_AWB0: [Reg16; 31] = [
     Reg16::new(0x519e, 0x38),
 ];
 
-/// OV5640 AF microcontroller firmware blob (`ov5640_af_firmware[]` in `ov5640_af_firmware.h`).
+/// OV5640 AF microcontroller firmware blob (`ov5640_af_firmware[]` in
+/// `ov5640_af_firmware.h`).
 pub const OV5640_AF_FIRMWARE: &[u8] = &[
     0x02, 0x0f, 0xd6, 0x02, 0x0a, 0x39, 0xc2, 0x01, 0x22, 0x22, 0x00, 0x02, 0x0f, 0xb2, 0xe5, 0x1f,
     0x70, 0x72, 0xf5, 0x1e, 0xd2, 0x35, 0xff, 0xef, 0x25, 0xe0, 0x24, 0x4e, 0xf8, 0xe4, 0xf6, 0x08,
@@ -739,6 +760,8 @@ pub const OV5640_AF_FIRMWARE: &[u8] = &[
     0x0c, 0x98, 0x8f, 0x82, 0x8e, 0x83, 0x75, 0xf0, 0x04, 0xed, 0x02, 0x06, 0xa5,
 ];
 
+const _: () = assert!(OV5640_AF_FW_BASE_ADDR as usize + OV5640_AF_FIRMWARE.len() <= 0x10000);
+
 /// Autofocus status decoded from `OV5640_CMD_FW_STATUS` (`0x3029`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ov5640AfStatus {
@@ -785,7 +808,9 @@ impl Ov5640Af {
             if ack == 0x00 {
                 return Ok(());
             }
-            if elapsed_ms >= timeout_ms {
+            if (timeout_ms > 0 && elapsed_ms >= timeout_ms)
+                || (timeout_ms == 0 && elapsed_ms >= 5000)
+            {
                 return Err(CameraError::Timeout);
             }
             bus.delay_ms(5);
@@ -793,7 +818,8 @@ impl Ov5640Af {
         }
     }
 
-    /// Waits for `OV5640_CMD_FW_STATUS` (`0x3029`) to become `OV5640_FW_STATUS_IDLE` (`0x70`).
+    /// Waits for `OV5640_CMD_FW_STATUS` (`0x3029`) to become
+    /// `OV5640_FW_STATUS_IDLE` (`0x70`).
     pub fn wait_fw_idle<B: SccbBus>(
         &self,
         bus: &mut B,
@@ -805,7 +831,9 @@ impl Ov5640Af {
             if st == OV5640_FW_STATUS_IDLE {
                 return Ok(());
             }
-            if elapsed_ms >= timeout_ms {
+            if (timeout_ms > 0 && elapsed_ms >= timeout_ms)
+                || (timeout_ms == 0 && elapsed_ms >= 5000)
+            {
                 return Err(CameraError::Timeout);
             }
             bus.delay_ms(5);
@@ -813,7 +841,8 @@ impl Ov5640Af {
         }
     }
 
-    /// Loads `OV5640_AF_FIRMWARE` into MCU SRAM at `0x8000` and waits for `OV5640_FW_STATUS_IDLE` (`ov5640_af_init`).
+    /// Loads `OV5640_AF_FIRMWARE` into MCU SRAM at `0x8000` and waits for
+    /// `OV5640_FW_STATUS_IDLE` (`ov5640_af_init`).
     pub fn init<B: SccbBus>(&self, bus: &mut B, timeout_ms: u32) -> Result<(), CameraError> {
         bus.write_reg16(self.slv_addr, 0x3000, 0x20)?;
         for (i, &byte) in OV5640_AF_FIRMWARE.iter().enumerate() {
@@ -855,7 +884,8 @@ impl Ov5640Af {
         self.wait_ack_clear(bus, timeout_ms)
     }
 
-    /// Sets autofocus mode (`0` = auto/continuous, `1` = manual; `ov5640_af_set_mode`).
+    /// Sets autofocus mode (`0` = auto/continuous, `1` = manual;
+    /// `ov5640_af_set_mode`).
     pub fn set_mode<B: SccbBus>(&self, bus: &mut B, mode: i32) -> Result<(), CameraError> {
         match mode {
             OV5640_AF_MODE_AUTO => self.start(bus, true, 2000),
@@ -877,7 +907,8 @@ impl Ov5640Af {
         Ok(Ov5640AfStatus { raw, focused, busy })
     }
 
-    /// Manual lens position is not exposed in the OV5640 firmware driver (`ov5640_af_set_manual_position`).
+    /// Manual lens position is not exposed in the OV5640 firmware driver
+    /// (`ov5640_af_set_manual_position`).
     pub fn set_manual_position<B: SccbBus>(
         &self,
         _bus: &mut B,
@@ -904,7 +935,8 @@ impl Default for Ov5640 {
 }
 
 impl Ov5640 {
-    /// Creates a new [`Ov5640`] instance with default SCCB address `0x3C` and PID `0x5640`.
+    /// Creates a new [`Ov5640`] instance with default SCCB address `0x3C` and
+    /// PID `0x5640`.
     pub const fn new() -> Self {
         Self {
             slv_addr: CameraSccbAddr::OV5640,
@@ -992,7 +1024,8 @@ impl Ov5640 {
         })
     }
 
-    /// Returns an [`Ov5640Af`] autofocus helper bound to this sensor's SCCB address.
+    /// Returns an [`Ov5640Af`] autofocus helper bound to this sensor's SCCB
+    /// address.
     #[inline]
     pub const fn af(&self) -> Ov5640Af {
         Ov5640Af::new(self.slv_addr)
@@ -1019,11 +1052,15 @@ impl Ov5640 {
     }
 
     /// Reads current autofocus status (`ov5640_af_get_status`).
-    pub fn af_get_status<B: SccbBus>(&mut self, bus: &mut B) -> Result<Ov5640AfStatus, CameraError> {
+    pub fn af_get_status<B: SccbBus>(
+        &mut self,
+        bus: &mut B,
+    ) -> Result<Ov5640AfStatus, CameraError> {
         self.af().get_status(bus)
     }
 
-    /// Sets manual lens position (`ov5640_af_set_manual_position` -> `CameraError::NotSupported`).
+    /// Sets manual lens position (`ov5640_af_set_manual_position` ->
+    /// `CameraError::NotSupported`).
     pub fn af_set_manual_position<B: SccbBus>(
         &mut self,
         bus: &mut B,
@@ -1657,13 +1694,7 @@ impl<B: SccbBus> CameraSensor<B> for Ov5640 {
         Ok(ret)
     }
 
-    fn set_reg(
-        &mut self,
-        bus: &mut B,
-        reg: i32,
-        mask: i32,
-        value: i32,
-    ) -> Result<(), CameraError> {
+    fn set_reg(&mut self, bus: &mut B, reg: i32, mask: i32, value: i32) -> Result<(), CameraError> {
         if !(0..=0xFFFF).contains(&reg) || mask < 0 {
             return Err(CameraError::InvalidArg);
         }

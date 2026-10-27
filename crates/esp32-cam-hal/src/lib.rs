@@ -1,4 +1,5 @@
-//! Safe `#![no_std]` type-state camera HAL, board pinout profiles, and RAII [`FramePool`].
+//! Safe `#![no_std]` type-state camera HAL, board pinout profiles, and RAII
+//! [`FramePool`].
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -23,5 +24,5 @@ pub use driver::{
     JPEG_SOI_MARKER,
 };
 pub use frame_pool::{
-    FrameGuard, FrameMetadata, FramePool, SLOT_FREE, SLOT_LEASED, SLOT_READY,
+    AlignedBuf, FrameGuard, FrameMetadata, FramePool, SLOT_FREE, SLOT_LEASED, SLOT_READY,
 };

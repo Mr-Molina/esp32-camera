@@ -1,6 +1,7 @@
 //! SC101IOT 720p HD YUV422 CMOS image sensor driver.
 //!
-//! Ported from `sensors/sc101iot.c` and `sensors/private_include/sc101iot_settings.h`.
+//! Ported from `sensors/sc101iot.c` and
+//! `sensors/private_include/sc101iot_settings.h`.
 
 use crate::{
     write_regs8, CameraError, CameraModel, CameraPid, CameraSccbAddr, CameraSensor, CameraStatus,
@@ -235,7 +236,8 @@ impl Default for Sc101Iot {
 }
 
 impl Sc101Iot {
-    /// Creates a new [`Sc101Iot`] instance with default SCCB address (`0x68`) and PID (`0xDA4A`).
+    /// Creates a new [`Sc101Iot`] instance with default SCCB address (`0x68`)
+    /// and PID (`0xDA4A`).
     pub const fn new() -> Self {
         Self {
             id: SensorId {
@@ -289,7 +291,8 @@ impl Sc101Iot {
         }
     }
 
-    /// Probes the SCCB bus at `slv_addr` (`0x68`) and verifies `SC101IOT_PID` (`0xDA4A`).
+    /// Probes the SCCB bus at `slv_addr` (`0x68`) and verifies `SC101IOT_PID`
+    /// (`0xDA4A`).
     pub fn detect<B: SccbBus>(bus: &mut B, slv_addr: u8) -> Result<SensorId, CameraError> {
         if slv_addr != CameraSccbAddr::SC101IOT {
             return Err(CameraError::NotDetected);
@@ -529,13 +532,7 @@ impl<B: SccbBus> CameraSensor<B> for Sc101Iot {
         Ok(val & mask)
     }
 
-    fn set_reg(
-        &mut self,
-        bus: &mut B,
-        reg: i32,
-        mask: i32,
-        value: i32,
-    ) -> Result<(), CameraError> {
+    fn set_reg(&mut self, bus: &mut B, reg: i32, mask: i32, value: i32) -> Result<(), CameraError> {
         if !(0..=0xFFFF).contains(&reg) || mask < 0 {
             return Err(CameraError::InvalidArg);
         }

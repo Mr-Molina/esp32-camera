@@ -1,25 +1,38 @@
-//! ESP32-S2 I2S0 camera parallel interface low-level driver (`target/esp32s2/ll_cam.c`).
+//! ESP32-S2 I2S0 camera parallel interface low-level driver
+//! (`target/esp32s2/ll_cam.c`).
 //!
-//! Supports 1-byte-per-item DMA packing (`rx_bits_mod = 8`, `rx_fifo_mod = 2`), high-bit GPIO
-//! matrix data alignment (`I2S0I_DATA_IN0_IDX + 8 + i`), 64-byte PSRAM DMA alignment, and
-//! YUV-to-Grayscale decimation (`ll_cam_memcpy`).
+//! Supports 1-byte-per-item DMA packing (`rx_bits_mod = 8`, `rx_fifo_mod = 2`),
+//! high-bit GPIO matrix data alignment (`ESP32S2_I2S0I_DATA_IN0_IDX + 8 + i`),
+//! 64-byte PSRAM DMA alignment, and YUV-to-Grayscale decimation
+//! (`ll_cam_memcpy`).
 
 use core::ptr;
 use esp32_cam_types::{CameraError, CameraPid, PixelFormat};
 
 use crate::dma_ring::{calc_rgb_dma_sizes, DmaSizeConfig};
 use crate::esp32_i2s::{
-    CamPinConfig, GpioMatrixBinding, GPIO_MATRIX_CONST_ONE_INPUT, I2S0I_DATA_IN0_IDX,
-    I2S0I_H_ENABLE_IDX, I2S0I_H_SYNC_IDX, I2S0I_V_SYNC_IDX, I2S0I_WS_IN_IDX,
+    CamPinConfig, GpioMatrixBinding, GPIO_MATRIX_CONST_ONE_INPUT, I2S0I_WS_IN_IDX,
     I2S_CAMERA_EN_BIT, I2S_INLINK_ADDR_MASK, I2S_INLINK_START_BIT, I2S_INLINK_STOP_BIT,
     I2S_IN_SUC_EOF_INT_BIT, I2S_LCD_EN_BIT, I2S_RX_START_BIT,
 };
 
-/// Maximum valid GPIO number on ESP32-S2 (`GPIO_NUM_MAX = 47`, valid indices `0..=46`).
+/// Maximum valid GPIO number on ESP32-S2 (`GPIO_NUM_MAX = 47`, valid `0..=46`).
 pub const ESP32S2_GPIO_NUM_MAX: u8 = 47;
 
-/// Required PSRAM DMA alignment on ESP32-S2 (`64` bytes, `target/esp32s2/ll_cam.c:280-283`).
+/// Required PSRAM DMA alignment on ESP32-S2 (`64` bytes).
 pub const ESP32S2_DMA_ALIGN: u8 = 64;
+
+/// ESP32-S2 GPIO matrix input signal index for `I2S0I_DATA_IN0_IDX` (`143`).
+pub const ESP32S2_I2S0I_DATA_IN0_IDX: u32 = 143;
+
+/// ESP32-S2 GPIO matrix input signal index for `I2S0I_H_SYNC_IDX` (`193`).
+pub const ESP32S2_I2S0I_H_SYNC_IDX: u32 = 193;
+
+/// ESP32-S2 GPIO matrix input signal index for `I2S0I_V_SYNC_IDX` (`194`).
+pub const ESP32S2_I2S0I_V_SYNC_IDX: u32 = 194;
+
+/// ESP32-S2 GPIO matrix input signal index for `I2S0I_H_ENABLE_IDX` (`195`).
+pub const ESP32S2_I2S0I_H_ENABLE_IDX: u32 = 195;
 
 /// Simulated / shadow MMIO register block for `I2S0` on ESP32-S2.
 #[repr(C, align(4))]
@@ -42,12 +55,13 @@ pub struct Esp32S2I2sRegisterBlock {
 #[inline]
 fn volatile_write_u32(reg: &mut u32, val: u32) {
     let ptr = ptr::from_mut(reg);
+    // JUSTIFICATION: Hardware register write requires raw pointer dereference.
     // SAFETY:
-    // 1. Alignment & Non-null: `ptr` is derived from a valid `&mut u32` reference (non-null, 4-byte aligned).
+    // 1. Alignment & Non-null: `ptr` is from a valid `&mut u32` ref.
     // 2. Memory layout: `u32` register word in `#[repr(C, align(4))]`.
-    // 3. Provenance & Lifetime: Valid mutable provenance for the duration of this call.
+    // 3. Provenance & Lifetime: Valid mutable provenance for this call.
     // 4. Exclusive aliasing: `reg` is uniquely borrowed.
-    // 5. Volatile semantics: `write_volatile` prevents register write elision.
+    // 5. Volatile semantics: `write_volatile` prevents write elision.
     // 6. Panic safety: Cannot unwind.
     unsafe {
         ptr::write_volatile(ptr, val);
@@ -57,17 +71,19 @@ fn volatile_write_u32(reg: &mut u32, val: u32) {
 #[inline]
 fn volatile_read_u32(reg: &u32) -> u32 {
     let ptr = ptr::from_ref(reg);
+    // JUSTIFICATION: Hardware register read requires raw pointer dereference.
     // SAFETY:
-    // 1. Alignment & Non-null: `ptr` is derived from a valid `&u32` reference (non-null, 4-byte aligned).
+    // 1. Alignment & Non-null: `ptr` is from a valid `&u32` ref.
     // 2. Memory layout: `u32` register word in `#[repr(C, align(4))]`.
-    // 3. Provenance & Lifetime: Valid shared provenance for the duration of this call.
+    // 3. Provenance & Lifetime: Valid shared provenance for this call.
     // 4. Aliasing: No concurrent mutable access exists.
     // 5. Volatile semantics: `read_volatile` prevents read elision.
     // 6. Panic safety: Cannot unwind.
     unsafe { ptr::read_volatile(ptr) }
 }
 
-/// Low-level ESP32-S2 I2S0 camera peripheral controller (`target/esp32s2/ll_cam.c`).
+/// Low-level ESP32-S2 I2S0 camera peripheral controller
+/// (`target/esp32s2/ll_cam.c`).
 #[derive(Debug, Clone)]
 pub struct Esp32S2I2sCamera {
     regs: Esp32S2I2sRegisterBlock,
@@ -127,22 +143,10 @@ impl Esp32S2I2sCamera {
         }
     }
 
-    /// Returns a shared reference to the register block.
+    /// Returns a shared reference to the simulated register block.
     #[inline]
     pub const fn regs(&self) -> &Esp32S2I2sRegisterBlock {
         &self.regs
-    }
-
-    /// Returns the PSRAM DMA alignment requirement on ESP32-S2 (`64` bytes).
-    #[inline]
-    pub const fn dma_align(&self) -> u8 {
-        ESP32S2_DMA_ALIGN
-    }
-
-    /// Enables or disables PSRAM direct-DMA mode.
-    #[inline]
-    pub fn set_psram_mode(&mut self, psram_mode: bool) {
-        self.psram_mode = psram_mode;
     }
 
     /// Returns `true` if PSRAM direct-DMA mode is enabled.
@@ -151,28 +155,38 @@ impl Esp32S2I2sCamera {
         self.psram_mode
     }
 
-    /// Sets byte swapping (`rx_msb_right`).
+    /// Enables or disables PSRAM direct-DMA mode.
     #[inline]
-    pub fn set_swap_data(&mut self, swap_data: bool) {
-        self.swap_data = swap_data;
+    pub fn set_psram_mode(&mut self, psram_mode: bool) {
+        self.psram_mode = psram_mode;
     }
 
-    /// Returns `true` if byte swapping (`rx_msb_right`) is enabled.
+    /// Returns the required DMA alignment in bytes (`64` on ESP32-S2).
+    #[inline]
+    pub const fn dma_align(&self) -> u8 {
+        ESP32S2_DMA_ALIGN
+    }
+
+    /// Returns `true` if data byte swap is enabled.
     #[inline]
     pub const fn swap_data(&self) -> bool {
         self.swap_data
     }
 
-    /// Returns the configured GPIO matrix bindings.
+    /// Sets data byte swap.
+    #[inline]
+    pub fn set_swap_data(&mut self, swap_data: bool) {
+        self.swap_data = swap_data;
+    }
+
+    /// Returns the active GPIO matrix bindings.
     #[inline]
     pub fn gpio_bindings(&self) -> &[GpioMatrixBinding] {
         &self.gpio_bindings[..self.gpio_binding_count]
     }
 
-    /// Configures GPIO matrix routing on ESP32-S2 (`target/esp32s2/ll_cam.c:221-264`).
-    ///
-    /// Note that on ESP32-S2 `D0..D7` are mapped to `I2S0I_DATA_IN0_IDX + 8 + i` (`148..=155`)
-    /// for 8-bit high-bit alignment.
+    /// Configures GPIO routing on ESP32-S2
+    /// (`ll_cam_set_pin` in `target/esp32s2/ll_cam.c:286-318`).
     pub fn set_pin(&mut self, cfg: &CamPinConfig) -> Result<(), CameraError> {
         if cfg.pin_vsync < 0
             || (cfg.pin_vsync as u8) >= ESP32S2_GPIO_NUM_MAX
@@ -180,6 +194,7 @@ impl Esp32S2I2sCamera {
             || (cfg.pin_pclk as u8) >= ESP32S2_GPIO_NUM_MAX
             || cfg.pin_href < 0
             || (cfg.pin_href as u8) >= ESP32S2_GPIO_NUM_MAX
+            || cfg.pin_xclk >= (ESP32S2_GPIO_NUM_MAX as i8)
         {
             return Err(CameraError::InvalidArg);
         }
@@ -204,12 +219,12 @@ impl Esp32S2I2sCamera {
         };
         self.gpio_bindings[1] = GpioMatrixBinding {
             gpio_num: cfg.pin_vsync as u8,
-            signal_idx: I2S0I_V_SYNC_IDX,
+            signal_idx: ESP32S2_I2S0I_V_SYNC_IDX as u8,
             inverted: cfg.vsync_invert,
         };
         self.gpio_bindings[2] = GpioMatrixBinding {
             gpio_num: cfg.pin_href as u8,
-            signal_idx: I2S0I_H_SYNC_IDX,
+            signal_idx: ESP32S2_I2S0I_H_SYNC_IDX as u8,
             inverted: false,
         };
 
@@ -217,7 +232,7 @@ impl Esp32S2I2sCamera {
         while d < 8 {
             self.gpio_bindings[3 + d] = GpioMatrixBinding {
                 gpio_num: cfg.data_pins[d] as u8,
-                signal_idx: I2S0I_DATA_IN0_IDX + 8 + (d as u8),
+                signal_idx: (ESP32S2_I2S0I_DATA_IN0_IDX as u8) + 8 + (d as u8),
                 inverted: false,
             };
             d += 1;
@@ -225,7 +240,7 @@ impl Esp32S2I2sCamera {
 
         self.gpio_bindings[11] = GpioMatrixBinding {
             gpio_num: GPIO_MATRIX_CONST_ONE_INPUT,
-            signal_idx: I2S0I_H_ENABLE_IDX,
+            signal_idx: ESP32S2_I2S0I_H_ENABLE_IDX as u8,
             inverted: false,
         };
         self.gpio_binding_count = 12;
@@ -233,7 +248,8 @@ impl Esp32S2I2sCamera {
         Ok(())
     }
 
-    /// Configures ESP32-S2 `I2S0` registers (`ll_cam_config` in `target/esp32s2/ll_cam.c:138-210`).
+    /// Configures ESP32-S2 `I2S0` registers
+    /// (`ll_cam_config` in `target/esp32s2/ll_cam.c:138-210`).
     pub fn config(&mut self) -> Result<(), CameraError> {
         // `clkm_div_num = 2, clk_sel = 2, clk_en = 1`
         volatile_write_u32(&mut self.regs.clkm_conf, 2 | (2 << 21) | (1 << 20));
@@ -241,7 +257,7 @@ impl Esp32S2I2sCamera {
         volatile_write_u32(&mut self.regs.int_ena, 0);
         volatile_write_u32(&mut self.regs.int_clr, u32::MAX);
 
-        // `lcd_en = 1, camera_en = 1, i_v_sync_filter_en = 1, i_v_sync_filter_thres = 4`
+        // `lcd_en = 1, camera_en = 1, v_sync_filter_en = 1, thres = 4`
         volatile_write_u32(
             &mut self.regs.conf2,
             I2S_LCD_EN_BIT | I2S_CAMERA_EN_BIT | (1 << 11) | (4 << 8),
@@ -251,22 +267,21 @@ impl Esp32S2I2sCamera {
         volatile_write_u32(&mut self.regs.sample_rate_conf, (1 << 6) | (8 << 18));
         volatile_write_u32(&mut self.regs.conf_chan, 1 << 3);
 
-        // `dscr_en = 1 (bit 12), rx_fifo_mod_force_en = 1 (bit 20), rx_data_num = 32 (bits 6..11), rx_fifo_mod = 2 (bits 16..18)`
+        // FIFO: `dscr_en = 1, rx_fifo_mod_force_en = 1`,
+        // `rx_data_num = 32, rx_fifo_mod = 2`.
         volatile_write_u32(
             &mut self.regs.fifo_conf,
             (1 << 12) | (1 << 20) | (32 << 6) | (2 << 16),
         );
 
         let swap_bit = if self.swap_data { 1 << 9 } else { 0 };
-        volatile_write_u32(
-            &mut self.regs.conf,
-            (1 << 7) | (1 << 26) | swap_bit,
-        );
+        volatile_write_u32(&mut self.regs.conf, (1 << 7) | (1 << 26) | swap_bit);
 
         Ok(())
     }
 
-    /// Configures byte-per-pixel ratios on ESP32-S2 (`ll_cam_set_sample_mode` in `target/esp32s2/ll_cam.c:404-424`).
+    /// Configures byte-per-pixel ratios on ESP32-S2
+    /// (`ll_cam_set_sample_mode` in `target/esp32s2/ll_cam.c:404-424`).
     pub fn set_sample_mode(
         &mut self,
         pix_format: PixelFormat,
@@ -300,7 +315,8 @@ impl Esp32S2I2sCamera {
         Ok((self.in_bytes_per_pixel, self.fb_bytes_per_pixel))
     }
 
-    /// Computes DMA buffer geometry on ESP32-S2 (`ll_cam_dma_sizes` in `target/esp32s2/ll_cam.c:362-381`).
+    /// Computes DMA buffer geometry on ESP32-S2
+    /// (`ll_cam_dma_sizes` in `target/esp32s2/ll_cam.c:362-381`).
     pub fn dma_sizes(
         &self,
         width: u16,
@@ -342,7 +358,8 @@ impl Esp32S2I2sCamera {
         }
     }
 
-    /// Starts ESP32-S2 DMA capture (`ll_cam_start` in `target/esp32s2/ll_cam.c:107-136`).
+    /// Starts ESP32-S2 DMA capture
+    /// (`ll_cam_start` in `target/esp32s2/ll_cam.c:107-136`).
     pub fn start(&mut self, dma_cfg: &DmaSizeConfig, first_desc_addr: u32) -> bool {
         if dma_cfg.dma_half_buffer_size == 0 {
             return false;
@@ -369,7 +386,8 @@ impl Esp32S2I2sCamera {
         true
     }
 
-    /// Stops ESP32-S2 DMA capture (`ll_cam_stop` in `target/esp32s2/ll_cam.c:84-94`).
+    /// Stops ESP32-S2 DMA capture
+    /// (`ll_cam_stop` in `target/esp32s2/ll_cam.c:84-94`).
     pub fn stop(&mut self) -> bool {
         let conf_stopped = volatile_read_u32(&self.regs.conf) & !I2S_RX_START_BIT;
         volatile_write_u32(&mut self.regs.conf, conf_stopped);
@@ -380,8 +398,8 @@ impl Esp32S2I2sCamera {
             volatile_write_u32(&mut self.regs.int_clr, I2S_IN_SUC_EOF_INT_BIT);
         }
 
-        let in_link = (volatile_read_u32(&self.regs.in_link) & !I2S_INLINK_START_BIT)
-            | I2S_INLINK_STOP_BIT;
+        let in_link =
+            (volatile_read_u32(&self.regs.in_link) & !I2S_INLINK_START_BIT) | I2S_INLINK_STOP_BIT;
         volatile_write_u32(&mut self.regs.in_link, in_link);
         self.running = false;
         true
@@ -400,7 +418,8 @@ impl Esp32S2I2sCamera {
         Ok(())
     }
 
-    /// Copies or decimates a DMA buffer slice (`ll_cam_memcpy` in `target/esp32s2/ll_cam.c:383-402`).
+    /// Copies or decimates a DMA buffer slice
+    /// (`ll_cam_memcpy` in `target/esp32s2/ll_cam.c:383-402`).
     pub fn memcpy(&self, dst: &mut [u8], src: &[u8]) -> usize {
         if self.in_bytes_per_pixel == 2 && self.fb_bytes_per_pixel == 1 {
             let end = (src.len() / 8).min(dst.len() / 4);
@@ -447,13 +466,31 @@ mod tests {
             vsync_invert: true,
         };
         assert_eq!(cam.set_pin(&pins), Ok(()));
-        // On S2, D0 is routed to I2S0I_DATA_IN0_IDX + 8 = 148
-        assert_eq!(cam.gpio_bindings()[3].signal_idx, I2S0I_DATA_IN0_IDX + 8);
-        assert_eq!(cam.gpio_bindings()[10].signal_idx, I2S0I_DATA_IN0_IDX + 15);
+        // On S2, D0 is routed to ESP32S2_I2S0I_DATA_IN0_IDX + 8 = 151
+        assert_eq!(
+            cam.gpio_bindings()[3].signal_idx,
+            (ESP32S2_I2S0I_DATA_IN0_IDX + 8) as u8
+        );
+        assert_eq!(
+            cam.gpio_bindings()[10].signal_idx,
+            (ESP32S2_I2S0I_DATA_IN0_IDX + 15) as u8
+        );
+        assert_eq!(
+            cam.gpio_bindings()[1].signal_idx,
+            ESP32S2_I2S0I_V_SYNC_IDX as u8
+        );
+        assert_eq!(
+            cam.gpio_bindings()[2].signal_idx,
+            ESP32S2_I2S0I_H_SYNC_IDX as u8
+        );
+        assert_eq!(
+            cam.gpio_bindings()[11].signal_idx,
+            ESP32S2_I2S0I_H_ENABLE_IDX as u8
+        );
         assert_eq!(cam.dma_align(), 64);
 
         assert_eq!(cam.config(), Ok(()));
-        // Verify rx_bck_div_num is shifted by 6, and rx_start bit is NOT set prematurely (LL-010)
+        // Verify rx_bck_div_num is shifted by 6, and rx_start bit is not set (LL-010)
         assert_ne!(cam.regs().sample_rate_conf & (1 << 6), 0);
         assert_eq!(cam.regs().conf & I2S_RX_START_BIT, 0);
 
@@ -474,8 +511,8 @@ mod tests {
         assert_eq!(cam.memcpy(&mut dst, &src), 4);
         assert_eq!(dst, [10, 20, 30, 40]);
 
-        // Remainder 1..=3 tail pixels (LL-010)
-        let src_tail = [10, 99, 20, 99, 30, 99, 40, 99, 50, 99, 60, 99, 70, 99]; // 14 bytes = 8 + 6 (3 tail pixels)
+        // Remainder 1..=3 tail pixels (LL-010): 14 bytes = 8 + 6 (3 tail pixels)
+        let src_tail = [10, 99, 20, 99, 30, 99, 40, 99, 50, 99, 60, 99, 70, 99];
         let mut dst_tail = [0u8; 8];
         assert_eq!(cam.memcpy(&mut dst_tail, &src_tail), 7);
         assert_eq!(&dst_tail[..7], &[10, 20, 30, 40, 50, 60, 70]);

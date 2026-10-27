@@ -1,7 +1,9 @@
-//! ESP32-S3 `LCD_CAM` + `GDMA` camera parallel interface low-level driver (`target/esp32s3/ll_cam.c`).
+//! ESP32-S3 `LCD_CAM` + `GDMA` camera parallel interface low-level driver
+//! (`target/esp32s3/ll_cam.c`).
 //!
-//! Models the `LCD_CAM` camera peripheral (`0x6004_1000`), `GDMA` RX channel (`0x6003_F000`),
-//! integrated `160 MHz` `CAM_CLK` divider (`xclk_timer_conf`), and hardware YUV/RGB color converter.
+//! Models the `LCD_CAM` camera peripheral (`0x6004_1000`), `GDMA` RX channel
+//! (`0x6003_F000`), integrated `160 MHz` `CAM_CLK` divider (`xclk_timer_conf`),
+//! and hardware YUV/RGB color converter.
 
 use core::ptr;
 use esp32_cam_types::{CameraConvMode, CameraError, CameraPid, PixelFormat};
@@ -12,21 +14,28 @@ use crate::esp32_i2s::{CamPinConfig, GpioMatrixBinding};
 /// Physical base address of `LCD_CAM` peripheral on ESP32-S3 (`0x6004_1000`).
 pub const ESP32S3_LCD_CAM_BASE_ADDR: usize = 0x6004_1000;
 
+/// Physical register address for `LCD_CAM_CAM_CTRL2_REG` (`0x6004_1024`).
+pub const LCD_CAM_CAM_CTRL2_REG: usize = ESP32S3_LCD_CAM_BASE_ADDR + 0x24;
+
+/// Enable VH DE mode in `LCD_CAM_CAM_CTRL2_REG` (`1 << 2`).
+pub const LCD_CAM_CAM_VH_DE_MODE_EN: u32 = 1 << 2;
+
 /// Physical base address of `GDMA` peripheral on ESP32-S3 (`0x6003_F000`).
 pub const ESP32S3_GDMA_BASE_ADDR: usize = 0x6003_F000;
 
-/// Maximum valid GPIO number on ESP32-S3 (`GPIO_NUM_MAX = 49`, valid indices `0..=48`).
+/// Maximum valid GPIO number on ESP32-S3 (`GPIO_NUM_MAX = 49`, valid 0..=48).
 pub const ESP32S3_GPIO_NUM_MAX: u8 = 49;
 
-/// ESP32-S3 GPIO matrix input/output signal indices for `LCD_CAM` (`soc/gpio_sig_map.h`).
-pub const CAM_PCLK_IDX: u8 = 133;
-pub const CAM_H_ENABLE_IDX: u8 = 134;
-pub const CAM_H_SYNC_IDX: u8 = 135;
-pub const CAM_V_SYNC_IDX: u8 = 136;
-pub const CAM_DATA_IN0_IDX: u8 = 137;
-pub const CAM_CLK_IDX: u8 = 133;
+/// ESP32-S3 GPIO matrix signal indices for `LCD_CAM` (`soc/gpio_sig_map.h`).
+pub const CAM_DATA_IN0_IDX: u32 = 133;
+pub const CAM_PCLK_IDX: u32 = 149;
+pub const CAM_CLK_IDX: u32 = 149;
+pub const CAM_H_ENABLE_IDX: u32 = 150;
+pub const CAM_H_SYNC_IDX: u32 = 151;
+pub const CAM_V_SYNC_IDX: u32 = 152;
 
-/// GDMA peripheral selector value for `LCD_CAM` (`GDMA.channel[n].in.peri_sel.sel = 5`).
+/// GDMA peripheral selector value for `LCD_CAM`
+/// (`GDMA.channel[n].in.peri_sel.sel = 5`).
 pub const GDMA_PERI_SEL_LCD_CAM: u8 = 5;
 
 /// Simulated / shadow MMIO register block for `LCD_CAM` and `GDMA` on ESP32-S3.
@@ -35,6 +44,7 @@ pub const GDMA_PERI_SEL_LCD_CAM: u8 = 5;
 pub struct Esp32S3LcdCamRegisterBlock {
     pub cam_ctrl: u32,
     pub cam_ctrl1: u32,
+    pub cam_ctrl2: u32,
     pub cam_rgb_yuv: u32,
     pub lc_dma_int_ena: u32,
     pub lc_dma_int_st: u32,
@@ -50,12 +60,13 @@ pub struct Esp32S3LcdCamRegisterBlock {
 #[inline]
 fn volatile_write_u32(reg: &mut u32, val: u32) {
     let ptr = ptr::from_mut(reg);
+    // JUSTIFICATION: Direct MMIO register access requires unsafe raw pointer write.
     // SAFETY:
-    // 1. Alignment & Non-null: `ptr` is obtained via `ptr::from_mut` from a valid `&mut u32` reference.
+    // 1. Alignment & Non-null: `ptr` is obtained from a valid `&mut u32` ref.
     // 2. Memory layout: `u32` word inside `#[repr(C, align(4))]`.
     // 3. Provenance & Lifetime: Valid mutable provenance for this call.
     // 4. Exclusive aliasing: `reg` is uniquely borrowed.
-    // 5. Volatile semantics: `write_volatile` prevents compiler elision or reordering.
+    // 5. Volatile semantics: `write_volatile` prevents compiler elision.
     // 6. Panic safety: Cannot unwind.
     unsafe {
         ptr::write_volatile(ptr, val);
@@ -65,8 +76,9 @@ fn volatile_write_u32(reg: &mut u32, val: u32) {
 #[inline]
 fn volatile_read_u32(reg: &u32) -> u32 {
     let ptr = ptr::from_ref(reg);
+    // JUSTIFICATION: Direct MMIO register access requires unsafe raw pointer read.
     // SAFETY:
-    // 1. Alignment & Non-null: `ptr` is obtained via `ptr::from_ref` from a valid `&u32` reference.
+    // 1. Alignment & Non-null: `ptr` is obtained from a valid `&u32` ref.
     // 2. Memory layout: `u32` word inside `#[repr(C, align(4))]`.
     // 3. Provenance & Lifetime: Valid shared provenance for this call.
     // 4. Aliasing: No concurrent mutable borrow exists.
@@ -75,7 +87,8 @@ fn volatile_read_u32(reg: &u32) -> u32 {
     unsafe { ptr::read_volatile(ptr) }
 }
 
-/// Low-level ESP32-S3 `LCD_CAM` + `GDMA` camera peripheral controller (`target/esp32s3/ll_cam.c`).
+/// Low-level ESP32-S3 `LCD_CAM` + `GDMA` camera controller
+/// (`target/esp32s3/ll_cam.c`).
 #[derive(Debug, Clone)]
 pub struct Esp32S3LcdCam {
     regs: Esp32S3LcdCamRegisterBlock,
@@ -86,7 +99,7 @@ pub struct Esp32S3LcdCam {
     conv_mode: CameraConvMode,
     in_bytes_per_pixel: u8,
     fb_bytes_per_pixel: u8,
-    gpio_bindings: [GpioMatrixBinding; 12],
+    gpio_bindings: [GpioMatrixBinding; 13],
     gpio_binding_count: usize,
     running: bool,
 }
@@ -105,6 +118,7 @@ impl Esp32S3LcdCam {
             regs: Esp32S3LcdCamRegisterBlock {
                 cam_ctrl: 0,
                 cam_ctrl1: 0,
+                cam_ctrl2: 0,
                 cam_rgb_yuv: 0,
                 lc_dma_int_ena: 0,
                 lc_dma_int_st: 0,
@@ -127,7 +141,7 @@ impl Esp32S3LcdCam {
                 gpio_num: 0,
                 signal_idx: 0,
                 inverted: false,
-            }; 12],
+            }; 13],
             gpio_binding_count: 0,
             running: false,
         }
@@ -181,14 +195,15 @@ impl Esp32S3LcdCam {
         self.swap_data = swap_data;
     }
 
-    /// Returns the required PSRAM DMA alignment (`16 << in_ext_mem_bk_size`, `target/esp32s3/ll_cam.c:457-460`).
+    /// Returns the required PSRAM DMA alignment
+    /// (`16 << in_ext_mem_bk_size`, `target/esp32s3/ll_cam.c:457-460`).
     #[inline]
     pub fn dma_align(&self) -> u8 {
         let bk_size = (volatile_read_u32(&self.regs.gdma_in_conf1) >> 12) & 0x3;
         16u8 << bk_size
     }
 
-    /// Resets and configures the GDMA RX channel (`ll_cam_dma_reset` in `target/esp32s3/ll_cam.c:73-96`).
+    /// Resets and configures GDMA RX channel (`target/esp32s3/ll_cam.c:73-96`).
     pub fn dma_reset(&mut self) {
         volatile_write_u32(&mut self.regs.gdma_in_int_clr, u32::MAX);
         volatile_write_u32(&mut self.regs.gdma_in_int_ena, 0);
@@ -206,7 +221,8 @@ impl Esp32S3LcdCam {
         );
     }
 
-    /// Configures GPIO matrix routing for ESP32-S3 `LCD_CAM` (`ll_cam_set_pin` in `target/esp32s3/ll_cam.c:386-420`).
+    /// Configures GPIO routing for ESP32-S3 `LCD_CAM`
+    /// (`ll_cam_set_pin` in `target/esp32s3/ll_cam.c:386-420`).
     pub fn set_pin(&mut self, cfg: &CamPinConfig) -> Result<(), CameraError> {
         if cfg.pin_vsync < 0
             || (cfg.pin_vsync as u8) >= ESP32S3_GPIO_NUM_MAX
@@ -230,45 +246,51 @@ impl Esp32S3LcdCam {
 
         self.gpio_bindings[0] = GpioMatrixBinding {
             gpio_num: cfg.pin_pclk as u8,
-            signal_idx: CAM_PCLK_IDX,
+            signal_idx: CAM_PCLK_IDX as u8,
             inverted: false,
         };
         self.gpio_bindings[1] = GpioMatrixBinding {
             gpio_num: cfg.pin_vsync as u8,
-            signal_idx: CAM_V_SYNC_IDX,
+            signal_idx: CAM_V_SYNC_IDX as u8,
             inverted: cfg.vsync_invert,
         };
         self.gpio_bindings[2] = GpioMatrixBinding {
             gpio_num: cfg.pin_href as u8,
-            signal_idx: CAM_H_SYNC_IDX,
+            signal_idx: CAM_H_ENABLE_IDX as u8,
+            inverted: false,
+        };
+        self.gpio_bindings[3] = GpioMatrixBinding {
+            gpio_num: cfg.pin_href as u8,
+            signal_idx: CAM_H_SYNC_IDX as u8,
             inverted: false,
         };
 
         let mut d = 0;
         while d < 8 {
-            self.gpio_bindings[3 + d] = GpioMatrixBinding {
+            self.gpio_bindings[4 + d] = GpioMatrixBinding {
                 gpio_num: cfg.data_pins[d] as u8,
-                signal_idx: CAM_DATA_IN0_IDX + (d as u8),
+                signal_idx: (CAM_DATA_IN0_IDX as u8) + (d as u8),
                 inverted: false,
             };
             d += 1;
         }
 
         if cfg.pin_xclk >= 0 {
-            self.gpio_bindings[11] = GpioMatrixBinding {
+            self.gpio_bindings[12] = GpioMatrixBinding {
                 gpio_num: cfg.pin_xclk as u8,
-                signal_idx: CAM_CLK_IDX,
+                signal_idx: CAM_CLK_IDX as u8,
                 inverted: false,
             };
-            self.gpio_binding_count = 12;
+            self.gpio_binding_count = 13;
         } else {
-            self.gpio_binding_count = 11;
+            self.gpio_binding_count = 12;
         }
 
+        volatile_write_u32(&mut self.regs.cam_ctrl2, LCD_CAM_CAM_VH_DE_MODE_EN);
         Ok(())
     }
 
-    /// Configures the `LCD_CAM` peripheral, clock divider, optional color converter, and GDMA channel
+    /// Configures `LCD_CAM` peripheral, clock divider, and GDMA channel
     /// (`ll_cam_config` in `target/esp32s3/ll_cam.c:315-374`).
     pub fn config(
         &mut self,
@@ -285,14 +307,19 @@ impl Esp32S3LcdCam {
         }
         let div_num = raw_div;
         let swap_bit = u32::from(self.swap_data) << 15;
-        // `cam_clkm_div_num` (bits 0..7), `cam_clk_sel = 3` (bits 21..22), `cam_vsync_filter_thres = 4` (bits 11..13), `cam_update = 1` (bit 14)
+        // `cam_clkm_div_num` (0..7), `cam_clk_sel = 3` (21..22),
+        // `cam_vsync_filter_thres = 4` (11..13), `cam_update = 1` (bit 14).
         let ctrl_val = div_num | (4 << 11) | (1 << 14) | swap_bit | (3 << 21);
         volatile_write_u32(&mut self.regs.cam_ctrl, ctrl_val);
 
-        // `cam_rec_data_bytelen = LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE - 1`, `cam_vsync_filter_en = 1 (bit 22)`, `cam_start = 1 (bit 29)`
+        // `cam_rec_data_bytelen = LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE - 1`,
+        // `cam_vsync_filter_en = 1 (bit 22)`, `cam_start = 1 (bit 29)`.
         let ctrl1_val =
             ((LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE as u32 - 1) & 0xFFFF) | (1 << 22) | (1 << 29);
         volatile_write_u32(&mut self.regs.cam_ctrl1, ctrl1_val);
+
+        // VH DE mode enable on ESP32-S3.
+        volatile_write_u32(&mut self.regs.cam_ctrl2, LCD_CAM_CAM_VH_DE_MODE_EN);
 
         volatile_write_u32(&mut self.regs.cam_rgb_yuv, 0);
         if conv_mode != CameraConvMode::Disable {
@@ -301,7 +328,10 @@ impl Esp32S3LcdCam {
                     if pixel_format != PixelFormat::Yuv422 {
                         return Err(CameraError::InvalidFormat);
                     }
-                    volatile_write_u32(&mut self.regs.cam_rgb_yuv, 1 | (1 << 4) | (1 << 30) | (1 << 31));
+                    volatile_write_u32(
+                        &mut self.regs.cam_rgb_yuv,
+                        1 | (1 << 4) | (1 << 30) | (1 << 31),
+                    );
                 }
                 CameraConvMode::Yuv422ToRgb565 => {
                     if pixel_format != PixelFormat::Yuv422 {
@@ -318,18 +348,23 @@ impl Esp32S3LcdCam {
         Ok(())
     }
 
-    /// Dynamically updates the `LCD_CAM` `XCLK` divider (`xclk_timer_conf` in `target/esp32s3/ll_cam.c:617-627`).
+    /// Updates the `LCD_CAM` `XCLK` divider
+    /// (`xclk_timer_conf` in `target/esp32s3/ll_cam.c:617-627`).
     pub fn xclk_timer_conf(&mut self, xclk_freq_hz: u32) -> Result<(), CameraError> {
         if xclk_freq_hz == 0 || xclk_freq_hz > 40_000_000 {
             return Err(CameraError::InvalidArg);
         }
         let div_num = (160_000_000 / xclk_freq_hz) & 0xFF;
         let prev = volatile_read_u32(&self.regs.cam_ctrl) & !0xFF;
-        volatile_write_u32(&mut self.regs.cam_ctrl, prev | div_num | (3 << 21) | (1 << 14));
+        volatile_write_u32(
+            &mut self.regs.cam_ctrl,
+            prev | div_num | (3 << 21) | (1 << 14),
+        );
         Ok(())
     }
 
-    /// Configures byte-per-pixel ratios on ESP32-S3 (`ll_cam_set_sample_mode` in `target/esp32s3/ll_cam.c:580-614`).
+    /// Configures byte-per-pixel ratios on ESP32-S3
+    /// (`ll_cam_set_sample_mode` in `target/esp32s3/ll_cam.c:580-614`).
     pub fn set_sample_mode(
         &mut self,
         pix_format: PixelFormat,
@@ -364,7 +399,8 @@ impl Esp32S3LcdCam {
         Ok((self.in_bytes_per_pixel, self.fb_bytes_per_pixel))
     }
 
-    /// Computes DMA buffer geometry on ESP32-S3 (`ll_cam_dma_sizes` in `target/esp32s3/ll_cam.c:538-557`).
+    /// Computes DMA buffer geometry on ESP32-S3
+    /// (`ll_cam_dma_sizes` in `target/esp32s3/ll_cam.c:538-557`).
     pub fn dma_sizes(
         &self,
         width: u16,
@@ -406,13 +442,14 @@ impl Esp32S3LcdCam {
         }
     }
 
-    /// Enables or disables the `LCD_CAM` VSYNC interrupt (`ll_cam_vsync_intr_enable` in `target/esp32s3/ll_cam.c:376-384`).
+    /// Enables or disables the `LCD_CAM` VSYNC interrupt
+    /// (`ll_cam_vsync_intr_enable` in `target/esp32s3/ll_cam.c:376-384`).
     pub fn vsync_intr_enable(&mut self, en: bool) {
         volatile_write_u32(&mut self.regs.lc_dma_int_clr, 1);
         volatile_write_u32(&mut self.regs.lc_dma_int_ena, u32::from(en));
     }
 
-    /// Starts `LCD_CAM` + `GDMA` frame reception (`ll_cam_start` in `target/esp32s3/ll_cam.c:152-181`).
+    /// Starts `LCD_CAM` + `GDMA` capture (`target/esp32s3/ll_cam.c:152-181`).
     pub fn start(&mut self, dma_cfg: &DmaSizeConfig, first_desc_addr: u32) -> bool {
         if dma_cfg.dma_half_buffer_size == 0 {
             return false;
@@ -423,10 +460,7 @@ impl Esp32S3LcdCam {
         }
 
         let rec_len = ((dma_cfg.dma_half_buffer_size - 1) as u32) & 0xFFFF;
-        volatile_write_u32(
-            &mut self.regs.cam_ctrl1,
-            rec_len | (1 << 22) | (1 << 29),
-        );
+        volatile_write_u32(&mut self.regs.cam_ctrl1, rec_len | (1 << 22) | (1 << 29));
         volatile_write_u32(
             &mut self.regs.gdma_in_link,
             (first_desc_addr & 0x000F_FFFF) | (1 << 29),
@@ -435,7 +469,7 @@ impl Esp32S3LcdCam {
         true
     }
 
-    /// Stops `LCD_CAM` + `GDMA` frame reception (`ll_cam_stop` in `target/esp32s3/ll_cam.c:142-150`).
+    /// Stops `LCD_CAM` + `GDMA` capture (`target/esp32s3/ll_cam.c:142-150`).
     pub fn stop(&mut self) -> bool {
         if self.jpeg_mode || !self.psram_mode {
             volatile_write_u32(&mut self.regs.gdma_in_int_ena, 0);
@@ -449,7 +483,7 @@ impl Esp32S3LcdCam {
         true
     }
 
-    /// Deinitializes `LCD_CAM` + `GDMA` (`ll_cam_deinit` in `target/esp32s3/ll_cam.c:183-204`).
+    /// Deinitializes `LCD_CAM` + `GDMA` (`target/esp32s3/ll_cam.c:183-204`).
     pub fn deinit(&mut self) -> Result<(), CameraError> {
         let _ = self.stop();
         volatile_write_u32(&mut self.regs.cam_ctrl1, 0);
@@ -475,7 +509,17 @@ mod tests {
         };
         assert_eq!(s3.set_pin(&pins), Ok(()));
         assert_eq!(s3.dma_align(), 16);
-        assert_eq!(s3.gpio_bindings()[2].signal_idx, CAM_H_SYNC_IDX);
+        assert_eq!(s3.gpio_bindings()[0].signal_idx, CAM_PCLK_IDX as u8);
+        assert_eq!(s3.gpio_bindings()[1].signal_idx, CAM_V_SYNC_IDX as u8);
+        assert_eq!(s3.gpio_bindings()[2].signal_idx, CAM_H_ENABLE_IDX as u8);
+        assert_eq!(s3.gpio_bindings()[3].signal_idx, CAM_H_SYNC_IDX as u8);
+        assert_eq!(s3.gpio_bindings()[4].signal_idx, CAM_DATA_IN0_IDX as u8);
+        assert_eq!(
+            s3.gpio_bindings()[11].signal_idx,
+            (CAM_DATA_IN0_IDX + 7) as u8
+        );
+        assert_eq!(s3.gpio_bindings()[12].signal_idx, CAM_CLK_IDX as u8);
+        assert_eq!(s3.regs().cam_ctrl2, LCD_CAM_CAM_VH_DE_MODE_EN);
 
         // PSRAM mode getter and setter (LL-010)
         assert!(!s3.psram_mode());
@@ -497,16 +541,25 @@ mod tests {
         );
 
         assert_eq!(
-            s3.config(20_000_000, PixelFormat::Yuv422, CameraConvMode::Yuv422ToRgb565),
+            s3.config(
+                20_000_000,
+                PixelFormat::Yuv422,
+                CameraConvMode::Yuv422ToRgb565
+            ),
             Ok(())
         );
         // 160MHz / 20MHz = 8
         assert_eq!(s3.regs().cam_ctrl & 0xFF, 8);
         assert_eq!(s3.regs().gdma_in_peri_sel, GDMA_PERI_SEL_LCD_CAM as u32);
+        assert_eq!(s3.regs().cam_ctrl2, LCD_CAM_CAM_VH_DE_MODE_EN);
 
         // Reject invalid color converter input format
         assert_eq!(
-            s3.config(20_000_000, PixelFormat::Jpeg, CameraConvMode::Yuv422ToRgb565),
+            s3.config(
+                20_000_000,
+                PixelFormat::Jpeg,
+                CameraConvMode::Yuv422ToRgb565
+            ),
             Err(CameraError::InvalidFormat)
         );
 

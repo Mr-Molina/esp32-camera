@@ -434,7 +434,12 @@ fn set_reg_bits<B: SccbBus>(
 }
 
 #[inline]
-fn check_reg_mask<B: SccbBus>(bus: &mut B, slv_addr: u8, reg: u8, mask: u8) -> Result<u8, CameraError> {
+fn check_reg_mask<B: SccbBus>(
+    bus: &mut B,
+    slv_addr: u8,
+    reg: u8,
+    mask: u8,
+) -> Result<u8, CameraError> {
     let val = bus.read_reg8(slv_addr, reg)?;
     Ok(u8::from((val & mask) == mask))
 }
@@ -481,7 +486,8 @@ impl Default for Gc032a {
 }
 
 impl Gc032a {
-    /// Creates a new [`Gc032a`] instance with default SCCB address (`0x21`) and PID (`0x232A`).
+    /// Creates a new [`Gc032a`] instance with default SCCB address (`0x21`)
+    /// and PID (`0x232A`).
     pub const fn new() -> Self {
         Self {
             id: SensorId {
@@ -534,7 +540,8 @@ impl Gc032a {
         }
     }
 
-    /// Probes the SCCB bus at `slv_addr` (`0x21`) and verifies `GC032A_PID` (`0x232A`).
+    /// Probes the SCCB bus at `slv_addr` (`0x21`) and verifies `GC032A_PID`
+    /// (`0x232A`).
     pub fn detect<B: SccbBus>(bus: &mut B, slv_addr: u8) -> Result<SensorId, CameraError> {
         if slv_addr != CameraSccbAddr::GC032A {
             return Err(CameraError::NotDetected);
@@ -698,7 +705,14 @@ impl<B: SccbBus> CameraSensor<B> for Gc032a {
 
     fn set_colorbar(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         bus.write_reg8(self.slv_addr, 0xFE, 0x00)?;
-        set_reg_bits(bus, self.slv_addr, P0_DEBUG_MODE2, 3, 0x01, u8::from(enable))?;
+        set_reg_bits(
+            bus,
+            self.slv_addr,
+            P0_DEBUG_MODE2,
+            3,
+            0x01,
+            u8::from(enable),
+        )?;
         self.status.colorbar = u8::from(enable);
         Ok(())
     }
@@ -706,13 +720,27 @@ impl<B: SccbBus> CameraSensor<B> for Gc032a {
     fn set_hmirror(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         self.status.hmirror = u8::from(enable);
         bus.write_reg8(self.slv_addr, 0xFE, 0x00)?;
-        set_reg_bits(bus, self.slv_addr, P0_CISCTL_MODE1, 0, 0x01, u8::from(enable))
+        set_reg_bits(
+            bus,
+            self.slv_addr,
+            P0_CISCTL_MODE1,
+            0,
+            0x01,
+            u8::from(enable),
+        )
     }
 
     fn set_vflip(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         self.status.vflip = u8::from(enable);
         bus.write_reg8(self.slv_addr, 0xFE, 0x00)?;
-        set_reg_bits(bus, self.slv_addr, P0_CISCTL_MODE1, 1, 0x01, u8::from(enable))
+        set_reg_bits(
+            bus,
+            self.slv_addr,
+            P0_CISCTL_MODE1,
+            1,
+            0x01,
+            u8::from(enable),
+        )
     }
 
     fn get_reg(&mut self, bus: &mut B, reg: i32, mask: i32) -> Result<i32, CameraError> {
@@ -723,13 +751,7 @@ impl<B: SccbBus> CameraSensor<B> for Gc032a {
         Ok(val & mask)
     }
 
-    fn set_reg(
-        &mut self,
-        bus: &mut B,
-        reg: i32,
-        mask: i32,
-        value: i32,
-    ) -> Result<(), CameraError> {
+    fn set_reg(&mut self, bus: &mut B, reg: i32, mask: i32, value: i32) -> Result<(), CameraError> {
         if !(0..=0xFF).contains(&reg) || !(0..=0xFF).contains(&mask) {
             return Err(CameraError::InvalidArg);
         }

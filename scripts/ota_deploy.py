@@ -37,14 +37,13 @@ ESP_IMAGE_HEADER_LEN = 24
 OTA_PARTITION_MAX_SIZE = 0x001B_0000  # 1,769,472 bytes
 
 
-def resolve_default_token() -> str:
-    """Resolves the default OTA authentication token without static secrets.
-
-    Prioritizes environment variables, then local configuration (.env.local),
-    falling back to a dynamically constructed token to prevent static secret
-    signature detection (bandit:B105).
-    """
-    env_token = os.environ.get("OTA_TOKEN") or os.environ.get("WIFI_OTA_TOKEN")
+def resolve_default_token() -> str | None:
+    """Resolves the default OTA authentication token from environment or local configuration."""
+    env_token = (
+        os.environ.get("CAM_OTA_TOKEN")
+        or os.environ.get("OTA_TOKEN")
+        or os.environ.get("WIFI_OTA_TOKEN")
+    )
     if env_token:
         return env_token
     env_local = os.path.join(os.path.dirname(__file__), "..", ".env.local")
@@ -53,13 +52,13 @@ def resolve_default_token() -> str:
             with open(env_local, "r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
-                    if line.startswith(("OTA_TOKEN=", "WIFI_OTA_TOKEN=")):
+                    if line.startswith(("CAM_OTA_TOKEN=", "OTA_TOKEN=", "WIFI_OTA_TOKEN=")):
                         val = line.split("=", 1)[1].strip().strip('"').strip("'")
                         if val:
                             return val
         except OSError:
             pass
-    return "klipper-" + "cam-ota-2026"
+    return None
 
 
 def stage_and_validate_image(elf_path: str, bin_path: str, host: str, port: int) -> bytes:
@@ -287,7 +286,7 @@ def main() -> int:
     parser.add_argument(
         "--token",
         default=resolve_default_token(),
-        help="X-OTA-Token authentication secret",
+        help="X-OTA-Token authentication secret (default: $CAM_OTA_TOKEN)",
     )
     parser.add_argument(
         "--stage-only",
@@ -295,6 +294,13 @@ def main() -> int:
         help="Convert ELF to .bin and validate 0xE9 header without touching the network",
     )
     args = parser.parse_args()
+
+    if not args.stage_only and not args.token:
+        print(
+            "[OTA-ERROR] No OTA authentication token provided. Pass --token <SECRET> or set CAM_OTA_TOKEN environment variable.",
+            file=sys.stderr,
+        )
+        return 1
 
     try:
         payload = stage_and_validate_image(args.elf, args.bin, args.host, args.port)

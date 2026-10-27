@@ -1,6 +1,7 @@
 //! NT99141 720p HD JPEG/YUV/RGB CMOS image sensor driver.
 //!
-//! Ported from `sensors/nt99141.c`, `sensors/private_include/nt99141_regs.h`, and
+//! Ported from `sensors/nt99141.c`,
+//! `sensors/private_include/nt99141_regs.h`, and
 //! `sensors/private_include/nt99141_settings.h`.
 
 use crate::{
@@ -546,8 +547,9 @@ pub const SENSOR_FRAMESIZE_VGA_XYSKIP: &[Reg16] = &[
     Reg16::new(0x3060, 0x01),
 ];
 
-/// Writes a slice of [`Reg16`] entries to `slv_addr`, interpreting `REG_DLY` (`0xFFFF`) as a delay in ms
-/// and `REGLIST_TAIL` (`0x0000`) as an early list terminator.
+/// Writes a slice of [`Reg16`] entries to `slv_addr`, interpreting `REG_DLY`
+/// (`0xFFFF`) as a delay in ms and `REGLIST_TAIL` (`0x0000`) as an early
+/// list terminator.
 pub fn write_reg_list<B: SccbBus>(
     bus: &mut B,
     slv_addr: u8,
@@ -593,7 +595,12 @@ fn write_reg_bits<B: SccbBus>(
 }
 
 #[inline]
-fn check_reg_mask<B: SccbBus>(bus: &mut B, slv_addr: u8, reg: u16, mask: u8) -> Result<u8, CameraError> {
+fn check_reg_mask<B: SccbBus>(
+    bus: &mut B,
+    slv_addr: u8,
+    reg: u16,
+    mask: u8,
+) -> Result<u8, CameraError> {
     let val = bus.read_reg16(slv_addr, reg)?;
     Ok(u8::from((val & mask) == mask))
 }
@@ -634,7 +641,8 @@ impl Default for Nt99141 {
 }
 
 impl Nt99141 {
-    /// Creates a new [`Nt99141`] instance with default SCCB address (`0x2A`) and PID (`0x1410`).
+    /// Creates a new [`Nt99141`] instance with default SCCB address (`0x2A`)
+    /// and PID (`0x1410`).
     pub const fn new() -> Self {
         Self {
             id: SensorId {
@@ -793,10 +801,20 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
         self.status.awb = check_reg_mask(bus, self.slv_addr, ISP_CONTROL_01, 0x10)?;
         self.status.dcw = u8::from(check_reg_mask(bus, self.slv_addr, 0x5183, 0x80)? == 0);
         self.status.agc = u8::from(
-            check_reg_mask(bus, self.slv_addr, AEC_PK_MANUAL, AEC_PK_MANUAL_AGC_MANUALEN)? == 0,
+            check_reg_mask(
+                bus,
+                self.slv_addr,
+                AEC_PK_MANUAL,
+                AEC_PK_MANUAL_AGC_MANUALEN,
+            )? == 0,
         );
         self.status.aec = u8::from(
-            check_reg_mask(bus, self.slv_addr, AEC_PK_MANUAL, AEC_PK_MANUAL_AEC_MANUALEN)? == 0,
+            check_reg_mask(
+                bus,
+                self.slv_addr,
+                AEC_PK_MANUAL,
+                AEC_PK_MANUAL_AEC_MANUALEN,
+            )? == 0,
         );
         self.status.hmirror =
             check_reg_mask(bus, self.slv_addr, TIMING_TC_REG21, TIMING_TC_REG21_HMIRROR)?;
@@ -935,7 +953,13 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
     }
 
     fn set_colorbar(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        write_reg_bits(bus, self.slv_addr, PRE_ISP_TEST_SETTING_1, TEST_COLOR_BAR, enable)?;
+        write_reg_bits(
+            bus,
+            self.slv_addr,
+            PRE_ISP_TEST_SETTING_1,
+            TEST_COLOR_BAR,
+            enable,
+        )?;
         self.status.colorbar = u8::from(enable);
         Ok(())
     }
@@ -1105,13 +1129,7 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
         Ok(ret)
     }
 
-    fn set_reg(
-        &mut self,
-        bus: &mut B,
-        reg: i32,
-        mask: i32,
-        value: i32,
-    ) -> Result<(), CameraError> {
+    fn set_reg(&mut self, bus: &mut B, reg: i32, mask: i32, value: i32) -> Result<(), CameraError> {
         if !(0..=0xFFFF).contains(&reg) || mask < 0 {
             return Err(CameraError::InvalidArg);
         }
@@ -1153,11 +1171,35 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
         scale: bool,
         binning: bool,
     ) -> Result<(), CameraError> {
-        write_addr_reg(bus, self.slv_addr, X_ADDR_ST_H, start_x as u16, start_y as u16)?;
+        write_addr_reg(
+            bus,
+            self.slv_addr,
+            X_ADDR_ST_H,
+            start_x as u16,
+            start_y as u16,
+        )?;
         write_addr_reg(bus, self.slv_addr, X_ADDR_END_H, end_x as u16, end_y as u16)?;
-        write_addr_reg(bus, self.slv_addr, X_OFFSET_H, offset_x as u16, offset_y as u16)?;
-        write_addr_reg(bus, self.slv_addr, X_TOTAL_SIZE_H, total_x as u16, total_y as u16)?;
-        write_addr_reg(bus, self.slv_addr, X_OUTPUT_SIZE_H, output_x as u16, output_y as u16)?;
+        write_addr_reg(
+            bus,
+            self.slv_addr,
+            X_OFFSET_H,
+            offset_x as u16,
+            offset_y as u16,
+        )?;
+        write_addr_reg(
+            bus,
+            self.slv_addr,
+            X_TOTAL_SIZE_H,
+            total_x as u16,
+            total_y as u16,
+        )?;
+        write_addr_reg(
+            bus,
+            self.slv_addr,
+            X_OUTPUT_SIZE_H,
+            output_x as u16,
+            output_y as u16,
+        )?;
         self.status.scale = scale;
         self.status.binning = binning;
         self.set_image_options(bus)

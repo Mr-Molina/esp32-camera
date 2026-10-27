@@ -1,13 +1,15 @@
 //! Pure-Rust `#![no_std]` baseline DCT JPEG encoder and decoder.
 //!
-//! Replaces `conversions/jpge.cpp`, `conversions/to_jpg.cpp`, and `conversions/esp_jpg_decode.c`
-//! with a zero-allocation, stack-only implementation (`#![forbid(unsafe_code)]`).
+//! Replaces `conversions/jpge.cpp`, `conversions/to_jpg.cpp`, and
+//! `conversions/esp_jpg_decode.c` with a zero-allocation, stack-only
+//! implementation (`#![forbid(unsafe_code)]`).
 
-use crate::bmp::{BMP_HEADER_LEN, write_bmp_header};
+use crate::bmp::{write_bmp_header, BMP_HEADER_LEN};
 use crate::yuv::rgb2yuv;
 use esp32_cam_types::CameraError;
 
-/// Full-range JFIF YCbCr to RGB888 conversion (inverse of `jpge.cpp`'s `RGB_to_YCC`).
+/// Full-range JFIF YCbCr to RGB888 conversion (inverse of `jpge.cpp`'s
+/// `RGB_to_YCC`).
 #[inline]
 fn jfif_ycbcr_to_rgb(y: u8, cb: u8, cr: u8) -> (u8, u8, u8) {
     let y = y as i32;
@@ -36,14 +38,16 @@ const ZAG: [usize; 64] = [
     52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
 ];
 
-/// Standard luminance quantization table in zig-zag order (`s_std_lum_quant` from `jpge.cpp:46`).
+/// Standard luminance quantization table in zig-zag order (`s_std_lum_quant`
+/// from `jpge.cpp:46`).
 const STD_LUM_QUANT: [i32; 64] = [
     16, 11, 12, 14, 12, 10, 16, 14, 13, 14, 18, 17, 16, 19, 24, 40, 26, 24, 22, 22, 24, 49, 35, 37,
     29, 40, 58, 51, 61, 60, 57, 51, 56, 55, 64, 72, 92, 78, 64, 68, 87, 69, 55, 56, 80, 109, 81,
     87, 95, 98, 103, 104, 103, 62, 77, 113, 121, 112, 100, 120, 92, 101, 103, 99,
 ];
 
-/// Standard chrominance quantization table in zig-zag order (`s_std_croma_quant` from `jpge.cpp:47`).
+/// Standard chrominance quantization table in zig-zag order
+/// (`s_std_croma_quant` from `jpge.cpp:47`).
 const STD_CHROMA_QUANT: [i32; 64] = [
     17, 18, 18, 24, 21, 24, 47, 26, 26, 47, 99, 66, 56, 66, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99,
     99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99,
@@ -152,7 +156,8 @@ fn dct_1d(
     *s7 = t4 + u1 + u3;
 }
 
-/// Performs the 8x8 forward 2D integer DCT matching `DCT2D` in `conversions/jpge.cpp:134-148`.
+/// Performs the 8x8 forward 2D integer DCT matching `DCT2D` in
+/// `conversions/jpge.cpp:134-148`.
 fn fdct_2d(block: &mut [i32; 64]) {
     for row in 0..8 {
         let base = row * 8;
@@ -204,8 +209,8 @@ fn fdct_2d(block: &mut [i32; 64]) {
     }
 }
 
-/// Performs the 8x8 inverse 2D integer IDCT (IJG `jidctint.c` LLM algorithm) and level-shifts
-/// output samples by `+128` into `0..=255`.
+/// Performs the 8x8 inverse 2D integer IDCT (IJG `jidctint.c` LLM algorithm)
+/// and level-shifts output samples by `+128` into `0..=255`.
 fn idct_2d(coeffs: &[i32; 64], out_pixels: &mut [u8; 64]) {
     let mut workspace = [0i32; 64];
 
@@ -327,15 +332,11 @@ fn idct_2d(coeffs: &[i32; 64], out_pixels: &mut [u8; 64]) {
 }
 
 fn compute_quant_table(base: &[i32; 64], quality: u8) -> [i32; 64] {
-    let q_clamped = quality.clamp(1, 100) as i32;
-    let scale = if q_clamped < 50 {
-        5000 / q_clamped
-    } else {
-        200 - q_clamped * 2
-    };
+    let q = quality.clamp(1, 100) as u32;
+    let scale = if q < 50 { 5000 / q } else { 200 - q * 2 };
     let mut out = [0i32; 64];
     for i in 0..64 {
-        let v = (base[i] * scale + 50) / 100;
+        let v = (base[i] * scale as i32 + 50) / 100;
         out[i] = v.clamp(1, 255);
     }
     out
@@ -507,7 +508,8 @@ impl<'a> JpegBitWriter<'a> {
             }
         }
 
-        // SOF0 (Baseline DCT, 1x1 H1V1 sampling for maximum sharpness and zero scanline heap buffer)
+        // SOF0 (Baseline DCT, 1x1 H1V1 sampling for maximum sharpness and zero
+        // scanline heap buffer)
         self.emit_marker(M_SOF0)?;
         self.emit_word(8 + 3 * (num_components as u16))?;
         self.emit_byte(8)?;
@@ -577,10 +579,18 @@ impl<'a> JpegBitWriter<'a> {
             let q = qtable[i];
             zz_coeffs[i] = if raw < 0 {
                 let adj = -raw + (q >> 1);
-                if adj < q { 0 } else { -(adj / q) }
+                if adj < q {
+                    0
+                } else {
+                    -(adj / q)
+                }
             } else {
                 let adj = raw + (q >> 1);
-                if adj < q { 0 } else { adj / q }
+                if adj < q {
+                    0
+                } else {
+                    adj / q
+                }
             };
         }
 
@@ -653,9 +663,11 @@ fn validate_encode_dims(
     Ok(req)
 }
 
-/// Encodes a 24-bit RGB888 image (`[R, G, B]`) into a baseline JFIF JPEG stream in `dst`.
+/// Encodes a 24-bit RGB888 image (`[R, G, B]`) into a baseline JFIF JPEG
+/// stream in `dst`.
 ///
-/// Performs zero heap allocations and returns the total JPEG byte length written to `dst`.
+/// Performs zero heap allocations and returns the total JPEG byte length
+/// written to `dst`.
 pub fn encode_rgb888_to_jpeg(
     src: &[u8],
     dst: &mut [u8],
@@ -696,7 +708,13 @@ pub fn encode_rgb888_to_jpeg(
                 }
             }
 
-            writer.encode_block(&mut y_block, &lum_q, &HUFF_DC_LUM, &HUFF_AC_LUM, &mut last_dc[0])?;
+            writer.encode_block(
+                &mut y_block,
+                &lum_q,
+                &HUFF_DC_LUM,
+                &HUFF_AC_LUM,
+                &mut last_dc[0],
+            )?;
             writer.encode_block(
                 &mut cb_block,
                 &chroma_q,
@@ -719,9 +737,11 @@ pub fn encode_rgb888_to_jpeg(
     Ok(writer.pos)
 }
 
-/// Encodes an 8-bit grayscale image into a single-component baseline JFIF JPEG stream in `dst`.
+/// Encodes an 8-bit grayscale image into a single-component baseline JFIF
+/// JPEG stream in `dst`.
 ///
-/// Performs zero heap allocations and returns the total JPEG byte length written to `dst`.
+/// Performs zero heap allocations and returns the total JPEG byte length
+/// written to `dst`.
 pub fn encode_grayscale_to_jpeg(
     src: &[u8],
     dst: &mut [u8],
@@ -754,7 +774,13 @@ pub fn encode_grayscale_to_jpeg(
                     y_block[dy * 8 + dx] = (src[py * w + px] as i32) - 128;
                 }
             }
-            writer.encode_block(&mut y_block, &lum_q, &HUFF_DC_LUM, &HUFF_AC_LUM, &mut last_dc)?;
+            writer.encode_block(
+                &mut y_block,
+                &lum_q,
+                &HUFF_DC_LUM,
+                &HUFF_AC_LUM,
+                &mut last_dc,
+            )?;
         }
     }
 
@@ -763,9 +789,11 @@ pub fn encode_grayscale_to_jpeg(
     Ok(writer.pos)
 }
 
-/// Encodes a packed YUV422 (YUYV: `[Y0, U, Y1, V]`) image into a baseline JFIF JPEG stream in `dst`.
+/// Encodes a packed YUV422 (YUYV: `[Y0, U, Y1, V]`) image into a baseline
+/// JFIF JPEG stream in `dst`.
 ///
-/// Performs zero heap allocations and returns the total JPEG byte length written to `dst`.
+/// Performs zero heap allocations and returns the total JPEG byte length
+/// written to `dst`.
 pub fn encode_yuv422_to_jpeg(
     src: &[u8],
     dst: &mut [u8],
@@ -825,7 +853,13 @@ pub fn encode_yuv422_to_jpeg(
                 }
             }
 
-            writer.encode_block(&mut y_block, &lum_q, &HUFF_DC_LUM, &HUFF_AC_LUM, &mut last_dc[0])?;
+            writer.encode_block(
+                &mut y_block,
+                &lum_q,
+                &HUFF_DC_LUM,
+                &HUFF_AC_LUM,
+                &mut last_dc[0],
+            )?;
             writer.encode_block(
                 &mut cb_block,
                 &chroma_q,
@@ -1029,7 +1063,9 @@ impl<'a> JpegBitReader<'a> {
         let dc_diff = self.receive_extend(dc_nbits)?;
         let dc_val = last_dc.saturating_add(dc_diff).clamp(-2048, 2047);
         *last_dc = dc_val;
-        coeffs[0] = dc_val.saturating_mul(i32::from(qtable[0])).clamp(-32768, 32767);
+        coeffs[0] = dc_val
+            .saturating_mul(i32::from(qtable[0]))
+            .clamp(-32768, 32767);
 
         let mut k = 1usize;
         while k < 64 {
@@ -1050,7 +1086,9 @@ impl<'a> JpegBitReader<'a> {
                 return Err(CameraError::CodecError);
             }
             let ac_val = self.receive_extend(s)?;
-            coeffs[ZAG[k]] = ac_val.saturating_mul(i32::from(qtable[k])).clamp(-32768, 32767);
+            coeffs[ZAG[k]] = ac_val
+                .saturating_mul(i32::from(qtable[k]))
+                .clamp(-32768, 32767);
             k += 1;
         }
 
@@ -1114,7 +1152,9 @@ fn decode_jpeg_internal(
             return Err(CameraError::CorruptedFrame);
         }
         let seg_len = u16::from_be_bytes([src[pos], src[pos + 1]]) as usize;
-        let seg_end = pos.checked_add(seg_len).ok_or(CameraError::CorruptedFrame)?;
+        let seg_end = pos
+            .checked_add(seg_len)
+            .ok_or(CameraError::CorruptedFrame)?;
         if seg_len < 2 || seg_end > src.len() {
             return Err(CameraError::CorruptedFrame);
         }
@@ -1221,7 +1261,8 @@ fn decode_jpeg_internal(
                 }
             }
             M_SOS => {
-                if !sof_parsed || !dht_seen || !dqt_seen || num_components == 0 || cur + 1 > seg_end {
+                if !sof_parsed || !dht_seen || !dqt_seen || num_components == 0 || cur + 1 > seg_end
+                {
                     return Err(CameraError::CodecError);
                 }
                 let sos_comps = src[cur] as usize;
@@ -1430,25 +1471,28 @@ fn decode_jpeg_internal(
     Ok((width, height, required_dst_len))
 }
 
-/// Decodes a baseline JPEG image from `src` into 24-bit RGB888 (`[R, G, B]`) in `dst`.
+/// Decodes a baseline JPEG image from `src` into 24-bit RGB888 (`[R, G, B]`)
+/// in `dst`.
 ///
-/// Performs zero heap allocations and returns the number of bytes written to `dst`
-/// (`width * height * 3`).
+/// Performs zero heap allocations and returns the number of bytes written
+/// to `dst` (`width * height * 3`).
 pub fn decode_jpeg_to_rgb888(src: &[u8], dst: &mut [u8]) -> Result<usize, CameraError> {
     let (_w, _h, written) = decode_jpeg_internal(src, dst, DecodeOutputFormat::Rgb888)?;
     Ok(written)
 }
 
-/// Decodes a baseline JPEG image from `src` into 16-bit big-endian RGB565 in `dst`.
+/// Decodes a baseline JPEG image from `src` into 16-bit big-endian RGB565
+/// in `dst`.
 ///
-/// Performs zero heap allocations and returns the number of bytes written to `dst`
-/// (`width * height * 2`).
+/// Performs zero heap allocations and returns the number of bytes written
+/// to `dst` (`width * height * 2`).
 pub fn decode_jpeg_to_rgb565(src: &[u8], dst: &mut [u8]) -> Result<usize, CameraError> {
     let (_w, _h, written) = decode_jpeg_internal(src, dst, DecodeOutputFormat::Rgb565)?;
     Ok(written)
 }
 
-/// Decodes a baseline JPEG image from `src` directly into a 24-bit BMP image in `dst`.
+/// Decodes a baseline JPEG image from `src` directly into a 24-bit BMP image
+/// in `dst`.
 ///
 /// Returns `(width, height, written_len)`.
 pub(crate) fn jpeg_to_bmp(src: &[u8], dst: &mut [u8]) -> Result<(u16, u16, usize), CameraError> {
@@ -1533,7 +1577,8 @@ mod tests {
 
     #[test]
     fn test_conv001_adversarial_max_quant_idct_no_overflow() {
-        // CONV-001: idct_2d must not panic with signed 32-bit overflow on extreme coefficients
+        // CONV-001: idct_2d must not panic with signed 32-bit overflow on
+        // extreme coefficients
         let mut out = [0u8; 64];
 
         let max_pos = [32767i32; 64];
@@ -1555,7 +1600,8 @@ mod tests {
 
     #[test]
     fn test_conv003_oversubscribed_huffman_kraft_inequality() {
-        // CONV-003: At bit length 1, 3 symbols requested when maximum allowed is 2 (Kraft violation)
+        // CONV-003: At bit length 1, 3 symbols requested when maximum allowed
+        // is 2 (Kraft violation)
         let mut bad_bits = [0u8; 17];
         bad_bits[1] = 3;
         let vals = [0u8; 3];
@@ -1565,7 +1611,8 @@ mod tests {
             CameraError::CodecError
         );
 
-        // At bit length 1: 2 symbols (fills tree at l=1); at length 2: 1 symbol -> Kraft violation
+        // At bit length 1: 2 symbols (fills tree at l=1); at length 2:
+        // 1 symbol -> Kraft violation
         let mut bad_bits2 = [0u8; 17];
         bad_bits2[1] = 2;
         bad_bits2[2] = 1;
@@ -1579,7 +1626,8 @@ mod tests {
 
     #[test]
     fn test_conv003_truncated_entropy_stream_pad_bound() {
-        // CONV-003: Severely truncated entropy streams must be rejected when eof_pad_bytes exceeded
+        // CONV-003: Severely truncated entropy streams must be rejected when
+        // eof_pad_bytes exceeded
         let rgb_in = [120u8; 16 * 16 * 3];
         let mut jpeg_buf = [0u8; 4096];
         let jpeg_len = encode_rgb888_to_jpeg(&rgb_in, &mut jpeg_buf, 16, 16, 90)
@@ -1601,7 +1649,8 @@ mod tests {
 
     #[test]
     fn test_conv003_unsupported_chroma_subsampling_rejection() {
-        // CONV-003: Reject unsupported chroma subsampling (c.h_samp != 1 || c.v_samp != 1 for c >= 1)
+        // CONV-003: Reject unsupported chroma subsampling
+        // (c.h_samp != 1 || c.v_samp != 1 for c >= 1)
         let rgb_in = [120u8; 16 * 16 * 3];
         let mut jpeg_buf = [0u8; 4096];
         let jpeg_len = encode_rgb888_to_jpeg(&rgb_in, &mut jpeg_buf, 16, 16, 90)
@@ -1640,7 +1689,8 @@ mod tests {
 
     #[test]
     fn test_conv003_restart_marker_multiple_ff_fill_bytes() {
-        // CONV-003: Verify restart interval resynchronization skips 0xFF fill bytes before RST0..RST7
+        // CONV-003: Verify restart interval resynchronization skips 0xFF fill
+        // bytes before RST0..RST7
         let mut jpeg = [0u8; 512];
         let mut p = 0usize;
 
@@ -1695,12 +1745,12 @@ mod tests {
         p += 6;
 
         // SOS: 1 component
-        jpeg[p..p + 10].copy_from_slice(&[
-            0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00,
-        ]);
+        jpeg[p..p + 10]
+            .copy_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00]);
         p += 10;
 
-        // MCU 0 scan data: DC diff 0 (00), EOB (1010) -> 0010_1011 (padded with 1s) = 0x2B
+        // MCU 0 scan data: DC diff 0 (00), EOB (1010) -> 0010_1011 (padded
+        // with 1s) = 0x2B
         jpeg[p] = 0x2B;
         p += 1;
 
@@ -1776,5 +1826,15 @@ mod tests {
             decode_jpeg_to_rgb888(&invalid_jpeg, &mut out),
             Err(CameraError::CorruptedFrame)
         );
+    }
+
+    #[test]
+    fn test_c06_quality_scaling_clamp() {
+        let q0 = compute_quant_table(&STD_LUM_QUANT, 0);
+        let q1 = compute_quant_table(&STD_LUM_QUANT, 1);
+        let q100 = compute_quant_table(&STD_LUM_QUANT, 100);
+        let q255 = compute_quant_table(&STD_LUM_QUANT, 255);
+        assert_eq!(q0, q1, "quality=0 must clamp to quality=1");
+        assert_eq!(q255, q100, "quality=255 must clamp to quality=100");
     }
 }

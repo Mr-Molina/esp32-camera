@@ -1,0 +1,6 @@
+edition = "2021"
+max_width = 100
+
+# Nightly options:
+# comment_width = 80
+# wrap_comments = true

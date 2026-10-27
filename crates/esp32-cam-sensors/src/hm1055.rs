@@ -817,7 +817,12 @@ fn write_reg_bits<B: SccbBus>(
 }
 
 #[inline]
-fn check_reg_mask<B: SccbBus>(bus: &mut B, slv_addr: u8, reg: u16, mask: u8) -> Result<u8, CameraError> {
+fn check_reg_mask<B: SccbBus>(
+    bus: &mut B,
+    slv_addr: u8,
+    reg: u16,
+    mask: u8,
+) -> Result<u8, CameraError> {
     let val = bus.read_reg16(slv_addr, reg)?;
     Ok(u8::from((val & mask) == mask))
 }
@@ -860,7 +865,8 @@ impl Default for Hm1055 {
 }
 
 impl Hm1055 {
-    /// Creates a new [`Hm1055`] instance with default SCCB address (`0x24`) and PID (`0x0955`).
+    /// Creates a new [`Hm1055`] instance with default SCCB address (`0x24`)
+    /// and PID (`0x0955`).
     pub const fn new() -> Self {
         Self {
             id: SensorId {
@@ -914,7 +920,8 @@ impl Hm1055 {
         }
     }
 
-    /// Probes the SCCB bus at `slv_addr` (`0x24`) and verifies `HM1055_PID` (`0x0955`).
+    /// Probes the SCCB bus at `slv_addr` (`0x24`) and verifies `HM1055_PID`
+    /// (`0x0955`).
     pub fn detect<B: SccbBus>(bus: &mut B, slv_addr: u8) -> Result<SensorId, CameraError> {
         if slv_addr != CameraSccbAddr::HM1055 {
             return Err(CameraError::NotDetected);
@@ -1069,7 +1076,11 @@ impl<B: SccbBus> CameraSensor<B> for Hm1055 {
     fn set_contrast(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
         let ispctrl5 = bus.read_reg16(self.slv_addr, ISPCTRL5)? | 0x80;
         bus.write_reg16(self.slv_addr, ISPCTRL5, ispctrl5)?;
-        bus.write_reg16(self.slv_addr, ACONTQ, ((level.wrapping_mul(0x20)) & 0xFF) as u8)?;
+        bus.write_reg16(
+            self.slv_addr,
+            ACONTQ,
+            ((level.wrapping_mul(0x20)) & 0xFF) as u8,
+        )?;
         bus.write_reg16(self.slv_addr, CMU, 0x01)?;
         self.status.contrast = level as i8;
         Ok(())
@@ -1226,13 +1237,7 @@ impl<B: SccbBus> CameraSensor<B> for Hm1055 {
         Ok(val & mask)
     }
 
-    fn set_reg(
-        &mut self,
-        bus: &mut B,
-        reg: i32,
-        mask: i32,
-        value: i32,
-    ) -> Result<(), CameraError> {
+    fn set_reg(&mut self, bus: &mut B, reg: i32, mask: i32, value: i32) -> Result<(), CameraError> {
         if !(0..=0xFFFF).contains(&reg) || mask < 0 {
             return Err(CameraError::InvalidArg);
         }

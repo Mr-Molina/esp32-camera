@@ -1,7 +1,9 @@
 //! MEGA_CCM 5MP JPEG/RGB565/YUV422 camera module driver.
 //!
-//! Ported from `sensors/mega_ccm.c` and `sensors/private_include/mega_ccm_regs.h`.
-//! Enforces strict 16-bit register address and 8-bit value bounds on register operations.
+//! Ported from `sensors/mega_ccm.c` and
+//! `sensors/private_include/mega_ccm_regs.h`.
+//! Enforces strict 16-bit register address and 8-bit value bounds on
+//! register operations.
 
 use crate::{
     CameraError, CameraModel, CameraPid, CameraSccbAddr, CameraSensor, CameraStatus, FrameSize,
@@ -65,7 +67,8 @@ impl Default for MegaCcm {
 }
 
 impl MegaCcm {
-    /// Creates a new [`MegaCcm`] instance with default SCCB address (`0x1F`) and PID (`0x039E`).
+    /// Creates a new [`MegaCcm`] instance with default SCCB address (`0x1F`)
+    /// and PID (`0x039E`).
     pub const fn new() -> Self {
         Self {
             id: SensorId {
@@ -118,7 +121,8 @@ impl MegaCcm {
         }
     }
 
-    /// Probes the SCCB bus at `slv_addr` (`0x1F`) and verifies `MEGA_CCM_PID` (`0x039E`).
+    /// Probes the SCCB bus at `slv_addr` (`0x1F`) and verifies `MEGA_CCM_PID`
+    /// (`0x039E`).
     pub fn detect<B: SccbBus>(bus: &mut B, slv_addr: u8) -> Result<SensorId, CameraError> {
         if slv_addr != CameraSccbAddr::MEGA_CCM {
             return Err(CameraError::NotDetected);
@@ -376,13 +380,7 @@ impl<B: SccbBus> CameraSensor<B> for MegaCcm {
         Ok(val & mask)
     }
 
-    fn set_reg(
-        &mut self,
-        bus: &mut B,
-        reg: i32,
-        mask: i32,
-        value: i32,
-    ) -> Result<(), CameraError> {
+    fn set_reg(&mut self, bus: &mut B, reg: i32, mask: i32, value: i32) -> Result<(), CameraError> {
         if !(0..=0xFFFF).contains(&reg) || !(0..=0xFF).contains(&mask) {
             return Err(CameraError::InvalidArg);
         }
