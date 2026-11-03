@@ -38,14 +38,17 @@ BOOTLOADER_BIN = REPO_ROOT / "firmware" / "bootloader_v554_gpio16.bin"
 # Authoritative ESP-IDF v5.5.4 `soc/*_reg.h` MMIO Register Address Map (`Invariant 72` / `INFRA-001`)
 AUTHORITATIVE_MMIO_REGISTERS: dict[str, int] = {
     "DPORT_HOST_INF_SEL_REG": 0x3FF0_00BC,
+    "DPORT_CORE_RST_EN_REG": 0x3FF0_00D0,
     "DPORT_PRO_FLASH_MMU_TABLE": 0x3FF1_0000,
     "SPI1_CMD_REG": 0x3FF4_2000,
     "SPI1_ADDR_REG": 0x3FF4_2004,
     "SPI1_CTRL_REG": 0x3FF4_2008,
+    "SPI1_CLOCK_REG": 0x3FF4_2018,
     "SPI1_USER_REG": 0x3FF4_201C,
     "SPI1_USER1_REG": 0x3FF4_2020,
     "SPI1_USER2_REG": 0x3FF4_2024,
     "SPI1_MOSI_DLEN_REG": 0x3FF4_2028,
+    "SPI1_MISO_DLEN_REG": 0x3FF4_202C,
     "SPI1_PIN_REG": 0x3FF4_2034,
     "SPI1_W0_REG": 0x3FF4_2080,
     "SPI1_EXT2_REG": 0x3FF4_20F8,
@@ -67,11 +70,31 @@ AUTHORITATIVE_MMIO_REGISTERS: dict[str, int] = {
     "RTC_CNTL_STORE6_REG": 0x3FF4_80B8,
     "RTC_CNTL_STORE7_REG": 0x3FF4_80BC,
     "RTC_CNTL_HOLD_FORCE_REG": 0x3FF4_80C8,
+    "RTC_IO_DIG_PAD_HOLD_REG": 0x3FF4_8474,
     "IO_MUX_GPIO16_REG": 0x3FF4_904C,
     "IO_MUX_GPIO17_REG": 0x3FF4_9050,
     "I2S_INT_RAW_REG": 0x3FF4_F00C,
     "I2S_INT_CLR_REG": 0x3FF4_F018,
     "RNG_DATA_REG": 0x3FF7_5144,
+    # ESP32-S3 LCD_CAM Registers (soc/esp32s3/register/soc/lcd_cam_reg.h)
+    "LCD_CAM_LCD_CLOCK_REG": 0x6004_1000,
+    "LCD_CAM_CAM_CTRL_REG": 0x6004_1004,
+    "LCD_CAM_CAM_CTRL1_REG": 0x6004_1008,
+    "LCD_CAM_CAM_RGB_YUV_REG": 0x6004_100C,
+    "LCD_CAM_LCD_RGB_YUV_REG": 0x6004_1010,
+    "LCD_CAM_LCD_USER_REG": 0x6004_1014,
+    "LCD_CAM_LCD_MISC_REG": 0x6004_1018,
+    "LCD_CAM_LCD_CTRL_REG": 0x6004_101C,
+    "LCD_CAM_LCD_CTRL1_REG": 0x6004_1020,
+    "LCD_CAM_LCD_CTRL2_REG": 0x6004_1024,
+    "LCD_CAM_LCD_CMD_VAL_REG": 0x6004_1028,
+    "LCD_CAM_LCD_DLY_MODE_REG": 0x6004_1030,
+    "LCD_CAM_LCD_DATA_DOUT_MODE_REG": 0x6004_1038,
+    "LCD_CAM_LC_DMA_INT_ENA_REG": 0x6004_1064,
+    "LCD_CAM_LC_DMA_INT_RAW_REG": 0x6004_1068,
+    "LCD_CAM_LC_DMA_INT_ST_REG": 0x6004_106C,
+    "LCD_CAM_LC_DMA_INT_CLR_REG": 0x6004_1070,
+    "LCD_CAM_LC_REG_DATE_REG": 0x6004_10FC,
 }
 
 
@@ -231,13 +254,24 @@ def verify_bootloader_bin() -> list[str]:
     if (
         b"\x00\x2b\x00\x00" not in data
         and b"\x2c\xb9\x80\x99\x11" not in data
+        and b"\x2c\xba\x80\xaa\x11" not in data
         and b"\x0c\xa9\x80\x88\x11" not in data
         and b"\x80\x99\x11" not in data
+        and b"\x80\xaa\x11" not in data
         and b"\x80\x88\x11" not in data
     ):
         errors.append(
             f"{BOOTLOADER_BIN}: missing GPIO 16 pull-up constant 0x2B00 in bootloader_before_init"
         )
+    for reg_label, reg_bytes in (
+        ("RTC_CNTL_HOLD_FORCE_REG 0x3FF480C8", b"\xc8\x80\xf4\x3f"),
+        ("RTC_IO_DIG_PAD_HOLD_REG 0x3FF48474", b"\x74\x84\xf4\x3f"),
+        ("GPIO_OUT_W1TS_REG 0x3FF44008", b"\x08\x40\xf4\x3f"),
+        ("GPIO_FUNC16_OUT_SEL_CFG_REG 0x3FF44570", b"\x70\x45\xf4\x3f"),
+        ("GPIO_ENABLE_W1TS_REG 0x3FF44024", b"\x24\x40\xf4\x3f"),
+    ):
+        if reg_bytes not in data:
+            errors.append(f"{BOOTLOADER_BIN}: missing {reg_label} in bootloader_before_init")
     return errors
 
 

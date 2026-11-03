@@ -1067,6 +1067,11 @@ impl Esp32I2sCamera {
 
         #[cfg(target_arch = "xtensa")]
         {
+            xtensa_mmio_write(
+                I2S0_BASE_ADDR + I2S_LC_CONF_REG_OFFSET,
+                I2S_LC_IN_RST_BIT | I2S_LC_AHBM_RST_BIT | I2S_LC_AHBM_FIFO_RST_BIT,
+            );
+            xtensa_mmio_write(I2S0_BASE_ADDR + I2S_LC_CONF_REG_OFFSET, 0);
             let hw_clk = xtensa_mmio_read(DPORT_PERIP_CLK_EN_REG) & !DPORT_I2S0_CLK_EN;
             xtensa_mmio_write(DPORT_PERIP_CLK_EN_REG, hw_clk);
             let hw_rst = xtensa_mmio_read(DPORT_PERIP_RST_EN_REG) | DPORT_I2S0_RST;

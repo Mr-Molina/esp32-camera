@@ -23,7 +23,9 @@ def get_camera_status():
         req = urllib.request.Request(STATUS_URL)
         with urllib.request.urlopen(req, timeout=3.0) as resp:
             if resp.status == 200:
-                return json.loads(resp.read().decode())
+                data = json.loads(resp.read().decode("utf-8"))
+                if data.get("uptime_ms") is not None:
+                    return data
     except Exception as exc:
         print(f"[WARN] Failed to read camera status from {STATUS_URL}: {exc}")
     return None
@@ -42,7 +44,7 @@ def ensure_passive(port_path: str = SERIAL_PORT):
 
     # 1. Disable HUPCL via stty
     cmd = ["stty", "-F", port_path, "-hupcl"]
-    res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    res = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=5.0)
     if res.returncode != 0:
         print(f"[ERROR] Failed to run stty -hupcl: {res.stderr}", file=sys.stderr)
         return 1

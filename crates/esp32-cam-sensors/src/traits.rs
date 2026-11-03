@@ -70,6 +70,9 @@ pub fn set_reg_bits8<B: SccbBus>(
     mask: u8,
     value: u8,
 ) -> Result<(), CameraError> {
+    if offset >= 8 {
+        return Err(CameraError::InvalidArg);
+    }
     let c_value = bus.read_reg8(slv_addr, reg)?;
     let shifted_mask = mask << offset;
     let new_value = (c_value & !shifted_mask) | ((value & mask) << offset);
@@ -85,6 +88,9 @@ pub fn set_reg_bits16<B: SccbBus>(
     mask: u8,
     value: u8,
 ) -> Result<(), CameraError> {
+    if offset >= 8 {
+        return Err(CameraError::InvalidArg);
+    }
     let c_value = bus.read_reg16(slv_addr, reg)?;
     let shifted_mask = mask << offset;
     let new_value = (c_value & !shifted_mask) | ((value & mask) << offset);
@@ -392,5 +398,18 @@ mod tests {
 
         run_sensor_checks(&mut sensor, &mut bus);
         assert_eq!(bus.reg8(CameraSccbAddr::OV2640, 0x12), 0x80);
+    }
+
+    #[test]
+    fn test_set_reg_bits_offset_bounds() {
+        let mut bus: MockSccbBus<32> = MockSccbBus::new();
+        assert_eq!(
+            set_reg_bits8(&mut bus, 0x30, 0x10, 8, 0x01, 0x01),
+            Err(CameraError::InvalidArg)
+        );
+        assert_eq!(
+            set_reg_bits16(&mut bus, 0x3C, 0x3000, 8, 0x01, 0x01),
+            Err(CameraError::InvalidArg)
+        );
     }
 }

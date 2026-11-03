@@ -14,11 +14,11 @@ use crate::esp32_i2s::{CamPinConfig, GpioMatrixBinding};
 /// Physical base address of `LCD_CAM` peripheral on ESP32-S3 (`0x6004_1000`).
 pub const ESP32S3_LCD_CAM_BASE_ADDR: usize = 0x6004_1000;
 
-/// Physical register address for `LCD_CAM_CAM_CTRL2_REG` (`0x6004_1024`).
-pub const LCD_CAM_CAM_CTRL2_REG: usize = ESP32S3_LCD_CAM_BASE_ADDR + 0x24;
+/// Physical register address for `LCD_CAM_CAM_CTRL1_REG` (`0x6004_1008`).
+pub const LCD_CAM_CAM_CTRL1_REG: usize = ESP32S3_LCD_CAM_BASE_ADDR + 0x08;
 
-/// Enable VH DE mode in `LCD_CAM_CAM_CTRL2_REG` (`1 << 2`).
-pub const LCD_CAM_CAM_VH_DE_MODE_EN: u32 = 1 << 2;
+/// Enable VH DE mode in `LCD_CAM_CAM_CTRL1_REG` (`1 << 28`).
+pub const LCD_CAM_CAM_VH_DE_MODE_EN: u32 = 1 << 28;
 
 /// Physical base address of `GDMA` peripheral on ESP32-S3 (`0x6003_F000`).
 pub const ESP32S3_GDMA_BASE_ADDR: usize = 0x6003_F000;
@@ -44,7 +44,6 @@ pub const GDMA_PERI_SEL_LCD_CAM: u8 = 5;
 pub struct Esp32S3LcdCamRegisterBlock {
     pub cam_ctrl: u32,
     pub cam_ctrl1: u32,
-    pub cam_ctrl2: u32,
     pub cam_rgb_yuv: u32,
     pub lc_dma_int_ena: u32,
     pub lc_dma_int_st: u32,
@@ -118,7 +117,6 @@ impl Esp32S3LcdCam {
             regs: Esp32S3LcdCamRegisterBlock {
                 cam_ctrl: 0,
                 cam_ctrl1: 0,
-                cam_ctrl2: 0,
                 cam_rgb_yuv: 0,
                 lc_dma_int_ena: 0,
                 lc_dma_int_st: 0,
@@ -286,7 +284,6 @@ impl Esp32S3LcdCam {
             self.gpio_binding_count = 12;
         }
 
-        volatile_write_u32(&mut self.regs.cam_ctrl2, LCD_CAM_CAM_VH_DE_MODE_EN);
         Ok(())
     }
 
@@ -313,13 +310,13 @@ impl Esp32S3LcdCam {
         volatile_write_u32(&mut self.regs.cam_ctrl, ctrl_val);
 
         // `cam_rec_data_bytelen = LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE - 1`,
-        // `cam_vsync_filter_en = 1 (bit 22)`, `cam_start = 1 (bit 29)`.
-        let ctrl1_val =
-            ((LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE as u32 - 1) & 0xFFFF) | (1 << 22) | (1 << 29);
+        // `cam_vsync_filter_en = 1 (bit 22)`, `cam_vh_de_mode_en = 1 (bit 28)`,
+        // `cam_start = 1 (bit 29)`.
+        let ctrl1_val = ((LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE as u32 - 1) & 0xFFFF)
+            | (1 << 22)
+            | LCD_CAM_CAM_VH_DE_MODE_EN
+            | (1 << 29);
         volatile_write_u32(&mut self.regs.cam_ctrl1, ctrl1_val);
-
-        // VH DE mode enable on ESP32-S3.
-        volatile_write_u32(&mut self.regs.cam_ctrl2, LCD_CAM_CAM_VH_DE_MODE_EN);
 
         volatile_write_u32(&mut self.regs.cam_rgb_yuv, 0);
         if conv_mode != CameraConvMode::Disable {
@@ -460,7 +457,10 @@ impl Esp32S3LcdCam {
         }
 
         let rec_len = ((dma_cfg.dma_half_buffer_size - 1) as u32) & 0xFFFF;
-        volatile_write_u32(&mut self.regs.cam_ctrl1, rec_len | (1 << 22) | (1 << 29));
+        volatile_write_u32(
+            &mut self.regs.cam_ctrl1,
+            rec_len | (1 << 22) | LCD_CAM_CAM_VH_DE_MODE_EN | (1 << 29),
+        );
         volatile_write_u32(
             &mut self.regs.gdma_in_link,
             (first_desc_addr & 0x000F_FFFF) | (1 << 29),
@@ -519,7 +519,8 @@ mod tests {
             (CAM_DATA_IN0_IDX + 7) as u8
         );
         assert_eq!(s3.gpio_bindings()[12].signal_idx, CAM_CLK_IDX as u8);
-        assert_eq!(s3.regs().cam_ctrl2, LCD_CAM_CAM_VH_DE_MODE_EN);
+        assert_eq!(LCD_CAM_CAM_CTRL1_REG, 0x6004_1008);
+        assert_eq!(LCD_CAM_CAM_VH_DE_MODE_EN, 1 << 28);
 
         // PSRAM mode getter and setter (LL-010)
         assert!(!s3.psram_mode());
@@ -551,7 +552,7 @@ mod tests {
         // 160MHz / 20MHz = 8
         assert_eq!(s3.regs().cam_ctrl & 0xFF, 8);
         assert_eq!(s3.regs().gdma_in_peri_sel, GDMA_PERI_SEL_LCD_CAM as u32);
-        assert_eq!(s3.regs().cam_ctrl2, LCD_CAM_CAM_VH_DE_MODE_EN);
+        assert_ne!(s3.regs().cam_ctrl1 & LCD_CAM_CAM_VH_DE_MODE_EN, 0);
 
         // Reject invalid color converter input format
         assert_eq!(
@@ -577,8 +578,11 @@ mod tests {
 
         assert!(s3.start(&dma_cfg, 0x3FC8_9ABC));
         assert_ne!(s3.regs().cam_ctrl1 & (1 << 29), 0);
+        assert_ne!(s3.regs().cam_ctrl1 & LCD_CAM_CAM_VH_DE_MODE_EN, 0);
         assert!(s3.stop());
         assert_eq!(s3.regs().cam_ctrl1 & (1 << 29), 0);
+        assert_ne!(s3.regs().cam_ctrl1 & LCD_CAM_CAM_VH_DE_MODE_EN, 0);
         assert_eq!(s3.deinit(), Ok(()));
+        assert_eq!(s3.regs().cam_ctrl1, 0);
     }
 }

@@ -161,13 +161,10 @@ fn hil_check_ll_dma_and_i2s0() -> bool {
     if !i2s_cam.is_vsync_intr_enabled() {
         return false;
     }
-    if !i2s_cam.start(&dma_sizing, nodes[0].link_addr_20bit()) || !i2s_cam.is_running() {
-        return false;
-    }
-    if !i2s_cam.stop() || i2s_cam.is_running() {
-        return false;
-    }
-    i2s_cam.deinit().is_ok()
+    let started = i2s_cam.start(&dma_sizing, nodes[0].link_addr_20bit()) && i2s_cam.is_running();
+    let stopped = i2s_cam.stop() && !i2s_cam.is_running();
+    let deinit_ok = i2s_cam.deinit().is_ok();
+    started && stopped && deinit_ok
 }
 
 #[inline(never)]
@@ -494,15 +491,19 @@ fn arm_rtc_wdt_15s() {
     }
 }
 
-/// Applies `ESP-IDF v5.5.4` (`rtc_init.c:30-31, 102-107`) Wi-Fi/RF modem force
-/// power-down and isolation during early peripheral initialization, and
-/// releases any latched RTC pad holds.
+/// Applies `ESP-IDF v5.5.4` (`rtc_init.c:30-31, 102-107` and
+/// `phy_init.c:434-448`) Wi-Fi/RF modem force power-down and isolation during
+/// early peripheral initialization, releases any latched RTC/digital pad holds,
+/// and pulses `MODEM_RESET_FIELD_WHEN_PU` when powering the Wi-Fi domain on.
 #[cfg(target_arch = "xtensa")]
 #[esp_hal::ram]
 fn esp_rtc_wifi_force_pd(enable_pd: bool) {
+    const DPORT_CORE_RST_EN_REG: *mut u32 = 0x3FF0_00D0 as *mut u32;
     const RTC_CNTL_DIG_PWC_REG: *mut u32 = 0x3FF4_8084 as *mut u32;
     const RTC_CNTL_DIG_ISO_REG: *mut u32 = 0x3FF4_8088 as *mut u32;
     const RTC_CNTL_HOLD_FORCE_REG: *mut u32 = 0x3FF4_80C8 as *mut u32;
+    const RTC_IO_DIG_PAD_HOLD_REG: *mut u32 = 0x3FF4_8474 as *mut u32;
+    const MODEM_RESET_FIELD_WHEN_PU: u32 = 0x21D;
     const RTC_CNTL_WIFI_FORCE_PD: u32 = 1u32 << 17;
     const RTC_CNTL_WIFI_FORCE_ISO: u32 = 1u32 << 28;
     const RTC_CNTL_DG_PAD_FORCE_HOLD: u32 = 1u32 << 15;
@@ -517,9 +518,10 @@ fn esp_rtc_wifi_force_pd(enable_pd: bool) {
         | RTC_CNTL_DG_PAD_AUTOHOLD_EN;
 
     // JUSTIFICATION: Hardware RTC power control and Wi-Fi modem isolation.
-    // SAFETY: RTC_CNTL power registers are valid MMIO addresses.
+    // SAFETY: RTC_CNTL, RTC_IO, and DPORT registers are valid MMIO addresses.
     unsafe {
         core::ptr::write_volatile(RTC_CNTL_HOLD_FORCE_REG, 0);
+        core::ptr::write_volatile(RTC_IO_DIG_PAD_HOLD_REG, 0);
         let iso = core::ptr::read_volatile(RTC_CNTL_DIG_ISO_REG) & !RTC_CNTL_DG_PAD_MASK;
         let pwc = core::ptr::read_volatile(RTC_CNTL_DIG_PWC_REG);
         if enable_pd {
@@ -527,6 +529,14 @@ fn esp_rtc_wifi_force_pd(enable_pd: bool) {
             core::ptr::write_volatile(RTC_CNTL_DIG_PWC_REG, pwc | RTC_CNTL_WIFI_FORCE_PD);
         } else {
             core::ptr::write_volatile(RTC_CNTL_DIG_PWC_REG, pwc & !RTC_CNTL_WIFI_FORCE_PD);
+            for _ in 0..3600u32 {
+                core::hint::spin_loop();
+            }
+            let rst = core::ptr::read_volatile(DPORT_CORE_RST_EN_REG);
+            core::ptr::write_volatile(DPORT_CORE_RST_EN_REG, rst | MODEM_RESET_FIELD_WHEN_PU);
+            let _ = core::ptr::read_volatile(DPORT_CORE_RST_EN_REG);
+            core::ptr::write_volatile(DPORT_CORE_RST_EN_REG, rst & !MODEM_RESET_FIELD_WHEN_PU);
+            let _ = core::ptr::read_volatile(DPORT_CORE_RST_EN_REG);
             core::ptr::write_volatile(RTC_CNTL_DIG_ISO_REG, iso & !RTC_CNTL_WIFI_FORCE_ISO);
         }
     }
@@ -827,10 +837,12 @@ fn psram_spi1_cmd(qpi_mode: bool, cmd_byte: u8) {
     const SPI1_CMD_REG: *mut u32 = 0x3FF4_2000 as *mut u32;
     const SPI1_ADDR_REG: *mut u32 = 0x3FF4_2004 as *mut u32;
     const SPI1_CTRL_REG: *mut u32 = 0x3FF4_2008 as *mut u32;
+    const SPI1_CLOCK_REG: *mut u32 = 0x3FF4_2018 as *mut u32;
     const SPI1_USER_REG: *mut u32 = 0x3FF4_201C as *mut u32;
     const SPI1_USER1_REG: *mut u32 = 0x3FF4_2020 as *mut u32;
     const SPI1_USER2_REG: *mut u32 = 0x3FF4_2024 as *mut u32;
     const SPI1_MOSI_DLEN_REG: *mut u32 = 0x3FF4_2028 as *mut u32;
+    const SPI1_MISO_DLEN_REG: *mut u32 = 0x3FF4_202C as *mut u32;
     const SPI1_PIN_REG: *mut u32 = 0x3FF4_2034 as *mut u32;
     const SPI1_W0_REG: *mut u32 = 0x3FF4_2080 as *mut u32;
     const SPI1_EXT2_REG: *const u32 = 0x3FF4_20F8 as *const u32;
@@ -877,10 +889,12 @@ fn psram_spi1_cmd(qpi_mode: bool, cmd_byte: u8) {
         }
 
         let saved_spi0_pin = core::ptr::read_volatile(SPI0_PIN_REG);
+        let saved_clock = core::ptr::read_volatile(SPI1_CLOCK_REG);
         let saved_user = core::ptr::read_volatile(SPI1_USER_REG);
         let saved_user1 = core::ptr::read_volatile(SPI1_USER1_REG);
         let saved_user2 = core::ptr::read_volatile(SPI1_USER2_REG);
         let saved_mosi_dlen = core::ptr::read_volatile(SPI1_MOSI_DLEN_REG);
+        let saved_miso_dlen = core::ptr::read_volatile(SPI1_MISO_DLEN_REG);
         let saved_w0 = core::ptr::read_volatile(SPI1_W0_REG);
         let saved_pin = core::ptr::read_volatile(SPI1_PIN_REG);
         let saved_ctrl = core::ptr::read_volatile(SPI1_CTRL_REG);
@@ -889,6 +903,10 @@ fn psram_spi1_cmd(qpi_mode: bool, cmd_byte: u8) {
         let saved_iomux16 = core::ptr::read_volatile(IO_MUX_GPIO16_REG);
         let saved_outsel17 = core::ptr::read_volatile(GPIO_FUNC17_OUT_SEL_CFG_REG);
         let saved_iomux17 = core::ptr::read_volatile(IO_MUX_GPIO17_REG);
+
+        if (saved_clock & (1u32 << 31)) != 0 {
+            core::ptr::write_volatile(SPI1_CLOCK_REG, 0x0000_1001);
+        }
 
         // Temporarily disable CS1 on SPI0 (SPI_CS1_DIS = 1 << 1) before
         // routing GPIO 16 to SPI1 SPICS1_OUT_IDX (6)
@@ -906,14 +924,18 @@ fn psram_spi1_cmd(qpi_mode: bool, cmd_byte: u8) {
         core::ptr::write_volatile(SPI1_PIN_REG, (saved_pin | 1u32) & !(1u32 << 1));
 
         if qpi_mode {
-            // Matches esp_psram_impl_quad.c:422-450 (psram_disable_qio_mode):
-            // 8-bit 0xF5 payload in SPI1_W0_REG via USR_MOSI + FWRITE_QIO (2 QPI nibbles).
+            // Matches esp_psram_impl_quad.c:435-436 (psram_disable_qio_mode):
+            // 16-bit (cmd_byte << 8) payload in SPI1_W0_REG via USR_MOSI +
+            // FWRITE_QIO (4 QPI clocks).
             core::ptr::write_volatile(
                 SPI1_CTRL_REG,
                 (saved_ctrl & !SPI_FREAD_MODE_MASK) | SPI_FREAD_QIO | SPI_WP_REG,
             );
-            core::ptr::write_volatile(SPI1_W0_REG, cmd_byte as u32);
-            core::ptr::write_volatile(SPI1_MOSI_DLEN_REG, 7u32);
+            core::ptr::write_volatile(SPI1_USER1_REG, 0);
+            core::ptr::write_volatile(SPI1_USER2_REG, 0);
+            core::ptr::write_volatile(SPI1_W0_REG, (cmd_byte as u32) << 8);
+            core::ptr::write_volatile(SPI1_MOSI_DLEN_REG, 15u32);
+            core::ptr::write_volatile(SPI1_MISO_DLEN_REG, 0);
             core::ptr::write_volatile(
                 SPI1_USER_REG,
                 SPI_USR_MOSI | SPI_FWRITE_QIO | SPI_CS_SETUP | SPI_CS_HOLD,
@@ -925,6 +947,9 @@ fn psram_spi1_cmd(qpi_mode: bool, cmd_byte: u8) {
                 SPI1_CTRL_REG,
                 (saved_ctrl & !SPI_FREAD_MODE_MASK) | SPI_WP_REG,
             );
+            core::ptr::write_volatile(SPI1_USER2_REG, 0);
+            core::ptr::write_volatile(SPI1_MOSI_DLEN_REG, 0);
+            core::ptr::write_volatile(SPI1_MISO_DLEN_REG, 0);
             core::ptr::write_volatile(SPI1_ADDR_REG, (cmd_byte as u32) << 24);
             core::ptr::write_volatile(SPI1_USER1_REG, (7u32 & 0x3F) << 26);
             core::ptr::write_volatile(SPI1_USER_REG, SPI_USR_ADDR | SPI_CS_SETUP | SPI_CS_HOLD);
@@ -955,13 +980,166 @@ fn psram_spi1_cmd(qpi_mode: bool, cmd_byte: u8) {
         );
 
         core::ptr::write_volatile(SPI1_CTRL_REG, saved_ctrl);
+        core::ptr::write_volatile(SPI1_CLOCK_REG, saved_clock);
         core::ptr::write_volatile(SPI1_USER_REG, saved_user);
         core::ptr::write_volatile(SPI1_USER1_REG, saved_user1);
         core::ptr::write_volatile(SPI1_USER2_REG, saved_user2);
         core::ptr::write_volatile(SPI1_MOSI_DLEN_REG, saved_mosi_dlen);
+        core::ptr::write_volatile(SPI1_MISO_DLEN_REG, saved_miso_dlen);
         core::ptr::write_volatile(SPI1_W0_REG, saved_w0);
         // Enforce CS1_DIS = 1 (bit 1) and CS0_DIS = 0 (bit 0) on
         // restore (esp_psram_impl_quad.c:327-328)
+        core::ptr::write_volatile(SPI1_PIN_REG, (saved_pin | (1u32 << 1)) & !1u32);
+        core::ptr::write_volatile(SPI1_ADDR_REG, saved_addr);
+        core::ptr::write_volatile(GPIO_FUNC16_OUT_SEL_CFG_REG, saved_outsel16);
+        core::ptr::write_volatile(IO_MUX_GPIO16_REG, saved_iomux16 | (1u32 << 8));
+        core::ptr::write_volatile(GPIO_FUNC17_OUT_SEL_CFG_REG, saved_outsel17);
+        core::ptr::write_volatile(IO_MUX_GPIO17_REG, saved_iomux17);
+        core::ptr::write_volatile(SPI0_PIN_REG, saved_spi0_pin);
+
+        core::arch::asm!("wsr.ps {0}; rsync", in(reg) saved_ps);
+    }
+}
+
+/// Issues a 1-bit SPI `0x9F` (`PSRAM_DEVICE_ID`) dummy read over `SPI1`
+/// (`esp_psram_impl_quad.c:467-495, 983-988`:
+/// `/* 16Mbit psram needs a dummy read to get id when cold start */`).
+#[cfg(target_arch = "xtensa")]
+#[esp_hal::ram]
+fn psram_spi1_dummy_read_id() {
+    const DPORT_HOST_INF_SEL_REG: *mut u32 = 0x3FF0_00BC as *mut u32;
+    const SPI0_PIN_REG: *mut u32 = 0x3FF4_3034 as *mut u32;
+    const SPI0_EXT2_REG: *const u32 = 0x3FF4_30F8 as *const u32;
+    const SPI1_CMD_REG: *mut u32 = 0x3FF4_2000 as *mut u32;
+    const SPI1_ADDR_REG: *mut u32 = 0x3FF4_2004 as *mut u32;
+    const SPI1_CTRL_REG: *mut u32 = 0x3FF4_2008 as *mut u32;
+    const SPI1_CLOCK_REG: *mut u32 = 0x3FF4_2018 as *mut u32;
+    const SPI1_USER_REG: *mut u32 = 0x3FF4_201C as *mut u32;
+    const SPI1_USER1_REG: *mut u32 = 0x3FF4_2020 as *mut u32;
+    const SPI1_USER2_REG: *mut u32 = 0x3FF4_2024 as *mut u32;
+    const SPI1_MOSI_DLEN_REG: *mut u32 = 0x3FF4_2028 as *mut u32;
+    const SPI1_MISO_DLEN_REG: *mut u32 = 0x3FF4_202C as *mut u32;
+    const SPI1_PIN_REG: *mut u32 = 0x3FF4_2034 as *mut u32;
+    const SPI1_W0_REG: *mut u32 = 0x3FF4_2080 as *mut u32;
+    const SPI1_EXT2_REG: *const u32 = 0x3FF4_20F8 as *const u32;
+
+    const GPIO_ENABLE_W1TS_REG: *mut u32 = 0x3FF4_4024 as *mut u32;
+    const GPIO_FUNC16_OUT_SEL_CFG_REG: *mut u32 = 0x3FF4_4570 as *mut u32;
+    const GPIO_FUNC17_OUT_SEL_CFG_REG: *mut u32 = 0x3FF4_4574 as *mut u32;
+    const IO_MUX_GPIO16_REG: *mut u32 = 0x3FF4_904C as *mut u32;
+    const IO_MUX_GPIO17_REG: *mut u32 = 0x3FF4_9050 as *mut u32;
+
+    const SPICLK_OUT_IDX: u32 = 0;
+    const SPICS1_OUT_IDX: u32 = 6;
+    const SPI_USR: u32 = 1u32 << 18;
+
+    const SPI_FREAD_DUAL: u32 = 1u32 << 14;
+    const SPI_FREAD_QUAD: u32 = 1u32 << 20;
+    const SPI_WP_REG: u32 = 1u32 << 21;
+    const SPI_FREAD_DIO: u32 = 1u32 << 23;
+    const SPI_FREAD_QIO: u32 = 1u32 << 24;
+    const SPI_FREAD_MODE_MASK: u32 =
+        SPI_FREAD_DUAL | SPI_FREAD_QUAD | SPI_FREAD_DIO | SPI_FREAD_QIO;
+
+    const SPI_CS_HOLD: u32 = 1u32 << 4;
+    const SPI_CS_SETUP: u32 = 1u32 << 5;
+    const SPI_USR_MISO: u32 = 1u32 << 28;
+    const SPI_USR_ADDR: u32 = 1u32 << 30;
+    const SPI_USR_COMMAND: u32 = 1u32 << 31;
+
+    // JUSTIFICATION: Hardware SPI1 peripheral registers for PSRAM 0x9F ID read.
+    // SAFETY: Disables interrupts during SPI1 bus transaction and restores PS.
+    unsafe {
+        let saved_ps: u32;
+        core::arch::asm!("rsil {0}, 15", out(reg) saved_ps);
+
+        let mut spin = 0u32;
+        while ((core::ptr::read_volatile(SPI0_EXT2_REG) & 0x7) != 0
+            || (core::ptr::read_volatile(SPI1_EXT2_REG) & 0x7) != 0
+            || (core::ptr::read_volatile(SPI1_CMD_REG) & SPI_USR) != 0)
+            && spin < 100_000
+        {
+            spin = spin.wrapping_add(1);
+        }
+
+        let saved_spi0_pin = core::ptr::read_volatile(SPI0_PIN_REG);
+        let saved_clock = core::ptr::read_volatile(SPI1_CLOCK_REG);
+        let saved_user = core::ptr::read_volatile(SPI1_USER_REG);
+        let saved_user1 = core::ptr::read_volatile(SPI1_USER1_REG);
+        let saved_user2 = core::ptr::read_volatile(SPI1_USER2_REG);
+        let saved_mosi_dlen = core::ptr::read_volatile(SPI1_MOSI_DLEN_REG);
+        let saved_miso_dlen = core::ptr::read_volatile(SPI1_MISO_DLEN_REG);
+        let saved_w0 = core::ptr::read_volatile(SPI1_W0_REG);
+        let saved_w1 = core::ptr::read_volatile(SPI1_W0_REG.wrapping_add(1));
+        let saved_pin = core::ptr::read_volatile(SPI1_PIN_REG);
+        let saved_ctrl = core::ptr::read_volatile(SPI1_CTRL_REG);
+        let saved_addr = core::ptr::read_volatile(SPI1_ADDR_REG);
+        let saved_outsel16 = core::ptr::read_volatile(GPIO_FUNC16_OUT_SEL_CFG_REG);
+        let saved_iomux16 = core::ptr::read_volatile(IO_MUX_GPIO16_REG);
+        let saved_outsel17 = core::ptr::read_volatile(GPIO_FUNC17_OUT_SEL_CFG_REG);
+        let saved_iomux17 = core::ptr::read_volatile(IO_MUX_GPIO17_REG);
+
+        if (saved_clock & (1u32 << 31)) != 0 {
+            core::ptr::write_volatile(SPI1_CLOCK_REG, 0x0000_1001);
+        }
+
+        core::ptr::write_volatile(SPI0_PIN_REG, saved_spi0_pin | (1u32 << 1));
+
+        core::ptr::write_volatile(GPIO_FUNC16_OUT_SEL_CFG_REG, SPICS1_OUT_IDX);
+        core::ptr::write_volatile(IO_MUX_GPIO16_REG, 0x2B00);
+        core::ptr::write_volatile(GPIO_FUNC17_OUT_SEL_CFG_REG, SPICLK_OUT_IDX);
+        core::ptr::write_volatile(IO_MUX_GPIO17_REG, 0x2800);
+        core::ptr::write_volatile(GPIO_ENABLE_W1TS_REG, (1u32 << 16) | (1u32 << 17));
+
+        core::ptr::write_volatile(SPI1_PIN_REG, (saved_pin | 1u32) & !(1u32 << 1));
+
+        core::ptr::write_volatile(
+            SPI1_CTRL_REG,
+            (saved_ctrl & !SPI_FREAD_MODE_MASK) | SPI_WP_REG,
+        );
+        core::ptr::write_volatile(SPI1_USER2_REG, 1u32 << 28);
+        core::ptr::write_volatile(SPI1_ADDR_REG, 0x9Fu32 << 24);
+        core::ptr::write_volatile(SPI1_USER1_REG, (31u32 & 0x3F) << 26);
+        core::ptr::write_volatile(SPI1_MOSI_DLEN_REG, 0);
+        core::ptr::write_volatile(SPI1_MISO_DLEN_REG, 63);
+        core::ptr::write_volatile(
+            SPI1_USER_REG,
+            SPI_USR_COMMAND | SPI_USR_ADDR | SPI_USR_MISO | SPI_CS_SETUP | SPI_CS_HOLD,
+        );
+
+        let mut wait0 = 0u32;
+        while (core::ptr::read_volatile(SPI0_EXT2_REG) & 0x7) != 0 && wait0 < 100_000 {
+            wait0 = wait0.wrapping_add(1);
+        }
+
+        core::ptr::write_volatile(
+            DPORT_HOST_INF_SEL_REG,
+            core::ptr::read_volatile(DPORT_HOST_INF_SEL_REG) | (1u32 << 14),
+        );
+        core::ptr::write_volatile(SPI1_CMD_REG, SPI_USR);
+
+        let mut wait1 = 0u32;
+        while ((core::ptr::read_volatile(SPI1_CMD_REG) & SPI_USR) != 0
+            || (core::ptr::read_volatile(SPI1_EXT2_REG) & 0x7) != 0)
+            && wait1 < 100_000
+        {
+            wait1 = wait1.wrapping_add(1);
+        }
+
+        core::ptr::write_volatile(
+            DPORT_HOST_INF_SEL_REG,
+            core::ptr::read_volatile(DPORT_HOST_INF_SEL_REG) & !(1u32 << 14),
+        );
+
+        core::ptr::write_volatile(SPI1_CTRL_REG, saved_ctrl);
+        core::ptr::write_volatile(SPI1_CLOCK_REG, saved_clock);
+        core::ptr::write_volatile(SPI1_USER_REG, saved_user);
+        core::ptr::write_volatile(SPI1_USER1_REG, saved_user1);
+        core::ptr::write_volatile(SPI1_USER2_REG, saved_user2);
+        core::ptr::write_volatile(SPI1_MOSI_DLEN_REG, saved_mosi_dlen);
+        core::ptr::write_volatile(SPI1_MISO_DLEN_REG, saved_miso_dlen);
+        core::ptr::write_volatile(SPI1_W0_REG, saved_w0);
+        core::ptr::write_volatile(SPI1_W0_REG.wrapping_add(1), saved_w1);
         core::ptr::write_volatile(SPI1_PIN_REG, (saved_pin | (1u32 << 1)) & !1u32);
         core::ptr::write_volatile(SPI1_ADDR_REG, saved_addr);
         core::ptr::write_volatile(GPIO_FUNC16_OUT_SEL_CFG_REG, saved_outsel16);
@@ -986,9 +1164,9 @@ fn release_psram_cs_and_exit_qpi() {
 /// `esp-hal-1.2.2`'s `psram_enable_qio_mode_spi1` (`esp32.rs:753`) erroneously
 /// sends `0x35` (`PSRAM_ENTER_QMODE`) in `PsramCmdQpi` mode instead of 1-bit
 /// `PSRAM_CMD_SPI` mode (`esp_psram_impl_quad.c:519`). Calling
-/// `psram_spi1_cmd(true, 0xF5)` followed by `psram_spi1_cmd(false, 0x35)`
-/// guarantees PSRAM enters QPI mode on both cold `0V -> 3.3V` power-on resets
-/// and warm reboots.
+/// `psram_spi1_cmd(true, 0xF5)`, two `psram_spi1_dummy_read_id()` cycles, and
+/// `psram_spi1_cmd(false, 0x35)` guarantees PSRAM enters QPI mode on both cold
+/// `0V -> 3.3V` power-on resets and warm reboots.
 #[cfg(target_arch = "xtensa")]
 #[esp_hal::ram]
 fn ensure_psram_qpi_mode_spi1() {
@@ -997,6 +1175,8 @@ fn ensure_psram_qpi_mode_spi1() {
     const SPICS1_OUT_IDX: u32 = 6;
 
     psram_spi1_cmd(true, 0xF5);
+    psram_spi1_dummy_read_id();
+    psram_spi1_dummy_read_id();
     psram_spi1_cmd(false, 0x35);
     // JUSTIFICATION: Route GPIO 16 to hardware SPI1 CS1 after mode transition.
     // SAFETY: GPIO_FUNC16_OUT_SEL_CFG_REG and IO_MUX_GPIO16_REG are valid MMIO.
@@ -1027,6 +1207,12 @@ pub extern "C" fn custom_halt() -> ! {
     quiesce_psram_and_software_reset()
 }
 
+/// Maximum Wi-Fi transmit power in quarter-dBm units (78 qdBm = 19.5 dBm,
+/// ~89 mW).
+///
+/// Sets the ESP32 Wi-Fi PHY transmit power to 78 qdBm (19.5 dBm), providing
+/// optimal link budget and packet throughput for MJPEG streaming under
+/// noisy RF conditions.
 #[cfg(target_arch = "xtensa")]
 pub const WIFI_MAX_TX_POWER_QDBM: i8 = 78;
 
@@ -1647,20 +1833,30 @@ fn init_psram_and_run_hil(psram_ptr: *mut u8, psram_len: usize, xclk_hw_ok: bool
     use esp_println::println;
     use klipper_cam_fw::SYNTHETIC_HD_JFIF_FRAME;
 
-    let psram_rw_ok = if !psram_ptr.is_null() && psram_len >= 128 * 1024 + 512 * 1024 + 2_097_152 {
-        // JUSTIFICATION: Volatile write/read to verify PSRAM memory bus.
-        // SAFETY: psram_ptr is verified non-null and within PSRAM bounds.
-        unsafe {
-            let p32 = psram_ptr as *mut u32;
-            core::ptr::write_volatile(p32, 0x55AA_55AA);
-            let r1 = core::ptr::read_volatile(p32);
-            core::ptr::write_volatile(p32, 0xA55A_A55A);
-            let r2 = core::ptr::read_volatile(p32);
-            r1 == 0x55AA_55AA && r2 == 0xA55A_A55A
+    let mut psram_rw_ok = false;
+    if !psram_ptr.is_null() && psram_len >= 128 * 1024 + 512 * 1024 + 2_097_152 {
+        for attempt in 0..3u8 {
+            // JUSTIFICATION: Volatile write/read to verify PSRAM memory bus.
+            // SAFETY: psram_ptr is verified non-null and within PSRAM bounds.
+            let ok = unsafe {
+                let p32 = psram_ptr as *mut u32;
+                core::ptr::write_volatile(p32, 0x55AA_55AA);
+                let r1 = core::ptr::read_volatile(p32);
+                core::ptr::write_volatile(p32, 0xA55A_A55A);
+                let r2 = core::ptr::read_volatile(p32);
+                r1 == 0x55AA_55AA && r2 == 0xA55A_A55A
+            };
+            if ok {
+                psram_rw_ok = true;
+                break;
+            }
+            if attempt < 2 {
+                ensure_psram_qpi_mode_spi1();
+                esp_hal::delay::Delay::new().delay_millis(10);
+                feed_rtc_wdt();
+            }
         }
-    } else {
-        false
-    };
+    }
     if !psram_rw_ok {
         println!(
             "[KLIPPER-CAM-RS] FATAL: PSRAM init/verify failed (ptr={:p}, len={}); resetting",

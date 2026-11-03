@@ -1,5 +1,7 @@
 //! Output frame resolution presets, aspect ratios, and resolution table.
 
+use crate::pixel_format::PixelFormat;
+
 /// Output frame resolution preset (`framesize_t` in `sensor.h`).
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -100,6 +102,32 @@ impl FrameSize {
     #[inline]
     pub const fn aspect_ratio(self) -> AspectRatio {
         RESOLUTION_TABLE[self as usize].aspect_ratio
+    }
+
+    /// Returns the total pixel count (`width * height`) for this frame size.
+    #[inline]
+    pub const fn pixel_count(self) -> usize {
+        (self.width() as usize) * (self.height() as usize)
+    }
+
+    /// Returns the uncompressed frame buffer size in bytes for the given
+    /// [`PixelFormat`], or `None` if the format has variable compressed
+    /// size (e.g. [`PixelFormat::Jpeg`]) or on arithmetic overflow.
+    #[inline]
+    pub const fn checked_byte_size(self, format: PixelFormat) -> Option<usize> {
+        let pixels = self.pixel_count();
+        match format {
+            PixelFormat::Jpeg => None,
+            PixelFormat::Grayscale | PixelFormat::Raw | PixelFormat::Raw8 => Some(pixels),
+            PixelFormat::Rgb565 | PixelFormat::Yuv422 => pixels.checked_mul(2),
+            PixelFormat::Rgb888 => pixels.checked_mul(3),
+            PixelFormat::Yuv420 | PixelFormat::Rgb444 | PixelFormat::Rgb555 => {
+                match pixels.checked_mul(3) {
+                    Some(val) => Some(val / 2),
+                    None => None,
+                }
+            }
+        }
     }
 
     /// Converts a raw index (`0..25`) into a [`FrameSize`].
@@ -356,5 +384,29 @@ mod tests {
         assert_eq!(five_mp.width, 2592);
         assert_eq!(five_mp.height, 1944);
         assert_eq!(five_mp.aspect_ratio, AspectRatio::Ratio4x3);
+    }
+
+    #[test]
+    fn test_code_types_001_pixel_count_and_checked_byte_size() {
+        let qvga = FrameSize::Qvga;
+        assert_eq!(qvga.width(), 320);
+        assert_eq!(qvga.height(), 240);
+        assert_eq!(qvga.pixel_count(), 320 * 240);
+
+        assert_eq!(qvga.checked_byte_size(PixelFormat::Jpeg), None);
+        assert_eq!(qvga.checked_byte_size(PixelFormat::Grayscale), Some(320 * 240));
+        assert_eq!(qvga.checked_byte_size(PixelFormat::Raw), Some(320 * 240));
+        assert_eq!(qvga.checked_byte_size(PixelFormat::Raw8), Some(320 * 240));
+        assert_eq!(qvga.checked_byte_size(PixelFormat::Rgb565), Some(320 * 240 * 2));
+        assert_eq!(qvga.checked_byte_size(PixelFormat::Yuv422), Some(320 * 240 * 2));
+        assert_eq!(qvga.checked_byte_size(PixelFormat::Rgb888), Some(320 * 240 * 3));
+        assert_eq!(qvga.checked_byte_size(PixelFormat::Yuv420), Some((320 * 240 * 3) / 2));
+        assert_eq!(qvga.checked_byte_size(PixelFormat::Rgb444), Some((320 * 240 * 3) / 2));
+        assert_eq!(qvga.checked_byte_size(PixelFormat::Rgb555), Some((320 * 240 * 3) / 2));
+
+        const CONST_PIXELS: usize = FrameSize::Vga.pixel_count();
+        assert_eq!(CONST_PIXELS, 640 * 480);
+        const CONST_BYTES: Option<usize> = FrameSize::Vga.checked_byte_size(PixelFormat::Rgb565);
+        assert_eq!(CONST_BYTES, Some(640 * 480 * 2));
     }
 }

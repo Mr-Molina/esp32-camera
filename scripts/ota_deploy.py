@@ -16,6 +16,8 @@ import argparse
 import hashlib
 import json
 import os
+from pathlib import Path
+import shutil
 import socket
 import struct
 import subprocess  # nosec B404
@@ -24,11 +26,13 @@ import time
 import urllib.error
 import urllib.request
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
 DEFAULT_HOST = "172.22.1.52"
 DEFAULT_PORT = 80
-DEFAULT_ELF = "/home/console-admin/Github/esp32-camera/target/xtensa-esp32-none-elf/release/klipper-cam-fw"
-DEFAULT_BIN = "/home/console-admin/Github/esp32-camera/target/xtensa-esp32-none-elf/release/klipper-cam-fw.bin"
-ESPFLASH_BIN = "/home/console-admin/.cargo/bin/espflash"
+DEFAULT_ELF = str(REPO_ROOT / "target" / "xtensa-esp32-none-elf" / "release" / "klipper-cam-fw")
+DEFAULT_BIN = str(REPO_ROOT / "target" / "xtensa-esp32-none-elf" / "release" / "klipper-cam-fw.bin")
+ESPFLASH_BIN = shutil.which("espflash") or str(Path.home() / ".cargo" / "bin" / "espflash")
 
 ESP_IMAGE_HEADER_MAGIC = 0xE9
 ESP_IMAGE_MIN_SEGMENTS = 1
@@ -65,7 +69,7 @@ def stage_and_validate_image(elf_path: str, bin_path: str, host: str, port: int)
     """Converts ELF to ESP32 .bin via espflash save-image and validates header invariants."""
     if not os.path.isfile(elf_path):
         raise FileNotFoundError(f"ELF binary not found at {elf_path}")
-    if not os.path.isfile(ESPFLASH_BIN):
+    if not ESPFLASH_BIN or not os.path.isfile(ESPFLASH_BIN):
         raise FileNotFoundError(f"espflash binary not found at {ESPFLASH_BIN}")
 
     cmd = [

@@ -307,6 +307,10 @@ mod tests {
                 ver: 0,
             })
         );
+        assert_eq!(
+            Ov5640::detect(&mut bus, 0x99),
+            Err(CameraError::NotDetected)
+        );
 
         let mut sensor = Ov5640::new();
         assert_eq!(sensor.model(), CameraModel::Ov5640);
@@ -427,6 +431,10 @@ mod tests {
         bus.preset_reg8(CameraSccbAddr::OV7725, ov7725::REG_MIDL, 0xA2);
 
         assert!(Ov7725::detect(&mut bus, CameraSccbAddr::OV7725).is_ok());
+        assert_eq!(
+            Ov7725::detect(&mut bus, 0x99),
+            Err(CameraError::NotDetected)
+        );
 
         let mut sensor = Ov7725::new();
         assert_eq!(sensor.model(), CameraModel::Ov7725);
@@ -494,6 +502,10 @@ mod tests {
         bus.preset_reg8(CameraSccbAddr::OV7670, ov7670::REG_MIDL, 0xA2);
 
         assert!(Ov7670::detect(&mut bus, CameraSccbAddr::OV7670).is_ok());
+        assert_eq!(
+            Ov7670::detect(&mut bus, 0x99),
+            Err(CameraError::NotDetected)
+        );
 
         let mut sensor = Ov7670::new();
         assert_eq!(sensor.model(), CameraModel::Ov7670);

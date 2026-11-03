@@ -365,7 +365,7 @@ impl Ov7670 {
     /// Probes the SCCB bus at `slv_addr` (`0x21`) and verifies `PID == 0x76`.
     pub fn detect<B: SccbBus>(bus: &mut B, slv_addr: u8) -> Result<SensorId, CameraError> {
         if slv_addr != CameraSccbAddr::OV7670 {
-            return Err(CameraError::NotSupported);
+            return Err(CameraError::NotDetected);
         }
         bus.write_reg8(slv_addr, 0xFF, 0x01)?;
         let pid = bus.read_reg8(slv_addr, REG_PID)? as u16;

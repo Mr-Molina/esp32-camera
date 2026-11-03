@@ -1008,7 +1008,7 @@ impl Ov5640 {
     /// Probes the SCCB bus at `slv_addr` (`0x3C`) and verifies `PID == 0x5640`.
     pub fn detect<B: SccbBus>(bus: &mut B, slv_addr: u8) -> Result<SensorId, CameraError> {
         if slv_addr != CameraSccbAddr::OV5640 {
-            return Err(CameraError::NotSupported);
+            return Err(CameraError::NotDetected);
         }
         let h = bus.read_reg16(slv_addr, 0x300A)?;
         let l = bus.read_reg16(slv_addr, 0x300B)?;

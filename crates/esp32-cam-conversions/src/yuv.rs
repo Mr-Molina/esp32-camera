@@ -1897,6 +1897,9 @@ pub fn rgb565_to_yuv422(
     height: u16,
 ) -> Result<usize, CameraError> {
     let pixels = checked_pixel_count(width, height, 2)?;
+    if (width & 1) != 0 {
+        return Err(CameraError::InvalidArg);
+    }
     let byte_len = pixels.checked_mul(2).ok_or(CameraError::Overflow)?;
     if src.len() < byte_len {
         return Err(CameraError::InvalidArg);
@@ -1944,6 +1947,9 @@ pub fn yuv422_to_rgb565(
     byte_swap: bool,
 ) -> Result<usize, CameraError> {
     let pixels = checked_pixel_count(width, height, 2)?;
+    if (width & 1) != 0 {
+        return Err(CameraError::InvalidArg);
+    }
     let byte_len = pixels.checked_mul(2).ok_or(CameraError::Overflow)?;
     if src.len() < byte_len {
         return Err(CameraError::InvalidArg);
@@ -1996,6 +2002,9 @@ pub fn yuv422_to_rgb888(
     height: u16,
 ) -> Result<usize, CameraError> {
     let pixels = checked_pixel_count(width, height, 3)?;
+    if (width & 1) != 0 {
+        return Err(CameraError::InvalidArg);
+    }
     let src_len = pixels.checked_mul(2).ok_or(CameraError::Overflow)?;
     let dst_len = pixels.checked_mul(3).ok_or(CameraError::Overflow)?;
     if src.len() < src_len {
@@ -2185,6 +2194,24 @@ mod tests {
         assert_eq!(
             yuv422_to_rgb888(&[0u8; 8], &mut dst[..4], 2, 2),
             Err(CameraError::BufferTooSmall)
+        );
+    }
+
+    #[test]
+    fn test_audit_07_yuv_001_odd_width_rejected() {
+        let mut dst = [0u8; 32];
+        let src = [0u8; 32];
+        assert_eq!(
+            rgb565_to_yuv422(&src, &mut dst, 3, 2),
+            Err(CameraError::InvalidArg)
+        );
+        assert_eq!(
+            yuv422_to_rgb565(&src, &mut dst, 3, 2, false),
+            Err(CameraError::InvalidArg)
+        );
+        assert_eq!(
+            yuv422_to_rgb888(&src, &mut dst, 3, 2),
+            Err(CameraError::InvalidArg)
         );
     }
 }
