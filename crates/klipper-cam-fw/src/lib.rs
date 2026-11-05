@@ -14,11 +14,19 @@
 #[cfg(test)]
 extern crate alloc;
 
+pub mod ap_select;
 pub mod config;
 pub mod frame_buffer;
 pub mod http;
 pub mod ota;
 pub mod runtime;
+
+pub use ap_select::{
+    roam_decision, ApCandidate, ApTracker, RoamBackoff, RoamDecision, WeakLinkTimer,
+    MAX_AP_CANDIDATES, MISSED_PASS_PENALTY_DB, ROAM_CHECK_INTERVAL_MS, ROAM_HYSTERESIS_DB,
+    ROAM_MAX_SCAN_INTERVAL_MS, ROAM_MIN_SCAN_INTERVAL_MS, ROAM_TRIGGER_RSSI_DBM,
+    ROAM_WEAK_DURATION_MS, SCAN_ACTIVE_MAX_MS, SCAN_ACTIVE_MIN_MS, SCAN_PASSES,
+};
 
 pub use config::{
     active_ota_token, active_wifi_pass, active_wifi_ssid, BoardVariant, CameraPinout, Ipv4Addr,

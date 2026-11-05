@@ -470,6 +470,8 @@ fn feed_rtc_wdt() {
 #[cfg(target_arch = "xtensa")]
 #[esp_hal::ram]
 fn arm_rtc_wdt_15s() {
+    const RTC_CNTL_INT_ENA_REG: *mut u32 = 0x3FF4_8040 as *mut u32;
+    const RTC_CNTL_INT_CLR_REG: *mut u32 = 0x3FF4_8048 as *mut u32;
     const RTC_CNTL_WDTCONFIG0_REG: *mut u32 = 0x3FF4_808C as *mut u32;
     const RTC_CNTL_WDTCONFIG1_REG: *mut u32 = 0x3FF4_8090 as *mut u32;
     const RTC_CNTL_WDTFEED_REG: *mut u32 = 0x3FF4_80A0 as *mut u32;
@@ -477,12 +479,21 @@ fn arm_rtc_wdt_15s() {
     const RTC_CNTL_WDT_WKEY: u32 = 0x50D8_3AA1;
     // WDT_EN (bit 31) | WDT_STG0 = 4 (RESET_RTC, bits 28..=30) |
     // WDT_CPU_RESET_LENGTH = 7 (bits 14..=16) | WDT_SYS_RESET_LENGTH = 7
-    // (bits 11..=13) | WDT_FLASHBOOT_MOD_EN (bit 10)
-    const WDT_CFG0_VAL: u32 =
-        (1u32 << 31) | (4u32 << 28) | (7u32 << 14) | (7u32 << 11) | (1u32 << 10);
+    // (bits 11..=13) | WDT_FLASHBOOT_MOD_EN (bit 10) |
+    // PROCPU_RESET_EN (bit 9) | APPCPU_RESET_EN (bit 8) | PAUSE_IN_SLP (bit 7)
+    const WDT_CFG0_VAL: u32 = (1u32 << 31)
+        | (4u32 << 28)
+        | (7u32 << 14)
+        | (7u32 << 11)
+        | (1u32 << 10)
+        | (1u32 << 9)
+        | (1u32 << 8)
+        | (1u32 << 7);
     // JUSTIFICATION: Hardware RTC watchdog timer 15-second arming configuration.
     // SAFETY: RTC_CNTL_WDT registers are valid MMIO addresses.
     unsafe {
+        core::ptr::write_volatile(RTC_CNTL_INT_ENA_REG, 0);
+        core::ptr::write_volatile(RTC_CNTL_INT_CLR_REG, 0xFFFF_FFFF);
         core::ptr::write_volatile(RTC_CNTL_WDTWPROTECT_REG, RTC_CNTL_WDT_WKEY);
         core::ptr::write_volatile(RTC_CNTL_WDTCONFIG1_REG, 15 * 150_000);
         core::ptr::write_volatile(RTC_CNTL_WDTCONFIG0_REG, WDT_CFG0_VAL);
@@ -924,17 +935,17 @@ fn psram_spi1_cmd(qpi_mode: bool, cmd_byte: u8) {
         core::ptr::write_volatile(SPI1_PIN_REG, (saved_pin | 1u32) & !(1u32 << 1));
 
         if qpi_mode {
-            // Matches esp_psram_impl_quad.c:435-436 (psram_disable_qio_mode):
-            // 16-bit (cmd_byte << 8) payload in SPI1_W0_REG via USR_MOSI +
-            // FWRITE_QIO (4 QPI clocks).
+            // Matches PSRAM_CLK_MODE_NORM 8-bit command transmission:
+            // 8-bit cmd_byte payload in SPI1_W0_REG via USR_MOSI +
+            // FWRITE_QIO (2 QPI clocks).
             core::ptr::write_volatile(
                 SPI1_CTRL_REG,
                 (saved_ctrl & !SPI_FREAD_MODE_MASK) | SPI_FREAD_QIO | SPI_WP_REG,
             );
             core::ptr::write_volatile(SPI1_USER1_REG, 0);
             core::ptr::write_volatile(SPI1_USER2_REG, 0);
-            core::ptr::write_volatile(SPI1_W0_REG, (cmd_byte as u32) << 8);
-            core::ptr::write_volatile(SPI1_MOSI_DLEN_REG, 15u32);
+            core::ptr::write_volatile(SPI1_W0_REG, cmd_byte as u32);
+            core::ptr::write_volatile(SPI1_MOSI_DLEN_REG, 7u32);
             core::ptr::write_volatile(SPI1_MISO_DLEN_REG, 0);
             core::ptr::write_volatile(
                 SPI1_USER_REG,
@@ -1045,7 +1056,6 @@ fn psram_spi1_dummy_read_id() {
     const SPI_CS_SETUP: u32 = 1u32 << 5;
     const SPI_USR_MISO: u32 = 1u32 << 28;
     const SPI_USR_ADDR: u32 = 1u32 << 30;
-    const SPI_USR_COMMAND: u32 = 1u32 << 31;
 
     // JUSTIFICATION: Hardware SPI1 peripheral registers for PSRAM 0x9F ID read.
     // SAFETY: Disables interrupts during SPI1 bus transaction and restores PS.
@@ -1097,14 +1107,14 @@ fn psram_spi1_dummy_read_id() {
             SPI1_CTRL_REG,
             (saved_ctrl & !SPI_FREAD_MODE_MASK) | SPI_WP_REG,
         );
-        core::ptr::write_volatile(SPI1_USER2_REG, 1u32 << 28);
+        core::ptr::write_volatile(SPI1_USER2_REG, 0);
         core::ptr::write_volatile(SPI1_ADDR_REG, 0x9Fu32 << 24);
         core::ptr::write_volatile(SPI1_USER1_REG, (31u32 & 0x3F) << 26);
         core::ptr::write_volatile(SPI1_MOSI_DLEN_REG, 0);
         core::ptr::write_volatile(SPI1_MISO_DLEN_REG, 63);
         core::ptr::write_volatile(
             SPI1_USER_REG,
-            SPI_USR_COMMAND | SPI_USR_ADDR | SPI_USR_MISO | SPI_CS_SETUP | SPI_CS_HOLD,
+            SPI_USR_ADDR | SPI_USR_MISO | SPI_CS_SETUP | SPI_CS_HOLD,
         );
 
         let mut wait0 = 0u32;
@@ -1216,6 +1226,193 @@ pub extern "C" fn custom_halt() -> ! {
 #[cfg(target_arch = "xtensa")]
 pub const WIFI_MAX_TX_POWER_QDBM: i8 = 78;
 
+/// Builds the active, SSID-filtered scan configuration shared by boot AP
+/// selection and runtime roaming scans.
+///
+/// Dwell time per channel is `SCAN_ACTIVE_MIN_MS..SCAN_ACTIVE_MAX_MS`.
+#[cfg(target_arch = "xtensa")]
+fn active_scan_config(ssid_str: &str) -> esp_radio::wifi::scan::ScanConfig {
+    use esp_hal::time::Duration;
+    use esp_radio::wifi::scan::{ScanConfig, ScanTypeConfig};
+    use klipper_cam_fw::{SCAN_ACTIVE_MAX_MS, SCAN_ACTIVE_MIN_MS};
+
+    let mut scan_cfg = ScanConfig::default()
+        .with_max(16)
+        .with_scan_type(ScanTypeConfig::Active {
+            min: Duration::from_millis(SCAN_ACTIVE_MIN_MS),
+            max: Duration::from_millis(SCAN_ACTIVE_MAX_MS),
+        });
+    if let Ok(s) = ssid_str.try_into() {
+        scan_cfg = scan_cfg.with_ssid(s);
+    }
+    scan_cfg
+}
+
+/// Runs one active scan pass (5000 ms timeout) and records every AP whose
+/// SSID equals `ssid_str` into `tracker`.
+///
+/// Returns `true` if the scan completed before the timeout (even if it
+/// reported an error or no matching AP).
+#[cfg(target_arch = "xtensa")]
+fn scan_pass_into_tracker(
+    wifi_controller: &mut esp_radio::wifi::WifiController<'_>,
+    scan_cfg: &esp_radio::wifi::scan::ScanConfig,
+    ssid_str: &str,
+    tracker: &mut klipper_cam_fw::ApTracker,
+) -> bool {
+    let Some(res) = block_on_with_timeout(wifi_controller.scan_async(scan_cfg), 5000) else {
+        return false;
+    };
+    if let Ok(aps) = res {
+        for ap in aps {
+            if ap.ssid.as_str() == ssid_str {
+                tracker.record(ap.bssid, ap.channel, ap.signal_strength);
+            }
+        }
+    }
+    true
+}
+
+/// Prints one `[WIFI] Candidate` line per BSSID recorded in `tracker`.
+///
+/// `passes` is the number of scan passes fed into `tracker`, printed as the
+/// denominator of the `seen=` hit count.
+#[cfg(target_arch = "xtensa")]
+fn log_ap_candidates(tracker: &klipper_cam_fw::ApTracker, passes: u8) {
+    use esp_println::println;
+
+    let max_hits = tracker.max_hits();
+    for c in tracker.candidates() {
+        let b = c.bssid();
+        println!(
+            concat!(
+                "[KLIPPER-CAM-RS] [WIFI] Candidate ",
+                "bssid={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ",
+                "ch={} eff={}dBm avg={}dBm max={}dBm seen={}/{}"
+            ),
+            b[0],
+            b[1],
+            b[2],
+            b[3],
+            b[4],
+            b[5],
+            c.channel(),
+            c.effective_rssi(max_hits),
+            c.rssi_avg(),
+            c.rssi_max(),
+            c.hits(),
+            passes
+        );
+    }
+}
+
+/// Returns `base_sta_cfg` locked to `bssid` on `channel` (fast scan, 2
+/// association retries), as used by boot selection and runtime roaming.
+#[cfg(target_arch = "xtensa")]
+fn locked_station_config(
+    base_sta_cfg: &esp_radio::wifi::sta::StationConfig,
+    bssid: [u8; 6],
+    channel: u8,
+) -> esp_radio::wifi::sta::StationConfig {
+    use esp_radio::wifi::sta::ScanMethod;
+
+    base_sta_cfg
+        .clone()
+        .with_bssid(bssid)
+        .with_channel(channel)
+        .with_scan_method(ScanMethod::Fast)
+        .with_failure_retry_cnt(2)
+}
+
+/// Runs one active roam scan and decides whether to leave `current_bssid`.
+///
+/// Candidates are logged; the decision applies `ROAM_HYSTERESIS_DB` to
+/// `current_rssi`.
+#[cfg(target_arch = "xtensa")]
+fn roam_scan_decision(
+    wifi_controller: &mut esp_radio::wifi::WifiController<'_>,
+    ssid_str: &str,
+    current_bssid: [u8; 6],
+    current_rssi: i8,
+) -> klipper_cam_fw::RoamDecision {
+    use klipper_cam_fw::{roam_decision, ApTracker, RoamDecision, ROAM_HYSTERESIS_DB};
+
+    let scan_cfg = active_scan_config(ssid_str);
+    let mut tracker = ApTracker::new();
+    if !scan_pass_into_tracker(wifi_controller, &scan_cfg, ssid_str, &mut tracker) {
+        return RoamDecision::Stay;
+    }
+    log_ap_candidates(&tracker, 1);
+    roam_decision(current_bssid, current_rssi, &tracker, ROAM_HYSTERESIS_DB)
+}
+
+/// Re-associates with `target`: disconnect (2 s), BSSID+channel locked
+/// config, `connect_async` (10 s).
+///
+/// On failure the unlocked `base_sta_cfg` is restored so the regular
+/// reconnect path in the server loop can recover the link.
+#[cfg(target_arch = "xtensa")]
+fn roam_to_candidate(
+    wifi_controller: &mut esp_radio::wifi::WifiController<'_>,
+    base_sta_cfg: &esp_radio::wifi::sta::StationConfig,
+    target: &klipper_cam_fw::ApCandidate,
+) -> Option<esp_radio::wifi::sta::ConnectedInfo> {
+    use esp_println::println;
+    use esp_radio::wifi::Config as WifiConfig;
+
+    let _ = block_on_with_timeout(wifi_controller.disconnect_async(), 2000);
+    let locked_cfg = locked_station_config(base_sta_cfg, target.bssid(), target.channel());
+    if wifi_controller
+        .set_config(&WifiConfig::Station(locked_cfg))
+        .is_err()
+    {
+        println!("[KLIPPER-CAM-RS] [ROAM] set_config(locked) failed; restoring base config");
+        let _ = wifi_controller.set_config(&WifiConfig::Station(base_sta_cfg.clone()));
+        return None;
+    }
+    let _ = wifi_controller.set_max_tx_power(WIFI_MAX_TX_POWER_QDBM);
+    match block_on_with_timeout(wifi_controller.connect_async(), 10_000) {
+        Some(Ok(info)) => Some(info),
+        Some(Err(e)) => {
+            println!("[KLIPPER-CAM-RS] [ROAM] connect_async error: {:?}", e);
+            let _ = block_on_with_timeout(wifi_controller.disconnect_async(), 2000);
+            let _ = wifi_controller.set_config(&WifiConfig::Station(base_sta_cfg.clone()));
+            None
+        }
+        None => {
+            println!("[KLIPPER-CAM-RS] [ROAM] connect_async timed out (10000 ms)");
+            let _ = block_on_with_timeout(wifi_controller.disconnect_async(), 2000);
+            let _ = wifi_controller.set_config(&WifiConfig::Station(base_sta_cfg.clone()));
+            None
+        }
+    }
+}
+
+/// Post-association steps shared by the reconnect and roam paths: mark the
+/// STA connected, disable power save, restore max TX power, run the
+/// OTA got-IP rollback check, and (once the IP is configured) send a
+/// gratuitous ARP announce.
+///
+/// `announce_ip` is `Some(ip)` once the static IP is configured; `None`
+/// skips the ARP announce.
+#[cfg(target_arch = "xtensa")]
+fn after_sta_associated(
+    wifi_controller: &mut esp_radio::wifi::WifiController<'_>,
+    runtime: &mut FirmwareRuntime,
+    flash_adapter: &mut EspFlashAdapter<'_>,
+    net_device: &mut SmoltcpWifiDevice,
+    mac: [u8; 6],
+    announce_ip: Option<[u8; 4]>,
+) {
+    runtime.on_wifi_sta_connected();
+    let _ = wifi_controller.set_power_saving(esp_radio::wifi::PowerSaveMode::None);
+    let _ = wifi_controller.set_max_tx_power(WIFI_MAX_TX_POWER_QDBM);
+    handle_wifi_got_ip_rollback(runtime, flash_adapter, Ipv4Addr::new(172, 22, 1, 52));
+    if let Some(ip) = announce_ip {
+        send_arp_announce(net_device, mac, ip, [172, 22, 1, 1]);
+    }
+}
+
 #[cfg(target_arch = "xtensa")]
 #[inline(never)]
 fn connect_strongest_ap(
@@ -1224,62 +1421,30 @@ fn connect_strongest_ap(
     ssid_str: &str,
     timeout_ms: u64,
 ) -> Option<esp_radio::wifi::sta::ConnectedInfo> {
-    use esp_hal::time::Duration;
     use esp_println::println;
-    use esp_radio::wifi::scan::{ScanConfig, ScanTypeConfig};
-    use esp_radio::wifi::sta::ScanMethod;
     use esp_radio::wifi::{Config as WifiConfig, PowerSaveMode};
+    use klipper_cam_fw::{ApTracker, SCAN_PASSES};
 
     let wait_ms = timeout_ms.max(15_000);
     let _ = wifi_controller.set_power_saving(PowerSaveMode::None);
     let _ = wifi_controller.set_max_tx_power(WIFI_MAX_TX_POWER_QDBM);
 
-    // 1. Active scan (60..100 ms per channel, with a second pass if best
-    //    RSSI < -62 dBm)
-    //    to pick the strongest AP at the camera's current physical location.
-    let mut scan_cfg = ScanConfig::default()
-        .with_max(16)
-        .with_scan_type(ScanTypeConfig::Active {
-            min: Duration::from_millis(60),
-            max: Duration::from_millis(100),
-        });
-    if let Ok(s) = ssid_str.try_into() {
-        scan_cfg = scan_cfg.with_ssid(s);
-    }
-
+    // 1. SCAN_PASSES active scans (SCAN_ACTIVE_MIN_MS..SCAN_ACTIVE_MAX_MS
+    //    dwell per channel, SSID-filtered) aggregated per BSSID, so the AP
+    //    choice uses averaged RSSI rather than one noisy sample.
+    let scan_cfg = active_scan_config(ssid_str);
+    let mut tracker = ApTracker::new();
     let mut scan_completed = false;
-    let mut best_target: Option<(u8, i8, [u8; 6])> = None;
-    if let Some(res) = block_on_with_timeout(wifi_controller.scan_async(&scan_cfg), 5000) {
-        scan_completed = true;
-        if let Ok(aps) = res {
-            if let Some(ap) = aps
-                .into_iter()
-                .filter(|ap| ap.ssid.as_str() == ssid_str)
-                .max_by_key(|ap| ap.signal_strength)
-            {
-                best_target = Some((ap.channel, ap.signal_strength, ap.bssid));
-            }
-        }
-    }
-    if scan_completed && best_target.is_none_or(|(_, rssi, _)| rssi < -62) {
-        scan_completed = false;
-        if let Some(res2) = block_on_with_timeout(wifi_controller.scan_async(&scan_cfg), 5000) {
+    for _ in 0..SCAN_PASSES {
+        if scan_pass_into_tracker(wifi_controller, &scan_cfg, ssid_str, &mut tracker) {
             scan_completed = true;
-            if let Ok(aps2) = res2 {
-                if let Some(ap2) = aps2
-                    .into_iter()
-                    .filter(|ap| ap.ssid.as_str() == ssid_str)
-                    .max_by_key(|ap| ap.signal_strength)
-                {
-                    if best_target.is_none_or(|(_, best_rssi, _)| ap2.signal_strength > best_rssi) {
-                        best_target = Some((ap2.channel, ap2.signal_strength, ap2.bssid));
-                    }
-                }
-            }
         }
     }
+    log_ap_candidates(&tracker, SCAN_PASSES);
     if scan_completed {
-        if let Some((target_ch, target_rssi, target_bssid)) = best_target {
+        if let Some(best) = tracker.best() {
+            let target_ch = best.channel();
+            let target_bssid = best.bssid();
             println!(
                 concat!(
                     "[KLIPPER-CAM-RS] [WIFI] Strongest '{}' AP: ch={} ",
@@ -1287,7 +1452,7 @@ fn connect_strongest_ap(
                 ),
                 ssid_str,
                 target_ch,
-                target_rssi,
+                best.rssi_avg(),
                 target_bssid[0],
                 target_bssid[1],
                 target_bssid[2],
@@ -1295,12 +1460,7 @@ fn connect_strongest_ap(
                 target_bssid[4],
                 target_bssid[5]
             );
-            let locked_cfg = base_sta_cfg
-                .clone()
-                .with_bssid(target_bssid)
-                .with_channel(target_ch)
-                .with_scan_method(ScanMethod::Fast)
-                .with_failure_retry_cnt(2);
+            let locked_cfg = locked_station_config(base_sta_cfg, target_bssid, target_ch);
             if wifi_controller
                 .set_config(&WifiConfig::Station(locked_cfg))
                 .is_ok()
@@ -2135,6 +2295,10 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
     use klipper_cam_fw::{
         parse_http_request, HttpMethod, OtaDataManager, StreamSessionGuard, OTA_PARTITION_MAX_SIZE,
     };
+    use klipper_cam_fw::{
+        RoamBackoff, RoamDecision, WeakLinkTimer, ROAM_CHECK_INTERVAL_MS, ROAM_TRIGGER_RSSI_DBM,
+        ROAM_WEAK_DURATION_MS,
+    };
     use smoltcp::iface::{Config as IfaceConfig, Interface as NetInterface, SocketSet};
     use smoltcp::socket::dhcpv4;
     use smoltcp::socket::tcp::{
@@ -2179,6 +2343,8 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
         delay.delay_millis(250);
         boot_connected = connect_strongest_ap(&mut wifi_controller, &sta_cfg, ssid, 15_000);
     }
+    // BSSID of the current association; drives the runtime roam decision.
+    let mut current_bssid: Option<[u8; 6]> = boot_connected.as_ref().map(|info| info.bssid);
     match boot_connected {
         Some(info) => {
             record_boot_breadcrumb_post_wifi(6, info.channel, info.aid);
@@ -2363,6 +2529,12 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
     let mut last_capture_ms = connect_ms;
     let mut post_snapshot_refresh_at_ms: Option<i64> = None;
     let mut last_applied_ctrl = klipper_cam_fw::CameraControlState::new_default();
+    // Runtime roaming state (see `ROAM_*` in `klipper_cam_fw::ap_select`).
+    let mut weak_link_timer = WeakLinkTimer::new();
+    let mut last_roam_check_ms: u64 = u64::try_from(connect_ms).unwrap_or(0);
+    let mut last_roam_scan_ms: Option<u64> = None;
+    // Spacing between roam scans; grows while scans find no better AP.
+    let mut roam_backoff = RoamBackoff::new();
 
     loop {
         feed_rtc_wdt();
@@ -2371,6 +2543,100 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
 
         if wifi_controller.is_connected() {
             last_wifi_connected_ms = now_ms;
+            let now_u64 = u64::try_from(now_ms).unwrap_or(0);
+            if now_u64.saturating_sub(last_roam_check_ms) >= ROAM_CHECK_INTERVAL_MS {
+                last_roam_check_ms = now_u64;
+                let rssi = wifi_controller
+                    .rssi()
+                    .ok()
+                    .and_then(|raw| i8::try_from(raw).ok());
+                let weak_ms = match rssi {
+                    Some(r) => weak_link_timer.update(now_u64, r, ROAM_TRIGGER_RSSI_DBM),
+                    None => 0,
+                };
+                let scan_allowed = last_roam_scan_ms
+                    .is_none_or(|t| now_u64.saturating_sub(t) >= roam_backoff.interval_ms());
+                if let (Some(r), Some(bssid)) = (rssi, current_bssid) {
+                    if weak_ms >= ROAM_WEAK_DURATION_MS && scan_allowed {
+                        println!(
+                            concat!(
+                                "[KLIPPER-CAM-RS] [ROAM] Link weak for {} ms ",
+                                "(rssi={}dBm < {}dBm); scanning..."
+                            ),
+                            weak_ms, r, ROAM_TRIGGER_RSSI_DBM
+                        );
+                        last_roam_scan_ms = Some(now_u64);
+                        let decision = roam_scan_decision(&mut wifi_controller, ssid, bssid, r);
+                        if let RoamDecision::Roam(target) = decision {
+                            let tb = target.bssid();
+                            println!(
+                                concat!(
+                                    "[KLIPPER-CAM-RS] [ROAM] Roaming {}dBm -> ",
+                                    "bssid={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ",
+                                    "ch={} avg={}dBm"
+                                ),
+                                r,
+                                tb[0],
+                                tb[1],
+                                tb[2],
+                                tb[3],
+                                tb[4],
+                                tb[5],
+                                target.channel(),
+                                target.rssi_avg()
+                            );
+                            match roam_to_candidate(&mut wifi_controller, &sta_cfg, &target) {
+                                Some(info) => {
+                                    println!(
+                                        concat!(
+                                            "[KLIPPER-CAM-RS] [ROAM] Roamed to AP ",
+                                            "(channel {}, aid {})"
+                                        ),
+                                        info.channel, info.aid
+                                    );
+                                    current_bssid = Some(info.bssid);
+                                    connect_ms = smol_now().total_millis();
+                                    last_wifi_connected_ms = connect_ms;
+                                    // The roam blocked the loop for seconds;
+                                    // give the port 81 stream a fresh 10 s
+                                    // window instead of aborting it as stalled.
+                                    p81_last_tx_progress_ms = connect_ms;
+                                    let announce_ip = ip_configured.then_some([172, 22, 1, 52]);
+                                    after_sta_associated(
+                                        &mut wifi_controller,
+                                        runtime,
+                                        &mut flash_adapter,
+                                        &mut net_device,
+                                        mac,
+                                        announce_ip,
+                                    );
+                                    if ip_configured {
+                                        last_arp_announce_ms = connect_ms;
+                                    }
+                                }
+                                None => {
+                                    println!(concat!(
+                                        "[KLIPPER-CAM-RS] [ROAM] Roam failed; ",
+                                        "base config restored, reconnect path will recover"
+                                    ));
+                                    current_bssid = None;
+                                }
+                            }
+                            roam_backoff.reset();
+                        } else {
+                            roam_backoff.on_no_better_ap();
+                            println!(
+                                concat!(
+                                    "[KLIPPER-CAM-RS] [ROAM] No better AP; staying ",
+                                    "(next scan in {} s)"
+                                ),
+                                roam_backoff.interval_ms() / 1000
+                            );
+                        }
+                        weak_link_timer.reset();
+                    }
+                }
+            }
         } else {
             if now_ms - last_wifi_connected_ms >= 90_000
                 && ota_accum_owner.is_none()
@@ -2403,16 +2669,19 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                     );
                     connect_ms = smol_now().total_millis();
                     last_wifi_connected_ms = connect_ms;
-                    runtime.on_wifi_sta_connected();
-                    let _ = wifi_controller.set_power_saving(esp_radio::wifi::PowerSaveMode::None);
-                    let _ = wifi_controller.set_max_tx_power(WIFI_MAX_TX_POWER_QDBM);
-                    handle_wifi_got_ip_rollback(
+                    current_bssid = Some(info.bssid);
+                    weak_link_timer.reset();
+                    roam_backoff.reset();
+                    let announce_ip = ip_configured.then_some([172, 22, 1, 52]);
+                    after_sta_associated(
+                        &mut wifi_controller,
                         runtime,
                         &mut flash_adapter,
-                        Ipv4Addr::new(172, 22, 1, 52),
+                        &mut net_device,
+                        mac,
+                        announce_ip,
                     );
                     if ip_configured {
-                        send_arp_announce(&mut net_device, mac, [172, 22, 1, 52], [172, 22, 1, 1]);
                         last_arp_announce_ms = connect_ms;
                     }
                 }
