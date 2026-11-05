@@ -724,6 +724,7 @@ fn block_on_with_timeout<F: core::future::Future>(
         if now_millis().saturating_sub(start_ms) >= timeout_ms {
             return None;
         }
+        core::hint::spin_loop();
     }
 }
 
@@ -785,8 +786,10 @@ fn enqueue_tcp_sliding_window(
     if *tx_off >= limit || !sock.can_send() {
         return;
     }
-    if sock.send_queue() == 0 {
-        let chunk_end = (*tx_off + TCP_MAX_INFLIGHT_BYTES).min(limit);
+    let queued = sock.send_queue();
+    if queued < TCP_MAX_INFLIGHT_BYTES {
+        let max_send = TCP_MAX_INFLIGHT_BYTES - queued;
+        let chunk_end = (*tx_off + max_send).min(limit);
         if chunk_end > *tx_off {
             if let Ok(sent) = sock.send_slice(&buf[*tx_off..chunk_end]) {
                 *tx_off += sent;
@@ -841,7 +844,7 @@ fn hold_psram_cs_high_safe() {
 /// Never disconnects or bit-bangs `SPI0`/`SPI1` data pads (`SD0..SD3`).
 #[cfg(target_arch = "xtensa")]
 #[esp_hal::ram]
-fn psram_spi1_cmd(qpi_mode: bool, cmd_byte: u8) {
+fn psram_spi1_cmd(qpi_mode: bool, cmd_byte: u8) -> bool {
     const DPORT_HOST_INF_SEL_REG: *mut u32 = 0x3FF0_00BC as *mut u32;
     const SPI0_PIN_REG: *mut u32 = 0x3FF4_3034 as *mut u32;
     const SPI0_EXT2_REG: *const u32 = 0x3FF4_30F8 as *const u32;
@@ -1009,6 +1012,7 @@ fn psram_spi1_cmd(qpi_mode: bool, cmd_byte: u8) {
         core::ptr::write_volatile(SPI0_PIN_REG, saved_spi0_pin);
 
         core::arch::asm!("wsr.ps {0}; rsync", in(reg) saved_ps);
+        wait1 < 100_000
     }
 }
 
@@ -1755,6 +1759,10 @@ fn capture_live_hd_jpeg_with_diag(
                         }
                         fb_len += 1024;
                         eof_cnt += 1;
+                        if (eof_cnt & 7) == 0 {
+                            feed_rtc_wdt();
+                            poll_net();
+                        }
                     } else {
                         let _ = i2s_cam.stop();
                         break;
@@ -1768,7 +1776,7 @@ fn capture_live_hd_jpeg_with_diag(
                         && !read_vsync()
                         && !read_vsync()
                         && !read_vsync();
-                    if vsync_ended || now_millis().saturating_sub(last_eof_ms) >= 5 {
+                    if vsync_ended || now_millis().saturating_sub(last_eof_ms) >= 25 {
                         let _ = i2s_cam.stop();
                         // JUSTIFICATION: Ensure memory writes complete after stopping camera.
                         // SAFETY: memw instruction enforces write ordering on Xtensa.
@@ -1778,7 +1786,9 @@ fn capture_live_hd_jpeg_with_diag(
                         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
                         let half_idx = (eof_cnt as usize) & 7;
                         let half_offset = half_idx * 4096;
-                        if fb_len + 1024 <= inactive_slot.len() {
+                        if desc_slice[half_idx * 2].owner() == 0
+                            && fb_len + 1024 <= inactive_slot.len()
+                        {
                             let _ = i2s_cam.memcpy_filtered(
                                 &mut inactive_slot[fb_len..fb_len + 1024],
                                 &dma_slice[half_offset..half_offset + 4096],
@@ -1831,6 +1841,18 @@ fn capture_live_hd_jpeg_with_diag(
 
     if let Some(exact_len) = commit_len {
         if ping_pong.commit_inactive(exact_len).is_ok() {
+            if let (Some(runtime), Some(psram_bufs)) =
+                // JUSTIFICATION: Single-threaded firmware loop accesses static
+                // runtime and PSRAM buffers.
+                // SAFETY: Interrupts do not mutate FIRMWARE_RUNTIME or
+                // PSRAM_BUFFERS concurrently.
+                unsafe { (FIRMWARE_RUNTIME.as_mut(), PSRAM_BUFFERS.as_mut()) }
+            {
+                runtime
+                    .server_mut()
+                    .camera_mut()
+                    .update_static_frame(active_ping_pong_static_slice(&psram_bufs.ping_pong));
+            }
             return Ok(exact_len);
         }
     }
@@ -1993,8 +2015,9 @@ fn init_psram_and_run_hil(psram_ptr: *mut u8, psram_len: usize, xclk_hw_ok: bool
     use esp_println::println;
     use klipper_cam_fw::SYNTHETIC_HD_JFIF_FRAME;
 
+    const REQUIRED_PSRAM_BYTES: usize = 3_264 * 1024;
     let mut psram_rw_ok = false;
-    if !psram_ptr.is_null() && psram_len >= 128 * 1024 + 512 * 1024 + 2_097_152 {
+    if !psram_ptr.is_null() && psram_len >= REQUIRED_PSRAM_BYTES {
         for attempt in 0..3u8 {
             // JUSTIFICATION: Volatile write/read to verify PSRAM memory bus.
             // SAFETY: psram_ptr is verified non-null and within PSRAM bounds.
@@ -2069,8 +2092,11 @@ fn init_psram_and_run_hil(psram_ptr: *mut u8, psram_len: usize, xclk_hw_ok: bool
     let (http80_ota_accum, psram_heap_rem) = rem.split_at_mut(1800 * 1024);
     let free_psram_bytes = psram_heap_rem.len() as u32;
 
-    let ping_pong = PingPongFrameBuffer::new(jpeg_slot_a, jpeg_slot_b, &SYNTHETIC_HD_JFIF_FRAME)
-        .expect("PingPongFrameBuffer::new");
+    let Some(ping_pong) =
+        PingPongFrameBuffer::new(jpeg_slot_a, jpeg_slot_b, &SYNTHETIC_HD_JFIF_FRAME)
+    else {
+        quiesce_psram_and_software_reset();
+    };
 
     // JUSTIFICATION: Initialize static PSRAM_BUFFERS singleton.
     // SAFETY: Single-threaded bare-metal init before server loop starts.
@@ -2162,10 +2188,14 @@ fn capture_boot_dma_and_init_runtime(
     let delay = Delay::new();
     // JUSTIFICATION: Access mutable static PSRAM_BUFFERS singleton.
     // SAFETY: Exclusively accessed from single-threaded initialization.
-    let psram_bufs = unsafe { PSRAM_BUFFERS.as_mut().expect("PSRAM_BUFFERS") };
+    let Some(psram_bufs) = (unsafe { PSRAM_BUFFERS.as_mut() }) else {
+        quiesce_psram_and_software_reset();
+    };
     // JUSTIFICATION: Access mutable static HW_I2S_CAM singleton.
     // SAFETY: Exclusively accessed from single-threaded initialization.
-    let hw_i2s_cam = unsafe { HW_I2S_CAM.as_mut().expect("HW_I2S_CAM") };
+    let Some(hw_i2s_cam) = (unsafe { HW_I2S_CAM.as_mut() }) else {
+        quiesce_psram_and_software_reset();
+    };
 
     let ov2640_dma_ok = ov2640_hw_ok;
     let mut boot_dma_ok = false;
@@ -2309,13 +2339,19 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
     let delay = Delay::new();
     // JUSTIFICATION: Access mutable static PSRAM_BUFFERS singleton.
     // SAFETY: Exclusively accessed from single-threaded server execution.
-    let psram_bufs = unsafe { PSRAM_BUFFERS.as_mut().expect("PSRAM_BUFFERS") };
+    let Some(psram_bufs) = (unsafe { PSRAM_BUFFERS.as_mut() }) else {
+        quiesce_psram_and_software_reset();
+    };
     // JUSTIFICATION: Access mutable static FIRMWARE_RUNTIME singleton.
     // SAFETY: Exclusively accessed from single-threaded server execution.
-    let runtime = unsafe { FIRMWARE_RUNTIME.as_mut().expect("FIRMWARE_RUNTIME") };
+    let Some(runtime) = (unsafe { FIRMWARE_RUNTIME.as_mut() }) else {
+        quiesce_psram_and_software_reset();
+    };
     // JUSTIFICATION: Access mutable static HW_I2S_CAM singleton.
     // SAFETY: Exclusively accessed from single-threaded server execution.
-    let hw_i2s_cam = unsafe { HW_I2S_CAM.as_mut().expect("HW_I2S_CAM") };
+    let Some(hw_i2s_cam) = (unsafe { HW_I2S_CAM.as_mut() }) else {
+        quiesce_psram_and_software_reset();
+    };
     let ping_pong = &mut psram_bufs.ping_pong;
     let p80_hdr_bufs = &mut psram_bufs.p80_hdr_bufs;
     let p80_resp_bufs = &mut psram_bufs.p80_resp_bufs;
@@ -2815,11 +2851,10 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
             })
             .is_ok()
             {
-                let fresh_slice = active_ping_pong_static_slice(ping_pong);
                 runtime
-                    .server
-                    .camera
-                    .set_frame(fresh_slice, runtime.server.control_state.framesize);
+                    .server_mut()
+                    .camera_mut()
+                    .update_static_frame(active_ping_pong_static_slice(&psram_bufs.ping_pong));
                 last_capture_ms = smol_now().total_millis();
             }
         }
@@ -3772,8 +3807,10 @@ fn main() -> ! {
 
     let (sta_cfg, ctrl_cfg, ssid) = build_wifi_station_configs();
     feed_rtc_wdt();
-    let wifi_controller = esp_radio::wifi::WifiController::new(peripherals.WIFI, ctrl_cfg)
-        .expect("WifiController::new");
+    let Ok(wifi_controller) = esp_radio::wifi::WifiController::new(peripherals.WIFI, ctrl_cfg)
+    else {
+        quiesce_psram_and_software_reset();
+    };
     feed_rtc_wdt();
 
     run_post_wifi_server_loop(

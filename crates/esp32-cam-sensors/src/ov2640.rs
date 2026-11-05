@@ -836,6 +836,12 @@ impl Ov2640 {
                 self.set_bank(bus, Ov2640Bank::from_u8(entry.val))?;
             } else {
                 bus.write_reg8(self.slv_addr, entry.reg, entry.val)?;
+                if self.reg_bank == Ov2640Bank::Sensor
+                    && entry.reg == COM7
+                    && (entry.val & COM7_SRST) != 0
+                {
+                    self.reg_bank = Ov2640Bank::Max;
+                }
             }
         }
         Ok(())
@@ -1200,8 +1206,13 @@ impl<B: SccbBus> CameraSensor<B> for Ov2640 {
     }
 
     fn set_vflip(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.write_reg_bits(bus, Ov2640Bank::Sensor, REG04, REG04_VREF_EN, enable)?;
-        self.write_reg_bits(bus, Ov2640Bank::Sensor, REG04, REG04_VFLIP_IMG, enable)?;
+        self.write_reg_bits(
+            bus,
+            Ov2640Bank::Sensor,
+            REG04,
+            REG04_VREF_EN | REG04_VFLIP_IMG,
+            enable,
+        )?;
         self.status.vflip = u8::from(enable);
         Ok(())
     }
@@ -1357,10 +1368,16 @@ impl<B: SccbBus> CameraSensor<B> for Ov2640 {
     ) -> Result<(), CameraError> {
         if offset_x < 0
             || offset_y < 0
+            || offset_x > u16::MAX as i32
+            || offset_y > u16::MAX as i32
             || total_x <= 0
             || total_y <= 0
             || output_x <= 0
             || output_y <= 0
+            || total_x > u16::MAX as i32
+            || total_y > u16::MAX as i32
+            || output_x > u16::MAX as i32
+            || output_y > u16::MAX as i32
         {
             return Err(CameraError::InvalidArg);
         }

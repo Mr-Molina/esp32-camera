@@ -61,6 +61,7 @@ pub struct MockSccbBus<const CAP: usize = MAX_MOCK_REGS> {
     strict_ack: bool,
     device_addrs: [u8; 16],
     device_addrs_len: usize,
+    device_mask: [u64; 2],
 }
 
 impl<const CAP: usize> Default for MockSccbBus<CAP> {
@@ -87,6 +88,17 @@ impl<const CAP: usize> MockSccbBus<CAP> {
             strict_ack: false,
             device_addrs: [0; 16],
             device_addrs_len: 0,
+            device_mask: [0; 2],
+        }
+    }
+
+    const fn set_device_bit(&mut self, addr: u8) {
+        if addr > 0 && addr < 128 {
+            if addr < 64 {
+                self.device_mask[0] |= 1u64 << addr;
+            } else {
+                self.device_mask[1] |= 1u64 << (addr - 64);
+            }
         }
     }
 
@@ -123,6 +135,7 @@ impl<const CAP: usize> MockSccbBus<CAP> {
     /// Registers a 7-bit slave device address as active on the mock bus.
     pub fn register_device_addr(&mut self, addr: u8) {
         if addr > 0 && addr < 0x80 {
+            self.set_device_bit(addr);
             let mut i = 0;
             while i < self.device_addrs_len {
                 if self.device_addrs[i] == addr {
@@ -137,24 +150,17 @@ impl<const CAP: usize> MockSccbBus<CAP> {
         }
     }
 
-    /// Checks if a register or device registration exists for `slv_addr`.
-    pub fn has_device(&self, slv_addr: u8) -> bool {
-        let mut i = 0;
-        while i < self.device_addrs_len {
-            if self.device_addrs[i] == slv_addr {
-                return true;
-            }
-            i += 1;
+    /// Checks if a register or device registration exists for `slv_addr` in
+    /// O(1) time.
+    pub const fn has_device(&self, slv_addr: u8) -> bool {
+        if slv_addr == 0 || slv_addr >= 128 {
+            return false;
         }
-        let mut i = 0;
-        while i < self.reg_len {
-            let entry = &self.regs[i];
-            if entry.occupied && entry.slv_addr == slv_addr {
-                return true;
-            }
-            i += 1;
+        if slv_addr < 64 {
+            (self.device_mask[0] & (1u64 << slv_addr)) != 0
+        } else {
+            (self.device_mask[1] & (1u64 << (slv_addr - 64))) != 0
         }
-        false
     }
 
     /// Probes device at `slv_addr`, returning detailed [`SccbError`].
@@ -243,13 +249,14 @@ impl<const CAP: usize> MockSccbBus<CAP> {
 
     fn store_reg(&mut self, slv_addr: u8, reg: u16, val: u8) -> Result<(), CameraError> {
         if CAP == 0 {
-            return Err(CameraError::SccbError);
+            return Err(CameraError::NoMem);
         }
         let mut i = 0;
         while i < self.reg_len {
             if self.regs[i].occupied && self.regs[i].slv_addr == slv_addr && self.regs[i].reg == reg
             {
                 self.regs[i].val = val;
+                self.set_device_bit(slv_addr);
                 return Ok(());
             }
             i += 1;
@@ -262,9 +269,10 @@ impl<const CAP: usize> MockSccbBus<CAP> {
                 occupied: true,
             };
             self.reg_len += 1;
+            self.set_device_bit(slv_addr);
             Ok(())
         } else {
-            Err(CameraError::SccbError)
+            Err(CameraError::NoMem)
         }
     }
 
@@ -371,7 +379,10 @@ impl<const CAP: usize> SccbBus for MockSccbBus<CAP> {
             return Err(err);
         }
         if (self.strict_ack || self.device_addrs_len > 0) && !self.has_device(slv_addr) {
-            return Err(CameraError::SccbError);
+            return Err(CameraError::SccbNack {
+                slv_addr,
+                phase: "device_addr",
+            });
         }
         Ok(())
     }
@@ -491,13 +502,10 @@ mod tests {
             Err(CameraError::InvalidArg)
         );
 
-        // Capacity overflow returns Err(CameraError::SccbError) when full
+        // Capacity overflow returns Err(CameraError::NoMem) when reg_len == CAP
         assert_eq!(bus.write_reg8(0x30, 0x01, 0xAA), Ok(()));
         assert_eq!(bus.write_reg8(0x30, 0x02, 0xBB), Ok(()));
-        assert_eq!(
-            bus.write_reg8(0x30, 0x03, 0xCC),
-            Err(CameraError::SccbError)
-        );
+        assert_eq!(bus.write_reg8(0x30, 0x03, 0xCC), Err(CameraError::NoMem));
         // Overwriting existing slot succeeds
         assert_eq!(bus.write_reg8(0x30, 0x01, 0xFF), Ok(()));
         assert_eq!(bus.read_reg8(0x30, 0x01), Ok(0xFF));
@@ -512,10 +520,13 @@ mod tests {
         // Populated address succeeds probe
         assert_eq!(bus.probe(CameraSccbAddr::OV2640), Ok(()));
 
-        // Unpopulated slave address returns SccbError in strict mode
+        // Unpopulated slave address returns SccbNack in strict mode
         assert_eq!(
             bus.probe(CameraSccbAddr::OV7725),
-            Err(CameraError::SccbError)
+            Err(CameraError::SccbNack {
+                slv_addr: CameraSccbAddr::OV7725,
+                phase: "device_addr",
+            })
         );
         assert_eq!(
             bus.probe_strict(CameraSccbAddr::OV7725),

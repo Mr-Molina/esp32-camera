@@ -107,7 +107,8 @@ impl FrameSize {
     /// Returns the total pixel count (`width * height`) for this frame size.
     #[inline]
     pub const fn pixel_count(self) -> usize {
-        (self.width() as usize) * (self.height() as usize)
+        let res = &RESOLUTION_TABLE[self as usize];
+        (res.width as usize) * (res.height as usize)
     }
 
     /// Returns the uncompressed frame buffer size in bytes for the given
@@ -119,50 +120,53 @@ impl FrameSize {
         match format {
             PixelFormat::Jpeg => None,
             PixelFormat::Grayscale | PixelFormat::Raw | PixelFormat::Raw8 => Some(pixels),
-            PixelFormat::Rgb565 | PixelFormat::Yuv422 => pixels.checked_mul(2),
+            PixelFormat::Rgb565
+            | PixelFormat::Yuv422
+            | PixelFormat::Rgb555
+            | PixelFormat::Rgb444 => pixels.checked_mul(2),
             PixelFormat::Rgb888 => pixels.checked_mul(3),
-            PixelFormat::Yuv420 | PixelFormat::Rgb444 | PixelFormat::Rgb555 => {
-                match pixels.checked_mul(3) {
-                    Some(val) => Some(val / 2),
-                    None => None,
-                }
-            }
+            PixelFormat::Yuv420 => match pixels.checked_mul(3) {
+                Some(val) => Some(val / 2),
+                None => None,
+            },
         }
     }
 
     /// Converts a raw index (`0..25`) into a [`FrameSize`].
     #[inline]
-    pub const fn from_u8(val: u8) -> Option<Self> {
-        match val {
-            0 => Some(Self::Size96x96),
-            1 => Some(Self::Qqvga),
-            2 => Some(Self::Size128x128),
-            3 => Some(Self::Qcif),
-            4 => Some(Self::Hqvga),
-            5 => Some(Self::Size240x240),
-            6 => Some(Self::Qvga),
-            7 => Some(Self::Size320x320),
-            8 => Some(Self::Cif),
-            9 => Some(Self::Hvga),
-            10 => Some(Self::Vga),
-            11 => Some(Self::Svga),
-            12 => Some(Self::Xga),
-            13 => Some(Self::Hd),
-            14 => Some(Self::Sxga),
-            15 => Some(Self::Uxga),
-            16 => Some(Self::Fhd),
-            17 => Some(Self::PHd),
-            18 => Some(Self::P3Mp),
-            19 => Some(Self::Qxga),
-            20 => Some(Self::Qhd),
-            21 => Some(Self::Wqxga),
-            22 => Some(Self::PFhd),
-            23 => Some(Self::Qsxga),
-            24 => Some(Self::Size5Mp),
-            _ => None,
-        }
+    pub fn from_u8(val: u8) -> Option<Self> {
+        ALL_FRAMESIZES.get(val as usize).copied()
     }
 }
+
+/// All 25 [`FrameSize`] variants in index order.
+pub const ALL_FRAMESIZES: [FrameSize; FrameSize::COUNT] = [
+    FrameSize::Size96x96,
+    FrameSize::Qqvga,
+    FrameSize::Size128x128,
+    FrameSize::Qcif,
+    FrameSize::Hqvga,
+    FrameSize::Size240x240,
+    FrameSize::Qvga,
+    FrameSize::Size320x320,
+    FrameSize::Cif,
+    FrameSize::Hvga,
+    FrameSize::Vga,
+    FrameSize::Svga,
+    FrameSize::Xga,
+    FrameSize::Hd,
+    FrameSize::Sxga,
+    FrameSize::Uxga,
+    FrameSize::Fhd,
+    FrameSize::PHd,
+    FrameSize::P3Mp,
+    FrameSize::Qxga,
+    FrameSize::Qhd,
+    FrameSize::Wqxga,
+    FrameSize::PFhd,
+    FrameSize::Qsxga,
+    FrameSize::Size5Mp,
+];
 
 /// Frame aspect ratio (`aspect_ratio_t` from `driver/include/sensor.h`).
 #[repr(u8)]
@@ -193,6 +197,7 @@ impl AspectRatio {
 }
 
 /// Resolution dimensions and aspect ratio from `driver/include/sensor.h`.
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ResolutionInfo {
     pub width: u16,
@@ -401,8 +406,14 @@ mod tests {
         assert_eq!(qvga.checked_byte_size(PixelFormat::Yuv422), Some(320 * 240 * 2));
         assert_eq!(qvga.checked_byte_size(PixelFormat::Rgb888), Some(320 * 240 * 3));
         assert_eq!(qvga.checked_byte_size(PixelFormat::Yuv420), Some((320 * 240 * 3) / 2));
-        assert_eq!(qvga.checked_byte_size(PixelFormat::Rgb444), Some((320 * 240 * 3) / 2));
-        assert_eq!(qvga.checked_byte_size(PixelFormat::Rgb555), Some((320 * 240 * 3) / 2));
+        assert_eq!(qvga.checked_byte_size(PixelFormat::Rgb444), Some(320 * 240 * 2));
+        assert_eq!(qvga.checked_byte_size(PixelFormat::Rgb555), Some(320 * 240 * 2));
+
+        assert_eq!(FrameSize::from_u8(0), Some(FrameSize::Size96x96));
+        assert_eq!(FrameSize::from_u8(6), Some(FrameSize::Qvga));
+        assert_eq!(FrameSize::from_u8(24), Some(FrameSize::Size5Mp));
+        assert_eq!(FrameSize::from_u8(25), None);
+        assert_eq!(FrameSize::from_u8(255), None);
 
         const CONST_PIXELS: usize = FrameSize::Vga.pixel_count();
         assert_eq!(CONST_PIXELS, 640 * 480);

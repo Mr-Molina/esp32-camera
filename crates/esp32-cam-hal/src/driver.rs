@@ -23,6 +23,11 @@ use crate::frame_pool::{FrameGuard, FramePool};
 /// `driver/cam_hal.c:161`).
 pub const JPEG_SOI_MARKER: [u8; 3] = [0xFF, 0xD8, 0xFF];
 
+/// Marker compatibility alias for `JPEG_SOI_MARKER`.
+pub mod esp32_cam_conversions {
+    pub use super::JPEG_SOI_MARKER;
+}
+
 /// JPEG End-Of-Image (`EOI`) 2-byte marker (`0xFF, 0xD9` in
 /// `driver/cam_hal.c:163`).
 pub const JPEG_EOI_MARKER: [u8; 2] = [0xFF, 0xD9];
@@ -379,27 +384,42 @@ impl<B: SccbBus> HalCameraSensor<B> for HalOv2640Sensor {
         Ok(())
     }
 
-    fn set_bpc(&mut self, _bus: &mut B, enable: bool) -> Result<(), CameraError> {
+    fn set_bpc(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
+        bus.write_reg8(self.slv_addr, 0xFF, 0x00)?;
+        let val = if enable { 0x04 } else { 0x00 };
+        bus.write_reg8_mask(self.slv_addr, 0xC3, 0x04, val)?;
         self.status.bpc = u8::from(enable);
         Ok(())
     }
 
-    fn set_wpc(&mut self, _bus: &mut B, enable: bool) -> Result<(), CameraError> {
+    fn set_wpc(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
+        bus.write_reg8(self.slv_addr, 0xFF, 0x00)?;
+        let val = if enable { 0x02 } else { 0x00 };
+        bus.write_reg8_mask(self.slv_addr, 0xC3, 0x02, val)?;
         self.status.wpc = u8::from(enable);
         Ok(())
     }
 
-    fn set_lenc(&mut self, _bus: &mut B, enable: bool) -> Result<(), CameraError> {
+    fn set_lenc(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
+        bus.write_reg8(self.slv_addr, 0xFF, 0x00)?;
+        let val = if enable { 0x01 } else { 0x00 };
+        bus.write_reg8_mask(self.slv_addr, 0xC3, 0x01, val)?;
         self.status.lenc = u8::from(enable);
         Ok(())
     }
 
-    fn set_hmirror(&mut self, _bus: &mut B, enable: bool) -> Result<(), CameraError> {
+    fn set_hmirror(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
+        bus.write_reg8(self.slv_addr, 0xFF, 0x01)?;
+        let val = if enable { 0x80 } else { 0x00 };
+        bus.write_reg8_mask(self.slv_addr, 0x04, 0x80, val)?;
         self.status.hmirror = u8::from(enable);
         Ok(())
     }
 
-    fn set_vflip(&mut self, _bus: &mut B, enable: bool) -> Result<(), CameraError> {
+    fn set_vflip(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
+        bus.write_reg8(self.slv_addr, 0xFF, 0x01)?;
+        let val = if enable { 0x50 } else { 0x00 };
+        bus.write_reg8_mask(self.slv_addr, 0x04, 0x50, val)?;
         self.status.vflip = u8::from(enable);
         Ok(())
     }
@@ -475,27 +495,42 @@ impl<B: SccbBus> esp32_cam_sensors::CameraSensor<B> for HalOv2640Sensor {
         Ok(())
     }
 
-    fn set_bpc(&mut self, _bus: &mut B, enable: bool) -> Result<(), CameraError> {
+    fn set_bpc(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
+        bus.write_reg8(self.slv_addr, 0xFF, 0x00)?;
+        let val = if enable { 0x04 } else { 0x00 };
+        bus.write_reg8_mask(self.slv_addr, 0xC3, 0x04, val)?;
         self.status.bpc = u8::from(enable);
         Ok(())
     }
 
-    fn set_wpc(&mut self, _bus: &mut B, enable: bool) -> Result<(), CameraError> {
+    fn set_wpc(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
+        bus.write_reg8(self.slv_addr, 0xFF, 0x00)?;
+        let val = if enable { 0x02 } else { 0x00 };
+        bus.write_reg8_mask(self.slv_addr, 0xC3, 0x02, val)?;
         self.status.wpc = u8::from(enable);
         Ok(())
     }
 
-    fn set_lenc(&mut self, _bus: &mut B, enable: bool) -> Result<(), CameraError> {
+    fn set_lenc(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
+        bus.write_reg8(self.slv_addr, 0xFF, 0x00)?;
+        let val = if enable { 0x01 } else { 0x00 };
+        bus.write_reg8_mask(self.slv_addr, 0xC3, 0x01, val)?;
         self.status.lenc = u8::from(enable);
         Ok(())
     }
 
-    fn set_hmirror(&mut self, _bus: &mut B, enable: bool) -> Result<(), CameraError> {
+    fn set_hmirror(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
+        bus.write_reg8(self.slv_addr, 0xFF, 0x01)?;
+        let val = if enable { 0x80 } else { 0x00 };
+        bus.write_reg8_mask(self.slv_addr, 0x04, 0x80, val)?;
         self.status.hmirror = u8::from(enable);
         Ok(())
     }
 
-    fn set_vflip(&mut self, _bus: &mut B, enable: bool) -> Result<(), CameraError> {
+    fn set_vflip(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
+        bus.write_reg8(self.slv_addr, 0xFF, 0x01)?;
+        let val = if enable { 0x50 } else { 0x00 };
+        bus.write_reg8_mask(self.slv_addr, 0x04, 0x50, val)?;
         self.status.vflip = u8::from(enable);
         Ok(())
     }
@@ -906,6 +941,7 @@ impl<
         self.i2s.vsync_intr_enable(true);
         if !self.i2s.start(&dma_cfg, 0) {
             self.i2s.vsync_intr_enable(false);
+            self.xclk.disable_out_clock();
             return Err(CameraError::HardwareError);
         }
         Ok(CameraDriver {
@@ -1154,33 +1190,30 @@ fn assemble_and_lease_frame<
             total_written += written;
 
             // Check for JPEG SOI at offset 0 of the first half-buffer (`cam_hal.c:350-393`)
-            if is_jpeg && cnt == 0 {
-                let probe_len = if psram_mode {
-                    total_written.min(CAM_SOI_PROBE_BYTES)
-                } else {
-                    total_written
-                };
-                match verify_jpeg_soi(&fb_buf[..probe_len]) {
-                    Some(0) => {}
-                    _ => return Err(CameraError::CorruptedFrame),
-                }
+            if is_jpeg
+                && cnt == 0
+                && !fb_buf.starts_with(&esp32_cam_conversions::JPEG_SOI_MARKER)
+            {
+                return Err(CameraError::CorruptedFrame);
             }
         }
 
         if is_jpeg {
             // Locate JPEG EOI marker (`0xFF, 0xD9`) and trim trailing padding bytes
             // (DMA-101 / PSRAM garbage, `cam_hal.c:787-817`)
+            let last_half_len = dma_half_buffers
+                .last()
+                .map(|b| b.len())
+                .unwrap_or(dma_cfg.dma_half_buffer_size);
+            let probe_len = eoi_probe_window(last_half_len, total_written);
+            let probe_start = total_written - probe_len;
+
             let offset_e = if psram_mode {
-                let last_half_len = dma_half_buffers
-                    .last()
-                    .map(|b| b.len())
-                    .unwrap_or(dma_cfg.dma_half_buffer_size);
-                let probe_len = eoi_probe_window(last_half_len, total_written);
-                let probe_start = total_written - probe_len;
                 verify_jpeg_eoi(&fb_buf[probe_start..total_written], true)
                     .map(|off| probe_start + off)
             } else {
-                verify_jpeg_eoi(&fb_buf[..total_written], false)
+                verify_jpeg_eoi(&fb_buf[probe_start..total_written], false)
+                    .map(|off| probe_start + off)
             };
 
             match offset_e {

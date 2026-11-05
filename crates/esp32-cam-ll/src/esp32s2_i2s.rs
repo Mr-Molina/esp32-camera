@@ -361,7 +361,10 @@ impl Esp32S2I2sCamera {
     /// Starts ESP32-S2 DMA capture
     /// (`ll_cam_start` in `target/esp32s2/ll_cam.c:107-136`).
     pub fn start(&mut self, dma_cfg: &DmaSizeConfig, first_desc_addr: u32) -> bool {
-        if dma_cfg.dma_half_buffer_size == 0 {
+        if dma_cfg.dma_half_buffer_size == 0
+            || first_desc_addr == 0
+            || (first_desc_addr & 0x3) != 0
+        {
             return false;
         }
         let conf_stopped = volatile_read_u32(&self.regs.conf) & !I2S_RX_START_BIT;
@@ -422,19 +425,16 @@ impl Esp32S2I2sCamera {
     /// (`ll_cam_memcpy` in `target/esp32s2/ll_cam.c:383-402`).
     pub fn memcpy(&self, dst: &mut [u8], src: &[u8]) -> usize {
         if self.in_bytes_per_pixel == 2 && self.fb_bytes_per_pixel == 1 {
-            let end = (src.len() / 8).min(dst.len() / 4);
-            let mut i = 0;
-            while i < end {
-                let in_off = i * 8;
-                let out_off = i * 4;
-                dst[out_off] = src[in_off];
-                dst[out_off + 1] = src[in_off + 2];
-                dst[out_off + 2] = src[in_off + 4];
-                dst[out_off + 3] = src[in_off + 6];
-                i += 1;
+            let mut out_bytes = 0;
+            for (in_chunk, out_chunk) in
+                src.as_chunks::<8>().0.iter().zip(dst.as_chunks_mut::<4>().0) {
+                out_chunk[0] = in_chunk[0];
+                out_chunk[1] = in_chunk[2];
+                out_chunk[2] = in_chunk[4];
+                out_chunk[3] = in_chunk[6];
+                out_bytes += 4;
             }
-            let mut out_bytes = end * 4;
-            let mut rem_in = end * 8;
+            let mut rem_in = (out_bytes / 4) * 8;
             while rem_in + 1 < src.len() && out_bytes < dst.len() {
                 dst[out_bytes] = src[rem_in];
                 out_bytes += 1;

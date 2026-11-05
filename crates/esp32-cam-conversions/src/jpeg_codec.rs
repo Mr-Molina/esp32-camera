@@ -99,11 +99,6 @@ const fn dct_descale(x: i32, n: i32) -> i32 {
 }
 
 #[inline]
-const fn dct_descale_i64(x: i64, n: i32) -> i64 {
-    (x + (1i64 << (n - 1))) >> n
-}
-
-#[inline]
 #[allow(clippy::too_many_arguments)]
 fn dct_1d(
     s0: &mut i32,
@@ -209,10 +204,15 @@ fn fdct_2d(block: &mut [i32; 64]) {
     }
 }
 
+#[inline]
+const fn dct_descale_i64(x: i64, n: u32) -> i64 {
+    (x + (1i64 << (n - 1))) >> n
+}
+
 /// Performs the 8x8 inverse 2D integer IDCT (IJG `jidctint.c` LLM algorithm)
 /// and level-shifts output samples by `+128` into `0..=255`.
 fn idct_2d(coeffs: &[i32; 64], out_pixels: &mut [u8; 64]) {
-    let mut workspace = [0i32; 64];
+    let mut workspace = [0i64; 64];
 
     // Pass 1: process rows
     for row in 0..8 {
@@ -227,7 +227,7 @@ fn idct_2d(coeffs: &[i32; 64], out_pixels: &mut [u8; 64]) {
         let f7 = coeffs[base + 7] as i64;
 
         if (f1 | f2 | f3 | f4 | f5 | f6 | f7) == 0 {
-            let dc_val = (f0 << ROW_BITS) as i32;
+            let dc_val = f0 << ROW_BITS;
             workspace[base..base + 8].fill(dc_val);
             continue;
         }
@@ -265,26 +265,27 @@ fn idct_2d(coeffs: &[i32; 64], out_pixels: &mut [u8; 64]) {
         otmp2 += oz2 + oz3;
         otmp3 += oz1 + oz4;
 
-        workspace[base] = dct_descale_i64(tmp10 + otmp3, CONST_BITS - ROW_BITS) as i32;
-        workspace[base + 7] = dct_descale_i64(tmp10 - otmp3, CONST_BITS - ROW_BITS) as i32;
-        workspace[base + 1] = dct_descale_i64(tmp11 + otmp2, CONST_BITS - ROW_BITS) as i32;
-        workspace[base + 6] = dct_descale_i64(tmp11 - otmp2, CONST_BITS - ROW_BITS) as i32;
-        workspace[base + 2] = dct_descale_i64(tmp12 + otmp1, CONST_BITS - ROW_BITS) as i32;
-        workspace[base + 5] = dct_descale_i64(tmp12 - otmp1, CONST_BITS - ROW_BITS) as i32;
-        workspace[base + 3] = dct_descale_i64(tmp13 + otmp0, CONST_BITS - ROW_BITS) as i32;
-        workspace[base + 4] = dct_descale_i64(tmp13 - otmp0, CONST_BITS - ROW_BITS) as i32;
+        let shift = (CONST_BITS - ROW_BITS) as u32;
+        workspace[base] = dct_descale_i64(tmp10 + otmp3, shift);
+        workspace[base + 7] = dct_descale_i64(tmp10 - otmp3, shift);
+        workspace[base + 1] = dct_descale_i64(tmp11 + otmp2, shift);
+        workspace[base + 6] = dct_descale_i64(tmp11 - otmp2, shift);
+        workspace[base + 2] = dct_descale_i64(tmp12 + otmp1, shift);
+        workspace[base + 5] = dct_descale_i64(tmp12 - otmp1, shift);
+        workspace[base + 3] = dct_descale_i64(tmp13 + otmp0, shift);
+        workspace[base + 4] = dct_descale_i64(tmp13 - otmp0, shift);
     }
 
     // Pass 2: process columns
     for col in 0..8 {
-        let f0 = workspace[col] as i64;
-        let f1 = workspace[col + 8] as i64;
-        let f2 = workspace[col + 16] as i64;
-        let f3 = workspace[col + 24] as i64;
-        let f4 = workspace[col + 32] as i64;
-        let f5 = workspace[col + 40] as i64;
-        let f6 = workspace[col + 48] as i64;
-        let f7 = workspace[col + 56] as i64;
+        let f0 = workspace[col];
+        let f1 = workspace[col + 8];
+        let f2 = workspace[col + 16];
+        let f3 = workspace[col + 24];
+        let f4 = workspace[col + 32];
+        let f5 = workspace[col + 40];
+        let f6 = workspace[col + 48];
+        let f7 = workspace[col + 56];
 
         let z2 = f2;
         let z3 = f6;
@@ -319,7 +320,7 @@ fn idct_2d(coeffs: &[i32; 64], out_pixels: &mut [u8; 64]) {
         otmp2 += oz2 + oz3;
         otmp3 += oz1 + oz4;
 
-        let shift = CONST_BITS + ROW_BITS + 3;
+        let shift = (CONST_BITS + ROW_BITS + 3) as u32;
         out_pixels[col] = (dct_descale_i64(tmp10 + otmp3, shift) + 128).clamp(0, 255) as u8;
         out_pixels[col + 56] = (dct_descale_i64(tmp10 - otmp3, shift) + 128).clamp(0, 255) as u8;
         out_pixels[col + 8] = (dct_descale_i64(tmp11 + otmp2, shift) + 128).clamp(0, 255) as u8;
@@ -417,10 +418,8 @@ impl<'a> JpegBitWriter<'a> {
 
     #[inline]
     fn emit_byte(&mut self, b: u8) -> Result<(), CameraError> {
-        if self.pos >= self.dst.len() {
-            return Err(CameraError::BufferTooSmall);
-        }
-        self.dst[self.pos] = b;
+        let slot = self.dst.get_mut(self.pos).ok_or(CameraError::BufferTooSmall)?;
+        *slot = b;
         self.pos += 1;
         Ok(())
     }
@@ -582,14 +581,14 @@ impl<'a> JpegBitWriter<'a> {
                 if adj < q {
                     0
                 } else {
-                    -(adj / q)
+                    -(((adj as u32) / (q as u32)) as i32)
                 }
             } else {
                 let adj = raw + (q >> 1);
                 if adj < q {
                     0
                 } else {
-                    adj / q
+                    ((adj as u32) / (q as u32)) as i32
                 }
             };
         }
@@ -697,9 +696,10 @@ pub fn encode_rgb888_to_jpeg(
         for bx in 0..mcu_cols {
             for dy in 0..8usize {
                 let py = (by * 8 + dy).min(h - 1);
+                let row_off = py * w;
                 for dx in 0..8usize {
                     let px = (bx * 8 + dx).min(w - 1);
-                    let p_idx = (py * w + px) * 3;
+                    let p_idx = (row_off + px) * 3;
                     let (y, cb, cr) = rgb2yuv(src[p_idx], src[p_idx + 1], src[p_idx + 2]);
                     let b_idx = dy * 8 + dx;
                     y_block[b_idx] = (y as i32) - 128;
@@ -769,9 +769,10 @@ pub fn encode_grayscale_to_jpeg(
         for bx in 0..mcu_cols {
             for dy in 0..8usize {
                 let py = (by * 8 + dy).min(h - 1);
+                let row_off = py * w;
                 for dx in 0..8usize {
                     let px = (bx * 8 + dx).min(w - 1);
-                    y_block[dy * 8 + dx] = (src[py * w + px] as i32) - 128;
+                    y_block[dy * 8 + dx] = (src[row_off + px] as i32) - 128;
                 }
             }
             writer.encode_block(
@@ -826,9 +827,10 @@ pub fn encode_yuv422_to_jpeg(
         for bx in 0..mcu_cols {
             for dy in 0..8usize {
                 let py = (by * 8 + dy).min(h - 1);
+                let row_off = py * w;
                 for dx in 0..8usize {
                     let px = (bx * 8 + dx).min(w - 1);
-                    let pair_idx = (py * w + (px & !1)) * 2;
+                    let pair_idx = (row_off + (px & !1)) * 2;
                     let y = if (px & 1) == 0 {
                         src[pair_idx]
                     } else if pair_idx + 2 < src.len() {
@@ -885,6 +887,7 @@ pub fn encode_yuv422_to_jpeg(
 #[derive(Clone, Copy, Debug)]
 struct DecHuffTable {
     valid: bool,
+    fast_lut: [u16; 256],
     max_code: [i32; 17],
     val_offset: [i32; 17],
     vals: [u8; 256],
@@ -894,6 +897,7 @@ impl Default for DecHuffTable {
     fn default() -> Self {
         Self {
             valid: false,
+            fast_lut: [0; 256],
             max_code: [-1; 17],
             val_offset: [0; 17],
             vals: [0; 256],
@@ -918,10 +922,23 @@ fn build_dec_huff_table(bits: &[u8; 17], vals: &[u8]) -> Result<DecHuffTable, Ca
         } else {
             table.val_offset[l] = (k as i32) - code;
             for _ in 0..count {
-                table.vals[k] = vals[k];
+                let sym = vals[k];
+                table.vals[k] = sym;
+                if l <= 8 {
+                    let shift = 8 - l;
+                    let base = (code as usize) << shift;
+                    let num_entries = 1usize << shift;
+                    let entry = ((l as u16) << 8) | (sym as u16);
+                    for fill in 0..num_entries {
+                        let idx = base + fill;
+                        if idx < 256 {
+                            table.fast_lut[idx] = entry;
+                        }
+                    }
+                }
                 k += 1;
+                code += 1;
             }
-            code += count as i32;
             table.max_code[l] = code - 1;
         }
         if code > (1i32 << l) {
@@ -1017,6 +1034,16 @@ impl<'a> JpegBitReader<'a> {
         if !table.valid {
             return Err(CameraError::CodecError);
         }
+        if self.fill_bits(8).is_ok() {
+            let peek = ((self.bit_buf >> (self.bits_in - 8)) & 0xFF) as usize;
+            let entry = table.fast_lut[peek];
+            if entry != 0 {
+                let len = (entry >> 8) as u32;
+                let sym = (entry & 0xFF) as u8;
+                self.bits_in -= len;
+                return Ok(sym);
+            }
+        }
         let mut code = 0i32;
         for l in 1..=16usize {
             let bit = self.get_bits(1)? as i32;
@@ -1075,6 +1102,9 @@ impl<'a> JpegBitReader<'a> {
 
             if s == 0 {
                 if r == 15 {
+                    if k + 16 > 64 {
+                        return Err(CameraError::CorruptedFrame);
+                    }
                     k += 16;
                     continue;
                 }
@@ -1115,8 +1145,8 @@ fn decode_jpeg_internal(
 
     let mut qtables = [[0u8; 64]; 4];
     let mut qtable_valid = [false; 4];
-    let mut dc_tables = [DecHuffTable::default(); 4];
-    let mut ac_tables = [DecHuffTable::default(); 4];
+    let mut dc_tables = [DecHuffTable::default(); 2];
+    let mut ac_tables = [DecHuffTable::default(); 2];
     let mut comps = [ComponentSpec::default(); 3];
     let mut num_components = 0usize;
     let mut width = 0u16;
@@ -1188,7 +1218,7 @@ fn decode_jpeg_internal(
                     cur += 1;
                     let is_ac = (info & 0x10) != 0;
                     let t_idx = (info & 0x0F) as usize;
-                    if t_idx >= 4 {
+                    if t_idx > 1 {
                         return Err(CameraError::CodecError);
                     }
                     let mut bits = [0u8; 17];
@@ -1276,7 +1306,7 @@ fn decode_jpeg_internal(
                     cur += 2;
                     let dc_idx = huff_sel >> 4;
                     let ac_idx = huff_sel & 0x0F;
-                    if dc_idx >= 4 || ac_idx >= 4 {
+                    if dc_idx > 1 || ac_idx > 1 {
                         return Err(CameraError::CodecError);
                     }
                     let mut matched = false;
@@ -1345,7 +1375,13 @@ fn decode_jpeg_internal(
     if out_fmt == DecodeOutputFormat::Bmp24 {
         let img_size = (required_dst_len - BMP_HEADER_LEN) as u32;
         write_bmp_header(dst, width, height, 24, img_size, 0)?;
-        dst[BMP_HEADER_LEN..required_dst_len].fill(0);
+        let row_stride = (width as usize) * 3;
+        if bmp_row_stride > row_stride {
+            for y in 0..(height as usize) {
+                let row_start = BMP_HEADER_LEN + y * bmp_row_stride;
+                dst[row_start + row_stride..row_start + bmp_row_stride].fill(0);
+            }
+        }
     }
 
     for comp in comps.iter().take(num_components) {

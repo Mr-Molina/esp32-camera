@@ -39,12 +39,14 @@ ESP_IMAGE_MIN_SEGMENTS = 1
 ESP_IMAGE_MAX_SEGMENTS = 16
 ESP_IMAGE_HEADER_LEN = 24
 OTA_PARTITION_MAX_SIZE = 0x001B_0000  # 1,769,472 bytes
+CHUNK_SIZE = 16384  # 16 KB chunks for high-throughput OTA upload (PERF-181)
 
 
 def resolve_default_token() -> str | None:
     """Resolves the default OTA authentication token from environment or local configuration."""
     env_token = (
         os.environ.get("CAM_OTA_TOKEN")
+        or os.environ.get("ESP32_CAM_OTA_TOKEN")
         or os.environ.get("OTA_TOKEN")
         or os.environ.get("WIFI_OTA_TOKEN")
     )
@@ -56,7 +58,9 @@ def resolve_default_token() -> str | None:
             with open(env_local, "r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
-                    if line.startswith(("CAM_OTA_TOKEN=", "OTA_TOKEN=", "WIFI_OTA_TOKEN=")):
+                    if line.startswith(
+                        ("CAM_OTA_TOKEN=", "ESP32_CAM_OTA_TOKEN=", "OTA_TOKEN=", "WIFI_OTA_TOKEN=")
+                    ):
                         val = line.split("=", 1)[1].strip().strip('"').strip("'")
                         if val:
                             return val
@@ -81,7 +85,9 @@ def stage_and_validate_image(elf_path: str, bin_path: str, host: str, port: int)
         elf_path,
         bin_path,
     ]
-    res = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=120)  # nosec B603
+    res = subprocess.run(
+        cmd, capture_output=True, text=True, encoding="utf-8", check=False, timeout=120
+    )  # nosec B603
     if res.returncode != 0:
         raise RuntimeError(
             f"espflash save-image failed (exit {res.returncode}):\n{res.stdout}\n{res.stderr}"
@@ -150,7 +156,7 @@ def fetch_status(host: str, port: int, timeout: float = 5.0) -> dict:
     url = f"http://{host}:{port}/status"
     if not url.startswith("http://"):
         raise ValueError(f"Invalid URL scheme: {url}")
-    req = urllib.request.Request(url, method="GET")
+    req = urllib.request.Request(url, method="GET", headers={"Connection": "close"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310
         if resp.status != 200:
             raise RuntimeError(f"GET /status returned HTTP {resp.status}")
@@ -204,6 +210,9 @@ def fetch_snapshot_info(host: str, port: int, timeout: float = 10.0) -> tuple[in
 
 def stream_ota_post(host: str, port: int, token: str, payload: bytes, timeout: float = 60.0) -> str:
     """Streams HTTP POST /update over a raw TCP socket in 4096-byte chunks."""
+    if any(c in host for c in ("\r", "\n")) or any(c in token for c in ("\r", "\n")):
+        raise ValueError("CRLF injection detected in host or token")
+
     headers = (
         f"POST /update HTTP/1.1\r\n"
         f"Host: {host}:{port}\r\n"
@@ -212,7 +221,7 @@ def stream_ota_post(host: str, port: int, token: str, payload: bytes, timeout: f
         f"Content-Length: {len(payload)}\r\n"
         f"Connection: close\r\n"
         f"\r\n"
-    ).encode("ascii")
+    ).encode("utf-8")
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -220,7 +229,7 @@ def stream_ota_post(host: str, port: int, token: str, payload: bytes, timeout: f
         sock.connect((host, port))
         sock.sendall(headers)
 
-        chunk_size = 2048
+        chunk_size = CHUNK_SIZE
         total = len(payload)
         sent = 0
         next_report_pct = 25
@@ -239,7 +248,7 @@ def stream_ota_post(host: str, port: int, token: str, payload: bytes, timeout: f
                 )
                 next_report_pct += 25
             if sent < total:
-                time.sleep(0.012)
+                time.sleep(0.002)
 
         upload_elapsed = time.monotonic() - start_time
         print(
@@ -248,6 +257,8 @@ def stream_ota_post(host: str, port: int, token: str, payload: bytes, timeout: f
         )
 
         resp_chunks = []
+        content_length = None
+        header_done = False
         while True:
             try:
                 data = sock.recv(4096)
@@ -255,8 +266,19 @@ def stream_ota_post(host: str, port: int, token: str, payload: bytes, timeout: f
                     break
                 resp_chunks.append(data)
                 joined = b"".join(resp_chunks)
-                if b"\r\n\r\n" in joined:
-                    _hdr_part, body_part = joined.split(b"\r\n\r\n", 1)
+                if not header_done and b"\r\n\r\n" in joined:
+                    header_part, _ = joined.split(b"\r\n\r\n", 1)
+                    header_done = True
+                    for line in header_part.split(b"\r\n"):
+                        if line.lower().startswith(b"content-length:"):
+                            try:
+                                content_length = int(line.split(b":", 1)[1].strip())
+                            except ValueError:
+                                pass
+                if header_done:
+                    _, body_part = joined.split(b"\r\n\r\n", 1)
+                    if content_length is not None and len(body_part) >= content_length:
+                        break
                     if b"Rebooting..." in body_part or len(body_part) >= 40:
                         break
             except TimeoutError as exc:
@@ -296,6 +318,11 @@ def main() -> int:
         "--stage-only",
         action="store_true",
         help="Convert ELF to .bin and validate 0xE9 header without touching the network",
+    )
+    parser.add_argument(
+        "--expected-dims",
+        default="1280x720",
+        help="Expected JPEG dimensions (e.g. '1280x720' or 'any', default: 1280x720)",
     )
     args = parser.parse_args()
 
@@ -370,9 +397,20 @@ def main() -> int:
 
     try:
         snap_len, has_soi, has_eoi, dims = fetch_snapshot_info(args.host, args.port, timeout=10.0)
-        if not (has_soi and has_eoi and dims == (1280, 720)):
+        dims_valid = False
+        if dims is not None and dims[0] > 0 and dims[1] > 0:
+            if args.expected_dims.lower() == "any":
+                dims_valid = True
+            else:
+                try:
+                    exp_w, exp_h = [int(p.strip()) for p in args.expected_dims.lower().split("x")]
+                    dims_valid = dims == (exp_w, exp_h)
+                except Exception:
+                    dims_valid = False
+
+        if not (has_soi and has_eoi and dims_valid):
             print(
-                f"[OTA-ERROR] Post-boot /snapshot invalid JPEG (len={snap_len}, soi={has_soi}, eoi={has_eoi}, dims={dims})",
+                f"[OTA-ERROR] Post-boot /snapshot invalid JPEG (len={snap_len}, soi={has_soi}, eoi={has_eoi}, dims={dims}, expected={args.expected_dims})",
                 file=sys.stderr,
             )
             return 1

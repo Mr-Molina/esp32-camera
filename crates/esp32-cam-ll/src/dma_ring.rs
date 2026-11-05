@@ -4,6 +4,8 @@
 //! `driver/cam_hal.c:465-482`).
 
 use core::ptr;
+use core::sync::atomic::Ordering;
+use core::sync::atomic::compiler_fence;
 use esp32_cam_types::CameraError;
 
 use crate::dma_filter::I2sSamplingMode;
@@ -98,94 +100,204 @@ impl Lldesc {
 
     /// Returns the 12-bit `size` field (`0..=4095`).
     #[inline]
-    pub const fn size(&self) -> u16 {
-        (self.size_length_flags & Self::SIZE_MASK) as u16
+    pub fn size(&self) -> u16 {
+        // JUSTIFICATION: Hardware DMA controller accesses descriptor fields
+        // concurrently.
+        // SAFETY: `self.size_length_flags` is an aligned, valid u32 reference.
+        let flags = unsafe {
+            compiler_fence(Ordering::SeqCst);
+            let val = ptr::read_volatile(&self.size_length_flags);
+            compiler_fence(Ordering::SeqCst);
+            val
+        };
+        (flags & Self::SIZE_MASK) as u16
     }
 
     /// Sets the 12-bit `size` field (`0..=4095`), saturating at `4095`.
     #[inline]
     pub fn set_size(&mut self, size: u16) {
         let s = size.min(0x0FFF) as u32;
-        self.size_length_flags = (self.size_length_flags & !Self::SIZE_MASK) | s;
+        // JUSTIFICATION: Hardware DMA controller accesses descriptor fields
+        // concurrently.
+        // SAFETY: `self.size_length_flags` is an aligned, valid u32 reference.
+        unsafe {
+            compiler_fence(Ordering::SeqCst);
+            let cur = ptr::read_volatile(&self.size_length_flags);
+            ptr::write_volatile(&mut self.size_length_flags, (cur & !Self::SIZE_MASK) | s);
+            compiler_fence(Ordering::SeqCst);
+        }
     }
 
     /// Returns the 12-bit `length` field (`0..=4095`).
     #[inline]
-    pub const fn length(&self) -> u16 {
-        ((self.size_length_flags & Self::LENGTH_MASK) >> Self::LENGTH_SHIFT) as u16
+    pub fn length(&self) -> u16 {
+        // JUSTIFICATION: Hardware DMA controller accesses descriptor fields
+        // concurrently.
+        // SAFETY: `self.size_length_flags` is an aligned, valid u32 reference.
+        let flags = unsafe {
+            compiler_fence(Ordering::SeqCst);
+            let val = ptr::read_volatile(&self.size_length_flags);
+            compiler_fence(Ordering::SeqCst);
+            val
+        };
+        ((flags & Self::LENGTH_MASK) >> Self::LENGTH_SHIFT) as u16
     }
 
     /// Sets the 12-bit `length` field (`0..=4095`), saturating at `4095`.
     #[inline]
     pub fn set_length(&mut self, length: u16) {
         let l = (length.min(0x0FFF) as u32) << Self::LENGTH_SHIFT;
-        self.size_length_flags = (self.size_length_flags & !Self::LENGTH_MASK) | l;
+        // JUSTIFICATION: Hardware DMA controller accesses descriptor fields
+        // concurrently.
+        // SAFETY: `self.size_length_flags` is an aligned, valid u32 reference.
+        unsafe {
+            compiler_fence(Ordering::SeqCst);
+            let cur = ptr::read_volatile(&self.size_length_flags);
+            ptr::write_volatile(&mut self.size_length_flags, (cur & !Self::LENGTH_MASK) | l);
+            compiler_fence(Ordering::SeqCst);
+        }
     }
 
     /// Returns the 5-bit `offset` field (`0..=31`).
     #[inline]
-    pub const fn offset(&self) -> u8 {
-        ((self.size_length_flags & Self::OFFSET_MASK) >> Self::OFFSET_SHIFT) as u8
+    pub fn offset(&self) -> u8 {
+        // JUSTIFICATION: Hardware DMA controller accesses descriptor fields
+        // concurrently.
+        // SAFETY: `self.size_length_flags` is an aligned, valid u32 reference.
+        let flags = unsafe {
+            compiler_fence(Ordering::SeqCst);
+            let val = ptr::read_volatile(&self.size_length_flags);
+            compiler_fence(Ordering::SeqCst);
+            val
+        };
+        ((flags & Self::OFFSET_MASK) >> Self::OFFSET_SHIFT) as u8
     }
 
     /// Sets the 5-bit `offset` field (`0..=31`), saturating at `31`.
     #[inline]
     pub fn set_offset(&mut self, offset: u8) {
         let o = (offset.min(0x1F) as u32) << Self::OFFSET_SHIFT;
-        self.size_length_flags = (self.size_length_flags & !Self::OFFSET_MASK) | o;
+        // JUSTIFICATION: Hardware DMA controller accesses descriptor fields
+        // concurrently.
+        // SAFETY: `self.size_length_flags` is an aligned, valid u32 reference.
+        unsafe {
+            compiler_fence(Ordering::SeqCst);
+            let cur = ptr::read_volatile(&self.size_length_flags);
+            ptr::write_volatile(&mut self.size_length_flags, (cur & !Self::OFFSET_MASK) | o);
+            compiler_fence(Ordering::SeqCst);
+        }
     }
 
     /// Returns the `sosf` (start of sub-frame) flag (`bit 29`).
     #[inline]
-    pub const fn sosf(&self) -> bool {
-        (self.size_length_flags & Self::SOSF_BIT) != 0
+    pub fn sosf(&self) -> bool {
+        // JUSTIFICATION: Hardware DMA controller accesses descriptor fields
+        // concurrently.
+        // SAFETY: `self.size_length_flags` is an aligned, valid u32 reference.
+        let flags = unsafe {
+            compiler_fence(Ordering::SeqCst);
+            let val = ptr::read_volatile(&self.size_length_flags);
+            compiler_fence(Ordering::SeqCst);
+            val
+        };
+        (flags & Self::SOSF_BIT) != 0
     }
 
     /// Sets the `sosf` (start of sub-frame) flag (`bit 29`).
     #[inline]
     pub fn set_sosf(&mut self, sosf: bool) {
-        if sosf {
-            self.size_length_flags |= Self::SOSF_BIT;
-        } else {
-            self.size_length_flags &= !Self::SOSF_BIT;
+        // JUSTIFICATION: Hardware DMA controller accesses descriptor fields
+        // concurrently.
+        // SAFETY: `self.size_length_flags` is an aligned, valid u32 reference.
+        unsafe {
+            compiler_fence(Ordering::SeqCst);
+            let cur = ptr::read_volatile(&self.size_length_flags);
+            let next = if sosf {
+                cur | Self::SOSF_BIT
+            } else {
+                cur & !Self::SOSF_BIT
+            };
+            ptr::write_volatile(&mut self.size_length_flags, next);
+            compiler_fence(Ordering::SeqCst);
         }
     }
 
     /// Returns the `eof` (end of frame) flag (`bit 30`).
     #[inline]
-    pub const fn eof(&self) -> bool {
-        (self.size_length_flags & Self::EOF_BIT) != 0
+    pub fn eof(&self) -> bool {
+        // JUSTIFICATION: Hardware DMA controller accesses descriptor fields
+        // concurrently.
+        // SAFETY: `self.size_length_flags` is an aligned, valid u32 reference.
+        let flags = unsafe {
+            compiler_fence(Ordering::SeqCst);
+            let val = ptr::read_volatile(&self.size_length_flags);
+            compiler_fence(Ordering::SeqCst);
+            val
+        };
+        (flags & Self::EOF_BIT) != 0
     }
 
     /// Sets the `eof` (end of frame) flag (`bit 30`).
     #[inline]
     pub fn set_eof(&mut self, eof: bool) {
-        if eof {
-            self.size_length_flags |= Self::EOF_BIT;
-        } else {
-            self.size_length_flags &= !Self::EOF_BIT;
+        // JUSTIFICATION: Hardware DMA controller accesses descriptor fields
+        // concurrently.
+        // SAFETY: `self.size_length_flags` is an aligned, valid u32 reference.
+        unsafe {
+            compiler_fence(Ordering::SeqCst);
+            let cur = ptr::read_volatile(&self.size_length_flags);
+            let next = if eof {
+                cur | Self::EOF_BIT
+            } else {
+                cur & !Self::EOF_BIT
+            };
+            ptr::write_volatile(&mut self.size_length_flags, next);
+            compiler_fence(Ordering::SeqCst);
         }
     }
 
     /// Returns the `owner` flag (`bit 31`, `true` = owned by DMA hardware).
     #[inline]
-    pub const fn owner(&self) -> bool {
-        (self.size_length_flags & Self::OWNER_BIT) != 0
+    pub fn owner(&self) -> bool {
+        // JUSTIFICATION: Hardware DMA controller accesses descriptor fields
+        // concurrently.
+        // SAFETY: `self.size_length_flags` is an aligned, valid u32 reference.
+        let flags = unsafe {
+            compiler_fence(Ordering::SeqCst);
+            let val = ptr::read_volatile(&self.size_length_flags);
+            compiler_fence(Ordering::SeqCst);
+            val
+        };
+        (flags & Self::OWNER_BIT) != 0
     }
 
     /// Sets the `owner` flag (`bit 31`, `true` = owned by DMA hardware).
     #[inline]
     pub fn set_owner(&mut self, owner: bool) {
-        if owner {
-            self.size_length_flags |= Self::OWNER_BIT;
-        } else {
-            self.size_length_flags &= !Self::OWNER_BIT;
+        // JUSTIFICATION: Hardware DMA controller accesses descriptor fields
+        // concurrently.
+        // SAFETY: `self.size_length_flags` is an aligned, valid u32 reference.
+        unsafe {
+            compiler_fence(Ordering::SeqCst);
+            let cur = ptr::read_volatile(&self.size_length_flags);
+            let next = if owner {
+                cur | Self::OWNER_BIT
+            } else {
+                cur & !Self::OWNER_BIT
+            };
+            ptr::write_volatile(&mut self.size_length_flags, next);
+            compiler_fence(Ordering::SeqCst);
         }
     }
 
-    /// Returns the 20-bit physical descriptor address mask (`addr & 0xFFFFF`) used
-    /// by `I2S0.in_link.addr`
-    /// and `GDMA.channel[n].in.link.addr`.
+    /// Returns the 20-bit physical descriptor address (`addr & 0x000F_FFFF`) used
+    /// by ESP32 `I2S0.in_link.addr`.
+    ///
+    /// # Hardware Addressing
+    /// Note that ESP32 I2S DMA uses a 20-bit link address (`addr & 0x000F_FFFF`),
+    /// where internal SRAM descriptors reside in `0x3FF8_0000..=0x3FFF_FFFF`, and
+    /// the hardware automatically assumes the high address bits. In contrast,
+    /// ESP32-S3 GDMA uses a full 32-bit descriptor address.
     #[inline]
     pub fn link_addr_20bit(&self) -> u32 {
         (ptr::from_ref(self) as usize as u32) & 0x000F_FFFF
@@ -374,8 +486,20 @@ pub fn calc_dma_sizes(
             2048
         };
         let dma_half_buffer_cnt = 8;
-        let dma_node_buffer_size = 2048.min(max_node_cap);
-        let dma_half_buffer_size = (dma_node_buffer_size * 2).min(dma_buffer_size_max / 2);
+        let dma_half_buffer_size = ((dma_buffer_size_max / 2) & !3).max(4);
+        let limit = 2048.min(max_node_cap);
+        let mut node_size = if limit == 0 {
+            4
+        } else {
+            1usize << (usize::BITS - 1 - limit.leading_zeros())
+        };
+        while node_size > 0 {
+            if dma_half_buffer_size.is_multiple_of(node_size) {
+                break;
+            }
+            node_size >>= 1;
+        }
+        let dma_node_buffer_size = node_size.max(4);
         let dma_buffer_size = dma_half_buffer_cnt * dma_half_buffer_size;
         let dma_node_cnt = dma_buffer_size
             .checked_div(dma_node_buffer_size)
@@ -409,7 +533,7 @@ pub fn calc_dma_sizes(
 /// `allocate_dma_descriptors` in `driver/cam_hal.c:465-482`.
 ///
 /// Validates that:
-/// - `descriptors` is non-empty,
+/// - `descriptors.len() >= 2`,
 /// - `node_size` is non-zero, `<= LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE` (`4092`),
 ///   and 4-byte aligned,
 /// - `buffer.len() >= descriptors.len() * node_size`.
@@ -419,7 +543,7 @@ pub fn build_circular_ring(
     node_size: usize,
 ) -> Result<(), CameraError> {
     let count = descriptors.len();
-    if count == 0
+    if count < 2
         || node_size == 0
         || node_size > LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE
         || !node_size.is_multiple_of(4)
@@ -480,6 +604,75 @@ pub fn build_circular_ring(
     Ok(())
 }
 
+/// Initializes a circular linked-list ring of [`Lldesc`] descriptors over
+/// a mutable `buffer` (SEC-011), returning the initialized descriptor count.
+///
+/// Validates that:
+/// - `descriptors.len() >= 2`,
+/// - `node_size` is non-zero, `<= LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE` (`4092`),
+///   and 4-byte aligned,
+/// - `buffer.len() >= descriptors.len() * node_size`.
+pub fn build_circular_ring_mut(
+    descriptors: &mut [Lldesc],
+    buffer: &mut [u8],
+    node_size: usize,
+) -> Result<usize, CameraError> {
+    let count = descriptors.len();
+    if count < 2
+        || node_size == 0
+        || node_size > LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE
+        || !node_size.is_multiple_of(4)
+    {
+        return Err(CameraError::InvalidArg);
+    }
+
+    let buf_base = buffer.as_mut_ptr();
+    let desc_base = descriptors.as_mut_ptr();
+
+    if ((buf_base as usize) & 0x3 != 0) || ((desc_base as usize) & 0x3 != 0) {
+        return Err(CameraError::InvalidArg);
+    }
+
+    let required_bytes = count.checked_mul(node_size).ok_or(CameraError::Overflow)?;
+    if buffer.len() < required_bytes {
+        return Err(CameraError::BufferTooSmall);
+    }
+
+    let mut x = 0;
+    while x < count {
+        let next_idx = (x + 1) % count;
+        let byte_offset = x * node_size;
+
+        let chunk_ptr: *mut u8;
+        let next_desc_ptr: *mut Lldesc;
+
+        // JUSTIFICATION: Initializing descriptor linked list and slice offsets.
+        // SAFETY:
+        // 1. Alignment & Non-null: `buf_base` is derived from a live valid
+        //    `&mut [u8]` slice and `desc_base` is derived from
+        //    `descriptors: &mut [Lldesc]`.
+        // 2. Memory layout: `Lldesc` is `#[repr(C, align(4))]`.
+        // 3. Provenance & Bounds: `byte_offset = x * node_size < count *`
+        //    `node_size <= buffer.len()`, and `next_idx < count ==`
+        //    `descriptors.len()`, staying within allocations.
+        // 4. Aliasing: `chunk_ptr` and `next_desc_ptr` pointers are stored in
+        //    descriptor fields.
+        unsafe {
+            chunk_ptr = buf_base.add(byte_offset);
+            next_desc_ptr = desc_base.add(next_idx);
+        }
+
+        descriptors[x] = Lldesc {
+            size_length_flags: Lldesc::pack_flags(node_size as u16, 0, 0, false, false, true),
+            buf: chunk_ptr,
+            qe_stqe_next: next_desc_ptr,
+        };
+        x += 1;
+    }
+
+    Ok(count)
+}
+
 /// Verifies that a slice of [`Lldesc`] descriptors forms a valid circular ring
 /// over `buffer`
 /// with each node having `size == expected_node_size`, `length == 0`, `owner ==
@@ -491,7 +684,7 @@ pub fn verify_circular_ring(
     expected_node_size: usize,
 ) -> Result<(), CameraError> {
     let count = descriptors.len();
-    if count == 0
+    if count < 2
         || expected_node_size == 0
         || expected_node_size > LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE
         || !expected_node_size.is_multiple_of(4)
@@ -611,9 +804,32 @@ mod tests {
         assert_eq!(build_circular_ring(&mut ring, &buf.0, 1024), Ok(()));
         assert_eq!(verify_circular_ring(&ring, &buf.0, 1024), Ok(()));
 
+        // Test build_circular_ring_mut (SEC-011)
+        let mut mut_buf = AlignedBuffer([0u8; 4096]);
+        let mut mut_ring = [Lldesc::empty(); 4];
+        assert_eq!(
+            build_circular_ring_mut(&mut mut_ring, &mut mut_buf.0, 1024),
+            Ok(4)
+        );
+
         // Verify circular wrap-around from last descriptor back to index 0
         assert!(ptr::eq(ring[3].qe_stqe_next, &ring[0]));
         assert!(ptr::eq(ring[0].buf, buf.0.as_ptr()));
+
+        // Reject count < 2 (LOGIC-013)
+        let mut single_desc = [Lldesc::empty(); 1];
+        assert_eq!(
+            build_circular_ring(&mut single_desc, &buf.0, 1024),
+            Err(CameraError::InvalidArg)
+        );
+        assert_eq!(
+            verify_circular_ring(&single_desc, &buf.0, 1024),
+            Err(CameraError::InvalidArg)
+        );
+        assert_eq!(
+            build_circular_ring_mut(&mut single_desc, &mut mut_buf.0, 1024),
+            Err(CameraError::InvalidArg)
+        );
 
         // Misaligned buffer tests
         assert_eq!(
@@ -682,9 +898,9 @@ mod tests {
         .expect("valid jpeg dma config");
         assert_eq!(jpeg_cfg.dma_half_buffer_cnt, 8);
         assert_eq!(jpeg_cfg.dma_node_buffer_size, 2048);
-        assert_eq!(jpeg_cfg.dma_half_buffer_size, 4096);
-        assert_eq!(jpeg_cfg.dma_buffer_size, 32768);
-        assert_eq!(jpeg_cfg.dma_node_cnt, 16);
+        assert_eq!(jpeg_cfg.dma_half_buffer_size, 16384);
+        assert_eq!(jpeg_cfg.dma_buffer_size, 8 * 16384);
+        assert_eq!(jpeg_cfg.dma_node_cnt, (8 * 16384) / 2048);
 
         // JPEG clamping to dma_buffer_size_max / 2 (LL-008)
         let jpeg_clamped = calc_dma_sizes(true, I2sSamplingMode::Sm0A000B00, 640, 480, 1, 4096)

@@ -758,6 +758,9 @@ fn set_reg_bits<B: SccbBus>(
     let c_value = bus.read_reg8(slv_addr, reg)?;
     let shifted_mask = mask << offset;
     let new_value = (c_value & !shifted_mask) | ((value & mask) << offset);
+    if new_value == c_value {
+        return Ok(());
+    }
     bus.write_reg8(slv_addr, reg, new_value)
 }
 
@@ -993,12 +996,10 @@ impl<B: SccbBus> CameraSensor<B> for Gc2145 {
     }
 
     fn set_framesize(&mut self, bus: &mut B, framesize: FrameSize) -> Result<(), CameraError> {
-        let fs = if framesize > FrameSize::Uxga {
-            FrameSize::Uxga
-        } else {
-            framesize
-        };
-        self.status.framesize = fs;
+        if framesize > FrameSize::Uxga {
+            return Err(CameraError::FailedToSetFrameSize);
+        }
+        let fs = framesize;
         let w = fs.width();
         let h = fs.height();
         let uxga_w = FrameSize::Uxga.width();
@@ -1054,7 +1055,9 @@ impl<B: SccbBus> CameraSensor<B> for Gc2145 {
         bus.write_reg8(self.slv_addr, 0x95, h8(h))?;
         bus.write_reg8(self.slv_addr, 0x96, l8(h))?;
         bus.write_reg8(self.slv_addr, 0x97, h8(w))?;
-        bus.write_reg8(self.slv_addr, 0x98, l8(w))
+        bus.write_reg8(self.slv_addr, 0x98, l8(w))?;
+        self.status.framesize = framesize;
+        Ok(())
     }
 
     fn set_colorbar(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
@@ -1072,7 +1075,6 @@ impl<B: SccbBus> CameraSensor<B> for Gc2145 {
     }
 
     fn set_hmirror(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.hmirror = u8::from(enable);
         bus.write_reg8(self.slv_addr, 0xFE, 0x00)?;
         set_reg_bits(
             bus,
@@ -1081,11 +1083,12 @@ impl<B: SccbBus> CameraSensor<B> for Gc2145 {
             0,
             0x01,
             u8::from(enable),
-        )
+        )?;
+        self.status.hmirror = u8::from(enable);
+        Ok(())
     }
 
     fn set_vflip(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.vflip = u8::from(enable);
         bus.write_reg8(self.slv_addr, 0xFE, 0x00)?;
         set_reg_bits(
             bus,
@@ -1094,22 +1097,30 @@ impl<B: SccbBus> CameraSensor<B> for Gc2145 {
             1,
             0x01,
             u8::from(enable),
-        )
+        )?;
+        self.status.vflip = u8::from(enable);
+        Ok(())
     }
 
     fn get_reg(&mut self, bus: &mut B, reg: i32, mask: i32) -> Result<i32, CameraError> {
-        if !(0..=0xFF).contains(&reg) || !(0..=0xFF).contains(&mask) {
+        if !(0..=0xFFFF).contains(&reg) || !(0..=0xFF).contains(&mask) {
             return Err(CameraError::InvalidArg);
         }
-        let val = bus.read_reg8(self.slv_addr, reg as u8)? as i32;
+        if (reg >> 8) != 0 {
+            bus.write_reg8(self.slv_addr, 0xFE, (reg >> 8) as u8)?;
+        }
+        let val = bus.read_reg8(self.slv_addr, (reg & 0xFF) as u8)? as i32;
         Ok(val & mask)
     }
 
     fn set_reg(&mut self, bus: &mut B, reg: i32, mask: i32, value: i32) -> Result<(), CameraError> {
-        if !(0..=0xFF).contains(&reg) || !(0..=0xFF).contains(&mask) {
+        if !(0..=0xFFFF).contains(&reg) || !(0..=0xFF).contains(&mask) {
             return Err(CameraError::InvalidArg);
         }
-        let reg8 = reg as u8;
+        if (reg >> 8) != 0 {
+            bus.write_reg8(self.slv_addr, 0xFE, (reg >> 8) as u8)?;
+        }
+        let reg8 = (reg & 0xFF) as u8;
         let current = bus.read_reg8(self.slv_addr, reg8)? as i32;
         let next = ((current & !mask) | (value & mask)) as u8;
         bus.write_reg8(self.slv_addr, reg8, next)

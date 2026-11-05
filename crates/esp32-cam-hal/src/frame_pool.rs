@@ -5,7 +5,7 @@
 #![forbid(unsafe_code)]
 
 use core::ops::Deref;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use esp32_cam_types::{CameraError, GrabMode, PixelFormat};
 
 /// A 4-byte aligned byte buffer for DMA controllers and hardware peripherals
@@ -138,9 +138,16 @@ impl<'a> FrameGuard<'a> {
 
     /// Truncates or updates the valid length of this frame (clamped to
     /// underlying capacity).
+    ///
+    /// Zeroes out newly exposed slack buffer space when expanding length to
+    /// prevent uninitialized memory leakage (`SEC-051`).
     #[inline]
     pub fn set_len(&mut self, new_len: usize) {
-        self.len = new_len.min(self.data.len());
+        let clamped = new_len.min(self.data.len());
+        if clamped > self.len {
+            self.data[self.len..clamped].fill(0);
+        }
+        self.len = clamped;
         self.meta.len = self.len;
     }
 
@@ -211,6 +218,7 @@ pub struct FramePool<const COUNT: usize, const BUF_CAP: usize> {
     states: [AtomicU8; COUNT],
     grab_mode: GrabMode,
     next_seq: u64,
+    write_cursor: AtomicUsize,
 }
 
 impl<const COUNT: usize, const BUF_CAP: usize> Default for FramePool<COUNT, BUF_CAP> {
@@ -236,6 +244,7 @@ impl<const COUNT: usize, const BUF_CAP: usize> FramePool<COUNT, BUF_CAP> {
             states: core::array::from_fn(|_| AtomicU8::new(SLOT_FREE)),
             grab_mode,
             next_seq: 1,
+            write_cursor: AtomicUsize::new(0),
         }
     }
 
@@ -302,24 +311,32 @@ impl<const COUNT: usize, const BUF_CAP: usize> FramePool<COUNT, BUF_CAP> {
     }
 
     /// Returns a mutable slice to the raw backing buffer of slot `idx`, or
-    /// `None` if out of bounds.
+    /// `None` if out of bounds or if currently leased (`LOGIC-054`).
     #[inline]
     pub fn raw_buffer_mut(&mut self, idx: usize) -> Option<&mut [u8]> {
-        if idx < COUNT {
+        if idx < COUNT && self.states[idx].load(Ordering::Acquire) != SLOT_LEASED {
             Some(&mut self.buffers[idx].0)
         } else {
             None
         }
     }
 
-    /// Selects a slot index for writing a new frame according to `self.grab_mode`.
-    fn select_write_slot(&mut self) -> Result<usize, CameraError> {
+    /// Finds a target slot index for writing a new frame according to
+    /// `self.grab_mode` (`LOGIC-052`).
+    ///
+    /// Searches starting from
+    /// `self.write_cursor.fetch_add(1, Ordering::Relaxed) % COUNT`
+    /// to prevent slots `2..COUNT` from starving in [`GrabMode::Latest`].
+    pub fn find_target_slot(&self) -> Result<usize, CameraError> {
         if COUNT == 0 || BUF_CAP == 0 {
             return Err(CameraError::NoMem);
         }
 
-        // First look for any SLOT_FREE buffer
-        for i in 0..COUNT {
+        let start = self.write_cursor.fetch_add(1, Ordering::Relaxed) % COUNT;
+
+        // First look for any SLOT_FREE buffer starting from write_cursor
+        for offset in 0..COUNT {
+            let i = (start + offset) % COUNT;
             if self.states[i].load(Ordering::Acquire) == SLOT_FREE {
                 return Ok(i);
             }
@@ -333,7 +350,8 @@ impl<const COUNT: usize, const BUF_CAP: usize> FramePool<COUNT, BUF_CAP> {
                 // ready slots are only drained after write successfully
                 // finishes. Never evict a SLOT_LEASED slot.
                 let mut oldest: Option<(u64, usize)> = None;
-                for j in 0..COUNT {
+                for offset in 0..COUNT {
+                    let j = (start + offset) % COUNT;
                     if self.states[j].load(Ordering::Acquire) == SLOT_READY {
                         let seq = self.meta[j].sequence;
                         match oldest {
@@ -352,6 +370,12 @@ impl<const COUNT: usize, const BUF_CAP: usize> FramePool<COUNT, BUF_CAP> {
                 }
             }
         }
+    }
+
+    /// Selects a slot index for writing a new frame according to `self.grab_mode`.
+    #[inline]
+    fn select_write_slot(&mut self) -> Result<usize, CameraError> {
+        self.find_target_slot()
     }
 
     /// Pushes a complete frame payload into the pool according to
@@ -689,5 +713,39 @@ mod tests {
         assert_eq!(pool.available_frames(), 0);
         assert_eq!(pool.free_count(), 1);
         assert_eq!(pool.take().err(), Some(CameraError::Timeout));
+    }
+
+    #[test]
+    fn test_sec_051_set_len_zeroes_slack_space() {
+        let mut pool: FramePool<1, 16> = FramePool::new(GrabMode::WhenEmpty);
+        let mut guard = pool
+            .write_and_lease(160, 120, PixelFormat::Grayscale, 10, |buf| {
+                buf[..8].fill(0xAA);
+                Ok(4)
+            })
+            .expect("lease");
+        assert_eq!(guard.len(), 4);
+        guard.set_len(8);
+        assert_eq!(guard.len(), 8);
+        // Bytes 4..8 must have been zeroed by set_len
+        assert_eq!(&guard.as_slice()[4..8], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_logic_054_raw_buffer_mut_none_when_leased() {
+        let mut pool: FramePool<2, 16> = FramePool::new(GrabMode::WhenEmpty);
+        pool.states[0].store(SLOT_LEASED, Ordering::Release);
+        assert!(pool.raw_buffer_mut(0).is_none());
+        assert!(pool.raw_buffer_mut(1).is_some());
+        pool.states[0].store(SLOT_FREE, Ordering::Release);
+        assert!(pool.raw_buffer_mut(0).is_some());
+    }
+
+    #[test]
+    fn test_logic_052_find_target_slot_round_robin() {
+        let mut pool: FramePool<4, 16> = FramePool::new(GrabMode::Latest);
+        let s0 = pool.push_frame(&[1], 10, 10, PixelFormat::Grayscale, 1).expect("push_frame");
+        let s1 = pool.push_frame(&[2], 10, 10, PixelFormat::Grayscale, 2).expect("push_frame");
+        assert_ne!(s0, s1);
     }
 }

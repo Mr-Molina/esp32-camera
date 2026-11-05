@@ -221,9 +221,11 @@ impl<'a> FirmwareRuntime<'a> {
         ip: Ipv4Addr,
         flash: &mut F,
     ) -> Result<(), OtaError> {
-        let _cancelled = self.server.on_wifi_got_ip_with_flash(flash)?;
+        if !self.rollback_cancelled {
+            let _ = self.server.on_wifi_got_ip_with_flash(flash)?;
+            self.rollback_cancelled = true;
+        }
         self.wifi_state = WifiStaState::ConnectedGotIp { ip };
-        self.rollback_cancelled = true;
         self.webservers_started = true;
         Ok(())
     }
@@ -317,6 +319,12 @@ mod tests {
         assert_eq!(rt.wifi_state, WifiStaState::ConnectedGotIp { ip });
         assert!(rt.webservers_started);
         assert!(rt.rollback_cancelled);
+
+        // Subsequent DHCP renewal does not re-write flash or fail when
+        // already cancelled
+        let ip_renewed = Ipv4Addr::new(172, 22, 1, 53);
+        assert!(rt.on_wifi_got_ip(ip_renewed).is_ok());
+        assert_eq!(rt.wifi_state, WifiStaState::ConnectedGotIp { ip: ip_renewed });
     }
 
     #[test]

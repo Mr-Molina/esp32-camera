@@ -22,6 +22,9 @@ pub const LEDC_LOW_SPEED_MODE: u8 = 1;
 /// LEDC 50% duty value for 1-bit resolution (`duty = 1`, `hpoint = 0`).
 pub const LEDC_DUTY_50_PERCENT_1BIT: u32 = 1;
 
+/// Minimum supported XCLK output frequency in Hz (`40 kHz`).
+pub const MIN_XCLK_FREQ_HZ: u32 = 40_000;
+
 /// Maximum supported XCLK output frequency in Hz (`40 MHz`, half of 80 MHz APB
 /// clock).
 pub const MAX_XCLK_FREQ_HZ: u32 = 40_000_000;
@@ -117,7 +120,7 @@ impl XclkController {
     /// Configures the LEDC timer frequency (`xclk_timer_conf` in
     /// `target/xclk.c:21-41`).
     pub fn timer_conf(&mut self, ledc_timer: u8, xclk_freq_hz: u32) -> Result<(), CameraError> {
-        if ledc_timer > 3 || xclk_freq_hz == 0 || xclk_freq_hz > MAX_XCLK_FREQ_HZ {
+        if ledc_timer > 3 || !(MIN_XCLK_FREQ_HZ..=MAX_XCLK_FREQ_HZ).contains(&xclk_freq_hz) {
             return Err(CameraError::InvalidArg);
         }
         self.active_timer = ledc_timer;
@@ -247,6 +250,10 @@ mod tests {
         // Invalid parameters
         assert_eq!(xclk.timer_conf(4, 20_000_000), Err(CameraError::InvalidArg));
         assert_eq!(xclk.timer_conf(0, 0), Err(CameraError::InvalidArg));
+        assert_eq!(
+            xclk.timer_conf(0, MIN_XCLK_FREQ_HZ - 1),
+            Err(CameraError::InvalidArg)
+        );
         assert_eq!(xclk.timer_conf(0, 80_000_000), Err(CameraError::InvalidArg));
     }
 }

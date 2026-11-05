@@ -22,7 +22,10 @@ pub use jpeg_scan::{
     eoi_probe_window, extract_jpeg_payload, parse_jpeg_dimensions, validate_jpeg_frame,
     verify_jpeg_eoi, verify_jpeg_soi, JPEG_EOI_MARKER, JPEG_SOI_MARKER,
 };
-pub use yuv::{rgb565_to_yuv422, yuv2rgb, yuv422_to_rgb565, yuv422_to_rgb888, yuv422_to_yuv420};
+pub use yuv::{
+    rgb565_to_yuv422, unpack_rgb565_be_full, yuv2rgb, yuv422_pair_to_rgb, yuv422_to_grayscale,
+    yuv422_to_rgb565, yuv422_to_rgb888, yuv422_to_yuv420,
+};
 
 #[cfg(test)]
 mod tests {

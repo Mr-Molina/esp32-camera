@@ -51,6 +51,7 @@ impl GainCeiling {
 }
 
 /// Sensor window timing settings (`ratio_settings_t` in `sensor.h`).
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub struct RatioSettings {
     pub max_width: u16,
@@ -66,6 +67,7 @@ pub struct RatioSettings {
 }
 
 /// Mutable camera control state (`camera_status_t` in `sensor.h`).
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CameraStatus {
     pub framesize: FrameSize,
@@ -98,8 +100,9 @@ pub struct CameraStatus {
     pub colorbar: u8,
 }
 
-impl Default for CameraStatus {
-    fn default() -> Self {
+impl CameraStatus {
+    /// Creates a new [`CameraStatus`] with default settings.
+    pub const fn new() -> Self {
         Self {
             framesize: FrameSize::Qvga,
             scale: false,
@@ -130,6 +133,39 @@ impl Default for CameraStatus {
             dcw: 1,
             colorbar: 0,
         }
+    }
+
+    /// Validates that all fields are within their permissible hardware ranges.
+    #[inline]
+    pub const fn is_valid(&self) -> bool {
+        self.quality <= 63
+            && self.brightness >= -2 && self.brightness <= 2
+            && self.contrast >= -2 && self.contrast <= 2
+            && self.saturation >= -2 && self.saturation <= 2
+            && self.sharpness >= -2 && self.sharpness <= 2
+            && self.ae_level >= -2 && self.ae_level <= 2
+            && self.denoise <= 8
+            && self.special_effect <= 6
+            && self.wb_mode <= 4
+            && self.awb <= 1
+            && self.awb_gain <= 1
+            && self.aec <= 1
+            && self.aec2 <= 1
+            && self.agc <= 1
+            && self.bpc <= 1
+            && self.wpc <= 1
+            && self.raw_gma <= 1
+            && self.lenc <= 1
+            && self.hmirror <= 1
+            && self.vflip <= 1
+            && self.dcw <= 1
+            && self.colorbar <= 1
+    }
+}
+
+impl Default for CameraStatus {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -194,5 +230,62 @@ mod tests {
         assert_eq!(status.quality, 10);
         assert_eq!(status.hmirror, 1);
         assert_eq!(status.vflip, 1);
+    }
+
+    #[test]
+    fn test_camera_status_new_and_is_valid() {
+        let status = CameraStatus::new();
+        assert!(status.is_valid());
+
+        const CONST_STATUS: CameraStatus = CameraStatus::new();
+        assert!(CONST_STATUS.is_valid());
+
+        let mut invalid = status;
+        invalid.quality = 64;
+        assert!(!invalid.is_valid());
+
+        let mut invalid_b = status;
+        invalid_b.brightness = 3;
+        assert!(!invalid_b.is_valid());
+
+        let mut invalid_b_neg = status;
+        invalid_b_neg.brightness = -3;
+        assert!(!invalid_b_neg.is_valid());
+
+        let mut invalid_contrast = status;
+        invalid_contrast.contrast = 3;
+        assert!(!invalid_contrast.is_valid());
+
+        let mut invalid_saturation = status;
+        invalid_saturation.saturation = -3;
+        assert!(!invalid_saturation.is_valid());
+
+        let mut invalid_sharpness = status;
+        invalid_sharpness.sharpness = 3;
+        assert!(!invalid_sharpness.is_valid());
+
+        let mut invalid_ae = status;
+        invalid_ae.ae_level = 3;
+        assert!(!invalid_ae.is_valid());
+
+        let mut invalid_denoise = status;
+        invalid_denoise.denoise = 9;
+        assert!(!invalid_denoise.is_valid());
+
+        let mut invalid_effect = status;
+        invalid_effect.special_effect = 7;
+        assert!(!invalid_effect.is_valid());
+
+        let mut invalid_wb = status;
+        invalid_wb.wb_mode = 5;
+        assert!(!invalid_wb.is_valid());
+
+        let mut invalid_awb = status;
+        invalid_awb.awb = 2;
+        assert!(!invalid_awb.is_valid());
+
+        let mut invalid_vflip = status;
+        invalid_vflip.vflip = 2;
+        assert!(!invalid_vflip.is_valid());
     }
 }

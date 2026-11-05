@@ -4,7 +4,6 @@
 //! Replaces `conversions/to_bmp.c` (`CONV-101`..`CONV-105`), eliminating
 //! unaligned packed struct pointer casts and integer overflow vulnerabilities.
 
-use crate::yuv::yuv2rgb;
 use esp32_cam_types::{CameraError, PixelFormat};
 
 /// Standard Windows BITMAPFILEHEADER (14 bytes) + BITMAPINFOHEADER (40 bytes)
@@ -115,7 +114,8 @@ pub fn write_bmp_header(
     dst[34..38].copy_from_slice(&image_size.to_le_bytes());
     dst[38..42].copy_from_slice(&0x0B13u32.to_le_bytes()); // 2835 ppm (72 DPI)
     dst[42..46].copy_from_slice(&0x0B13u32.to_le_bytes()); // 2835 ppm (72 DPI)
-    dst[46..50].copy_from_slice(&0u32.to_le_bytes());
+    let clr_used: u32 = palette_size / 4;
+    dst[46..50].copy_from_slice(&clr_used.to_le_bytes());
     dst[50..54].copy_from_slice(&0u32.to_le_bytes());
 
     Ok(BMP_HEADER_LEN)
@@ -140,27 +140,22 @@ pub fn rgb888_to_bmp(
 
     write_bmp_header(dst, width, height, 24, layout.image_size, 0)?;
 
-    let mut out_off = BMP_HEADER_LEN;
-    let mut in_off = 0usize;
-    let w = width as usize;
-    let h = height as usize;
+    let row_stride = layout.row_bytes + layout.padding;
+    let src_rows = src[..layout.src_required].chunks_exact(layout.row_bytes);
+    let dst_rows = dst[BMP_HEADER_LEN..layout.total_size].chunks_exact_mut(row_stride);
 
-    for _y in 0..h {
-        for _x in 0..w {
-            let r = src[in_off];
-            let g = src[in_off + 1];
-            let b = src[in_off + 2];
-            in_off += 3;
-
-            dst[out_off] = b;
-            dst[out_off + 1] = g;
-            dst[out_off + 2] = r;
-            out_off += 3;
+    for (src_row, dst_row) in src_rows.zip(dst_rows) {
+        for (in_pix, out_pix) in src_row
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .zip(dst_row[..layout.row_bytes].as_chunks_mut::<3>().0)
+        {
+            out_pix[0] = in_pix[2];
+            out_pix[1] = in_pix[1];
+            out_pix[2] = in_pix[0];
         }
-        for _p in 0..layout.padding {
-            dst[out_off] = 0;
-            out_off += 1;
-        }
+        dst_row[layout.row_bytes..].fill(0);
     }
 
     Ok(layout.total_size)
@@ -185,26 +180,25 @@ pub fn rgb565_to_bmp(
 
     write_bmp_header(dst, width, height, 24, layout.image_size, 0)?;
 
-    let mut out_off = BMP_HEADER_LEN;
-    let mut in_off = 0usize;
-    let w = width as usize;
-    let h = height as usize;
+    let src_row_bytes = (width as usize) * 2;
+    let row_stride = layout.row_bytes + layout.padding;
+    let src_rows = src[..layout.src_required].chunks_exact(src_row_bytes);
+    let dst_rows = dst[BMP_HEADER_LEN..layout.total_size].chunks_exact_mut(row_stride);
 
-    for _y in 0..h {
-        for _x in 0..w {
-            let hb = src[in_off];
-            let lb = src[in_off + 1];
-            in_off += 2;
-
-            dst[out_off] = (lb & 0x1F) << 3;
-            dst[out_off + 1] = ((hb & 0x07) << 5) | ((lb & 0xE0) >> 3);
-            dst[out_off + 2] = hb & 0xF8;
-            out_off += 3;
+    for (src_row, dst_row) in src_rows.zip(dst_rows) {
+        for (in_pix, out_pix) in src_row
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(dst_row[..layout.row_bytes].as_chunks_mut::<3>().0)
+        {
+            let hb = in_pix[0];
+            let lb = in_pix[1];
+            out_pix[0] = (lb & 0x1F) << 3;
+            out_pix[1] = ((hb & 0x07) << 5) | ((lb & 0xE0) >> 3);
+            out_pix[2] = hb & 0xF8;
         }
-        for _p in 0..layout.padding {
-            dst[out_off] = 0;
-            out_off += 1;
-        }
+        dst_row[layout.row_bytes..].fill(0);
     }
 
     Ok(layout.total_size)
@@ -286,34 +280,28 @@ pub fn yuv422_to_bmp(
 
     write_bmp_header(dst, width, height, 24, layout.image_size, 0)?;
 
-    let mut out_off = BMP_HEADER_LEN;
-    let mut in_off = 0usize;
-    let w = width as usize;
-    let h = height as usize;
+    let src_row_bytes = (width as usize) * 2;
+    let row_stride = layout.row_bytes + layout.padding;
+    let src_rows = src[..layout.src_required].chunks_exact(src_row_bytes);
+    let dst_rows = dst[BMP_HEADER_LEN..layout.total_size].chunks_exact_mut(row_stride);
 
-    for _y in 0..h {
-        for _x in 0..(w / 2) {
-            let y0 = src[in_off];
-            let u = src[in_off + 1];
-            let y1 = src[in_off + 2];
-            let v = src[in_off + 3];
-            in_off += 4;
-
-            let (r0, g0, b0) = yuv2rgb(y0, u, v);
-            dst[out_off] = b0;
-            dst[out_off + 1] = g0;
-            dst[out_off + 2] = r0;
-
-            let (r1, g1, b1) = yuv2rgb(y1, u, v);
-            dst[out_off + 3] = b1;
-            dst[out_off + 4] = g1;
-            dst[out_off + 5] = r1;
-            out_off += 6;
+    for (src_row, dst_row) in src_rows.zip(dst_rows) {
+        for (chunk, out) in src_row
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(dst_row[..layout.row_bytes].as_chunks_mut::<6>().0)
+        {
+            let ((r0, g0, b0), (r1, g1, b1)) =
+                crate::yuv::yuv422_pair_to_rgb(chunk[0], chunk[1], chunk[2], chunk[3]);
+            out[0] = b0;
+            out[1] = g0;
+            out[2] = r0;
+            out[3] = b1;
+            out[4] = g1;
+            out[5] = r1;
         }
-        for _p in 0..layout.padding {
-            dst[out_off] = 0;
-            out_off += 1;
-        }
+        dst_row[layout.row_bytes..].fill(0);
     }
 
     Ok(layout.total_size)
@@ -378,6 +366,8 @@ mod tests {
         assert_eq!(i32::from_le_bytes([dst[18], dst[19], dst[20], dst[21]]), 3);
         assert_eq!(i32::from_le_bytes([dst[22], dst[23], dst[24], dst[25]]), -2);
         assert_eq!(u16::from_le_bytes([dst[28], dst[29]]), 24);
+        // SEC-061: clr_used is 0 when palette_size is 0
+        assert_eq!(u32::from_le_bytes([dst[46], dst[47], dst[48], dst[49]]), 0);
         // Verify CONV-002: little-endian BMP pixel byte order is
         // [B, G, R] = [0x33, 0x22, 0x11]
         assert_eq!(&dst[54..57], &[0x33, 0x22, 0x11]);
@@ -415,6 +405,8 @@ mod tests {
             54 + 1024
         );
         assert_eq!(u16::from_le_bytes([dst[28], dst[29]]), 8);
+        // SEC-061: clr_used is 256 (1024 / 4) for grayscale palette
+        assert_eq!(u32::from_le_bytes([dst[46], dst[47], dst[48], dst[49]]), 256);
 
         // Verify 256-entry palette
         for i in 0..256usize {

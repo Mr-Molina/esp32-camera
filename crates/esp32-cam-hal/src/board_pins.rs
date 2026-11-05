@@ -59,6 +59,16 @@ impl TargetChip {
             Self::Esp32S2 | Self::Esp32S3 => gpio >= 26 && gpio <= 32,
         }
     }
+
+    /// Returns `true` if `pin` is reserved for Octal PSRAM on ESP32-S3
+    /// (`GPIO 33..=37`) (`LOGIC-053`).
+    #[inline]
+    pub const fn is_octal_psram_reserved(self, pin: i8) -> bool {
+        match self {
+            Self::Esp32S3 => matches!(pin, 33..=37),
+            _ => false,
+        }
+    }
 }
 
 /// Complete camera pinout profile matching `camera_config_t` and
@@ -644,5 +654,18 @@ mod tests {
             bad_flash_s3.d0 = gpio;
             assert_eq!(bad_flash_s3.validate_pins(), Err(CameraError::InvalidArg));
         }
+    }
+
+    #[test]
+    fn test_logic_053_octal_psram_reserved() {
+        assert!(TargetChip::Esp32S3.is_octal_psram_reserved(33));
+        assert!(TargetChip::Esp32S3.is_octal_psram_reserved(35));
+        assert!(TargetChip::Esp32S3.is_octal_psram_reserved(37));
+        assert!(!TargetChip::Esp32S3.is_octal_psram_reserved(32));
+        assert!(!TargetChip::Esp32S3.is_octal_psram_reserved(38));
+        assert!(!TargetChip::Esp32S3.is_octal_psram_reserved(-1));
+
+        assert!(!TargetChip::Esp32.is_octal_psram_reserved(35));
+        assert!(!TargetChip::Esp32S2.is_octal_psram_reserved(35));
     }
 }

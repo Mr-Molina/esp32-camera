@@ -7,6 +7,9 @@
 /// JPEG Start-Of-Image plus following marker prefix (`0xFF, 0xD8, 0xFF`).
 pub const JPEG_SOI_MARKER: [u8; 3] = [0xFF, 0xD8, 0xFF];
 
+/// JPEG Start-Of-Image 2-byte marker (`0xFF, 0xD8`).
+pub const JPEG_SOI_2BYTE_MARKER: [u8; 2] = [0xFF, 0xD8];
+
 /// JPEG End-Of-Image marker (`0xFF, 0xD9`).
 pub const JPEG_EOI_MARKER: [u8; 2] = [0xFF, 0xD9];
 
@@ -28,16 +31,100 @@ pub const fn eoi_probe_window(half: usize, frame_len: usize) -> usize {
 /// Scans `buf` forward for the 3-byte [`JPEG_SOI_MARKER`]
 /// (`[0xFF, 0xD8, 0xFF]`).
 ///
+/// Uses 4-byte SWAR (`0x0101_0101` / `0x8080_8080`) fast scanning to locate
+/// `0xFF` bytes across words.
+///
 /// Returns `Some(offset)` of the first match, or `None` if `buf.len() < 3` or
 /// no SOI marker is present. Matches `cam_verify_jpeg_soi` in
 /// `driver/cam_hal.c:173-192`.
 #[inline]
 pub fn verify_jpeg_soi(buf: &[u8]) -> Option<usize> {
-    if buf.len() < JPEG_SOI_MARKER.len() {
+    let length = buf.len();
+    if length < JPEG_SOI_MARKER.len() {
         return None;
     }
-    buf.windows(JPEG_SOI_MARKER.len())
-        .position(|w| w == JPEG_SOI_MARKER)
+
+    const A: u32 = (JPEG_SOI_MARKER[0] as u32) * 0x0101_0101;
+    const ONE: u32 = 0x0101_0101;
+    const HIGH: u32 = 0x8080_8080;
+
+    let mut i = 0usize;
+    while i + 4 <= length {
+        let w = u32::from_le_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]);
+        let x = w ^ A;
+        let mut m = (!x & x.wrapping_sub(ONE)) & HIGH;
+        while m != 0 {
+            let off = (m.trailing_zeros() >> 3) as usize;
+            let pos = i + off;
+            if pos + JPEG_SOI_MARKER.len() <= length
+                && buf[pos] == JPEG_SOI_MARKER[0]
+                && buf[pos + 1] == JPEG_SOI_MARKER[1]
+                && buf[pos + 2] == JPEG_SOI_MARKER[2]
+            {
+                return Some(pos);
+            }
+            m &= m.wrapping_sub(1);
+        }
+        i += 4;
+    }
+
+    while i + JPEG_SOI_MARKER.len() <= length {
+        if buf[i] == JPEG_SOI_MARKER[0]
+            && buf[i + 1] == JPEG_SOI_MARKER[1]
+            && buf[i + 2] == JPEG_SOI_MARKER[2]
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Scans `buf` forward for the 2-byte [`JPEG_SOI_2BYTE_MARKER`]
+/// (`[0xFF, 0xD8]`).
+///
+/// Uses 4-byte SWAR (`0x0101_0101` / `0x8080_8080`) fast scanning to locate
+/// `0xFF` candidate bytes across words.
+///
+/// Returns `Some(offset)` of the first match, or `None` if `buf.len() < 2` or
+/// no SOI marker is present.
+#[inline]
+pub fn verify_jpeg_soi_2byte(buf: &[u8]) -> Option<usize> {
+    let length = buf.len();
+    if length < JPEG_SOI_2BYTE_MARKER.len() {
+        return None;
+    }
+
+    const A: u32 = (JPEG_SOI_2BYTE_MARKER[0] as u32) * 0x0101_0101;
+    const ONE: u32 = 0x0101_0101;
+    const HIGH: u32 = 0x8080_8080;
+
+    let mut i = 0usize;
+    while i + 4 <= length {
+        let w = u32::from_le_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]);
+        let x = w ^ A;
+        let mut m = (!x & x.wrapping_sub(ONE)) & HIGH;
+        while m != 0 {
+            let off = (m.trailing_zeros() >> 3) as usize;
+            let pos = i + off;
+            if pos + JPEG_SOI_2BYTE_MARKER.len() <= length
+                && buf[pos] == JPEG_SOI_2BYTE_MARKER[0]
+                && buf[pos + 1] == JPEG_SOI_2BYTE_MARKER[1]
+            {
+                return Some(pos);
+            }
+            m &= m.wrapping_sub(1);
+        }
+        i += 4;
+    }
+
+    while i + JPEG_SOI_2BYTE_MARKER.len() <= length {
+        if buf[i] == JPEG_SOI_2BYTE_MARKER[0] && buf[i + 1] == JPEG_SOI_2BYTE_MARKER[1] {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Scans `buf` for the 2-byte [`JPEG_EOI_MARKER`] (`[0xFF, 0xD9]`).
@@ -46,19 +133,20 @@ pub fn verify_jpeg_soi(buf: &[u8]) -> Option<usize> {
 ///   (`0x0101_0101` / `0x8080_8080`) candidate detector from
 ///   `driver/cam_hal.c:200-233` via safe `u32::from_le_bytes` to locate
 ///   the earliest `0xFF, 0xD9` marker in `buf`.
-/// - When `search_forward` is `false`, scans backward from the end of `buf`
-///   to find the last `0xFF, 0xD9` marker (`driver/cam_hal.c:235-245`).
+/// - When `search_forward` is `false`, scans backward using 4-byte SWAR
+///   candidate detection from the end of `buf` to find the last `0xFF, 0xD9`
+///   marker.
 pub fn verify_jpeg_eoi(buf: &[u8], search_forward: bool) -> Option<usize> {
     let length = buf.len();
     if length < JPEG_EOI_MARKER.len() {
         return None;
     }
 
-    if search_forward {
-        const A: u32 = (JPEG_EOI_MARKER[0] as u32) * 0x0101_0101;
-        const ONE: u32 = 0x0101_0101;
-        const HIGH: u32 = 0x8080_8080;
+    const A: u32 = (JPEG_EOI_MARKER[0] as u32) * 0x0101_0101;
+    const ONE: u32 = 0x0101_0101;
+    const HIGH: u32 = 0x8080_8080;
 
+    if search_forward {
         let mut i = 0usize;
         while i + 4 <= length {
             let w = u32::from_le_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]);
@@ -87,6 +175,36 @@ pub fn verify_jpeg_eoi(buf: &[u8], search_forward: bool) -> Option<usize> {
         return None;
     }
 
+    if length >= 4 {
+        let mut i = length - 4;
+        loop {
+            let w = u32::from_le_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]);
+            let x = w ^ A;
+            let mut m = (!x & x.wrapping_sub(ONE)) & HIGH;
+            while m != 0 {
+                let lz = m.leading_zeros();
+                let off = ((31 - lz) >> 3) as usize;
+                let pos = i + off;
+                if pos + JPEG_EOI_MARKER.len() <= length
+                    && buf[pos] == JPEG_EOI_MARKER[0]
+                    && buf[pos + 1] == JPEG_EOI_MARKER[1]
+                {
+                    return Some(pos);
+                }
+                m ^= 1u32 << (31 - lz);
+            }
+            if i == 0 {
+                break;
+            }
+            if i >= 4 {
+                i -= 4;
+            } else {
+                i = 0;
+            }
+        }
+        return None;
+    }
+
     let mut pos = length - JPEG_EOI_MARKER.len();
     loop {
         if buf[pos] == JPEG_EOI_MARKER[0] && buf[pos + 1] == JPEG_EOI_MARKER[1] {
@@ -102,7 +220,7 @@ pub fn verify_jpeg_eoi(buf: &[u8], search_forward: bool) -> Option<usize> {
 
 /// Extracts the valid JPEG payload slice from `buf`, verifying that:
 /// 1. A valid SOI marker exists.
-/// 2. A valid EOI marker exists.
+/// 2. A valid EOI marker exists after the SOI marker.
 /// 3. The SOI marker occurs strictly before EOI (`soi_offset + 2 <= eoi_end`).
 ///
 /// Safely handles truncated or malformed buffers without panic or arithmetic
@@ -113,7 +231,30 @@ pub fn extract_jpeg_payload(buf: &[u8]) -> Option<&[u8]> {
         return None;
     }
     let soi_offset = verify_jpeg_soi(buf)?;
-    let eoi_offset = verify_jpeg_eoi(buf, false)?;
+    let sub = &buf[soi_offset..];
+    let rel_eoi = verify_jpeg_eoi(sub, false)?;
+    let eoi_offset = soi_offset.checked_add(rel_eoi)?;
+    let eoi_end = eoi_offset.checked_add(JPEG_EOI_MARKER.len())?;
+    let soi_min_end = soi_offset.checked_add(2)?;
+    if soi_min_end > eoi_end || eoi_end > buf.len() {
+        return None;
+    }
+    Some(&buf[soi_offset..eoi_end])
+}
+
+/// Extracts the first JPEG payload slice from `buf` using forward EOI scanning.
+///
+/// Ensures callers extracting the first frame in a stream containing multiple
+/// concatenated frames or trailing data receive the frame ending at the
+/// earliest matching EOI after the SOI marker.
+pub fn extract_first_jpeg_payload(buf: &[u8]) -> Option<&[u8]> {
+    if buf.len() < 4 {
+        return None;
+    }
+    let soi_offset = verify_jpeg_soi(buf)?;
+    let sub = &buf[soi_offset..];
+    let rel_eoi = verify_jpeg_eoi(sub, true)?;
+    let eoi_offset = soi_offset.checked_add(rel_eoi)?;
     let eoi_end = eoi_offset.checked_add(JPEG_EOI_MARKER.len())?;
     let soi_min_end = soi_offset.checked_add(2)?;
     if soi_min_end > eoi_end || eoi_end > buf.len() {
@@ -195,7 +336,11 @@ pub fn parse_jpeg_dimensions(buf: &[u8]) -> Option<(u16, u16)> {
                 if seg_len < 2 {
                     return None;
                 }
-                i = i.checked_add(seg_len)?;
+                let next_i = i.checked_add(seg_len)?;
+                if next_i > buf.len() {
+                    return None;
+                }
+                i = next_i;
             }
         }
     }
@@ -225,6 +370,31 @@ mod tests {
             Some(2)
         );
         assert_eq!(verify_jpeg_soi(&[0xFF, 0xD8, 0x00, 0xFF, 0xD9]), None);
+    }
+
+    #[test]
+    fn test_verify_jpeg_soi_2byte() {
+        assert_eq!(verify_jpeg_soi_2byte(&[]), None);
+        assert_eq!(verify_jpeg_soi_2byte(&[0xFF]), None);
+        assert_eq!(verify_jpeg_soi_2byte(&[0xFF, 0xD8]), Some(0));
+        assert_eq!(verify_jpeg_soi_2byte(&[0x00, 0x11, 0xFF, 0xD8, 0x00]), Some(2));
+        assert_eq!(
+            verify_jpeg_soi_2byte(&[0x00, 0x11, 0xFF, 0xD8, 0xFF, 0xE0]),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn test_extract_first_jpeg_payload() {
+        let multi_frame = [
+            0xFF, 0xD8, 0xFF, 0xE0, 0xFF, 0xD9, // First frame (len 6)
+            0xAA, 0xBB,
+            0xFF, 0xD8, 0xFF, 0xE0, 0xFF, 0xD9, // Second frame
+        ];
+        assert_eq!(
+            extract_first_jpeg_payload(&multi_frame),
+            Some(&multi_frame[..6])
+        );
     }
 
     #[test]

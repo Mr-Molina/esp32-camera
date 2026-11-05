@@ -280,13 +280,12 @@ fn parse_isize_ascii(s: &str) -> Option<isize> {
 pub fn parse_http_request(raw: &[u8]) -> Result<HttpRequest<'_>, HttpError> {
     let hdr_end = find_subslice(raw, b"\r\n\r\n").ok_or(HttpError::MalformedRequest)?;
     let header_block = core::str::from_utf8(&raw[..hdr_end]).map_err(|_| HttpError::InvalidUtf8)?;
-    let body = &raw[hdr_end + 4..];
 
     let mut lines = header_block.split("\r\n");
     let request_line = lines
         .find(|l| !l.is_empty())
         .ok_or(HttpError::MalformedRequest)?;
-    let mut parts = request_line.split_whitespace();
+    let mut parts = request_line.split(' ').filter(|s| !s.is_empty());
     let method_str = parts.next().ok_or(HttpError::MalformedRequest)?;
     let target_str = parts.next().ok_or(HttpError::MalformedRequest)?;
     let version = parts.next().ok_or(HttpError::MalformedRequest)?;
@@ -311,7 +310,13 @@ pub fn parse_http_request(raw: &[u8]) -> Result<HttpRequest<'_>, HttpError> {
     };
 
     let (path, query) = match target_str.find('?') {
-        Some(idx) => (&target_str[..idx], Some(&target_str[idx + 1..])),
+        Some(idx) => {
+            let q = &target_str[idx + 1..];
+            if q.len() > MAX_URL_QUERY_LEN {
+                return Err(HttpError::MalformedRequest);
+            }
+            (&target_str[..idx], Some(q))
+        }
         None => (target_str, None),
     };
 
@@ -349,6 +354,16 @@ pub fn parse_http_request(raw: &[u8]) -> Result<HttpRequest<'_>, HttpError> {
             content_length = Some(cl as isize);
         } else if name.eq_ignore_ascii_case("Content-Type") {
             content_type = Some(val);
+        }
+    }
+
+    let mut body = &raw[hdr_end + 4..];
+    if let Some(cl) = content_length {
+        if cl >= 0 {
+            let cl_usize = cl as usize;
+            if raw.len() > hdr_end + 4 + cl_usize {
+                body = &raw[hdr_end + 4..hdr_end + 4 + cl_usize];
+            }
         }
     }
 
@@ -472,7 +487,10 @@ impl Default for TelemetrySnapshot<'static> {
 
 fn sanitize_status_json_field<'a>(field: &'a str, buf: &'a mut [u8; 64]) -> &'a str {
     let bytes = field.as_bytes();
-    let len = bytes.len().min(64);
+    let mut len = bytes.len().min(64);
+    while !field.is_char_boundary(len) {
+        len = len.saturating_sub(1);
+    }
     let mut i = 0;
     while i < len {
         let b = bytes[i];
@@ -612,10 +630,12 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         return false;
     }
     let mut diff: usize = a.len() ^ b.len();
+    let max_len = a.len().max(b.len());
     let mut i = 0usize;
-    while i < b.len() {
+    while i < max_len {
         let a_byte = if i < a.len() { a[i] } else { 0 };
-        diff |= (a_byte ^ b[i]) as usize;
+        let b_byte = if i < b.len() { b[i] } else { 0 };
+        diff |= (a_byte ^ b_byte) as usize;
         i += 1;
     }
     diff == 0
@@ -631,9 +651,9 @@ pub const fn parse_framesize_val(val: isize) -> Option<FrameSize> {
         7 | 480 => Some(FrameSize::Hvga),
         8 | 640 => Some(FrameSize::Vga),
         9 | 800 => Some(FrameSize::Svga),
-        10 | 1024 => Some(FrameSize::Xga),
+        10 => Some(FrameSize::Xga),
         11 | 1280 => Some(FrameSize::Hd),
-        12 => Some(FrameSize::Sxga),
+        12 | 1024 => Some(FrameSize::Sxga),
         13 | 1600 => Some(FrameSize::Uxga),
         _ => None,
     }
@@ -978,7 +998,6 @@ impl<'a> StreamSessionGuard<'a> {
                 g
             }
             Err(CameraError::InvalidState) => {
-                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
                 return Err(HttpError::CameraBusy);
             }
             Err(_) => {
@@ -1179,7 +1198,19 @@ impl<'a> KlipperCamServer<'a> {
         out_buf: &'b mut [u8],
         flash: &mut F,
     ) -> Result<&'b [u8], HttpError> {
-        let req = parse_http_request(raw_req)?;
+        let req = match parse_http_request(raw_req) {
+            Ok(r) => r,
+            Err(HttpError::MalformedRequest) | Err(HttpError::InvalidUtf8) => {
+                return write_http_error(
+                    out_buf,
+                    400,
+                    "Bad Request",
+                    "400 Bad Request\n",
+                    false,
+                );
+            }
+            Err(e) => return Err(e),
+        };
         self.handle_request_with_flash(port, &req, out_buf, flash)
     }
 
@@ -3000,5 +3031,31 @@ Host: 172.22.1.52\r\n\r\n";
             format_ota_minimal_root(&mgr, 180_000, &mut resp_buf).expect("format_ota_minimal_root");
         let min_view = HttpResponseView::parse(min_resp).expect("parse minimal root");
         assert!(min_view.headers_raw.contains("Connection: close"));
+    }
+
+    #[test]
+    fn test_stream_session_guard_camera_busy_does_not_increment_failures() {
+        let camera = CameraDriver::new_hd_default();
+        let flag = AtomicBool::new(false);
+        let mut session = StreamSessionGuard::try_acquire(&flag).expect("acquire");
+        let mut buf = [0u8; 512];
+
+        // Lock mutex to simulate camera busy (InvalidState)
+        camera.set_mutex_locked(true);
+        assert_eq!(
+            session.write_next_frame_chunk(&camera, &mut buf),
+            Err(HttpError::CameraBusy)
+        );
+        assert_eq!(session.consecutive_failures(), 0);
+        assert!(!session.should_abort());
+
+        // Now simulate hardware failure
+        camera.set_mutex_locked(false);
+        camera.set_simulate_failure(true);
+        assert_eq!(
+            session.write_next_frame_chunk(&camera, &mut buf),
+            Err(HttpError::CaptureFailed)
+        );
+        assert_eq!(session.consecutive_failures(), 1);
     }
 }

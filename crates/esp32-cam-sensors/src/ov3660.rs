@@ -1032,10 +1032,15 @@ impl<B: SccbBus> CameraSensor<B> for Ov3660 {
     }
 
     fn set_awb_gain(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        let old_mode = self.status.wb_mode;
-        let mode = if enable { old_mode as i32 } else { 0 };
-        self.set_wb_mode(bus, mode)?;
-        self.status.wb_mode = old_mode;
+        let val = if enable {
+            u8::from(self.status.wb_mode != 0)
+        } else {
+            0x01
+        };
+        bus.write_reg16(self.slv_addr, 0x3406, val)?;
+        if enable && self.status.wb_mode != 0 {
+            self.set_wb_mode(bus, self.status.wb_mode as i32)?;
+        }
         self.status.awb_gain = u8::from(enable);
         Ok(())
     }
@@ -1289,7 +1294,11 @@ impl<B: SccbBus> CameraSensor<B> for Ov3660 {
         if xclk <= 0 {
             return Err(CameraError::InvalidArg);
         }
-        self.xclk_freq_hz = (xclk as u32).saturating_mul(1_000_000);
+        let xclk_freq_hz = (xclk as u32).saturating_mul(1_000_000);
+        if !(6_000_000..=27_000_000).contains(&xclk_freq_hz) {
+            return Err(CameraError::InvalidArg);
+        }
+        self.xclk_freq_hz = xclk_freq_hz;
         Ok(())
     }
 }

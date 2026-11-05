@@ -40,6 +40,10 @@ pub const ROAM_MAX_SCAN_INTERVAL_MS: u64 = 900_000;
 /// Required RSSI advantage of a new AP over the current one, in dB.
 pub const ROAM_HYSTERESIS_DB: i8 = 8;
 
+/// Recovery hysteresis added to weak-link threshold when resetting timer,
+/// in dB.
+pub const ROAM_RECOVERY_HYSTERESIS_DB: i8 = 2;
+
 /// RSSI penalty per missed scan pass relative to the highest hit count, in dB.
 pub const MISSED_PASS_PENALTY_DB: i8 = 3;
 
@@ -83,11 +87,13 @@ impl ApCandidate {
         if rssi > self.rssi_max {
             self.rssi_max = rssi;
         }
-        // Once `hits` saturates, freeze the sum so the mean stays exact.
-        if self.hits < u8::MAX {
-            self.hits = self.hits.saturating_add(1);
-            self.rssi_sum = self.rssi_sum.saturating_add(i32::from(rssi));
+        // When hit count saturates, halve to allow ongoing adaptation.
+        if self.hits == u8::MAX {
+            self.hits = 128;
+            self.rssi_sum /= 2;
         }
+        self.hits = self.hits.saturating_add(1);
+        self.rssi_sum = self.rssi_sum.saturating_add(i32::from(rssi));
     }
 
     /// Ranking key: effective RSSI, then average RSSI, then hit count, then
@@ -187,8 +193,8 @@ impl ApTracker {
     /// Records one scan sample.
     ///
     /// Updates the entry for `bssid` if present, otherwise inserts it. When
-    /// the table is full the weakest entry is replaced only if `rssi` is
-    /// stronger than that entry's average.
+    /// the table is full the weakest entry is replaced only if the new
+    /// candidate outranks that entry.
     pub fn record(&mut self, bssid: [u8; 6], channel: u8, rssi: i8) {
         let Some(active) = self.entries.get_mut(..self.len) else {
             return;
@@ -205,13 +211,14 @@ impl ApTracker {
             self.len = self.len.saturating_add(1);
             return;
         }
+        let max_hits = self.max_hits();
         let Some(weakest_idx) = self.weakest_index() else {
             return;
         };
         let Some(weakest) = self.entries.get_mut(weakest_idx) else {
             return;
         };
-        if rssi > weakest.rssi_avg() {
+        if fresh.rank(max_hits) > weakest.rank(max_hits) {
             *weakest = fresh;
         }
     }
@@ -251,6 +258,17 @@ impl ApTracker {
     #[must_use]
     pub fn best(&self) -> Option<ApCandidate> {
         self.best_filtered(None)
+    }
+
+    /// Strongest candidate whose BSSID matches `pinned_bssid` if set,
+    /// otherwise falls back to [`Self::best`].
+    #[must_use]
+    pub fn best_pinned(&self, pinned_bssid: Option<[u8; 6]>) -> Option<ApCandidate> {
+        if let Some(pinned) = pinned_bssid {
+            self.candidates().iter().copied().find(|c| c.bssid == pinned)
+        } else {
+            self.best()
+        }
     }
 
     /// Strongest candidate whose BSSID differs from `bssid`.
@@ -325,7 +343,29 @@ impl WeakLinkTimer {
     /// `rssi >= threshold_dbm` (which also resets the timer) or on the first
     /// weak sample.
     pub fn update(&mut self, now_ms: u64, rssi: i8, threshold_dbm: i8) -> u64 {
-        if rssi >= threshold_dbm {
+        self.update_with_hysteresis(now_ms, rssi, threshold_dbm, 0)
+    }
+
+    /// Feeds an RSSI sample taken at `now_ms` (monotonic milliseconds) with
+    /// recovery hysteresis.
+    ///
+    /// Once the link has been declared weak, it must recover to at least
+    /// `threshold_dbm + hysteresis_db` dBm to reset the timer. While strong,
+    /// dropping below `threshold_dbm` triggers the weak state.
+    pub fn update_with_hysteresis(
+        &mut self,
+        now_ms: u64,
+        rssi: i8,
+        threshold_dbm: i8,
+        hysteresis_db: i8,
+    ) -> u64 {
+        let recovery_threshold = threshold_dbm.saturating_add(hysteresis_db);
+        let clear_threshold = if self.weak_since_ms.is_some() {
+            recovery_threshold
+        } else {
+            threshold_dbm
+        };
+        if rssi >= clear_threshold {
             self.weak_since_ms = None;
             return 0;
         }
@@ -443,6 +483,7 @@ mod tests {
         assert_eq!(ROAM_CHECK_INTERVAL_MS, 5_000);
         assert_eq!(ROAM_MIN_SCAN_INTERVAL_MS, 120_000);
         assert_eq!(ROAM_HYSTERESIS_DB, 8);
+        assert_eq!(ROAM_RECOVERY_HYSTERESIS_DB, 2);
         assert_eq!(MAX_AP_CANDIDATES, 16);
     }
 
@@ -703,13 +744,74 @@ mod tests {
             tracker.record(AP_A, 1, -60);
         }
         let a = tracker.candidates()[0];
-        assert_eq!(a.hits(), u8::MAX);
+        assert_eq!(a.hits(), 173);
         assert_eq!(a.rssi_avg(), -60);
 
         tracker.record(AP_B, 1, 3);
         tracker.record(AP_B, 1, 2);
         // 2.5 -> 3
         assert_eq!(tracker.candidates()[1].rssi_avg(), 3);
+    }
+
+    #[test]
+    fn test_weak_timer_with_hysteresis() {
+        let mut timer = WeakLinkTimer::new();
+        // -70 is below -65 -> weak starts
+        assert_eq!(
+            timer.update_with_hysteresis(
+                0,
+                -70,
+                ROAM_TRIGGER_RSSI_DBM,
+                ROAM_RECOVERY_HYSTERESIS_DB
+            ),
+            0
+        );
+        assert_eq!(
+            timer.update_with_hysteresis(
+                10_000,
+                -70,
+                ROAM_TRIGGER_RSSI_DBM,
+                ROAM_RECOVERY_HYSTERESIS_DB
+            ),
+            10_000
+        );
+        // -64 is above threshold (-65) but below recovery threshold
+        // (-65 + 2 = -63) -> remains weak
+        assert_eq!(
+            timer.update_with_hysteresis(
+                20_000,
+                -64,
+                ROAM_TRIGGER_RSSI_DBM,
+                ROAM_RECOVERY_HYSTERESIS_DB
+            ),
+            20_000
+        );
+        // -63 reaches recovery threshold -> resets
+        assert_eq!(
+            timer.update_with_hysteresis(
+                30_000,
+                -63,
+                ROAM_TRIGGER_RSSI_DBM,
+                ROAM_RECOVERY_HYSTERESIS_DB
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn test_best_pinned() {
+        let mut tracker = ApTracker::new();
+        tracker.record(AP_A, 1, -40);
+        tracker.record(AP_B, 6, -70);
+        // Pin to AP_B returns AP_B even though AP_A has better RSSI
+        assert_eq!(
+            tracker.best_pinned(Some(AP_B)).map(|c| c.bssid()),
+            Some(AP_B)
+        );
+        // Pin to non-existent AP_C returns None
+        assert_eq!(tracker.best_pinned(Some(AP_C)), None);
+        // Pin None falls back to best (AP_A)
+        assert_eq!(tracker.best_pinned(None).map(|c| c.bssid()), Some(AP_A));
     }
 
     #[test]

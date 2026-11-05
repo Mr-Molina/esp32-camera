@@ -428,7 +428,8 @@ impl<B: SccbBus> CameraSensor<B> for Sc030Iot {
         Ok(())
     }
 
-    fn init_status(&mut self, _bus: &mut B) -> Result<(), CameraError> {
+    fn init_status(&mut self, bus: &mut B) -> Result<(), CameraError> {
+        self.get_reg(bus, 0x0144, 0xFF)?;
         Ok(())
     }
 
@@ -456,6 +457,9 @@ impl<B: SccbBus> CameraSensor<B> for Sc030Iot {
     }
 
     fn set_contrast(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
+        if !(-4..=4).contains(&level) {
+            return Err(CameraError::InvalidArg);
+        }
         self.set_reg_bits(bus, 0x00F5, 6, 1, 0)?;
         self.set_reg(bus, 0x014B, 0xFF, level & 0xFF)?;
         self.status.contrast = level as i8;
@@ -463,6 +467,9 @@ impl<B: SccbBus> CameraSensor<B> for Sc030Iot {
     }
 
     fn set_saturation(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
+        if !(0..=0xFFFF).contains(&level) {
+            return Err(CameraError::InvalidArg);
+        }
         self.set_reg_bits(bus, 0x00F5, 5, 1, 0)?;
         self.set_reg(bus, 0x0149, 0xFF, level & 0xFF)?;
         self.set_reg(bus, 0x014A, 0xFF, (level >> 8) & 0xFF)?;
@@ -471,6 +478,9 @@ impl<B: SccbBus> CameraSensor<B> for Sc030Iot {
     }
 
     fn set_sharpness(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
+        if !(0..=0xFFFF).contains(&level) {
+            return Err(CameraError::InvalidArg);
+        }
         self.set_reg_bits(bus, 0x00E0, 1, 1, 1)?;
         self.set_reg(bus, 0x00D0, 0xFF, level & 0xFF)?;
         self.set_reg(bus, 0x00D2, 0xFF, (level >> 8) & 0xFF)?;

@@ -189,44 +189,42 @@ pub fn filter_grayscale(dst: &mut [u8], src: &[u8]) -> usize {
 /// matching `target/esp32/ll_cam.c:141-167`.
 #[inline]
 pub fn filter_grayscale_highspeed(dst: &mut [u8], src: &[u8]) -> usize {
-    let elements = src.len() / 4;
-    let end = elements / 8;
+    let elements = (src.len() / 32).min(dst.len() / 4);
+    let in_bytes = elements * 32;
+    let out_bytes = elements * 4;
 
-    let mut i = 0;
-    let mut out_bytes = 0;
-    while i < end {
-        if out_bytes + 4 > dst.len() {
-            break;
-        }
-        let base_in = i * 32;
-        dst[out_bytes] = src[base_in + 2]; // dma_el[0].sample1
-        dst[out_bytes + 1] = src[base_in + 10]; // dma_el[2].sample1
-        dst[out_bytes + 2] = src[base_in + 18]; // dma_el[4].sample1
-        dst[out_bytes + 3] = src[base_in + 26]; // dma_el[6].sample1
-        out_bytes += 4;
-        i += 1;
+    for (c_in, c_out) in src[..in_bytes]
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .zip(dst[..out_bytes].as_chunks_mut::<4>().0.iter_mut())
+    {
+        let w = u32::from_le_bytes([c_in[2], c_in[10], c_in[18], c_in[26]]);
+        c_out.copy_from_slice(&w.to_le_bytes());
     }
 
-    let rem = elements - i * 8;
-    let tail_base = i * 32;
-    if rem > 0 && out_bytes < dst.len() {
-        dst[out_bytes] = src[tail_base + 2]; // dma_el[0].sample1
-        out_bytes += 1;
-        if rem >= 3 && out_bytes < dst.len() {
-            dst[out_bytes] = src[tail_base + 10]; // dma_el[2].sample1
-            out_bytes += 1;
-            if rem >= 5 && out_bytes < dst.len() {
-                dst[out_bytes] = src[tail_base + 18]; // dma_el[4].sample1
-                out_bytes += 1;
-                if rem >= 7 && out_bytes < dst.len() {
-                    dst[out_bytes] = src[tail_base + 26]; // dma_el[6].sample1
-                    out_bytes += 1;
+    let total_elements = src.len() / 4;
+    let rem = total_elements.saturating_sub(elements * 8);
+    let tail_base = in_bytes;
+    let mut written = out_bytes;
+    if rem > 0 && written < dst.len() {
+        dst[written] = src[tail_base + 2]; // dma_el[0].sample1
+        written += 1;
+        if rem >= 3 && written < dst.len() {
+            dst[written] = src[tail_base + 10]; // dma_el[2].sample1
+            written += 1;
+            if rem >= 5 && written < dst.len() {
+                dst[written] = src[tail_base + 18]; // dma_el[4].sample1
+                written += 1;
+                if rem >= 7 && written < dst.len() {
+                    dst[written] = src[tail_base + 26]; // dma_el[6].sample1
+                    written += 1;
                 }
             }
         }
     }
 
-    out_bytes
+    written
 }
 
 /// Unpacks standard-speed YUYV / RGB565 DMA elements
@@ -239,31 +237,32 @@ pub fn filter_grayscale_highspeed(dst: &mut [u8], src: &[u8]) -> usize {
 pub fn filter_yuyv(dst: &mut [u8], src: &[u8]) -> usize {
     let max_elements = dst.len() / 2;
     let elements = (src.len() / 4).min(max_elements);
-    let end = elements / 4;
+    let in_bytes = elements * 4;
+    let out_bytes = elements * 2;
 
-    let mut i = 0;
-    while i < end {
-        let base_in = i * 16;
-        let base_out = i * 8;
-        dst[base_out] = src[base_in + 2]; // dma_el[0].sample1 (y0)
-        dst[base_out + 1] = src[base_in]; // dma_el[0].sample2 (u)
-        dst[base_out + 2] = src[base_in + 6]; // dma_el[1].sample1 (y1)
-        dst[base_out + 3] = src[base_in + 4]; // dma_el[1].sample2 (v)
-
-        dst[base_out + 4] = src[base_in + 10]; // dma_el[2].sample1 (y0)
-        dst[base_out + 5] = src[base_in + 8]; // dma_el[2].sample2 (u)
-        dst[base_out + 6] = src[base_in + 14]; // dma_el[3].sample1 (y1)
-        dst[base_out + 7] = src[base_in + 12]; // dma_el[3].sample2 (v)
-        i += 1;
+    for (c_in, c_out) in src[..in_bytes]
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .zip(dst[..out_bytes].as_chunks_mut::<8>().0.iter_mut())
+    {
+        let w0 = u32::from_le_bytes([c_in[2], c_in[0], c_in[6], c_in[4]]);
+        let w1 = u32::from_le_bytes([c_in[10], c_in[8], c_in[14], c_in[12]]);
+        c_out[..4].copy_from_slice(&w0.to_le_bytes());
+        c_out[4..8].copy_from_slice(&w1.to_le_bytes());
     }
 
-    let mut rem_idx = end * 4;
-    while rem_idx < elements {
-        let base_in = rem_idx * 4;
-        let base_out = rem_idx * 2;
-        dst[base_out] = src[base_in + 2];
-        dst[base_out + 1] = src[base_in];
-        rem_idx += 1;
+    let end = (elements / 4) * 4;
+    let rem_in = &src[end * 4..in_bytes];
+    let rem_out = &mut dst[end * 2..out_bytes];
+    for (c_in, c_out) in rem_in
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(rem_out.as_chunks_mut::<2>().0.iter_mut())
+    {
+        c_out[0] = c_in[2];
+        c_out[1] = c_in[0];
     }
 
     elements * 2
@@ -280,72 +279,68 @@ pub fn filter_yuyv(dst: &mut [u8], src: &[u8]) -> usize {
 /// `target/esp32/ll_cam.c:190-224`.
 #[inline]
 pub fn filter_yuyv_highspeed(dst: &mut [u8], src: &[u8]) -> usize {
-    let elements = src.len() / 4;
-    let end = elements / 8;
+    let elements = (src.len() / 32).min(dst.len() / 8);
+    let in_bytes = elements * 32;
+    let out_bytes = elements * 8;
 
-    let mut i = 0;
-    let mut out_bytes = 0;
-    while i < end {
-        if out_bytes + 8 > dst.len() {
-            break;
-        }
-        let base_in = i * 32;
-        dst[out_bytes] = src[base_in + 2]; // dma_el[0].sample1 (y0)
-        dst[out_bytes + 1] = src[base_in + 6]; // dma_el[1].sample1 (u)
-        dst[out_bytes + 2] = src[base_in + 10]; // dma_el[2].sample1 (y1)
-        dst[out_bytes + 3] = src[base_in + 14]; // dma_el[3].sample1 (v)
-        dst[out_bytes + 4] = src[base_in + 18]; // dma_el[4].sample1 (y0)
-        dst[out_bytes + 5] = src[base_in + 22]; // dma_el[5].sample1 (u)
-        dst[out_bytes + 6] = src[base_in + 26]; // dma_el[6].sample1 (y1)
-        dst[out_bytes + 7] = src[base_in + 30]; // dma_el[7].sample1 (v)
-        out_bytes += 8;
-        i += 1;
+    for (c_in, c_out) in src[..in_bytes]
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .zip(dst[..out_bytes].as_chunks_mut::<8>().0.iter_mut())
+    {
+        let w0 = u32::from_le_bytes([c_in[2], c_in[6], c_in[10], c_in[14]]);
+        let w1 = u32::from_le_bytes([c_in[18], c_in[22], c_in[26], c_in[30]]);
+        c_out[..4].copy_from_slice(&w0.to_le_bytes());
+        c_out[4..8].copy_from_slice(&w1.to_le_bytes());
     }
 
-    let rem = elements - i * 8;
-    let tail_base = i * 32;
-    if rem > 0 && out_bytes < dst.len() {
-        dst[out_bytes] = src[tail_base + 2]; // dma_el[0].sample1 (y0)
-        out_bytes += 1;
-        if rem >= 2 && out_bytes < dst.len() {
-            dst[out_bytes] = src[tail_base + 6]; // dma_el[1].sample1 (u)
-            out_bytes += 1;
+    let total_elements = src.len() / 4;
+    let rem = total_elements.saturating_sub(elements * 8);
+    let tail_base = in_bytes;
+    let mut written = out_bytes;
+    if rem > 0 && written < dst.len() {
+        dst[written] = src[tail_base + 2]; // dma_el[0].sample1 (y0)
+        written += 1;
+        if rem >= 2 && written < dst.len() {
+            dst[written] = src[tail_base + 6]; // dma_el[1].sample1 (u)
+            written += 1;
         }
-        if rem >= 3 && out_bytes < dst.len() {
-            dst[out_bytes] = src[tail_base + 10]; // dma_el[2].sample1 (y1)
-            out_bytes += 1;
-            if out_bytes < dst.len() {
-                dst[out_bytes] = if rem >= 4 {
+        if rem >= 3 && written < dst.len() {
+            dst[written] = src[tail_base + 10]; // dma_el[2].sample1 (y1)
+            written += 1;
+            if written < dst.len() {
+                dst[written] = if rem >= 4 {
                     src[tail_base + 14] // dma_el[3].sample1 (v)
                 } else {
                     src[tail_base + 8] // dma_el[2].sample2 (v)
                 };
-                out_bytes += 1;
+                written += 1;
             }
         }
-        if rem >= 5 && out_bytes < dst.len() {
-            dst[out_bytes] = src[tail_base + 18]; // dma_el[4].sample1 (y0)
-            out_bytes += 1;
-            if rem >= 6 && out_bytes < dst.len() {
-                dst[out_bytes] = src[tail_base + 22]; // dma_el[5].sample1 (u)
-                out_bytes += 1;
+        if rem >= 5 && written < dst.len() {
+            dst[written] = src[tail_base + 18]; // dma_el[4].sample1 (y0)
+            written += 1;
+            if rem >= 6 && written < dst.len() {
+                dst[written] = src[tail_base + 22]; // dma_el[5].sample1 (u)
+                written += 1;
             }
-            if rem >= 7 && out_bytes < dst.len() {
-                dst[out_bytes] = src[tail_base + 26]; // dma_el[6].sample1 (y1)
-                out_bytes += 1;
-                if out_bytes < dst.len() {
-                    dst[out_bytes] = if rem >= 8 {
+            if rem >= 7 && written < dst.len() {
+                dst[written] = src[tail_base + 26]; // dma_el[6].sample1 (y1)
+                written += 1;
+                if written < dst.len() {
+                    dst[written] = if rem >= 8 {
                         src[tail_base + 30] // dma_el[7].sample1 (v)
                     } else {
                         src[tail_base + 24] // dma_el[6].sample2 (v)
                     };
-                    out_bytes += 1;
+                    written += 1;
                 }
             }
         }
     }
 
-    out_bytes
+    written
 }
 
 /// Returns `true` if the sensor outputs native 1-byte Y8 in

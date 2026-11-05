@@ -21,8 +21,17 @@ pub trait SccbBus {
         val: u8,
         mask: u8,
     ) -> Result<(), CameraError> {
+        if mask == 0 {
+            return Ok(());
+        }
+        if mask == 0xFF {
+            return self.write_reg8(slv_addr, reg, val);
+        }
         let current = self.read_reg8(slv_addr, reg)?;
         let next = (current & !mask) | (val & mask);
+        if next == current {
+            return Ok(());
+        }
         self.write_reg8(slv_addr, reg, next)
     }
 
@@ -40,8 +49,17 @@ pub trait SccbBus {
         val: u8,
         mask: u8,
     ) -> Result<(), CameraError> {
+        if mask == 0 {
+            return Ok(());
+        }
+        if mask == 0xFF {
+            return self.write_reg16(slv_addr, reg, val);
+        }
         let current = self.read_reg16(slv_addr, reg)?;
         let next = (current & !mask) | (val & mask);
+        if next == current {
+            return Ok(());
+        }
         self.write_reg16(slv_addr, reg, next)
     }
 
@@ -66,6 +84,28 @@ pub trait SccbBus {
         self.write_reg16(slv_addr, next_reg, (data & 0xFF) as u8)
     }
 
+    /// Writes multiple 8-bit register address/value pairs in sequence.
+    fn write_reg8_bulk(&mut self, addr: u8, pairs: &[(u8, u8)]) -> Result<(), CameraError> {
+        if addr == 0 || addr >= 0x80 {
+            return Err(CameraError::InvalidArg);
+        }
+        for &(reg, data) in pairs {
+            self.write_reg8(addr, reg, data)?;
+        }
+        Ok(())
+    }
+
+    /// Writes multiple 16-bit register address/value pairs in sequence.
+    fn write_reg16_bulk(&mut self, addr: u8, pairs: &[(u16, u8)]) -> Result<(), CameraError> {
+        if addr == 0 || addr >= 0x80 {
+            return Err(CameraError::InvalidArg);
+        }
+        for &(reg, data) in pairs {
+            self.write_reg16(addr, reg, data)?;
+        }
+        Ok(())
+    }
+
     /// Probes whether a device responds at the 7-bit `slv_addr`.
     fn probe(&mut self, slv_addr: u8) -> Result<(), CameraError> {
         if slv_addr == 0 || slv_addr >= 0x80 {
@@ -77,4 +117,132 @@ pub trait SccbBus {
 
     /// Delays execution for `ms` milliseconds.
     fn delay_ms(&mut self, ms: u32);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct SpyBus {
+        reads: usize,
+        writes: usize,
+        reg_val: u8,
+    }
+
+    impl SccbBus for SpyBus {
+        fn read_reg8(&mut self, _slv_addr: u8, _reg: u8) -> Result<u8, CameraError> {
+            self.reads += 1;
+            Ok(self.reg_val)
+        }
+        fn write_reg8(&mut self, _slv_addr: u8, _reg: u8, data: u8) -> Result<(), CameraError> {
+            self.writes += 1;
+            self.reg_val = data;
+            Ok(())
+        }
+        fn read_reg16(&mut self, _slv_addr: u8, _reg: u16) -> Result<u8, CameraError> {
+            self.reads += 1;
+            Ok(self.reg_val)
+        }
+        fn write_reg16(&mut self, _slv_addr: u8, _reg: u16, data: u8) -> Result<(), CameraError> {
+            self.writes += 1;
+            self.reg_val = data;
+            Ok(())
+        }
+        fn delay_ms(&mut self, _ms: u32) {}
+    }
+
+    #[test]
+    fn test_write_reg8_mask_fast_paths() {
+        let mut bus = SpyBus {
+            reads: 0,
+            writes: 0,
+            reg_val: 0x55,
+        };
+
+        // mask == 0: fast path (no read, no write)
+        assert_eq!(bus.write_reg8_mask(0x30, 0x10, 0xAA, 0x00), Ok(()));
+        assert_eq!(bus.reads, 0);
+        assert_eq!(bus.writes, 0);
+
+        // mask == 0xFF: direct write without read
+        assert_eq!(bus.write_reg8_mask(0x30, 0x10, 0xAA, 0xFF), Ok(()));
+        assert_eq!(bus.reads, 0);
+        assert_eq!(bus.writes, 1);
+        assert_eq!(bus.reg_val, 0xAA);
+
+        // next == current: reads once, no write
+        bus.reads = 0;
+        bus.writes = 0;
+        assert_eq!(bus.write_reg8_mask(0x30, 0x10, 0x0A, 0x0F), Ok(()));
+        assert_eq!(bus.reads, 1);
+        assert_eq!(bus.writes, 0);
+
+        // modified bits: reads once, writes once
+        bus.reads = 0;
+        bus.writes = 0;
+        assert_eq!(bus.write_reg8_mask(0x30, 0x10, 0x05, 0x0F), Ok(()));
+        assert_eq!(bus.reads, 1);
+        assert_eq!(bus.writes, 1);
+        assert_eq!(bus.reg_val, 0xA5);
+    }
+
+    #[test]
+    fn test_write_reg16_mask_fast_paths() {
+        let mut bus = SpyBus {
+            reads: 0,
+            writes: 0,
+            reg_val: 0x55,
+        };
+
+        // mask == 0: fast path (no read, no write)
+        assert_eq!(bus.write_reg16_mask(0x30, 0x1000, 0xAA, 0x00), Ok(()));
+        assert_eq!(bus.reads, 0);
+        assert_eq!(bus.writes, 0);
+
+        // mask == 0xFF: direct write without read
+        assert_eq!(bus.write_reg16_mask(0x30, 0x1000, 0xAA, 0xFF), Ok(()));
+        assert_eq!(bus.reads, 0);
+        assert_eq!(bus.writes, 1);
+        assert_eq!(bus.reg_val, 0xAA);
+
+        // next == current: reads once, no write
+        bus.reads = 0;
+        bus.writes = 0;
+        assert_eq!(bus.write_reg16_mask(0x30, 0x1000, 0x0A, 0x0F), Ok(()));
+        assert_eq!(bus.reads, 1);
+        assert_eq!(bus.writes, 0);
+
+        // modified bits: reads once, writes once
+        bus.reads = 0;
+        bus.writes = 0;
+        assert_eq!(bus.write_reg16_mask(0x30, 0x1000, 0x05, 0x0F), Ok(()));
+        assert_eq!(bus.reads, 1);
+        assert_eq!(bus.writes, 1);
+        assert_eq!(bus.reg_val, 0xA5);
+    }
+
+    #[test]
+    fn test_bulk_writes() {
+        let mut bus = SpyBus {
+            reads: 0,
+            writes: 0,
+            reg_val: 0,
+        };
+        let pairs8 = [(0x01, 0x10), (0x02, 0x20), (0x03, 0x30)];
+        assert_eq!(bus.write_reg8_bulk(0x30, &pairs8), Ok(()));
+        assert_eq!(bus.writes, 3);
+
+        let pairs16 = [(0x1001, 0x10), (0x1002, 0x20)];
+        assert_eq!(bus.write_reg16_bulk(0x30, &pairs16), Ok(()));
+        assert_eq!(bus.writes, 5);
+
+        assert_eq!(
+            bus.write_reg8_bulk(0x00, &pairs8),
+            Err(CameraError::InvalidArg)
+        );
+        assert_eq!(
+            bus.write_reg16_bulk(0x80, &pairs16),
+            Err(CameraError::InvalidArg)
+        );
+    }
 }

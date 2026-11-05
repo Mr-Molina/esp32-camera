@@ -13,6 +13,11 @@ use crate::{
 
 pub const SYSTEM_CTROL0: u16 = 0x3008;
 pub const DRIVE_CAPABILITY: u16 = 0x302C;
+pub const SC_PLL_CONTRL0: u16 = 0x3034;
+pub const SC_PLL_CONTRL1: u16 = 0x3035;
+pub const SC_PLL_CONTRL2: u16 = 0x3036;
+pub const SC_PLL_CONTRL3: u16 = 0x3037;
+pub const SC_PLL_SYS: u16 = 0x3039;
 pub const SC_PLLS_CTRL0: u16 = 0x303A;
 pub const SC_PLLS_CTRL1: u16 = 0x303B;
 pub const SC_PLLS_CTRL2: u16 = 0x303C;
@@ -1152,13 +1157,13 @@ impl Ov5640 {
         if multiplier > 127 {
             multiplier &= 0xFE;
         }
-        bus.write_reg16(self.slv_addr, 0x3039, if bypass { 0x80 } else { 0x00 })?;
-        bus.write_reg16(self.slv_addr, 0x3034, 0x1A)?;
-        bus.write_reg16(self.slv_addr, 0x3035, 0x01 | ((sys_div & 0x0F) << 4))?;
-        bus.write_reg16(self.slv_addr, 0x3036, multiplier)?;
+        bus.write_reg16(self.slv_addr, SC_PLL_SYS, if bypass { 0x80 } else { 0x00 })?;
+        bus.write_reg16(self.slv_addr, SC_PLL_CONTRL0, 0x1A)?;
+        bus.write_reg16(self.slv_addr, SC_PLL_CONTRL1, 0x01 | ((sys_div & 0x0F) << 4))?;
+        bus.write_reg16(self.slv_addr, SC_PLL_CONTRL2, multiplier)?;
         bus.write_reg16(
             self.slv_addr,
-            0x3037,
+            SC_PLL_CONTRL3,
             (pre_div & 0x0F) | if root_2x { 0x10 } else { 0x00 },
         )?;
         bus.write_reg16(self.slv_addr, 0x3108, ((pclk_root_div & 0x03) << 4) | 0x06)?;
@@ -1538,10 +1543,15 @@ impl<B: SccbBus> CameraSensor<B> for Ov5640 {
     }
 
     fn set_awb_gain(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        let old_mode = self.status.wb_mode;
-        let mode = if enable { old_mode as i32 } else { 0 };
-        self.set_wb_mode(bus, mode)?;
-        self.status.wb_mode = old_mode;
+        let val = if enable {
+            u8::from(self.status.wb_mode != 0)
+        } else {
+            0x01
+        };
+        bus.write_reg16(self.slv_addr, 0x3406, val)?;
+        if enable && self.status.wb_mode != 0 {
+            self.set_wb_mode(bus, self.status.wb_mode as i32)?;
+        }
         self.status.awb_gain = u8::from(enable);
         Ok(())
     }
@@ -1795,7 +1805,11 @@ impl<B: SccbBus> CameraSensor<B> for Ov5640 {
         if xclk <= 0 {
             return Err(CameraError::InvalidArg);
         }
-        self.xclk_freq_hz = (xclk as u32).saturating_mul(1_000_000);
+        let xclk_freq_hz = (xclk as u32).saturating_mul(1_000_000);
+        if !(6_000_000..=27_000_000).contains(&xclk_freq_hz) {
+            return Err(CameraError::InvalidArg);
+        }
+        self.xclk_freq_hz = xclk_freq_hz;
         Ok(())
     }
 }

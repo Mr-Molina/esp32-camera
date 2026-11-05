@@ -104,6 +104,25 @@ pub const fn active_ota_token() -> &'static str {
 /// tests compile cleanly without environment requirements.
 pub const OTA_TOKEN: &str = active_ota_token();
 
+/// Returns `true` if the active OTA token matches the factory default
+/// (`SEC-171`).
+#[inline]
+pub const fn is_using_default_ota_token() -> bool {
+    let active = active_ota_token().as_bytes();
+    let default = DEFAULT_OTA_TOKEN.as_bytes();
+    if active.len() != default.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < active.len() {
+        if active[i] != default[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 const _: () = assert!(HTTP_PORT != STREAM_PORT);
 const _: () = assert!(JPEG_QUALITY >= 1 && JPEG_QUALITY <= 63);
 const _: () = assert!(!OTA_TOKEN.is_empty());
@@ -419,7 +438,8 @@ impl StaticIpConfig {
         prefix_len: 24,
     };
 
-    /// Returns `true` if the static IP configuration is structurally valid.
+    /// Returns `true` if the static IP configuration is structurally valid
+    /// (`LOGIC-171`).
     #[inline]
     pub const fn is_valid(&self) -> bool {
         self.prefix_len > 0
@@ -429,6 +449,9 @@ impl StaticIpConfig {
                 || self.gateway.0[1] != 0
                 || self.gateway.0[2] != 0
                 || self.gateway.0[3] != 0)
+            && self.ip.to_u32_be() != self.gateway.to_u32_be()
+            && (self.ip.to_u32_be() & self.netmask.to_u32_be())
+                == (self.gateway.to_u32_be() & self.netmask.to_u32_be())
     }
 }
 
@@ -655,6 +678,58 @@ impl KlipperCamConfig {
         cfg.ota_token = active_ota_token();
         cfg
     }
+
+    /// Applies optional configuration overrides loaded from NVS (`LOGIC-172`).
+    #[inline]
+    pub fn with_nvs_overrides(mut self, overrides: NvsConfigOverrides<'static>) -> Self {
+        if let Some(ssid) = overrides.wifi_ssid {
+            self.network.wifi_ssid = ssid;
+        }
+        if let Some(pass) = overrides.wifi_password {
+            self.network.wifi_password = pass;
+        }
+        if let Some(token) = overrides.ota_token {
+            self.ota_token = token;
+        }
+        if let Some(vflip) = overrides.vflip {
+            self.vflip = vflip;
+        }
+        if let Some(hmirror) = overrides.hmirror {
+            self.hmirror = hmirror;
+        }
+        if let Some(quality) = overrides.quality {
+            self.quality = quality;
+        }
+        if let Some(frame_size) = overrides.frame_size {
+            self.frame_size = frame_size;
+        }
+        if let Some(static_ip) = overrides.static_ip {
+            self.network.static_ip = static_ip;
+        }
+        self
+    }
+}
+
+/// Optional configuration overrides retrieved from non-volatile storage
+/// (`LOGIC-172`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NvsConfigOverrides<'a> {
+    /// Optional Wi-Fi SSID override.
+    pub wifi_ssid: Option<&'a str>,
+    /// Optional Wi-Fi password override.
+    pub wifi_password: Option<&'a str>,
+    /// Optional OTA authentication token override.
+    pub ota_token: Option<&'a str>,
+    /// Optional vertical flip override.
+    pub vflip: Option<bool>,
+    /// Optional horizontal mirror override.
+    pub hmirror: Option<bool>,
+    /// Optional JPEG compression quality override (`1..=63`).
+    pub quality: Option<u8>,
+    /// Optional frame size override.
+    pub frame_size: Option<FrameSize>,
+    /// Optional static IP configuration override.
+    pub static_ip: Option<StaticIpConfig>,
 }
 
 impl Default for KlipperCamConfig {
@@ -766,8 +841,32 @@ mod tests {
         let cfg = KlipperCamConfig::default();
         assert!(cfg.is_valid());
         assert!(cfg.is_default_ota_token());
+        assert!(is_using_default_ota_token());
         assert_eq!(cfg.http_port(), 80);
         assert_eq!(cfg.static_ip().prefix_len, 24);
+
+        // LOGIC-171: IP and Gateway cannot be identical or on different subnets
+        let mut bad_same_ip = static_cfg;
+        bad_same_ip.ip = bad_same_ip.gateway;
+        assert!(!bad_same_ip.is_valid());
+
+        let mut bad_diff_subnet = static_cfg;
+        bad_diff_subnet.gateway = Ipv4Addr::new(10, 0, 0, 1);
+        assert!(!bad_diff_subnet.is_valid());
+
+        // LOGIC-172: NvsConfigOverrides application
+        let overrides = NvsConfigOverrides {
+            vflip: Some(true),
+            hmirror: Some(true),
+            quality: Some(20),
+            frame_size: Some(FrameSize::Vga),
+            ..Default::default()
+        };
+        let overridden = cfg.with_nvs_overrides(overrides);
+        assert!(overridden.vflip);
+        assert!(overridden.hmirror);
+        assert_eq!(overridden.quality, 20);
+        assert_eq!(overridden.frame_size, FrameSize::Vga);
 
         let env_cfg = KlipperCamConfig::from_build_env();
         assert!(env_cfg.is_valid());

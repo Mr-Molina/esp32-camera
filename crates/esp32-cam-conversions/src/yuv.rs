@@ -6,6 +6,7 @@
 use esp32_cam_types::CameraError;
 
 #[derive(Clone, Copy)]
+#[repr(C, align(16))]
 struct YuvTableRow {
     v_y: i16,
     v_vr: i16,
@@ -1829,6 +1830,27 @@ pub fn yuv2rgb(y: u8, u: u8, v: u8) -> (u8, u8, u8) {
     )
 }
 
+/// Converts a macropixel pair `(y0, u, y1, v)` to two RGB `(r, g, b)` pixels
+/// sharing chroma `u` and `v`, fetching table rows for `u` and `v` only once.
+#[inline]
+pub fn yuv422_pair_to_rgb(y0: u8, u: u8, y1: u8, v: u8) -> ((u8, u8, u8), (u8, u8, u8)) {
+    let u_row = YUV_TABLE[u as usize];
+    let v_row = YUV_TABLE[v as usize];
+    let uv_g = u_row.v_vg + v_row.v_ug;
+
+    let y0_row = YUV_TABLE[y0 as usize];
+    let r0 = (y0_row.v_y + v_row.v_vr).clamp(0, 255) as u8;
+    let g0 = (y0_row.v_y + uv_g).clamp(0, 255) as u8;
+    let b0 = (y0_row.v_y + u_row.v_ub).clamp(0, 255) as u8;
+
+    let y1_row = YUV_TABLE[y1 as usize];
+    let r1 = (y1_row.v_y + v_row.v_vr).clamp(0, 255) as u8;
+    let g1 = (y1_row.v_y + uv_g).clamp(0, 255) as u8;
+    let b1 = (y1_row.v_y + u_row.v_ub).clamp(0, 255) as u8;
+
+    ((r0, g0, b0), (r1, g1, b1))
+}
+
 #[inline]
 const fn clamp_u8(v: i32) -> u8 {
     if v < 0 {
@@ -1861,15 +1883,30 @@ const fn unpack_rgb565_be(hb: u8, lb: u8) -> (u8, u8, u8) {
     (r, g, b)
 }
 
+/// Unpacks a big-endian RGB565 pixel (`[b0, b1]`) into full-range 8-bit RGB888
+/// `(r, g, b)` using bit-replication (`LOGIC-063`).
+///
+/// Maps 5-bit channels `[0..31]` to `[0..255]` via `(v << 3) | (v >> 2)` and
+/// 6-bit green `[0..63]` to `[0..255]` via `(v << 2) | (v >> 4)`.
 #[inline]
-const fn pack_rgb565(r: u8, g: u8, b: u8, byte_swap: bool) -> [u8; 2] {
+pub const fn unpack_rgb565_be_full(b0: u8, b1: u8) -> (u8, u8, u8) {
+    let r5 = b0 >> 3;
+    let r = (r5 << 3) | (r5 >> 2);
+
+    let g6 = ((b0 & 0x07) << 3) | (b1 >> 5);
+    let g = (g6 << 2) | (g6 >> 4);
+
+    let b5 = b1 & 0x1F;
+    let b = (b5 << 3) | (b5 >> 2);
+
+    (r, g, b)
+}
+
+#[inline]
+const fn pack_rgb565_raw(r: u8, g: u8, b: u8) -> (u8, u8) {
     let hb = (r & 0xF8) | (g >> 5);
     let lb = ((g & 0x1C) << 3) | (b >> 3);
-    if byte_swap {
-        [lb, hb]
-    } else {
-        [hb, lb]
-    }
+    (hb, lb)
 }
 
 fn checked_pixel_count(width: u16, height: u16, max_bpp: u32) -> Result<usize, CameraError> {
@@ -1884,6 +1921,43 @@ fn checked_pixel_count(width: u16, height: u16, max_bpp: u32) -> Result<usize, C
         return Err(CameraError::Overflow);
     }
     usize::try_from(pixels32).map_err(|_| CameraError::Overflow)
+}
+
+/// Converts a packed YUV422 (YUYV: `[Y0, U, Y1, V]`) buffer into
+/// 8-bit grayscale by extracting `Y0` and `Y1` without inner bounds
+/// checks (`LOGIC-061`).
+///
+/// Returns the number of bytes written to `dst` (`width * height`).
+pub fn yuv422_to_grayscale(
+    src: &[u8],
+    width: u16,
+    height: u16,
+    dst: &mut [u8],
+) -> Result<usize, CameraError> {
+    let pixels = checked_pixel_count(width, height, 2)?;
+    if (width & 1) != 0 {
+        return Err(CameraError::InvalidArg);
+    }
+    let src_len = pixels.checked_mul(2).ok_or(CameraError::Overflow)?;
+    let dst_len = pixels;
+    if src.len() < src_len {
+        return Err(CameraError::InvalidArg);
+    }
+    if dst.len() < dst_len {
+        return Err(CameraError::BufferTooSmall);
+    }
+
+    for (chunk, out) in src[..src_len]
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(dst[..dst_len].as_chunks_mut::<2>().0)
+    {
+        out[0] = chunk[0];
+        out[1] = chunk[2];
+    }
+
+    Ok(dst_len)
 }
 
 /// Converts a big-endian RGB565 buffer into packed YUV422
@@ -1908,27 +1982,22 @@ pub fn rgb565_to_yuv422(
         return Err(CameraError::BufferTooSmall);
     }
 
-    let pairs = pixels / 2;
-    for i in 0..pairs {
-        let base = i * 4;
-        let (r0, g0, b0) = unpack_rgb565_be(src[base], src[base + 1]);
-        let (r1, g1, b1) = unpack_rgb565_be(src[base + 2], src[base + 3]);
+    for (chunk, out) in src[..byte_len]
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(dst[..byte_len].as_chunks_mut::<4>().0)
+    {
+        let (r0, g0, b0) = unpack_rgb565_be(chunk[0], chunk[1]);
+        let (r1, g1, b1) = unpack_rgb565_be(chunk[2], chunk[3]);
 
         let (y0, u0, v0) = rgb2yuv(r0, g0, b0);
         let (y1, u1, v1) = rgb2yuv(r1, g1, b1);
 
-        dst[base] = y0;
-        dst[base + 1] = ((u0 as u16 + u1 as u16) / 2) as u8;
-        dst[base + 2] = y1;
-        dst[base + 3] = ((v0 as u16 + v1 as u16) / 2) as u8;
-    }
-
-    if pixels & 1 != 0 {
-        let base = pairs * 4;
-        let (r0, g0, b0) = unpack_rgb565_be(src[base], src[base + 1]);
-        let (y0, u0, _v0) = rgb2yuv(r0, g0, b0);
-        dst[base] = y0;
-        dst[base + 1] = u0;
+        out[0] = y0;
+        out[1] = ((u0 as u16 + u1 as u16) / 2) as u8;
+        out[2] = y1;
+        out[3] = ((v0 as u16 + v1 as u16) / 2) as u8;
     }
 
     Ok(byte_len)
@@ -1958,34 +2027,31 @@ pub fn yuv422_to_rgb565(
         return Err(CameraError::BufferTooSmall);
     }
 
-    let pairs = pixels / 2;
-    for i in 0..pairs {
-        let base = i * 4;
-        let y0 = src[base];
-        let u = src[base + 1];
-        let y1 = src[base + 2];
-        let v = src[base + 3];
+    let src_chunks = src[..byte_len].as_chunks::<4>().0;
+    let dst_chunks = dst[..byte_len].as_chunks_mut::<4>().0;
 
-        let (r0, g0, b0) = yuv2rgb(y0, u, v);
-        let (r1, g1, b1) = yuv2rgb(y1, u, v);
-
-        let p0 = pack_rgb565(r0, g0, b0, byte_swap);
-        let p1 = pack_rgb565(r1, g1, b1, byte_swap);
-
-        dst[base] = p0[0];
-        dst[base + 1] = p0[1];
-        dst[base + 2] = p1[0];
-        dst[base + 3] = p1[1];
-    }
-
-    if pixels & 1 != 0 {
-        let base = pairs * 4;
-        let y0 = src[base];
-        let u = src[base + 1];
-        let (r0, g0, b0) = yuv2rgb(y0, u, 128);
-        let p0 = pack_rgb565(r0, g0, b0, byte_swap);
-        dst[base] = p0[0];
-        dst[base + 1] = p0[1];
+    if byte_swap {
+        for (chunk, out) in src_chunks.iter().zip(dst_chunks.iter_mut()) {
+            let ((r0, g0, b0), (r1, g1, b1)) =
+                yuv422_pair_to_rgb(chunk[0], chunk[1], chunk[2], chunk[3]);
+            let (hb0, lb0) = pack_rgb565_raw(r0, g0, b0);
+            let (hb1, lb1) = pack_rgb565_raw(r1, g1, b1);
+            out[0] = lb0;
+            out[1] = hb0;
+            out[2] = lb1;
+            out[3] = hb1;
+        }
+    } else {
+        for (chunk, out) in src_chunks.iter().zip(dst_chunks.iter_mut()) {
+            let ((r0, g0, b0), (r1, g1, b1)) =
+                yuv422_pair_to_rgb(chunk[0], chunk[1], chunk[2], chunk[3]);
+            let (hb0, lb0) = pack_rgb565_raw(r0, g0, b0);
+            let (hb1, lb1) = pack_rgb565_raw(r1, g1, b1);
+            out[0] = hb0;
+            out[1] = lb0;
+            out[2] = hb1;
+            out[3] = lb1;
+        }
     }
 
     Ok(byte_len)
@@ -2014,35 +2080,20 @@ pub fn yuv422_to_rgb888(
         return Err(CameraError::BufferTooSmall);
     }
 
-    let pairs = pixels / 2;
-    for i in 0..pairs {
-        let s_base = i * 4;
-        let d_base = i * 6;
-        let y0 = src[s_base];
-        let u = src[s_base + 1];
-        let y1 = src[s_base + 2];
-        let v = src[s_base + 3];
-
-        let (r0, g0, b0) = yuv2rgb(y0, u, v);
-        let (r1, g1, b1) = yuv2rgb(y1, u, v);
-
-        dst[d_base] = r0;
-        dst[d_base + 1] = g0;
-        dst[d_base + 2] = b0;
-        dst[d_base + 3] = r1;
-        dst[d_base + 4] = g1;
-        dst[d_base + 5] = b1;
-    }
-
-    if pixels & 1 != 0 {
-        let s_base = pairs * 4;
-        let d_base = pairs * 6;
-        let y0 = src[s_base];
-        let u = src[s_base + 1];
-        let (r0, g0, b0) = yuv2rgb(y0, u, 128);
-        dst[d_base] = r0;
-        dst[d_base + 1] = g0;
-        dst[d_base + 2] = b0;
+    for (chunk, out) in src[..src_len]
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(dst[..dst_len].as_chunks_mut::<6>().0)
+    {
+        let ((r0, g0, b0), (r1, g1, b1)) =
+            yuv422_pair_to_rgb(chunk[0], chunk[1], chunk[2], chunk[3]);
+        out[0] = r0;
+        out[1] = g0;
+        out[2] = b0;
+        out[3] = r1;
+        out[4] = g1;
+        out[5] = b1;
     }
 
     Ok(dst_len)

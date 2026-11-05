@@ -11,78 +11,123 @@ use crate::{
 /// Automatically detects an attached camera sensor by querying each of
 /// the 18 supported sensor models at their canonical SCCB addresses in order.
 pub fn detect_sensor<B: SccbBus>(bus: &mut B) -> Result<(CameraModel, u8, SensorId), CameraError> {
+    macro_rules! probe {
+        ($res:expr, $model:expr, $addr:expr) => {
+            match $res {
+                Ok(id) => return Ok(($model, $addr, id)),
+                Err(CameraError::I2cError) => return Err(CameraError::I2cError),
+                Err(_) => {}
+            }
+        };
+    }
+
     // 1. Ov7725 (0x21)
-    if let Ok(id) = ov7725::Ov7725::detect(bus, CameraSccbAddr::OV7725) {
-        return Ok((CameraModel::Ov7725, CameraSccbAddr::OV7725, id));
-    }
-    // 2. Ov2640 (0x30)
-    if let Ok(id) = ov2640::Ov2640::detect(bus, CameraSccbAddr::OV2640) {
-        return Ok((CameraModel::Ov2640, CameraSccbAddr::OV2640, id));
-    }
-    // 3. Ov3660 (0x3C)
-    if let Ok(id) = ov3660::Ov3660::detect(bus, CameraSccbAddr::OV3660) {
-        return Ok((CameraModel::Ov3660, CameraSccbAddr::OV3660, id));
-    }
-    // 4. Ov3640 (0x3C)
-    if let Ok(id) = ov3640::Ov3640::detect(bus, CameraSccbAddr::OV3640) {
-        return Ok((CameraModel::Ov3640, CameraSccbAddr::OV3640, id));
-    }
-    // 5. Ov5640 (0x3C)
-    if let Ok(id) = ov5640::Ov5640::detect(bus, CameraSccbAddr::OV5640) {
-        return Ok((CameraModel::Ov5640, CameraSccbAddr::OV5640, id));
-    }
-    // 6. Ov7670 (0x21)
-    if let Ok(id) = ov7670::Ov7670::detect(bus, CameraSccbAddr::OV7670) {
-        return Ok((CameraModel::Ov7670, CameraSccbAddr::OV7670, id));
-    }
-    // 7. Nt99141 (0x2A)
-    if let Ok(id) = nt99141::Nt99141::detect(bus, CameraSccbAddr::NT99141) {
-        return Ok((CameraModel::Nt99141, CameraSccbAddr::NT99141, id));
-    }
-    // 8. Gc2145 (0x3C)
-    if let Ok(id) = gc2145::Gc2145::detect(bus, CameraSccbAddr::GC2145) {
-        return Ok((CameraModel::Gc2145, CameraSccbAddr::GC2145, id));
-    }
-    // 9. Gc032a (0x21)
-    if let Ok(id) = gc032a::Gc032a::detect(bus, CameraSccbAddr::GC032A) {
-        return Ok((CameraModel::Gc032a, CameraSccbAddr::GC032A, id));
-    }
-    // 10. Gc0308 (0x21)
-    if let Ok(id) = gc0308::Gc0308::detect(bus, CameraSccbAddr::GC0308) {
-        return Ok((CameraModel::Gc0308, CameraSccbAddr::GC0308, id));
-    }
-    // 11. Bf3005 (0x6E)
-    if let Ok(id) = bf3005::Bf3005::detect(bus, CameraSccbAddr::BF3005) {
-        return Ok((CameraModel::Bf3005, CameraSccbAddr::BF3005, id));
-    }
-    // 12. Bf20a6 (0x6E)
-    if let Ok(id) = bf20a6::Bf20a6::detect(bus, CameraSccbAddr::BF20A6) {
-        return Ok((CameraModel::Bf20a6, CameraSccbAddr::BF20A6, id));
-    }
-    // 13. Sc101Iot (0x68)
-    if let Ok(id) = sc101iot::Sc101Iot::detect(bus, CameraSccbAddr::SC101IOT) {
-        return Ok((CameraModel::Sc101Iot, CameraSccbAddr::SC101IOT, id));
-    }
-    // 14. Sc030Iot (0x68)
-    if let Ok(id) = sc030iot::Sc030Iot::detect(bus, CameraSccbAddr::SC030IOT) {
-        return Ok((CameraModel::Sc030Iot, CameraSccbAddr::SC030IOT, id));
-    }
-    // 15. Sc031Gs (0x30)
-    if let Ok(id) = sc031gs::Sc031Gs::detect(bus, CameraSccbAddr::SC031GS) {
-        return Ok((CameraModel::Sc031Gs, CameraSccbAddr::SC031GS, id));
-    }
-    // 16. MegaCcm (0x1F)
-    if let Ok(id) = mega_ccm::MegaCcm::detect(bus, CameraSccbAddr::MEGA_CCM) {
-        return Ok((CameraModel::MegaCcm, CameraSccbAddr::MEGA_CCM, id));
-    }
-    // 17. Hm1055 (0x24)
-    if let Ok(id) = hm1055::Hm1055::detect(bus, CameraSccbAddr::HM1055) {
-        return Ok((CameraModel::Hm1055, CameraSccbAddr::HM1055, id));
-    }
-    // 18. Hm0360 (0x12)
-    if let Ok(id) = hm0360::Hm0360::detect(bus, CameraSccbAddr::HM0360) {
-        return Ok((CameraModel::Hm0360, CameraSccbAddr::HM0360, id));
-    }
+    probe!(
+        ov7725::Ov7725::detect(bus, CameraSccbAddr::OV7725),
+        CameraModel::Ov7725,
+        CameraSccbAddr::OV7725
+    );
+    // 2. 16-bit SmartSens sensors at 0x30 / 0x68 probed before Ov2640
+    // (which writes bank register 0xFF)
+    probe!(
+        sc031gs::Sc031Gs::detect(bus, CameraSccbAddr::SC031GS),
+        CameraModel::Sc031Gs,
+        CameraSccbAddr::SC031GS
+    );
+    probe!(
+        sc101iot::Sc101Iot::detect(bus, CameraSccbAddr::SC101IOT),
+        CameraModel::Sc101Iot,
+        CameraSccbAddr::SC101IOT
+    );
+    probe!(
+        sc030iot::Sc030Iot::detect(bus, CameraSccbAddr::SC030IOT),
+        CameraModel::Sc030Iot,
+        CameraSccbAddr::SC030IOT
+    );
+    // 3. Ov2640 (0x30)
+    probe!(
+        ov2640::Ov2640::detect(bus, CameraSccbAddr::OV2640),
+        CameraModel::Ov2640,
+        CameraSccbAddr::OV2640
+    );
+    // 4. Ov3660 (0x3C)
+    probe!(
+        ov3660::Ov3660::detect(bus, CameraSccbAddr::OV3660),
+        CameraModel::Ov3660,
+        CameraSccbAddr::OV3660
+    );
+    // 5. Ov3640 (0x3C)
+    probe!(
+        ov3640::Ov3640::detect(bus, CameraSccbAddr::OV3640),
+        CameraModel::Ov3640,
+        CameraSccbAddr::OV3640
+    );
+    // 6. Ov5640 (0x3C)
+    probe!(
+        ov5640::Ov5640::detect(bus, CameraSccbAddr::OV5640),
+        CameraModel::Ov5640,
+        CameraSccbAddr::OV5640
+    );
+    // 7. Ov7670 (0x21)
+    probe!(
+        ov7670::Ov7670::detect(bus, CameraSccbAddr::OV7670),
+        CameraModel::Ov7670,
+        CameraSccbAddr::OV7670
+    );
+    // 8. Nt99141 (0x2A)
+    probe!(
+        nt99141::Nt99141::detect(bus, CameraSccbAddr::NT99141),
+        CameraModel::Nt99141,
+        CameraSccbAddr::NT99141
+    );
+    // 9. Gc2145 (0x3C)
+    probe!(
+        gc2145::Gc2145::detect(bus, CameraSccbAddr::GC2145),
+        CameraModel::Gc2145,
+        CameraSccbAddr::GC2145
+    );
+    // 10. Gc032a (0x21)
+    probe!(
+        gc032a::Gc032a::detect(bus, CameraSccbAddr::GC032A),
+        CameraModel::Gc032a,
+        CameraSccbAddr::GC032A
+    );
+    // 11. Gc0308 (0x21)
+    probe!(
+        gc0308::Gc0308::detect(bus, CameraSccbAddr::GC0308),
+        CameraModel::Gc0308,
+        CameraSccbAddr::GC0308
+    );
+    // 12. Bf3005 (0x6E)
+    probe!(
+        bf3005::Bf3005::detect(bus, CameraSccbAddr::BF3005),
+        CameraModel::Bf3005,
+        CameraSccbAddr::BF3005
+    );
+    // 13. Bf20a6 (0x6E)
+    probe!(
+        bf20a6::Bf20a6::detect(bus, CameraSccbAddr::BF20A6),
+        CameraModel::Bf20a6,
+        CameraSccbAddr::BF20A6
+    );
+    // 14. MegaCcm (0x1F)
+    probe!(
+        mega_ccm::MegaCcm::detect(bus, CameraSccbAddr::MEGA_CCM),
+        CameraModel::MegaCcm,
+        CameraSccbAddr::MEGA_CCM
+    );
+    // 15. Hm1055 (0x24)
+    probe!(
+        hm1055::Hm1055::detect(bus, CameraSccbAddr::HM1055),
+        CameraModel::Hm1055,
+        CameraSccbAddr::HM1055
+    );
+    // 16. Hm0360 (0x12)
+    probe!(
+        hm0360::Hm0360::detect(bus, CameraSccbAddr::HM0360),
+        CameraModel::Hm0360,
+        CameraSccbAddr::HM0360
+    );
 
     Err(CameraError::NotDetected)
 }
@@ -92,6 +137,30 @@ mod tests {
     use super::*;
     use crate::traits::{set_reg_bits16, set_reg_bits8};
     use esp32_cam_sccb::MockSccbBus;
+
+    struct FaultyI2cBus;
+
+    impl SccbBus for FaultyI2cBus {
+        fn read_reg8(&mut self, _addr: u8, _reg: u8) -> Result<u8, CameraError> {
+            Err(CameraError::I2cError)
+        }
+        fn write_reg8(&mut self, _addr: u8, _reg: u8, _val: u8) -> Result<(), CameraError> {
+            Err(CameraError::I2cError)
+        }
+        fn read_reg16(&mut self, _addr: u8, _reg: u16) -> Result<u8, CameraError> {
+            Err(CameraError::I2cError)
+        }
+        fn write_reg16(&mut self, _addr: u8, _reg: u16, _val: u8) -> Result<(), CameraError> {
+            Err(CameraError::I2cError)
+        }
+        fn delay_ms(&mut self, _ms: u32) {}
+    }
+
+    #[test]
+    fn test_detect_sensor_i2c_error_early_abort() {
+        let mut bus = FaultyI2cBus;
+        assert_eq!(detect_sensor(&mut bus), Err(CameraError::I2cError));
+    }
 
     #[test]
     fn test_detect_sensor_and_set_reg_bits() {

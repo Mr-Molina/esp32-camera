@@ -42,6 +42,7 @@ pub const CKCFG3: u16 = 0x002B;
 pub const PLL2: u16 = 0x002C;
 
 pub const BLCTGT: u16 = 0x0040;
+pub const AEC_PK_ENABLE: u16 = 0x0048;
 pub const BLCTGT2: u16 = 0x0053;
 
 pub const VAWINSTARTH: u16 = 0x0078;
@@ -802,6 +803,9 @@ fn set_reg_bits<B: SccbBus>(
     let c_value = bus.read_reg16(slv_addr, reg)?;
     let shifted_mask = mask << offset;
     let new_value = (c_value & !shifted_mask) | ((value & mask) << offset);
+    if new_value == c_value {
+        return Ok(());
+    }
     bus.write_reg16(slv_addr, reg, new_value)
 }
 
@@ -1036,7 +1040,7 @@ impl<B: SccbBus> CameraSensor<B> for Hm1055 {
         let portctrl = match pixformat {
             PixelFormat::Raw => 0x20,
             PixelFormat::Yuv422 => 0x30,
-            PixelFormat::Rgb565 | PixelFormat::Rgb888 => 0x40,
+            PixelFormat::Rgb565 => 0x40,
             PixelFormat::Rgb555 => 0x50,
             PixelFormat::Rgb444 => 0x60,
             _ => return Err(CameraError::NotSupported),
@@ -1048,29 +1052,28 @@ impl<B: SccbBus> CameraSensor<B> for Hm1055 {
     }
 
     fn set_framesize(&mut self, bus: &mut B, framesize: FrameSize) -> Result<(), CameraError> {
-        if framesize > FrameSize::Hd {
-            return Err(CameraError::FailedToSetFrameSize);
-        }
-        self.status.framesize = framesize;
+        let framesize_regs: &[Reg16] = match framesize {
+            FrameSize::Qqvga => SENSOR_FRAMESIZE_QQVGA,
+            FrameSize::Qcif => SENSOR_FRAMESIZE_QCIF,
+            FrameSize::Size240x240 => SENSOR_FRAMESIZE_240X240,
+            FrameSize::Qvga => SENSOR_FRAMESIZE_QVGA,
+            FrameSize::Cif => SENSOR_FRAMESIZE_CIF,
+            FrameSize::Vga => SENSOR_FRAMESIZE_VGA,
+            FrameSize::Svga => SENSOR_FRAMESIZE_SVGA,
+            FrameSize::Hd => SENSOR_FRAMESIZE_HD,
+            _ => return Err(CameraError::FailedToSetFrameSize),
+        };
         write_reg_list(bus, self.slv_addr, SENSOR_DEFAULT_REGS)?;
-        match framesize {
-            FrameSize::Qqvga => write_reg_list(bus, self.slv_addr, SENSOR_FRAMESIZE_QQVGA)?,
-            FrameSize::Qcif => write_reg_list(bus, self.slv_addr, SENSOR_FRAMESIZE_QCIF)?,
-            FrameSize::Size240x240 => write_reg_list(bus, self.slv_addr, SENSOR_FRAMESIZE_240X240)?,
-            FrameSize::Qvga => write_reg_list(bus, self.slv_addr, SENSOR_FRAMESIZE_QVGA)?,
-            FrameSize::Cif => write_reg_list(bus, self.slv_addr, SENSOR_FRAMESIZE_CIF)?,
-            FrameSize::Vga => write_reg_list(bus, self.slv_addr, SENSOR_FRAMESIZE_VGA)?,
-            FrameSize::Svga => write_reg_list(bus, self.slv_addr, SENSOR_FRAMESIZE_SVGA)?,
-            FrameSize::Hd => {
-                write_reg_list(bus, self.slv_addr, SENSOR_FRAMESIZE_HD)?;
-                self.set_pll(bus, 0, 288, 1, 0, 0, 0, 1, 16)?;
-            }
-            _ => write_reg_list(bus, self.slv_addr, SENSOR_FRAMESIZE_VGA)?,
+        write_reg_list(bus, self.slv_addr, framesize_regs)?;
+        if framesize == FrameSize::Hd {
+            self.set_pll(bus, 0, 288, 1, 0, 0, 0, 1, 16)?;
         }
         let pixformat = self.pixformat;
         self.set_pixformat(bus, pixformat)?;
         bus.write_reg16(self.slv_addr, CMU, 0x01)?;
-        bus.write_reg16(self.slv_addr, TGRDCFG, 0x01)
+        bus.write_reg16(self.slv_addr, TGRDCFG, 0x01)?;
+        self.status.framesize = framesize;
+        Ok(())
     }
 
     fn set_contrast(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
@@ -1087,6 +1090,9 @@ impl<B: SccbBus> CameraSensor<B> for Hm1055 {
     }
 
     fn set_brightness(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
+        if !(-3..=3).contains(&level) {
+            return Err(CameraError::InvalidArg);
+        }
         let ispctrl5 = bus.read_reg16(self.slv_addr, ISPCTRL5)? | 0x40;
         let brightness = match level {
             3 => 0xFF,
@@ -1136,7 +1142,9 @@ impl<B: SccbBus> CameraSensor<B> for Hm1055 {
         Ok(())
     }
 
-    fn set_colorbar(&mut self, _bus: &mut B, enable: bool) -> Result<(), CameraError> {
+    fn set_colorbar(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
+        write_reg_bits(bus, self.slv_addr, TESTIMG, 0x01, enable)?;
+        bus.write_reg16(self.slv_addr, CMU, 0x01)?;
         self.status.colorbar = u8::from(enable);
         Ok(())
     }
@@ -1148,7 +1156,9 @@ impl<B: SccbBus> CameraSensor<B> for Hm1055 {
         Ok(())
     }
 
-    fn set_gain_ctrl(&mut self, _bus: &mut B, enable: bool) -> Result<(), CameraError> {
+    fn set_gain_ctrl(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
+        write_reg_bits(bus, self.slv_addr, AEC_PK_ENABLE, 0x02, enable)?;
+        bus.write_reg16(self.slv_addr, CMU, 0x01)?;
         self.status.agc = u8::from(enable);
         Ok(())
     }

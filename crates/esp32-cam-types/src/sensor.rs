@@ -92,14 +92,14 @@ impl CameraPid {
 impl PartialEq<u16> for CameraPid {
     #[inline]
     fn eq(&self, other: &u16) -> bool {
-        (*self as u16) == *other
+        Self::from_u16(*other) == Some(*self)
     }
 }
 
 impl PartialEq<CameraPid> for u16 {
     #[inline]
     fn eq(&self, other: &CameraPid) -> bool {
-        *self == (*other as u16)
+        CameraPid::from_u16(*self) == Some(*other)
     }
 }
 
@@ -159,6 +159,32 @@ impl CameraModel {
     #[inline]
     pub const fn info(self) -> &'static SensorInfo {
         &CAMERA_SENSOR_INFO[self as usize]
+    }
+
+    /// Converts a raw model index (`0..18`) into a [`CameraModel`].
+    #[inline]
+    pub const fn from_u8(val: u8) -> Option<Self> {
+        match val {
+            0 => Some(Self::Ov7725),
+            1 => Some(Self::Ov2640),
+            2 => Some(Self::Ov3660),
+            3 => Some(Self::Ov3640),
+            4 => Some(Self::Ov5640),
+            5 => Some(Self::Ov7670),
+            6 => Some(Self::Nt99141),
+            7 => Some(Self::Gc2145),
+            8 => Some(Self::Gc032a),
+            9 => Some(Self::Gc0308),
+            10 => Some(Self::Bf3005),
+            11 => Some(Self::Bf20a6),
+            12 => Some(Self::Sc101Iot),
+            13 => Some(Self::Sc030Iot),
+            14 => Some(Self::Sc031Gs),
+            15 => Some(Self::MegaCcm),
+            16 => Some(Self::Hm1055),
+            17 => Some(Self::Hm0360),
+            _ => None,
+        }
     }
 }
 
@@ -375,7 +401,11 @@ pub const CAMERA_SENSOR_INFO: [SensorInfo; 18] = [
     },
 ];
 
+/// Alias for [`CAMERA_SENSOR_INFO`].
+pub const SENSOR_INFO: [SensorInfo; 18] = CAMERA_SENSOR_INFO;
+
 /// Sensor hardware identification registers (`sensor_id_t` in `sensor.h`).
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub struct SensorId {
     pub midh: u8,
@@ -385,14 +415,44 @@ pub struct SensorId {
 }
 
 /// Looks up [`SensorInfo`] by 16-bit sensor PID (`esp_camera_sensor_get_info`).
-pub fn esp_camera_sensor_get_info(id: &SensorId) -> Option<&'static SensorInfo> {
-    let pid = CameraPid::from_u16(id.pid)?;
-    CAMERA_SENSOR_INFO.iter().find(|info| info.pid == pid)
+pub const fn esp_camera_sensor_get_info(id: &SensorId) -> Option<&'static SensorInfo> {
+    let target_pid = match CameraPid::from_u16(id.pid) {
+        Some(pid) => pid,
+        None => return None,
+    };
+    let mut i = 0;
+    while i < SENSOR_INFO.len() {
+        if SENSOR_INFO[i].pid as u16 == target_pid as u16 {
+            return Some(&CAMERA_SENSOR_INFO[i]);
+        }
+        i += 1;
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_logic_091_ov3640_revision_equality() {
+        assert!(CameraPid::OV3640 == 0x364C);
+        assert!(0x364C == CameraPid::OV3640);
+        assert!(CameraPid::OV3640 == 0x3640);
+        assert!(CameraPid::OV3640 != 0x3650);
+    }
+
+    #[test]
+    fn test_camera_model_from_u8() {
+        assert_eq!(CameraModel::from_u8(0), Some(CameraModel::Ov7725));
+        assert_eq!(CameraModel::from_u8(1), Some(CameraModel::Ov2640));
+        assert_eq!(CameraModel::from_u8(17), Some(CameraModel::Hm0360));
+        assert_eq!(CameraModel::from_u8(18), None);
+        assert_eq!(CameraModel::from_u8(255), None);
+
+        const MODEL_OV2640: Option<CameraModel> = CameraModel::from_u8(1);
+        assert_eq!(MODEL_OV2640, Some(CameraModel::Ov2640));
+    }
 
     #[test]
     fn test_camera_sensor_info_table() {

@@ -268,45 +268,63 @@ pub const fn verify_partition_table_integrity() -> bool {
     true
 }
 
-/// Constant-time OTA authentication token comparator (`FW-010` / `APP-002`).
+/// Constant-time OTA authentication token comparator (`FW-010` / `APP-002` /
+/// `SEC-170`).
 ///
 /// Uses a bitwise XOR accumulator across all bytes of `expected` without
 /// branching early on byte mismatches or length mismatches, preventing
 /// timing side-channel recovery of `X-OTA-Token` over Wi-Fi.
 ///
+/// Uses branchless byte selection inside the comparison loop (`SEC-170`).
 /// Rejects empty `provided` or empty `expected` tokens unconditionally.
 #[inline]
 pub const fn verify_ota_token(provided: &[u8], expected: &[u8]) -> bool {
-    if expected.is_empty() {
+    if expected.is_empty() || provided.is_empty() {
         return false;
     }
     let mut diff: usize = provided.len() ^ expected.len();
     let mut i: usize = 0;
     while i < expected.len() {
-        let p_byte = if i < provided.len() { provided[i] } else { 0 };
+        let mask = ((i < provided.len()) as usize).wrapping_neg();
+        let safe_idx = i & mask;
+        let p_byte = provided[safe_idx] & (mask as u8);
         diff |= (p_byte ^ expected[i]) as usize;
         i += 1;
     }
-    diff == 0 && !provided.is_empty()
+    diff == 0
 }
+
+/// 16-entry nibble lookup table for IEEE 802.3 CRC-32 (polynomial
+/// `0xEDB8_8320`, `PERF-170`).
+pub const CRC32_NIBBLE_LUT: [u32; 16] = [
+    0x0000_0000,
+    0x1DB7_1064,
+    0x3B6E_20C8,
+    0x26D9_30AC,
+    0x76DC_4190,
+    0x6B6B_51F4,
+    0x4DB2_6158,
+    0x5005_713C,
+    0xEDB8_8320,
+    0xF00F_9344,
+    0xD6D6_A3E8,
+    0xCB61_B38C,
+    0x9B64_C2B0,
+    0x86D3_D2D4,
+    0xA00A_E278,
+    0xBDBD_F21C,
+];
 
 /// Computes the standard IEEE 802.3 CRC-32 checksum over `data`
 /// (polynomial `0xEDB88320`, initial value `0xFFFFFFFF`, final XOR
-/// `0xFFFFFFFF`).
+/// `0xFFFFFFFF`, `PERF-170`).
 pub const fn crc32_ieee(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
     let mut i: usize = 0;
     while i < data.len() {
         crc ^= data[i] as u32;
-        let mut bit: u8 = 0;
-        while bit < 8 {
-            if (crc & 1) != 0 {
-                crc = (crc >> 1) ^ 0xEDB8_8320;
-            } else {
-                crc >>= 1;
-            }
-            bit += 1;
-        }
+        crc = (crc >> 4) ^ CRC32_NIBBLE_LUT[(crc & 0x0F) as usize];
+        crc = (crc >> 4) ^ CRC32_NIBBLE_LUT[(crc & 0x0F) as usize];
         i += 1;
     }
     !crc
@@ -314,21 +332,14 @@ pub const fn crc32_ieee(data: &[u8]) -> u32 {
 
 /// Computes the ESP-IDF / ESP32 ROM `esp_rom_crc32_le(u32::MAX, data)`
 /// checksum used by `bootloader_common_ota_select_crc` (`init = 0x0000_0000`,
-/// reflected polynomial `0xEDB8_8320`, final XOR `0xFFFF_FFFF`).
+/// reflected polynomial `0xEDB8_8320`, final XOR `0xFFFF_FFFF`, `PERF-170`).
 pub const fn crc32_esp_ota(data: &[u8]) -> u32 {
     let mut crc: u32 = 0x0000_0000;
     let mut i: usize = 0;
     while i < data.len() {
         crc ^= data[i] as u32;
-        let mut bit: u8 = 0;
-        while bit < 8 {
-            if (crc & 1) != 0 {
-                crc = (crc >> 1) ^ 0xEDB8_8320;
-            } else {
-                crc >>= 1;
-            }
-            bit += 1;
-        }
+        crc = (crc >> 4) ^ CRC32_NIBBLE_LUT[(crc & 0x0F) as usize];
+        crc = (crc >> 4) ^ CRC32_NIBBLE_LUT[(crc & 0x0F) as usize];
         i += 1;
     }
     !crc
@@ -728,15 +739,18 @@ impl<const APP_WINDOW: usize> OtaFlashStorage for MockNorFlash<APP_WINDOW> {
 }
 
 /// Returns `true` if `seq_a` is newer than `seq_b`, handling sequence
-/// wraparound near `u32::MAX`.
+/// wraparound near `u32::MAX` with strict weak ordering (`LOGIC-170`).
 #[inline]
 pub const fn is_seq_greater(seq_a: u32, seq_b: u32) -> bool {
+    if seq_a == seq_b {
+        return false;
+    }
     if seq_a >= u32::MAX - 10 && seq_b <= 10 {
         false
     } else if seq_b >= u32::MAX - 10 && seq_a <= 10 {
         true
     } else {
-        seq_a >= seq_b
+        seq_a > seq_b
     }
 }
 
@@ -1818,6 +1832,16 @@ mod tests {
         assert!(!verify_ota_token(b"", expected));
         assert!(!verify_ota_token(b"klipper-cam-ota-2026", b""));
         assert!(!verify_ota_token(b"", b""));
+    }
+
+    #[test]
+    fn test_is_seq_greater_strict_weak_ordering() {
+        assert!(!is_seq_greater(1, 1));
+        assert!(!is_seq_greater(u32::MAX, u32::MAX));
+        assert!(is_seq_greater(2, 1));
+        assert!(!is_seq_greater(1, 2));
+        assert!(is_seq_greater(1, u32::MAX));
+        assert!(!is_seq_greater(u32::MAX, 1));
     }
 
     #[test]

@@ -212,7 +212,8 @@ impl Esp32S3LcdCam {
             0
         };
         volatile_write_u32(&mut self.regs.gdma_in_conf0, burst_bits);
-        volatile_write_u32(&mut self.regs.gdma_in_conf1, 0);
+        let conf1 = if self.psram_mode { 2 << 12 } else { 0 };
+        volatile_write_u32(&mut self.regs.gdma_in_conf1, conf1);
         volatile_write_u32(
             &mut self.regs.gdma_in_peri_sel,
             GDMA_PERI_SEL_LCD_CAM as u32,
@@ -351,7 +352,11 @@ impl Esp32S3LcdCam {
         if xclk_freq_hz == 0 || xclk_freq_hz > 40_000_000 {
             return Err(CameraError::InvalidArg);
         }
-        let div_num = (160_000_000 / xclk_freq_hz) & 0xFF;
+        let raw_div = 160_000_000u32 / xclk_freq_hz;
+        if !(1..=0xFF).contains(&raw_div) {
+            return Err(CameraError::InvalidArg);
+        }
+        let div_num = raw_div;
         let prev = volatile_read_u32(&self.regs.cam_ctrl) & !0xFF;
         volatile_write_u32(
             &mut self.regs.cam_ctrl,
@@ -448,7 +453,10 @@ impl Esp32S3LcdCam {
 
     /// Starts `LCD_CAM` + `GDMA` capture (`target/esp32s3/ll_cam.c:152-181`).
     pub fn start(&mut self, dma_cfg: &DmaSizeConfig, first_desc_addr: u32) -> bool {
-        if dma_cfg.dma_half_buffer_size == 0 {
+        if dma_cfg.dma_half_buffer_size == 0
+            || first_desc_addr == 0
+            || (first_desc_addr & 0x3) != 0
+        {
             return false;
         }
         if self.jpeg_mode || !self.psram_mode {

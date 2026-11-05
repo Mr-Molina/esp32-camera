@@ -38,13 +38,15 @@ impl<'a> PingPongFrameBuffer<'a> {
         if slot_a.len() < init_len || slot_b.len() < init_len {
             return Err(CameraError::BufferTooSmall);
         }
+        if slot_a.len() != slot_b.len() {
+            return Err(CameraError::InvalidArg);
+        }
         slot_a[..init_len].copy_from_slice(initial_frame);
-        slot_b[..init_len].copy_from_slice(initial_frame);
         Ok(Self {
             slot_a,
             slot_b,
             len_a: init_len,
-            len_b: init_len,
+            len_b: 0,
             active_is_b: false,
             frame_seq: 1,
         })
@@ -73,6 +75,12 @@ impl<'a> PingPongFrameBuffer<'a> {
     /// Returns the monotonically increasing sequence number of the active frame.
     #[inline]
     pub const fn frame_seq(&self) -> u64 {
+        self.frame_seq
+    }
+
+    /// Returns the active frame generation sequence counter (`LOGIC-143`).
+    #[inline]
+    pub const fn active_generation(&self) -> u64 {
         self.frame_seq
     }
 
@@ -232,8 +240,16 @@ mod tests {
         );
 
         let mut slot_a = [0u8; 8];
+        let mut slot_b = [0u8; 12];
+        // Unequal slot lengths rejected with InvalidArg (PERF-142)
+        assert_eq!(
+            PingPongFrameBuffer::new(&mut slot_a, &mut slot_b, &init),
+            Err(CameraError::InvalidArg)
+        );
+
+        let mut slot_a = [0u8; 4];
         let mut slot_b = [0u8; 4];
-        // Oversized initial frame for slot_b rejected
+        // Oversized initial frame for both slots rejected
         assert_eq!(
             PingPongFrameBuffer::new(&mut slot_a, &mut slot_b, &init),
             Err(CameraError::BufferTooSmall)
@@ -244,6 +260,7 @@ mod tests {
         let mut pp = PingPongFrameBuffer::new(&mut slot_a, &mut slot_b, &init).expect("valid init");
         assert_eq!(pp.active_frame(), &init);
         assert_eq!(pp.frame_seq(), 1);
+        assert_eq!(pp.active_generation(), 1);
         assert_eq!(pp.active_slot_index(), 0);
 
         // Empty write_and_commit_inactive rejected; active frame & seq preserved

@@ -70,12 +70,15 @@ pub fn set_reg_bits8<B: SccbBus>(
     mask: u8,
     value: u8,
 ) -> Result<(), CameraError> {
-    if offset >= 8 {
+    if mask == 0 || offset >= 8 || ((mask as u16) << offset) > 0xFF {
         return Err(CameraError::InvalidArg);
     }
     let c_value = bus.read_reg8(slv_addr, reg)?;
     let shifted_mask = mask << offset;
     let new_value = (c_value & !shifted_mask) | ((value & mask) << offset);
+    if new_value == c_value {
+        return Ok(());
+    }
     bus.write_reg8(slv_addr, reg, new_value)
 }
 
@@ -88,12 +91,15 @@ pub fn set_reg_bits16<B: SccbBus>(
     mask: u8,
     value: u8,
 ) -> Result<(), CameraError> {
-    if offset >= 8 {
+    if mask == 0 || offset >= 8 || ((mask as u16) << offset) > 0xFF {
         return Err(CameraError::InvalidArg);
     }
     let c_value = bus.read_reg16(slv_addr, reg)?;
     let shifted_mask = mask << offset;
     let new_value = (c_value & !shifted_mask) | ((value & mask) << offset);
+    if new_value == c_value {
+        return Ok(());
+    }
     bus.write_reg16(slv_addr, reg, new_value)
 }
 
@@ -410,6 +416,27 @@ mod tests {
         assert_eq!(
             set_reg_bits16(&mut bus, 0x3C, 0x3000, 8, 0x01, 0x01),
             Err(CameraError::InvalidArg)
+        );
+    }
+
+    #[test]
+    fn test_set_reg_bits8_mask_overflow_rejection() {
+        let mut bus: MockSccbBus<32> = MockSccbBus::new();
+        // offset 1 with mask 0x80 => (0x80 << 1) = 0x100 > 0xFF, must reject
+        assert_eq!(
+            set_reg_bits8(&mut bus, 0x30, 0x10, 1, 0x80, 0x80),
+            Err(CameraError::InvalidArg)
+        );
+        // offset 7 with mask 0x02 => (0x02 << 7) = 0x100 > 0xFF, must reject
+        assert_eq!(
+            set_reg_bits8(&mut bus, 0x30, 0x10, 7, 0x02, 0x02),
+            Err(CameraError::InvalidArg)
+        );
+        // no-op write check when new_value == c_value
+        bus.preset_reg8(0x30, 0x10, 0b1010_1010);
+        assert_eq!(
+            set_reg_bits8(&mut bus, 0x30, 0x10, 1, 0x07, 0b101),
+            Ok(())
         );
     }
 }
