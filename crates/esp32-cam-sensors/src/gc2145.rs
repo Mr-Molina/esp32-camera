@@ -1110,6 +1110,9 @@ impl<B: SccbBus> CameraSensor<B> for Gc2145 {
             bus.write_reg8(self.slv_addr, 0xFE, (reg >> 8) as u8)?;
         }
         let val = bus.read_reg8(self.slv_addr, (reg & 0xFF) as u8)? as i32;
+        if (reg >> 8) != 0 {
+            bus.write_reg8(self.slv_addr, 0xFE, 0x00)?;
+        }
         Ok(val & mask)
     }
 
@@ -1123,6 +1126,29 @@ impl<B: SccbBus> CameraSensor<B> for Gc2145 {
         let reg8 = (reg & 0xFF) as u8;
         let current = bus.read_reg8(self.slv_addr, reg8)? as i32;
         let next = ((current & !mask) | (value & mask)) as u8;
-        bus.write_reg8(self.slv_addr, reg8, next)
+        bus.write_reg8(self.slv_addr, reg8, next)?;
+        if (reg >> 8) != 0 {
+            bus.write_reg8(self.slv_addr, 0xFE, 0x00)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use esp32_cam_sccb::MockSccbBus;
+
+    #[test]
+    fn test_gc2145_page0_restoration() {
+        let mut bus: MockSccbBus<64> = MockSccbBus::new();
+        let mut sensor = Gc2145::new();
+        bus.preset_reg8(sensor.slv_addr, 0x15, 0xAA);
+        assert_eq!(sensor.get_reg(&mut bus, 0x0115, 0xFF), Ok(0xAA));
+        assert_eq!(bus.reg8(sensor.slv_addr, 0xFE), 0x00);
+
+        assert_eq!(sensor.set_reg(&mut bus, 0x0115, 0xFF, 0x55), Ok(()));
+        assert_eq!(bus.reg8(sensor.slv_addr, 0xFE), 0x00);
+        assert_eq!(bus.reg8(sensor.slv_addr, 0x15), 0x55);
     }
 }

@@ -3,6 +3,7 @@
 use core::fmt;
 
 /// Unified error type for the `esp32-camera` Rust workspace.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CameraError {
     /// Camera sensor was not detected on the SCCB/I2C bus.

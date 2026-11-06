@@ -414,6 +414,9 @@ impl<B: SccbBus> CameraSensor<B> for Bf20a6 {
     }
 
     fn set_sharpness(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
+        if !(-2..=2).contains(&level) {
+            return Err(CameraError::InvalidArg);
+        }
         bus.write_reg8(self.slv_addr, 0x70, (level & 0xFF) as u8)?;
         self.status.sharpness = level as i8;
         Ok(())
@@ -454,5 +457,22 @@ impl<B: SccbBus> CameraSensor<B> for Bf20a6 {
         let current = bus.read_reg8(self.slv_addr, reg8)? as i32;
         let next = ((current & !mask) | (value & mask)) as u8;
         bus.write_reg8(self.slv_addr, reg8, next)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use esp32_cam_sccb::MockSccbBus;
+
+    #[test]
+    fn test_bf20a6_sharpness_range() {
+        let mut bus: MockSccbBus<64> = MockSccbBus::new();
+        let mut sensor = Bf20a6::new();
+        assert_eq!(sensor.set_sharpness(&mut bus, -3), Err(CameraError::InvalidArg));
+        assert_eq!(sensor.set_sharpness(&mut bus, 3), Err(CameraError::InvalidArg));
+        assert!(sensor.set_sharpness(&mut bus, -2).is_ok());
+        assert!(sensor.set_sharpness(&mut bus, 0).is_ok());
+        assert!(sensor.set_sharpness(&mut bus, 2).is_ok());
     }
 }

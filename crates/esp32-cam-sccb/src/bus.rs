@@ -2,6 +2,15 @@
 
 use esp32_cam_types::CameraError;
 
+/// Returns true if `addr` is a valid 7-bit SCCB / I2C slave address
+/// (0x08..=0x77).
+///
+/// Addresses 0x00..=0x07 and 0x78..=0x7F are reserved by the I2C specification.
+#[inline]
+pub const fn is_valid_sccb_addr(addr: u8) -> bool {
+    matches!(addr, 0x08..=0x77)
+}
+
 /// Hardware-agnostic SCCB / I2C register bus trait for camera sensors.
 ///
 /// Supports both 8-bit register addressing (e.g. `OV2640`, `OV7725`, `GC0308`)
@@ -21,6 +30,9 @@ pub trait SccbBus {
         val: u8,
         mask: u8,
     ) -> Result<(), CameraError> {
+        if !is_valid_sccb_addr(slv_addr) {
+            return Err(CameraError::InvalidArg);
+        }
         if mask == 0 {
             return Ok(());
         }
@@ -49,6 +61,9 @@ pub trait SccbBus {
         val: u8,
         mask: u8,
     ) -> Result<(), CameraError> {
+        if !is_valid_sccb_addr(slv_addr) {
+            return Err(CameraError::InvalidArg);
+        }
         if mask == 0 {
             return Ok(());
         }
@@ -65,7 +80,7 @@ pub trait SccbBus {
 
     /// Reads a 16-bit big-endian value from a 16-bit register address.
     fn read_reg16_val16(&mut self, slv_addr: u8, reg: u16) -> Result<u16, CameraError> {
-        if slv_addr == 0 || slv_addr >= 0x80 {
+        if !is_valid_sccb_addr(slv_addr) {
             return Err(CameraError::InvalidArg);
         }
         let next_reg = reg.checked_add(1).ok_or(CameraError::InvalidArg)?;
@@ -76,7 +91,7 @@ pub trait SccbBus {
 
     /// Writes a 16-bit big-endian value to a 16-bit register address.
     fn write_reg16_val16(&mut self, slv_addr: u8, reg: u16, data: u16) -> Result<(), CameraError> {
-        if slv_addr == 0 || slv_addr >= 0x80 {
+        if !is_valid_sccb_addr(slv_addr) {
             return Err(CameraError::InvalidArg);
         }
         let next_reg = reg.checked_add(1).ok_or(CameraError::InvalidArg)?;
@@ -86,7 +101,7 @@ pub trait SccbBus {
 
     /// Writes multiple 8-bit register address/value pairs in sequence.
     fn write_reg8_bulk(&mut self, addr: u8, pairs: &[(u8, u8)]) -> Result<(), CameraError> {
-        if addr == 0 || addr >= 0x80 {
+        if !is_valid_sccb_addr(addr) {
             return Err(CameraError::InvalidArg);
         }
         for &(reg, data) in pairs {
@@ -97,7 +112,7 @@ pub trait SccbBus {
 
     /// Writes multiple 16-bit register address/value pairs in sequence.
     fn write_reg16_bulk(&mut self, addr: u8, pairs: &[(u16, u8)]) -> Result<(), CameraError> {
-        if addr == 0 || addr >= 0x80 {
+        if !is_valid_sccb_addr(addr) {
             return Err(CameraError::InvalidArg);
         }
         for &(reg, data) in pairs {
@@ -108,7 +123,7 @@ pub trait SccbBus {
 
     /// Probes whether a device responds at the 7-bit `slv_addr`.
     fn probe(&mut self, slv_addr: u8) -> Result<(), CameraError> {
-        if slv_addr == 0 || slv_addr >= 0x80 {
+        if !is_valid_sccb_addr(slv_addr) {
             return Err(CameraError::InvalidArg);
         }
         let _ = self.read_reg8(slv_addr, 0x00)?;
@@ -241,8 +256,70 @@ mod tests {
             Err(CameraError::InvalidArg)
         );
         assert_eq!(
+            bus.write_reg8_bulk(0x07, &pairs8),
+            Err(CameraError::InvalidArg)
+        );
+        assert_eq!(
+            bus.write_reg16_bulk(0x78, &pairs16),
+            Err(CameraError::InvalidArg)
+        );
+        assert_eq!(
             bus.write_reg16_bulk(0x80, &pairs16),
             Err(CameraError::InvalidArg)
         );
+    }
+
+    #[test]
+    fn test_is_valid_sccb_addr() {
+        assert!(!is_valid_sccb_addr(0x00));
+        assert!(!is_valid_sccb_addr(0x07));
+        assert!(is_valid_sccb_addr(0x08));
+        assert!(is_valid_sccb_addr(0x30));
+        assert!(is_valid_sccb_addr(0x77));
+        assert!(!is_valid_sccb_addr(0x78));
+        assert!(!is_valid_sccb_addr(0x7F));
+        assert!(!is_valid_sccb_addr(0x80));
+        assert!(!is_valid_sccb_addr(0xFF));
+    }
+
+    #[test]
+    fn test_write_reg_mask_invalid_address() {
+        let mut bus = SpyBus {
+            reads: 0,
+            writes: 0,
+            reg_val: 0x55,
+        };
+
+        // mask == 0 with invalid address must return InvalidArg (SCCB-002)
+        assert_eq!(
+            bus.write_reg8_mask(0x00, 0x10, 0xAA, 0x00),
+            Err(CameraError::InvalidArg)
+        );
+        assert_eq!(
+            bus.write_reg8_mask(0x07, 0x10, 0xAA, 0x00),
+            Err(CameraError::InvalidArg)
+        );
+        assert_eq!(
+            bus.write_reg8_mask(0x78, 0x10, 0xAA, 0x00),
+            Err(CameraError::InvalidArg)
+        );
+        assert_eq!(bus.reads, 0);
+        assert_eq!(bus.writes, 0);
+
+        // write_reg16_mask with mask == 0 and invalid address
+        assert_eq!(
+            bus.write_reg16_mask(0x00, 0x1000, 0xAA, 0x00),
+            Err(CameraError::InvalidArg)
+        );
+        assert_eq!(
+            bus.write_reg16_mask(0x07, 0x1000, 0xAA, 0x00),
+            Err(CameraError::InvalidArg)
+        );
+        assert_eq!(
+            bus.write_reg16_mask(0x78, 0x1000, 0xAA, 0x00),
+            Err(CameraError::InvalidArg)
+        );
+        assert_eq!(bus.reads, 0);
+        assert_eq!(bus.writes, 0);
     }
 }

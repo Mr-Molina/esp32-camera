@@ -394,18 +394,27 @@ impl<B: SccbBus> CameraSensor<B> for Bf3005 {
     }
 
     fn set_contrast(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
+        if !(-2..=2).contains(&level) {
+            return Err(CameraError::InvalidArg);
+        }
         bus.write_reg8(self.slv_addr, 0x56, (level & 0xFF) as u8)?;
         self.status.contrast = level as i8;
         Ok(())
     }
 
     fn set_brightness(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
+        if !(-2..=2).contains(&level) {
+            return Err(CameraError::InvalidArg);
+        }
         bus.write_reg8(self.slv_addr, 0x55, (level & 0xFF) as u8)?;
         self.status.brightness = level as i8;
         Ok(())
     }
 
     fn set_sharpness(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
+        if !(-2..=2).contains(&level) {
+            return Err(CameraError::InvalidArg);
+        }
         bus.write_reg8(self.slv_addr, 0x70, (level & 0xFF) as u8)?;
         self.status.sharpness = level as i8;
         Ok(())
@@ -504,5 +513,32 @@ impl<B: SccbBus> CameraSensor<B> for Bf3005 {
         }
         self.xclk_freq_hz = (xclk as u32).saturating_mul(1_000_000);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use esp32_cam_sccb::MockSccbBus;
+
+    #[test]
+    fn test_bf3005_control_levels_range() {
+        let mut bus: MockSccbBus<64> = MockSccbBus::new();
+        let mut sensor = Bf3005::new();
+
+        assert_eq!(sensor.set_contrast(&mut bus, -3), Err(CameraError::InvalidArg));
+        assert_eq!(sensor.set_contrast(&mut bus, 3), Err(CameraError::InvalidArg));
+        assert!(sensor.set_contrast(&mut bus, -2).is_ok());
+        assert!(sensor.set_contrast(&mut bus, 2).is_ok());
+
+        assert_eq!(sensor.set_brightness(&mut bus, -3), Err(CameraError::InvalidArg));
+        assert_eq!(sensor.set_brightness(&mut bus, 3), Err(CameraError::InvalidArg));
+        assert!(sensor.set_brightness(&mut bus, -2).is_ok());
+        assert!(sensor.set_brightness(&mut bus, 2).is_ok());
+
+        assert_eq!(sensor.set_sharpness(&mut bus, -3), Err(CameraError::InvalidArg));
+        assert_eq!(sensor.set_sharpness(&mut bus, 3), Err(CameraError::InvalidArg));
+        assert!(sensor.set_sharpness(&mut bus, -2).is_ok());
+        assert!(sensor.set_sharpness(&mut bus, 2).is_ok());
     }
 }

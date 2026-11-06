@@ -4,7 +4,7 @@ use embedded_hal::delay::DelayNs;
 use embedded_hal::i2c::{ErrorKind, I2c};
 use esp32_cam_types::CameraError;
 
-use crate::bus::SccbBus;
+use crate::bus::{is_valid_sccb_addr, SccbBus};
 
 /// Maps an `embedded-hal` I2C error to [`CameraError`].
 fn map_i2c_error<E: embedded_hal::i2c::Error>(e: E, slv_addr: u8) -> CameraError {
@@ -56,7 +56,7 @@ where
     D: DelayNs,
 {
     fn read_reg8(&mut self, slv_addr: u8, reg: u8) -> Result<u8, CameraError> {
-        if slv_addr == 0 || slv_addr >= 0x80 {
+        if !is_valid_sccb_addr(slv_addr) {
             return Err(CameraError::InvalidArg);
         }
         let mut data = [0u8; 1];
@@ -70,7 +70,7 @@ where
     }
 
     fn write_reg8(&mut self, slv_addr: u8, reg: u8, data: u8) -> Result<(), CameraError> {
-        if slv_addr == 0 || slv_addr >= 0x80 {
+        if !is_valid_sccb_addr(slv_addr) {
             return Err(CameraError::InvalidArg);
         }
         self.i2c
@@ -79,7 +79,7 @@ where
     }
 
     fn read_reg16(&mut self, slv_addr: u8, reg: u16) -> Result<u8, CameraError> {
-        if slv_addr == 0 || slv_addr >= 0x80 {
+        if !is_valid_sccb_addr(slv_addr) {
             return Err(CameraError::InvalidArg);
         }
         let reg_bytes = reg.to_be_bytes();
@@ -94,7 +94,7 @@ where
     }
 
     fn write_reg16(&mut self, slv_addr: u8, reg: u16, data: u8) -> Result<(), CameraError> {
-        if slv_addr == 0 || slv_addr >= 0x80 {
+        if !is_valid_sccb_addr(slv_addr) {
             return Err(CameraError::InvalidArg);
         }
         let reg_bytes = reg.to_be_bytes();
@@ -104,7 +104,7 @@ where
     }
 
     fn probe(&mut self, slv_addr: u8) -> Result<(), CameraError> {
-        if slv_addr == 0 || slv_addr >= 0x80 {
+        if !is_valid_sccb_addr(slv_addr) {
             return Err(CameraError::InvalidArg);
         }
         self.i2c

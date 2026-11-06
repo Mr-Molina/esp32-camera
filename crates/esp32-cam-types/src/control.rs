@@ -152,6 +152,7 @@ impl CameraStatus {
             && self.aec <= 1
             && self.aec2 <= 1
             && self.agc <= 1
+            && self.gainceiling <= 6
             && self.bpc <= 1
             && self.wpc <= 1
             && self.raw_gma <= 1
@@ -287,5 +288,9 @@ mod tests {
         let mut invalid_vflip = status;
         invalid_vflip.vflip = 2;
         assert!(!invalid_vflip.is_valid());
+
+        let mut invalid_gainceiling = status;
+        invalid_gainceiling.gainceiling = 7;
+        assert!(!invalid_gainceiling.is_valid());
     }
 }
