@@ -4,8 +4,8 @@
 //! `driver/cam_hal.c:465-482`).
 
 use core::ptr;
-use core::sync::atomic::Ordering;
 use core::sync::atomic::compiler_fence;
+use core::sync::atomic::Ordering;
 use esp32_cam_types::CameraError;
 
 use crate::dma_filter::I2sSamplingMode;

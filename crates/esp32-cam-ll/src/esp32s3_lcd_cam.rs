@@ -453,9 +453,7 @@ impl Esp32S3LcdCam {
 
     /// Starts `LCD_CAM` + `GDMA` capture (`target/esp32s3/ll_cam.c:152-181`).
     pub fn start(&mut self, dma_cfg: &DmaSizeConfig, first_desc_addr: u32) -> bool {
-        if dma_cfg.dma_half_buffer_size == 0
-            || first_desc_addr == 0
-            || (first_desc_addr & 0x3) != 0
+        if dma_cfg.dma_half_buffer_size == 0 || first_desc_addr == 0 || (first_desc_addr & 0x3) != 0
         {
             return false;
         }

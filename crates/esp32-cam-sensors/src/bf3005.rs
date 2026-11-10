@@ -526,18 +526,36 @@ mod tests {
         let mut bus: MockSccbBus<64> = MockSccbBus::new();
         let mut sensor = Bf3005::new();
 
-        assert_eq!(sensor.set_contrast(&mut bus, -3), Err(CameraError::InvalidArg));
-        assert_eq!(sensor.set_contrast(&mut bus, 3), Err(CameraError::InvalidArg));
+        assert_eq!(
+            sensor.set_contrast(&mut bus, -3),
+            Err(CameraError::InvalidArg)
+        );
+        assert_eq!(
+            sensor.set_contrast(&mut bus, 3),
+            Err(CameraError::InvalidArg)
+        );
         assert!(sensor.set_contrast(&mut bus, -2).is_ok());
         assert!(sensor.set_contrast(&mut bus, 2).is_ok());
 
-        assert_eq!(sensor.set_brightness(&mut bus, -3), Err(CameraError::InvalidArg));
-        assert_eq!(sensor.set_brightness(&mut bus, 3), Err(CameraError::InvalidArg));
+        assert_eq!(
+            sensor.set_brightness(&mut bus, -3),
+            Err(CameraError::InvalidArg)
+        );
+        assert_eq!(
+            sensor.set_brightness(&mut bus, 3),
+            Err(CameraError::InvalidArg)
+        );
         assert!(sensor.set_brightness(&mut bus, -2).is_ok());
         assert!(sensor.set_brightness(&mut bus, 2).is_ok());
 
-        assert_eq!(sensor.set_sharpness(&mut bus, -3), Err(CameraError::InvalidArg));
-        assert_eq!(sensor.set_sharpness(&mut bus, 3), Err(CameraError::InvalidArg));
+        assert_eq!(
+            sensor.set_sharpness(&mut bus, -3),
+            Err(CameraError::InvalidArg)
+        );
+        assert_eq!(
+            sensor.set_sharpness(&mut bus, 3),
+            Err(CameraError::InvalidArg)
+        );
         assert!(sensor.set_sharpness(&mut bus, -2).is_ok());
         assert!(sensor.set_sharpness(&mut bus, 2).is_ok());
     }

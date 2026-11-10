@@ -10,6 +10,7 @@ import json
 import os
 import struct
 import sys
+import urllib.error
 import urllib.request
 
 if sys.platform == "linux":
@@ -31,7 +32,7 @@ def get_camera_status(status_url: str = STATUS_URL, timeout: float = 3.0):
                 data = json.loads(resp.read().decode("utf-8"))
                 if data.get("uptime_ms") is not None:
                     return data
-    except Exception as exc:
+    except (OSError, urllib.error.URLError, TimeoutError, ValueError) as exc:
         print(f"[WARN] Failed to read camera status from {status_url}: {exc}")
     return None
 
@@ -40,6 +41,7 @@ def ensure_passive(
     port_path: str = SERIAL_PORT,
     status_url: str = STATUS_URL,
     timeout: float = 3.0,
+    check_http: bool = True,
 ):
     if sys.platform != "linux" or fcntl is None or termios is None:
         print(
@@ -52,11 +54,13 @@ def ensure_passive(
         print(f"[ERROR] Serial port {port_path} does not exist", file=sys.stderr)
         return 1
 
-    pre_status = get_camera_status(status_url, timeout=timeout)
-    if pre_status:
-        print(
-            f"[STATUS-PRE] Camera online, uptime_ms={pre_status.get('uptime_ms')}, active_partition={pre_status.get('active_partition')}"
-        )
+    pre_status = None
+    if check_http:
+        pre_status = get_camera_status(status_url, timeout=timeout)
+        if pre_status:
+            print(
+                f"[STATUS-PRE] Camera online, uptime_ms={pre_status.get('uptime_ms')}, active_partition={pre_status.get('active_partition')}"
+            )
 
     # 1. Open without controlling tty and without blocking directly (avoiding stty process invocation)
     fd = os.open(port_path, os.O_RDWR | os.O_NONBLOCK | os.O_NOCTTY)
@@ -87,18 +91,21 @@ def ensure_passive(
         os.close(fd)
 
     # 2. Verify camera remains online with non-zero, increasing uptime
-    post_status = get_camera_status(status_url, timeout=timeout)
-    if post_status:
-        print(
-            f"[STATUS-POST] Camera online, uptime_ms={post_status.get('uptime_ms')}, active_partition={post_status.get('active_partition')}"
-        )
-        if pre_status and post_status.get("uptime_ms", 0) < pre_status.get("uptime_ms", 0):
-            print("[ERROR] Camera uptime reset during serial configuration!", file=sys.stderr)
+    if check_http:
+        post_status = get_camera_status(status_url, timeout=timeout)
+        if post_status:
+            print(
+                f"[STATUS-POST] Camera online, uptime_ms={post_status.get('uptime_ms')}, active_partition={post_status.get('active_partition')}"
+            )
+            if pre_status and post_status.get("uptime_ms", 0) < pre_status.get("uptime_ms", 0):
+                print("[ERROR] Camera uptime reset during serial configuration!", file=sys.stderr)
+                return 1
+            print("[PASSIVITY] Serial port passive and camera uptime preserved successfully.")
+        else:
+            print("[WARN] Could not reach camera after serial configuration", file=sys.stderr)
             return 1
-        print("[PASSIVITY] Serial port passive and camera uptime preserved successfully.")
     else:
-        print("[WARN] Could not reach camera after serial configuration", file=sys.stderr)
-        return 1
+        print("[PASSIVITY] Serial port passive (HTTP check skipped).")
 
     return 0
 
@@ -109,8 +116,15 @@ def main() -> int:
     parser.add_argument(
         "--status-url", default=STATUS_URL, help=f"Camera HTTP status URL (default: {STATUS_URL})"
     )
+    parser.add_argument(
+        "--no-http-check",
+        action="store_true",
+        help="Skip camera HTTP status checks (verify serial passivity only)",
+    )
     args = parser.parse_args()
-    return ensure_passive(port_path=args.port, status_url=args.status_url)
+    return ensure_passive(
+        port_path=args.port, status_url=args.status_url, check_http=not args.no_http_check
+    )
 
 
 if __name__ == "__main__":

@@ -418,7 +418,10 @@ impl<'a> JpegBitWriter<'a> {
 
     #[inline]
     fn emit_byte(&mut self, b: u8) -> Result<(), CameraError> {
-        let slot = self.dst.get_mut(self.pos).ok_or(CameraError::BufferTooSmall)?;
+        let slot = self
+            .dst
+            .get_mut(self.pos)
+            .ok_or(CameraError::BufferTooSmall)?;
         *slot = b;
         self.pos += 1;
         Ok(())

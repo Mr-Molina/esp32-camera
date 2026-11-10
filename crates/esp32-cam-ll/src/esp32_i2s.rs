@@ -618,7 +618,7 @@ impl Esp32I2sCamera {
             in_bytes_per_pixel: 1,
             fb_bytes_per_pixel: 1,
             vsync_pin: None,
-            vsync_invert: true,
+            vsync_invert: false,
             vsync_intr_enabled: false,
             gpio_bindings: [GpioMatrixBinding {
                 gpio_num: 0,
@@ -890,7 +890,7 @@ impl Esp32I2sCamera {
             // `rx_bits_mod = 0`, `rx_dsync_sw = 1`
             xtensa_mmio_write(I2S0_BASE_ADDR + I2S_CONF_CHAN_REG_OFFSET, 1 << 3);
             let sr =
-                xtensa_mmio_read(I2S0_BASE_ADDR + I2S_SAMPLE_RATE_CONF_REG_OFFSET) & !(0x3F << 12);
+                xtensa_mmio_read(I2S0_BASE_ADDR + I2S_SAMPLE_RATE_CONF_REG_OFFSET) & !(0x3F << 18);
             xtensa_mmio_write(I2S0_BASE_ADDR + I2S_SAMPLE_RATE_CONF_REG_OFFSET, sr);
             xtensa_mmio_write(I2S0_BASE_ADDR + I2S_TIMING_REG_OFFSET, 1 << 21);
         }
@@ -1182,14 +1182,6 @@ impl Esp32I2sCamera {
 
             // Synchronize to VSYNC vertical blanking transition before starting I2S0 DMA
             let mut sync_iters = 0u32;
-            while xtensa_read_gpio_level(vsync_pin) == vsync_sync_level
-                && sync_iters < max_poll_iters
-            {
-                sync_iters += 1;
-            }
-            if sync_iters >= max_poll_iters {
-                return Err(CameraError::Timeout);
-            }
             while xtensa_read_gpio_level(vsync_pin) != vsync_sync_level
                 && sync_iters < max_poll_iters
             {
@@ -1763,5 +1755,34 @@ mod tests {
             assert!(cam2.is_running());
             drop(cam2); // Drops and executes stop()
         }
+    }
+
+    #[test]
+    fn test_i2s_rx_bits_mod_clear_mask() {
+        // ESP32 Technical Reference Manual (Table 12-4):
+        // I2S_SAMPLE_RATE_CONF_REG:
+        // - I2S_TX_BCK_DIV_NUM: bits [5:0]
+        // - I2S_RX_BCK_DIV_NUM: bits [11:6]
+        // - I2S_TX_BITS_MOD:    bits [17:12] (mask: 0x3F << 12)
+        // - I2S_RX_BITS_MOD:    bits [23:18] (mask: 0x3F << 18)
+        let rx_bits_mod_mask: u32 = 0x3F << 18;
+        let tx_bits_mod_mask: u32 = 0x3F << 12;
+
+        // Verify that the I2S_RX_BITS_MOD clear mask !(0x3F << 18) clears
+        // bits [23:18] and preserves I2S_TX_BITS_MOD bits [17:12].
+        let initial_val: u32 = 0xFFFF_FFFF;
+        let cleared = initial_val & !rx_bits_mod_mask;
+
+        // Bits [23:18] must be 0
+        assert_eq!(cleared & rx_bits_mod_mask, 0);
+        // Bits [17:12] (TX_BITS_MOD) must be preserved
+        assert_eq!(cleared & tx_bits_mod_mask, tx_bits_mod_mask);
+
+        // Verify with arbitrary distinct bit patterns in RX and TX fields
+        let sample_reg: u32 = (0x2A << 18) | (0x15 << 12) | 0x3F;
+        let result = sample_reg & !(0x3F << 18);
+        assert_eq!(result & (0x3F << 18), 0);
+        assert_eq!(result & (0x3F << 12), 0x15 << 12);
+        assert_eq!(result & 0x3F, 0x3F);
     }
 }

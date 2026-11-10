@@ -134,6 +134,49 @@ mod tests {
     }
 
     #[test]
+    fn test_ov2640_pixformat_clears_jpeg_en_sen_ov2640_001() {
+        let mut bus: MockSccbBus<512> = MockSccbBus::new();
+        let mut sensor = Ov2640::new();
+
+        // 1. Configure Jpeg format: IMAGE_MODE register should have
+        // IMAGE_MODE_JPEG_EN (0x10) set.
+        assert_eq!(sensor.set_pixformat(&mut bus, PixelFormat::Jpeg), Ok(()));
+        let img_mode = bus.reg8(CameraSccbAddr::OV2640, ov2640::IMAGE_MODE);
+        assert_ne!(img_mode & ov2640::IMAGE_MODE_JPEG_EN, 0);
+
+        // 2. Switch to Rgb565: must clear IMAGE_MODE_JPEG_EN (SEN-OV2640-001).
+        assert_eq!(sensor.set_pixformat(&mut bus, PixelFormat::Rgb565), Ok(()));
+        let img_mode = bus.reg8(CameraSccbAddr::OV2640, ov2640::IMAGE_MODE);
+        assert_eq!(img_mode & ov2640::IMAGE_MODE_JPEG_EN, 0);
+        assert_eq!(img_mode, ov2640::IMAGE_MODE_RGB565);
+
+        // 3. Switch back to Jpeg then to Yuv422: must clear IMAGE_MODE_JPEG_EN.
+        assert_eq!(sensor.set_pixformat(&mut bus, PixelFormat::Jpeg), Ok(()));
+        assert_ne!(
+            bus.reg8(CameraSccbAddr::OV2640, ov2640::IMAGE_MODE) & ov2640::IMAGE_MODE_JPEG_EN,
+            0
+        );
+        assert_eq!(sensor.set_pixformat(&mut bus, PixelFormat::Yuv422), Ok(()));
+        let img_mode = bus.reg8(CameraSccbAddr::OV2640, ov2640::IMAGE_MODE);
+        assert_eq!(img_mode & ov2640::IMAGE_MODE_JPEG_EN, 0);
+        assert_eq!(img_mode, ov2640::IMAGE_MODE_YUV422);
+
+        // 4. Switch back to Jpeg then to Grayscale: must clear IMAGE_MODE_JPEG_EN.
+        assert_eq!(sensor.set_pixformat(&mut bus, PixelFormat::Jpeg), Ok(()));
+        assert_ne!(
+            bus.reg8(CameraSccbAddr::OV2640, ov2640::IMAGE_MODE) & ov2640::IMAGE_MODE_JPEG_EN,
+            0
+        );
+        assert_eq!(
+            sensor.set_pixformat(&mut bus, PixelFormat::Grayscale),
+            Ok(())
+        );
+        let img_mode = bus.reg8(CameraSccbAddr::OV2640, ov2640::IMAGE_MODE);
+        assert_eq!(img_mode & ov2640::IMAGE_MODE_JPEG_EN, 0);
+        assert_eq!(img_mode, ov2640::IMAGE_MODE_YUV422);
+    }
+
+    #[test]
     fn test_ov3660_detect_reset_window_and_16bit_bounds() {
         let mut bus: MockSccbBus<512> = MockSccbBus::new();
         bus.preset_reg16(CameraSccbAddr::OV3660, 0x300A, 0x36);

@@ -16,7 +16,6 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
 import shutil
 import socket
 import struct
@@ -25,6 +24,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -221,7 +221,7 @@ def stream_ota_post(host: str, port: int, token: str, payload: bytes, timeout: f
         f"Content-Length: {len(payload)}\r\n"
         f"Connection: close\r\n"
         f"\r\n"
-    ).encode("utf-8")
+    ).encode()
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -405,7 +405,7 @@ def main() -> int:
                 try:
                     exp_w, exp_h = [int(p.strip()) for p in args.expected_dims.lower().split("x")]
                     dims_valid = dims == (exp_w, exp_h)
-                except Exception:
+                except (OSError, urllib.error.URLError, TimeoutError, ValueError):
                     dims_valid = False
 
         if not (has_soi and has_eoi and dims_valid):

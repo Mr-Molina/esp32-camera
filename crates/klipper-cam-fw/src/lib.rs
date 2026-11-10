@@ -9,7 +9,7 @@
 //! - `examples/camera_example/main/camera_pinout.h`
 
 #![no_std]
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 #[cfg(test)]
 extern crate alloc;
@@ -20,6 +20,7 @@ pub mod frame_buffer;
 pub mod http;
 pub mod ota;
 pub mod runtime;
+pub mod spsc_ring;
 
 pub use ap_select::{
     roam_decision, ApCandidate, ApTracker, RoamBackoff, RoamDecision, WeakLinkTimer,
@@ -58,7 +59,7 @@ pub use esp32_cam_types::{
     CameraError, CameraFbLocation, CameraGrabMode, CameraModel, CameraStatus, FrameSize,
     GainCeiling, GrabMode, PixelFormat, SensorId,
 };
-pub use frame_buffer::*;
+pub use frame_buffer::{PingPongFrameBuffer, TripleFrameBuffer};
 pub use http::{
     format_control_json, format_mjpeg_part_header, format_ota_minimal_root, format_status_json,
     framesize_control_code, framesize_label, parse_framesize_val, parse_http_request,
@@ -77,4 +78,10 @@ pub use ota::{
     OTADATA_SIZE, OTA_0_OFFSET, OTA_0_SIZE, OTA_1_OFFSET, OTA_1_SIZE, OTA_CHUNK_SIZE,
     OTA_PARTITION_MAX_SIZE, PARTITION_TABLE, PHY_INIT_OFFSET, PHY_INIT_SIZE,
 };
-pub use runtime::*;
+pub use runtime::{
+    FirmwareRuntime, SensorHalAdapter, TakePictureRunner, WifiLifecycleState, WifiStaState,
+};
+pub use spsc_ring::{
+    Core1JpegSpsc, JpegSpscSlot, JPEG_SPSC_CHUNK_BYTES, SPSC_FLAG_ABORT, SPSC_FLAG_EOF,
+    SPSC_FLAG_SOF,
+};

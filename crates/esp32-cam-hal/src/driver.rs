@@ -1190,10 +1190,7 @@ fn assemble_and_lease_frame<
             total_written += written;
 
             // Check for JPEG SOI at offset 0 of the first half-buffer (`cam_hal.c:350-393`)
-            if is_jpeg
-                && cnt == 0
-                && !fb_buf.starts_with(&esp32_cam_conversions::JPEG_SOI_MARKER)
-            {
+            if is_jpeg && cnt == 0 && !fb_buf.starts_with(&esp32_cam_conversions::JPEG_SOI_MARKER) {
                 return Err(CameraError::CorruptedFrame);
             }
         }
@@ -1484,8 +1481,8 @@ mod tests {
             CameraDriver::new(WroverKitPins, bus, sensor, cfg);
         let init_driver = driver.init().expect("driver init");
 
-        // Confirming CLKRC 0x11 is 0x00 and R_DVP_SP 0xD3 is 12 (0x0C) rather
-        // than 0x8C
+        // Confirming CLKRC 0x11 is 0x00 and R_DVP_SP 0xD3 is 12 (0x0C)
+        // rather than 0x8C
         let bus = init_driver.bus();
         assert_eq!(bus.reg8(CameraSccbAddr::OV2640, 0x11), 0x00);
         assert_eq!(bus.reg8(CameraSccbAddr::OV2640, 0xD3), 12);

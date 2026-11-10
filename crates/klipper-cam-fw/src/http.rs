@@ -27,6 +27,13 @@ pub const MJPEG_BOUNDARY: &str = "123456789000000000000987654321";
 pub const MJPEG_CONTENT_TYPE: &str =
     "multipart/x-mixed-replace;boundary=123456789000000000000987654321";
 
+/// Initial HTTP 200 multipart response header prefix for Port 81 stream.
+pub const STREAM_INITIAL_HEADER: &[u8] = b"HTTP/1.1 200 OK\r\n\
+Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\
+Cache-Control: no-store, no-cache, must-revalidate, max-age=0\r\n\
+Pragma: no-cache\r\n\
+Access-Control-Allow-Origin: *\r\n\r\n";
+
 /// Maximum URL query string length accepted by `GET /` (`256` bytes,
 /// `APP-013`).
 pub const MAX_URL_QUERY_LEN: usize = 256;
@@ -623,22 +630,12 @@ pub const fn framesize_control_code(fs: FrameSize) -> u8 {
 }
 
 /// Compares two byte slices in constant time to prevent timing side-channel
-/// attacks (`C13-SEC-001`).
+/// attacks (`C13-SEC-001` / `FW-AUDIT-HTTP-001`).
+///
+/// Delegates to branchless [`crate::ota::verify_ota_token`].
 #[inline]
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.is_empty() || b.is_empty() {
-        return false;
-    }
-    let mut diff: usize = a.len() ^ b.len();
-    let max_len = a.len().max(b.len());
-    let mut i = 0usize;
-    while i < max_len {
-        let a_byte = if i < a.len() { a[i] } else { 0 };
-        let b_byte = if i < b.len() { b[i] } else { 0 };
-        diff |= (a_byte ^ b_byte) as usize;
-        i += 1;
-    }
-    diff == 0
+    crate::ota::verify_ota_token(a, b)
 }
 
 /// Parses a `framesize` query parameter (`5..=13` or horizontal width
@@ -651,12 +648,41 @@ pub const fn parse_framesize_val(val: isize) -> Option<FrameSize> {
         7 | 480 => Some(FrameSize::Hvga),
         8 | 640 => Some(FrameSize::Vga),
         9 | 800 => Some(FrameSize::Svga),
-        10 => Some(FrameSize::Xga),
+        10 | 1024 => Some(FrameSize::Xga),
         11 | 1280 => Some(FrameSize::Hd),
-        12 | 1024 => Some(FrameSize::Sxga),
+        12 => Some(FrameSize::Sxga),
         13 | 1600 => Some(FrameSize::Uxga),
         _ => None,
     }
+}
+
+/// Extracts the single value for header `name` from `raw_headers`
+/// (`SEC-HTTP-001`).
+///
+/// Returns `None` if the header is missing, malformed, non-UTF-8, or present
+/// more than once (preventing HTTP header smuggling / token shadowing).
+#[allow(dead_code)]
+pub(crate) fn extract_header_value_strict<'a>(
+    raw_headers: &'a [u8],
+    name: &str,
+) -> Option<&'a str> {
+    let header_str = core::str::from_utf8(raw_headers).ok()?;
+    let mut found: Option<&'a str> = None;
+    for line in header_str.split("\r\n") {
+        if line.is_empty() {
+            continue;
+        }
+        let colon = line.find(':')?;
+        let hname = line[..colon].trim();
+        if hname.eq_ignore_ascii_case(name) {
+            if found.is_some() {
+                // Duplicate header rejected per RFC 9112 / SEC-HTTP-001
+                return None;
+            }
+            found = Some(line[colon + 1..].trim());
+        }
+    }
+    found
 }
 
 /// Formats a [`CameraControlState`] as JSON into a 384-byte stack buffer.
@@ -759,20 +785,62 @@ catch(function(){clearTimeout(bt);pb=0;ne=1;$('st').innerText='Offline - reconne
 sc();ss();poll();setInterval(poll,3000);\
 </script></body></html>";
 
+/// Formats an MJPEG multipart frame boundary header into `out_buf` without
+/// copying the JPEG frame payload (`klipper_cam.c`).
+pub fn write_mjpeg_part_header(content_len: usize, out_buf: &mut [u8]) -> Result<&[u8], HttpError> {
+    let mut writer = SliceWriter::new(out_buf);
+    write!(
+        writer,
+        "\r\n--{}\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
+        MJPEG_BOUNDARY, content_len
+    )
+    .map_err(|_| HttpError::BufferTooSmall)?;
+    Ok(writer.into_bytes())
+}
+
+/// Formats an MJPEG multipart frame boundary header into `out_buf` and returns
+/// the number of header bytes written without copying the JPEG payload.
+#[inline]
+pub fn write_mjpeg_part_header_only(
+    content_len: usize,
+    out_buf: &mut [u8],
+) -> Result<usize, HttpError> {
+    Ok(write_mjpeg_part_header(content_len, out_buf)?.len())
+}
+
+/// Formats HTTP `200 OK` snapshot response headers into `out_buf` without
+/// copying the JPEG frame payload (`klipper_cam.c` lines 170-194).
+pub fn write_snapshot_headers(content_len: usize, out_buf: &mut [u8]) -> Result<&[u8], HttpError> {
+    let mut writer = SliceWriter::new(out_buf);
+    write!(
+        writer,
+        "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\n\
+        Content-Disposition: inline; filename=capture.jpg\r\n\
+        Access-Control-Allow-Origin: *\r\nConnection: close\r\n\
+        Content-Length: {}\r\n\r\n",
+        content_len
+    )
+    .map_err(|_| HttpError::BufferTooSmall)?;
+    Ok(writer.into_bytes())
+}
+
+/// Formats HTTP `200 OK` snapshot response headers into `out_buf` and returns
+/// the number of header bytes written without copying the JPEG payload.
+#[inline]
+pub fn write_snapshot_headers_only(
+    content_len: usize,
+    out_buf: &mut [u8],
+) -> Result<usize, HttpError> {
+    Ok(write_snapshot_headers(content_len, out_buf)?.len())
+}
+
 /// Formats an MJPEG multipart frame boundary header into a 128-byte stack
 /// buffer (`klipper_cam.c`).
 pub fn format_mjpeg_part_header(
     jpeg_len: usize,
     part_buf: &mut [u8; MJPEG_PART_HDR_BUF_LEN],
 ) -> Result<&[u8], HttpError> {
-    let mut writer = SliceWriter::new(part_buf);
-    write!(
-        writer,
-        "\r\n--{}\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
-        MJPEG_BOUNDARY, jpeg_len
-    )
-    .map_err(|_| HttpError::BufferTooSmall)?;
-    Ok(writer.into_bytes())
+    write_mjpeg_part_header(jpeg_len, part_buf)
 }
 
 /// RAII guard for a captured camera frame buffer (`camera_fb_t` + `s_fb_mutex`,
@@ -1135,6 +1203,26 @@ impl<'a> KlipperCamServer<'a> {
         StreamSessionGuard::try_acquire(&self.stream_active)
     }
 
+    /// Formats an MJPEG multipart frame boundary header into `out_buf` and returns
+    /// the number of header bytes written without copying the JPEG payload.
+    #[inline]
+    pub fn write_mjpeg_part_header_only(
+        content_len: usize,
+        out_buf: &mut [u8],
+    ) -> Result<usize, HttpError> {
+        write_mjpeg_part_header_only(content_len, out_buf)
+    }
+
+    /// Formats HTTP `200 OK` snapshot response headers into `out_buf` and returns
+    /// the number of header bytes written without copying the JPEG payload.
+    #[inline]
+    pub fn write_snapshot_headers_only(
+        content_len: usize,
+        out_buf: &mut [u8],
+    ) -> Result<usize, HttpError> {
+        write_snapshot_headers_only(content_len, out_buf)
+    }
+
     /// Returns `true` if a valid OTA firmware upload has completed and scheduled a
     /// reboot.
     #[inline]
@@ -1201,13 +1289,7 @@ impl<'a> KlipperCamServer<'a> {
         let req = match parse_http_request(raw_req) {
             Ok(r) => r,
             Err(HttpError::MalformedRequest) | Err(HttpError::InvalidUtf8) => {
-                return write_http_error(
-                    out_buf,
-                    400,
-                    "Bad Request",
-                    "400 Bad Request\n",
-                    false,
-                );
+                return write_http_error(out_buf, 400, "Bad Request", "400 Bad Request\n", false);
             }
             Err(e) => return Err(e),
         };
@@ -3057,5 +3139,95 @@ Host: 172.22.1.52\r\n\r\n";
             Err(HttpError::CaptureFailed)
         );
         assert_eq!(session.consecutive_failures(), 1);
+    }
+
+    #[test]
+    fn test_extract_header_value_strict_sec_http_001() {
+        let headers = b"Host: 172.22.1.52\r\nX-OTA-Token: secret123\r\nContent-Length: 24\r\n\r\n";
+        assert_eq!(
+            extract_header_value_strict(headers, "X-OTA-Token"),
+            Some("secret123")
+        );
+        assert_eq!(
+            extract_header_value_strict(headers, "x-ota-token"),
+            Some("secret123")
+        );
+        assert_eq!(
+            extract_header_value_strict(headers, "Content-Length"),
+            Some("24")
+        );
+        assert_eq!(extract_header_value_strict(headers, "Missing-Header"), None);
+
+        let dup_headers = b"Host: 172.22.1.52\r\nX-OTA-Token: tok1\r\nX-OTA-Token: tok2\r\n\r\n";
+        assert_eq!(
+            extract_header_value_strict(dup_headers, "X-OTA-Token"),
+            None,
+            "Duplicate header must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_parse_framesize_val_fw_audit_http_002() {
+        assert_eq!(parse_framesize_val(10), Some(FrameSize::Xga));
+        assert_eq!(parse_framesize_val(1024), Some(FrameSize::Xga));
+        assert_eq!(parse_framesize_val(12), Some(FrameSize::Sxga));
+    }
+
+    #[test]
+    fn test_duplicate_ota_token_rejected_sec_http_001() {
+        let mut server = KlipperCamServer::new(
+            KlipperCamConfig::WROVER_KIT_HD,
+            CameraDriver::new_hd_default(),
+        );
+        let mut resp_buf = [0u8; 1024];
+        let dup_req = b"POST /update HTTP/1.1\r\n\
+Host: 172.22.1.52\r\n\
+X-OTA-Token: tok1\r\n\
+X-OTA-Token: tok2\r\n\r\n";
+        let resp = server
+            .handle_raw_request(ServerPort::Control, dup_req, &mut resp_buf)
+            .expect("handled");
+        let view = HttpResponseView::parse(resp).expect("parse error view");
+        assert_eq!(view.status_code, 400);
+        assert!(view.body.starts_with(b"400 Bad Request"));
+    }
+
+    #[test]
+    fn test_zero_copy_mjpeg_and_snapshot_header_helpers() {
+        let mut buf = [0u8; 256];
+        let mjpeg_hdr = write_mjpeg_part_header(51_200, &mut buf).expect("mjpeg header");
+        let expected_mjpeg = b"\r\n--123456789000000000000987654321\r\n\
+Content-Type: image/jpeg\r\nContent-Length: 51200\r\n\r\n";
+        assert_eq!(mjpeg_hdr, expected_mjpeg);
+
+        let mjpeg_len = write_mjpeg_part_header_only(51_200, &mut buf).expect("mjpeg len");
+        assert_eq!(mjpeg_len, expected_mjpeg.len());
+        assert_eq!(
+            KlipperCamServer::write_mjpeg_part_header_only(51_200, &mut buf).expect("server mjpeg"),
+            expected_mjpeg.len()
+        );
+
+        let snap_len = write_snapshot_headers_only(51_200, &mut buf).expect("snapshot header");
+        let expected_snap = b"HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\n\
+Content-Disposition: inline; filename=capture.jpg\r\n\
+Access-Control-Allow-Origin: *\r\nConnection: close\r\n\
+Content-Length: 51200\r\n\r\n";
+        assert_eq!(snap_len, expected_snap.len());
+        assert_eq!(&buf[..snap_len], expected_snap);
+        assert_eq!(
+            KlipperCamServer::write_snapshot_headers_only(51_200, &mut buf)
+                .expect("server snapshot"),
+            expected_snap.len()
+        );
+
+        let mut tiny_buf = [0u8; 16];
+        assert_eq!(
+            write_mjpeg_part_header(51_200, &mut tiny_buf),
+            Err(HttpError::BufferTooSmall)
+        );
+        assert_eq!(
+            write_snapshot_headers_only(51_200, &mut tiny_buf),
+            Err(HttpError::BufferTooSmall)
+        );
     }
 }

@@ -469,8 +469,14 @@ mod tests {
     fn test_bf20a6_sharpness_range() {
         let mut bus: MockSccbBus<64> = MockSccbBus::new();
         let mut sensor = Bf20a6::new();
-        assert_eq!(sensor.set_sharpness(&mut bus, -3), Err(CameraError::InvalidArg));
-        assert_eq!(sensor.set_sharpness(&mut bus, 3), Err(CameraError::InvalidArg));
+        assert_eq!(
+            sensor.set_sharpness(&mut bus, -3),
+            Err(CameraError::InvalidArg)
+        );
+        assert_eq!(
+            sensor.set_sharpness(&mut bus, 3),
+            Err(CameraError::InvalidArg)
+        );
         assert!(sensor.set_sharpness(&mut bus, -2).is_ok());
         assert!(sensor.set_sharpness(&mut bus, 0).is_ok());
         assert!(sensor.set_sharpness(&mut bus, 2).is_ok());

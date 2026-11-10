@@ -406,7 +406,10 @@ mod tests {
         );
         assert_eq!(u16::from_le_bytes([dst[28], dst[29]]), 8);
         // SEC-061: clr_used is 256 (1024 / 4) for grayscale palette
-        assert_eq!(u32::from_le_bytes([dst[46], dst[47], dst[48], dst[49]]), 256);
+        assert_eq!(
+            u32::from_le_bytes([dst[46], dst[47], dst[48], dst[49]]),
+            256
+        );
 
         // Verify 256-entry palette
         for i in 0..256usize {

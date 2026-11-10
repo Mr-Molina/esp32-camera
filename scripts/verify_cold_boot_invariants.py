@@ -36,15 +36,17 @@ Invariant 71 (PM-2026-1026-001), and Invariant 72 (PM-2026-1026-002 / INFRA-001)
 
 import argparse
 import json
-from pathlib import Path
 import re
 import sys
+import urllib.error
 import urllib.request
+from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ETC_UDEV_RULE = Path("/etc/udev/rules.d/99-esp32-wrover.rules")
 DOCS_UDEV_RULE = REPO_ROOT / "docs" / "99-esp32-wrover.rules"
 MAIN_RS = REPO_ROOT / "crates" / "klipper-cam-fw" / "src" / "main.rs"
+ESP32_I2S_RS = REPO_ROOT / "crates" / "esp32-cam-ll" / "src" / "esp32_i2s.rs"
 BOOTLOADER_BIN = REPO_ROOT / "firmware" / "bootloader_v554_gpio16.bin"
 
 # Authoritative ESP-IDF v5.5.4 `soc/*_reg.h` MMIO Register Address Map (`Invariant 72` / `INFRA-001`)
@@ -322,8 +324,28 @@ def verify_live_status(url: str) -> list[str]:
                 print(
                     f"[PASS] Live status from {url}: reset_reason='{reset_reason}', uptime_ms={uptime}, partition='{partition}'"
                 )
-    except Exception as exc:
+    except (OSError, urllib.error.URLError, TimeoutError, ValueError) as exc:
         errors.append(f"Failed to query live status from {url}: {exc}")
+    return errors
+
+
+def verify_esp32_i2s_rs() -> list[str]:
+    """FIND-VERIF-001: Verifies esp32_i2s.rs masks I2S_SAMPLE_RATE_CONF_REG_OFFSET with & !(0x3F << 18)."""
+    errors: list[str] = []
+    if not ESP32_I2S_RS.is_file():
+        errors.append(f"Missing esp32_i2s.rs at {ESP32_I2S_RS}")
+        return errors
+
+    content = ESP32_I2S_RS.read_text(encoding="utf-8")
+    if "I2S_SAMPLE_RATE_CONF_REG_OFFSET" not in content:
+        errors.append("esp32_i2s.rs does not reference I2S_SAMPLE_RATE_CONF_REG_OFFSET")
+    if "& !(0x3F << 18)" not in content:
+        errors.append("esp32_i2s.rs does not mask I2S_SAMPLE_RATE_CONF_REG_OFFSET with '& !(0x3F << 18)'")
+
+    if not errors:
+        print(
+            f"[PASS] esp32_i2s.rs ({ESP32_I2S_RS}) correctly masks I2S_SAMPLE_RATE_CONF_REG_OFFSET with & !(0x3F << 18)"
+        )
     return errors
 
 
@@ -342,6 +364,7 @@ def main() -> int:
     all_errors.extend(verify_udev_rules())
     all_errors.extend(verify_main_rs())
     all_errors.extend(verify_bootloader_bin())
+    all_errors.extend(verify_esp32_i2s_rs())
     if args.live_status_url:
         all_errors.extend(verify_live_status(args.live_status_url))
 

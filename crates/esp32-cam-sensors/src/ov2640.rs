@@ -959,10 +959,9 @@ impl Ov2640 {
 
         let (clk_2x, clk_div, pclk_auto, pclk_div): (u8, u8, u8, u8) =
             if self.pixformat == PixelFormat::Jpeg {
-                let div = if mode == Ov2640SensorMode::Uxga {
-                    12
-                } else {
-                    8
+                let div = match mode {
+                    Ov2640SensorMode::Cif | Ov2640SensorMode::Svga => 4,
+                    Ov2640SensorMode::Uxga => 12,
                 };
                 (0, 0, 0, div)
             } else {
@@ -997,7 +996,11 @@ impl Ov2640 {
         self.write_reg(bus, Ov2640Bank::Dsp, R_BYPASS, R_BYPASS_DSP_EN)?;
 
         bus.delay_ms(10);
-        self.set_pixformat(bus, self.pixformat)
+        self.set_pixformat(bus, self.pixformat)?;
+        if self.pixformat == PixelFormat::Jpeg {
+            self.write_reg(bus, Ov2640Bank::Dsp, R_DVP_SP, pclk)?;
+        }
+        Ok(())
     }
 }
 
@@ -1069,6 +1072,14 @@ impl<B: SccbBus> CameraSensor<B> for Ov2640 {
         Ok(())
     }
 
+    /// Configures the output pixel format.
+    ///
+    /// ### `SEN-OV2640-001` Invariant
+    /// Switching from [`PixelFormat::Jpeg`] to non-JPEG formats
+    /// ([`PixelFormat::Rgb565`], [`PixelFormat::Yuv422`], or
+    /// [`PixelFormat::Grayscale`]) writes [`IMAGE_MODE_RGB565`] or
+    /// [`IMAGE_MODE_YUV422`] to DSP register [`IMAGE_MODE`] (`0xDA`),
+    /// clearing [`IMAGE_MODE_JPEG_EN`] (`0x10`).
     fn set_pixformat(&mut self, bus: &mut B, pixformat: PixelFormat) -> Result<(), CameraError> {
         let regs: &[Reg8] = match pixformat {
             PixelFormat::Rgb565 | PixelFormat::Rgb888 => &OV2640_SETTINGS_RGB565,
@@ -1077,6 +1088,15 @@ impl<B: SccbBus> CameraSensor<B> for Ov2640 {
             _ => return Err(CameraError::NotSupported),
         };
         self.write_regs(bus, regs)?;
+        if pixformat == PixelFormat::Jpeg {
+            let pclk_div = if (self.status.framesize as u8) > (FrameSize::Svga as u8) {
+                0x0c
+            } else {
+                0x04
+            };
+            self.write_reg(bus, Ov2640Bank::Sensor, CLKRC, 0x00)?;
+            self.write_reg(bus, Ov2640Bank::Dsp, R_DVP_SP, pclk_div)?;
+        }
         bus.delay_ms(10);
         self.pixformat = pixformat;
         Ok(())
@@ -1114,8 +1134,12 @@ impl<B: SccbBus> CameraSensor<B> for Ov2640 {
             offset_y /= 2;
         }
 
-        self.set_window(bus, mode, offset_x, offset_y, max_x, max_y, w, h)?;
+        let prev_framesize = self.status.framesize;
         self.status.framesize = framesize;
+        if let Err(err) = self.set_window(bus, mode, offset_x, offset_y, max_x, max_y, w, h) {
+            self.status.framesize = prev_framesize;
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -1400,5 +1424,46 @@ impl<B: SccbBus> CameraSensor<B> for Ov2640 {
         }
         self.xclk_freq_hz = (xclk as u32).saturating_mul(1_000_000);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::MockSccbBus;
+
+    #[test]
+    fn test_ov2640_jpeg_pclk_dividers_and_pixformat_sync() {
+        let mut bus: MockSccbBus<512> = MockSccbBus::new();
+        let mut sensor = Ov2640::new();
+
+        // 1. set_pixformat(Jpeg) before set_framesize:
+        assert_eq!(sensor.set_pixformat(&mut bus, PixelFormat::Jpeg), Ok(()));
+        assert_eq!(sensor.set_framesize(&mut bus, FrameSize::Svga), Ok(()));
+        assert_eq!(bus.reg8(CameraSccbAddr::OV2640, CLKRC), 0x00);
+        assert_eq!(bus.reg8(CameraSccbAddr::OV2640, R_DVP_SP), 0x04);
+
+        assert_eq!(sensor.set_framesize(&mut bus, FrameSize::Cif), Ok(()));
+        assert_eq!(bus.reg8(CameraSccbAddr::OV2640, CLKRC), 0x00);
+        assert_eq!(bus.reg8(CameraSccbAddr::OV2640, R_DVP_SP), 0x04);
+
+        assert_eq!(sensor.set_framesize(&mut bus, FrameSize::Hd), Ok(()));
+        assert_eq!(bus.reg8(CameraSccbAddr::OV2640, CLKRC), 0x00);
+        assert_eq!(bus.reg8(CameraSccbAddr::OV2640, R_DVP_SP), 0x0c);
+
+        // 2. set_framesize before set_pixformat(Jpeg):
+        let mut bus2: MockSccbBus<512> = MockSccbBus::new();
+        let mut sensor2 = Ov2640::new();
+        assert_eq!(sensor2.set_framesize(&mut bus2, FrameSize::Hd), Ok(()));
+        assert_eq!(sensor2.set_pixformat(&mut bus2, PixelFormat::Jpeg), Ok(()));
+        assert_eq!(bus2.reg8(CameraSccbAddr::OV2640, CLKRC), 0x00);
+        assert_eq!(bus2.reg8(CameraSccbAddr::OV2640, R_DVP_SP), 0x0c);
+
+        let mut bus3: MockSccbBus<512> = MockSccbBus::new();
+        let mut sensor3 = Ov2640::new();
+        assert_eq!(sensor3.set_framesize(&mut bus3, FrameSize::Svga), Ok(()));
+        assert_eq!(sensor3.set_pixformat(&mut bus3, PixelFormat::Jpeg), Ok(()));
+        assert_eq!(bus3.reg8(CameraSccbAddr::OV2640, CLKRC), 0x00);
+        assert_eq!(bus3.reg8(CameraSccbAddr::OV2640, R_DVP_SP), 0x04);
     }
 }

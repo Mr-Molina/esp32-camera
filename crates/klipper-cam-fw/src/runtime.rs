@@ -324,7 +324,10 @@ mod tests {
         // already cancelled
         let ip_renewed = Ipv4Addr::new(172, 22, 1, 53);
         assert!(rt.on_wifi_got_ip(ip_renewed).is_ok());
-        assert_eq!(rt.wifi_state, WifiStaState::ConnectedGotIp { ip: ip_renewed });
+        assert_eq!(
+            rt.wifi_state,
+            WifiStaState::ConnectedGotIp { ip: ip_renewed }
+        );
     }
 
     #[test]

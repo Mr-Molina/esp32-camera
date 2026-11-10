@@ -434,9 +434,6 @@ mod tests {
         );
         // no-op write check when new_value == c_value
         bus.preset_reg8(0x30, 0x10, 0b1010_1010);
-        assert_eq!(
-            set_reg_bits8(&mut bus, 0x30, 0x10, 1, 0x07, 0b101),
-            Ok(())
-        );
+        assert_eq!(set_reg_bits8(&mut bus, 0x30, 0x10, 1, 0x07, 0b101), Ok(()));
     }
 }

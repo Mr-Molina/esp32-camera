@@ -744,8 +744,12 @@ mod tests {
     #[test]
     fn test_logic_052_find_target_slot_round_robin() {
         let mut pool: FramePool<4, 16> = FramePool::new(GrabMode::Latest);
-        let s0 = pool.push_frame(&[1], 10, 10, PixelFormat::Grayscale, 1).expect("push_frame");
-        let s1 = pool.push_frame(&[2], 10, 10, PixelFormat::Grayscale, 2).expect("push_frame");
+        let s0 = pool
+            .push_frame(&[1], 10, 10, PixelFormat::Grayscale, 1)
+            .expect("push_frame");
+        let s1 = pool
+            .push_frame(&[2], 10, 10, PixelFormat::Grayscale, 2)
+            .expect("push_frame");
         assert_ne!(s0, s1);
     }
 }

@@ -377,7 +377,10 @@ mod tests {
         assert_eq!(verify_jpeg_soi_2byte(&[]), None);
         assert_eq!(verify_jpeg_soi_2byte(&[0xFF]), None);
         assert_eq!(verify_jpeg_soi_2byte(&[0xFF, 0xD8]), Some(0));
-        assert_eq!(verify_jpeg_soi_2byte(&[0x00, 0x11, 0xFF, 0xD8, 0x00]), Some(2));
+        assert_eq!(
+            verify_jpeg_soi_2byte(&[0x00, 0x11, 0xFF, 0xD8, 0x00]),
+            Some(2)
+        );
         assert_eq!(
             verify_jpeg_soi_2byte(&[0x00, 0x11, 0xFF, 0xD8, 0xFF, 0xE0]),
             Some(2)
@@ -388,8 +391,7 @@ mod tests {
     fn test_extract_first_jpeg_payload() {
         let multi_frame = [
             0xFF, 0xD8, 0xFF, 0xE0, 0xFF, 0xD9, // First frame (len 6)
-            0xAA, 0xBB,
-            0xFF, 0xD8, 0xFF, 0xE0, 0xFF, 0xD9, // Second frame
+            0xAA, 0xBB, 0xFF, 0xD8, 0xFF, 0xE0, 0xFF, 0xD9, // Second frame
         ];
         assert_eq!(
             extract_first_jpeg_payload(&multi_frame),

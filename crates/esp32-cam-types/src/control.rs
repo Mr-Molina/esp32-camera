@@ -139,11 +139,16 @@ impl CameraStatus {
     #[inline]
     pub const fn is_valid(&self) -> bool {
         self.quality <= 63
-            && self.brightness >= -2 && self.brightness <= 2
-            && self.contrast >= -2 && self.contrast <= 2
-            && self.saturation >= -2 && self.saturation <= 2
-            && self.sharpness >= -2 && self.sharpness <= 2
-            && self.ae_level >= -2 && self.ae_level <= 2
+            && self.brightness >= -2
+            && self.brightness <= 2
+            && self.contrast >= -2
+            && self.contrast <= 2
+            && self.saturation >= -2
+            && self.saturation <= 2
+            && self.sharpness >= -2
+            && self.sharpness <= 2
+            && self.ae_level >= -2
+            && self.ae_level <= 2
             && self.denoise <= 8
             && self.special_effect <= 6
             && self.wb_mode <= 4

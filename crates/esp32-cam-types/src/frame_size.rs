@@ -399,15 +399,36 @@ mod tests {
         assert_eq!(qvga.pixel_count(), 320 * 240);
 
         assert_eq!(qvga.checked_byte_size(PixelFormat::Jpeg), None);
-        assert_eq!(qvga.checked_byte_size(PixelFormat::Grayscale), Some(320 * 240));
+        assert_eq!(
+            qvga.checked_byte_size(PixelFormat::Grayscale),
+            Some(320 * 240)
+        );
         assert_eq!(qvga.checked_byte_size(PixelFormat::Raw), Some(320 * 240));
         assert_eq!(qvga.checked_byte_size(PixelFormat::Raw8), Some(320 * 240));
-        assert_eq!(qvga.checked_byte_size(PixelFormat::Rgb565), Some(320 * 240 * 2));
-        assert_eq!(qvga.checked_byte_size(PixelFormat::Yuv422), Some(320 * 240 * 2));
-        assert_eq!(qvga.checked_byte_size(PixelFormat::Rgb888), Some(320 * 240 * 3));
-        assert_eq!(qvga.checked_byte_size(PixelFormat::Yuv420), Some((320 * 240 * 3) / 2));
-        assert_eq!(qvga.checked_byte_size(PixelFormat::Rgb444), Some(320 * 240 * 2));
-        assert_eq!(qvga.checked_byte_size(PixelFormat::Rgb555), Some(320 * 240 * 2));
+        assert_eq!(
+            qvga.checked_byte_size(PixelFormat::Rgb565),
+            Some(320 * 240 * 2)
+        );
+        assert_eq!(
+            qvga.checked_byte_size(PixelFormat::Yuv422),
+            Some(320 * 240 * 2)
+        );
+        assert_eq!(
+            qvga.checked_byte_size(PixelFormat::Rgb888),
+            Some(320 * 240 * 3)
+        );
+        assert_eq!(
+            qvga.checked_byte_size(PixelFormat::Yuv420),
+            Some((320 * 240 * 3) / 2)
+        );
+        assert_eq!(
+            qvga.checked_byte_size(PixelFormat::Rgb444),
+            Some(320 * 240 * 2)
+        );
+        assert_eq!(
+            qvga.checked_byte_size(PixelFormat::Rgb555),
+            Some(320 * 240 * 2)
+        );
 
         assert_eq!(FrameSize::from_u8(0), Some(FrameSize::Size96x96));
         assert_eq!(FrameSize::from_u8(6), Some(FrameSize::Qvga));

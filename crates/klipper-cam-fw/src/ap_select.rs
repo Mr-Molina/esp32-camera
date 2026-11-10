@@ -265,7 +265,10 @@ impl ApTracker {
     #[must_use]
     pub fn best_pinned(&self, pinned_bssid: Option<[u8; 6]>) -> Option<ApCandidate> {
         if let Some(pinned) = pinned_bssid {
-            self.candidates().iter().copied().find(|c| c.bssid == pinned)
+            self.candidates()
+                .iter()
+                .copied()
+                .find(|c| c.bssid == pinned)
         } else {
             self.best()
         }

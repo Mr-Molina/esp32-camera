@@ -1159,7 +1159,11 @@ impl Ov5640 {
         }
         bus.write_reg16(self.slv_addr, SC_PLL_SYS, if bypass { 0x80 } else { 0x00 })?;
         bus.write_reg16(self.slv_addr, SC_PLL_CONTRL0, 0x1A)?;
-        bus.write_reg16(self.slv_addr, SC_PLL_CONTRL1, 0x01 | ((sys_div & 0x0F) << 4))?;
+        bus.write_reg16(
+            self.slv_addr,
+            SC_PLL_CONTRL1,
+            0x01 | ((sys_div & 0x0F) << 4),
+        )?;
         bus.write_reg16(self.slv_addr, SC_PLL_CONTRL2, multiplier)?;
         bus.write_reg16(
             self.slv_addr,
