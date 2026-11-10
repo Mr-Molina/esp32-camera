@@ -27,13 +27,6 @@ pub const MJPEG_BOUNDARY: &str = "123456789000000000000987654321";
 pub const MJPEG_CONTENT_TYPE: &str =
     "multipart/x-mixed-replace;boundary=123456789000000000000987654321";
 
-/// Initial HTTP 200 multipart response header prefix for Port 81 stream.
-pub const STREAM_INITIAL_HEADER: &[u8] = b"HTTP/1.1 200 OK\r\n\
-Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\
-Cache-Control: no-store, no-cache, must-revalidate, max-age=0\r\n\
-Pragma: no-cache\r\n\
-Access-Control-Allow-Origin: *\r\n\r\n";
-
 /// Maximum URL query string length accepted by `GET /` (`256` bytes,
 /// `APP-013`).
 pub const MAX_URL_QUERY_LEN: usize = 256;
@@ -656,35 +649,6 @@ pub const fn parse_framesize_val(val: isize) -> Option<FrameSize> {
     }
 }
 
-/// Extracts the single value for header `name` from `raw_headers`
-/// (`SEC-HTTP-001`).
-///
-/// Returns `None` if the header is missing, malformed, non-UTF-8, or present
-/// more than once (preventing HTTP header smuggling / token shadowing).
-#[allow(dead_code)]
-pub(crate) fn extract_header_value_strict<'a>(
-    raw_headers: &'a [u8],
-    name: &str,
-) -> Option<&'a str> {
-    let header_str = core::str::from_utf8(raw_headers).ok()?;
-    let mut found: Option<&'a str> = None;
-    for line in header_str.split("\r\n") {
-        if line.is_empty() {
-            continue;
-        }
-        let colon = line.find(':')?;
-        let hname = line[..colon].trim();
-        if hname.eq_ignore_ascii_case(name) {
-            if found.is_some() {
-                // Duplicate header rejected per RFC 9112 / SEC-HTTP-001
-                return None;
-            }
-            found = Some(line[colon + 1..].trim());
-        }
-    }
-    found
-}
-
 /// Formats a [`CameraControlState`] as JSON into a 384-byte stack buffer.
 pub fn format_control_json<'a>(
     ctrl: &CameraControlState,
@@ -796,42 +760,6 @@ pub fn write_mjpeg_part_header(content_len: usize, out_buf: &mut [u8]) -> Result
     )
     .map_err(|_| HttpError::BufferTooSmall)?;
     Ok(writer.into_bytes())
-}
-
-/// Formats an MJPEG multipart frame boundary header into `out_buf` and returns
-/// the number of header bytes written without copying the JPEG payload.
-#[inline]
-pub fn write_mjpeg_part_header_only(
-    content_len: usize,
-    out_buf: &mut [u8],
-) -> Result<usize, HttpError> {
-    Ok(write_mjpeg_part_header(content_len, out_buf)?.len())
-}
-
-/// Formats HTTP `200 OK` snapshot response headers into `out_buf` without
-/// copying the JPEG frame payload (`klipper_cam.c` lines 170-194).
-pub fn write_snapshot_headers(content_len: usize, out_buf: &mut [u8]) -> Result<&[u8], HttpError> {
-    let mut writer = SliceWriter::new(out_buf);
-    write!(
-        writer,
-        "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\n\
-        Content-Disposition: inline; filename=capture.jpg\r\n\
-        Access-Control-Allow-Origin: *\r\nConnection: close\r\n\
-        Content-Length: {}\r\n\r\n",
-        content_len
-    )
-    .map_err(|_| HttpError::BufferTooSmall)?;
-    Ok(writer.into_bytes())
-}
-
-/// Formats HTTP `200 OK` snapshot response headers into `out_buf` and returns
-/// the number of header bytes written without copying the JPEG payload.
-#[inline]
-pub fn write_snapshot_headers_only(
-    content_len: usize,
-    out_buf: &mut [u8],
-) -> Result<usize, HttpError> {
-    Ok(write_snapshot_headers(content_len, out_buf)?.len())
 }
 
 /// Formats an MJPEG multipart frame boundary header into a 128-byte stack
@@ -1201,26 +1129,6 @@ impl<'a> KlipperCamServer<'a> {
     #[inline]
     pub fn try_start_stream(&self) -> Option<StreamSessionGuard<'_>> {
         StreamSessionGuard::try_acquire(&self.stream_active)
-    }
-
-    /// Formats an MJPEG multipart frame boundary header into `out_buf` and returns
-    /// the number of header bytes written without copying the JPEG payload.
-    #[inline]
-    pub fn write_mjpeg_part_header_only(
-        content_len: usize,
-        out_buf: &mut [u8],
-    ) -> Result<usize, HttpError> {
-        write_mjpeg_part_header_only(content_len, out_buf)
-    }
-
-    /// Formats HTTP `200 OK` snapshot response headers into `out_buf` and returns
-    /// the number of header bytes written without copying the JPEG payload.
-    #[inline]
-    pub fn write_snapshot_headers_only(
-        content_len: usize,
-        out_buf: &mut [u8],
-    ) -> Result<usize, HttpError> {
-        write_snapshot_headers_only(content_len, out_buf)
     }
 
     /// Returns `true` if a valid OTA firmware upload has completed and scheduled a
@@ -3142,31 +3050,6 @@ Host: 172.22.1.52\r\n\r\n";
     }
 
     #[test]
-    fn test_extract_header_value_strict_sec_http_001() {
-        let headers = b"Host: 172.22.1.52\r\nX-OTA-Token: secret123\r\nContent-Length: 24\r\n\r\n";
-        assert_eq!(
-            extract_header_value_strict(headers, "X-OTA-Token"),
-            Some("secret123")
-        );
-        assert_eq!(
-            extract_header_value_strict(headers, "x-ota-token"),
-            Some("secret123")
-        );
-        assert_eq!(
-            extract_header_value_strict(headers, "Content-Length"),
-            Some("24")
-        );
-        assert_eq!(extract_header_value_strict(headers, "Missing-Header"), None);
-
-        let dup_headers = b"Host: 172.22.1.52\r\nX-OTA-Token: tok1\r\nX-OTA-Token: tok2\r\n\r\n";
-        assert_eq!(
-            extract_header_value_strict(dup_headers, "X-OTA-Token"),
-            None,
-            "Duplicate header must be rejected"
-        );
-    }
-
-    #[test]
     fn test_parse_framesize_val_fw_audit_http_002() {
         assert_eq!(parse_framesize_val(10), Some(FrameSize::Xga));
         assert_eq!(parse_framesize_val(1024), Some(FrameSize::Xga));
@@ -3193,40 +3076,16 @@ X-OTA-Token: tok2\r\n\r\n";
     }
 
     #[test]
-    fn test_zero_copy_mjpeg_and_snapshot_header_helpers() {
+    fn test_zero_copy_mjpeg_part_header() {
         let mut buf = [0u8; 256];
         let mjpeg_hdr = write_mjpeg_part_header(51_200, &mut buf).expect("mjpeg header");
         let expected_mjpeg = b"\r\n--123456789000000000000987654321\r\n\
 Content-Type: image/jpeg\r\nContent-Length: 51200\r\n\r\n";
         assert_eq!(mjpeg_hdr, expected_mjpeg);
 
-        let mjpeg_len = write_mjpeg_part_header_only(51_200, &mut buf).expect("mjpeg len");
-        assert_eq!(mjpeg_len, expected_mjpeg.len());
-        assert_eq!(
-            KlipperCamServer::write_mjpeg_part_header_only(51_200, &mut buf).expect("server mjpeg"),
-            expected_mjpeg.len()
-        );
-
-        let snap_len = write_snapshot_headers_only(51_200, &mut buf).expect("snapshot header");
-        let expected_snap = b"HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\n\
-Content-Disposition: inline; filename=capture.jpg\r\n\
-Access-Control-Allow-Origin: *\r\nConnection: close\r\n\
-Content-Length: 51200\r\n\r\n";
-        assert_eq!(snap_len, expected_snap.len());
-        assert_eq!(&buf[..snap_len], expected_snap);
-        assert_eq!(
-            KlipperCamServer::write_snapshot_headers_only(51_200, &mut buf)
-                .expect("server snapshot"),
-            expected_snap.len()
-        );
-
         let mut tiny_buf = [0u8; 16];
         assert_eq!(
             write_mjpeg_part_header(51_200, &mut tiny_buf),
-            Err(HttpError::BufferTooSmall)
-        );
-        assert_eq!(
-            write_snapshot_headers_only(51_200, &mut tiny_buf),
             Err(HttpError::BufferTooSmall)
         );
     }

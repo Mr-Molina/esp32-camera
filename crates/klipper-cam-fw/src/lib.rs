@@ -63,10 +63,11 @@ pub use frame_buffer::{PingPongFrameBuffer, TripleFrameBuffer};
 pub use http::{
     format_control_json, format_mjpeg_part_header, format_ota_minimal_root, format_status_json,
     framesize_control_code, framesize_label, parse_framesize_val, parse_http_request,
-    write_http_error, CameraControlState, CameraDriver, FrameGuard, HttpError, HttpMethod,
-    HttpRequest, HttpResponseView, KlipperCamServer, ServerPort, SliceWriter, StreamSessionGuard,
-    TelemetrySnapshot, CONTROL_JSON_BUF_LEN, KLIPPER_CONTROL_PANEL_HTML, KLIPPER_ROOT_STATUS_PAGE,
-    MJPEG_BOUNDARY, MJPEG_CONTENT_TYPE, SYNTHETIC_HD_JFIF_FRAME,
+    write_http_error, write_mjpeg_part_header, CameraControlState, CameraDriver, FrameGuard,
+    HttpError, HttpMethod, HttpRequest, HttpResponseView, KlipperCamServer, ServerPort,
+    SliceWriter, StreamSessionGuard, TelemetrySnapshot, CONTROL_JSON_BUF_LEN,
+    KLIPPER_CONTROL_PANEL_HTML, KLIPPER_ROOT_STATUS_PAGE, MJPEG_BOUNDARY, MJPEG_CONTENT_TYPE,
+    SYNTHETIC_HD_JFIF_FRAME,
 };
 pub use ota::{
     crc32_ieee, find_partition_by_label, validate_ota_image_header, verify_ota_token,

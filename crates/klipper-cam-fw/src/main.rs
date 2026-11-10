@@ -374,15 +374,43 @@ static CORE1_IS_PAUSED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_arch = "xtensa")]
 static CORE1_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+/// Requests Core 1 to stop I2S0 capture and waits for it to acknowledge.
+///
+/// Returns `true` once Core 1 is parked in its IRAM-resident pause loop (or
+/// when Core 1 was never started). Returns `false` on timeout, in which case
+/// Core 1 may still be executing flash-resident code: callers that are about
+/// to disable the flash cache must treat that as a failure, not proceed.
 #[cfg(target_arch = "xtensa")]
 #[esp_hal::ram]
-fn pause_core1_camera_producer() {
+fn pause_core1_camera_producer() -> bool {
+    if !CORE1_ACTIVE.load(Ordering::Acquire) {
+        return true;
+    }
+    CORE1_PAUSE_REQ.store(true, Ordering::Release);
+    for spin in 0..2_000_000u32 {
+        if CORE1_IS_PAUSED.load(Ordering::Acquire) {
+            return true;
+        }
+        if (spin & 0xFFF) == 0 {
+            feed_rtc_wdt();
+        }
+        core::hint::spin_loop();
+    }
+    false
+}
+
+/// Releases Core 1 from its pause loop and waits until it has actually left
+/// it, so a subsequent `pause_core1_camera_producer` can never observe a stale
+/// `CORE1_IS_PAUSED == true` from this pause cycle.
+#[cfg(target_arch = "xtensa")]
+#[esp_hal::ram]
+fn resume_core1_camera_producer() {
+    CORE1_PAUSE_REQ.store(false, Ordering::Release);
     if !CORE1_ACTIVE.load(Ordering::Acquire) {
         return;
     }
-    CORE1_PAUSE_REQ.store(true, Ordering::Release);
-    for spin in 0..500_000u32 {
-        if CORE1_IS_PAUSED.load(Ordering::Acquire) {
+    for spin in 0..2_000_000u32 {
+        if !CORE1_IS_PAUSED.load(Ordering::Acquire) {
             break;
         }
         if (spin & 0xFFF) == 0 {
@@ -390,12 +418,6 @@ fn pause_core1_camera_producer() {
         }
         core::hint::spin_loop();
     }
-}
-
-#[cfg(target_arch = "xtensa")]
-#[esp_hal::ram]
-fn resume_core1_camera_producer() {
-    CORE1_PAUSE_REQ.store(false, Ordering::Release);
 }
 
 #[cfg(target_arch = "xtensa")]
@@ -852,12 +874,10 @@ fn enqueue_p81_zero_copy(
     sock: &mut smoltcp::socket::tcp::Socket<'_>,
     hdr: &[u8],
     jpeg: &[u8],
-    tail: &[u8],
     tx_off: &mut usize,
 ) {
     let hdr_end = hdr.len();
-    let jpeg_end = hdr_end.saturating_add(jpeg.len());
-    let total_len = jpeg_end.saturating_add(tail.len());
+    let total_len = hdr_end.saturating_add(jpeg.len());
     while *tx_off < total_len && sock.can_send() {
         let queued = sock.send_queue();
         if queued >= TCP_MAX_INFLIGHT_BYTES {
@@ -867,13 +887,9 @@ fn enqueue_p81_zero_copy(
         let seg = if *tx_off < hdr_end {
             let rem = &hdr[*tx_off..hdr_end];
             &rem[..rem.len().min(budget)]
-        } else if *tx_off < jpeg_end {
+        } else {
             let off = *tx_off - hdr_end;
             let rem = &jpeg[off..];
-            &rem[..rem.len().min(budget)]
-        } else {
-            let off = *tx_off - jpeg_end;
-            let rem = &tail[off..];
             &rem[..rem.len().min(budget)]
         };
         if seg.is_empty() {
@@ -1294,7 +1310,7 @@ fn ensure_psram_qpi_mode_spi1() {
 #[cfg(target_arch = "xtensa")]
 #[esp_hal::ram]
 fn quiesce_psram_and_software_reset() -> ! {
-    pause_core1_camera_producer();
+    let _ = pause_core1_camera_producer();
     release_psram_cs_and_exit_qpi();
     // JUSTIFICATION: Mask interrupts at CPU level 15 prior to software reset.
     // SAFETY: Inline assembly modifies only processor interrupt priority.
@@ -1746,6 +1762,7 @@ fn capture_live_hd_jpeg_with_diag(
                     spin = spin.wrapping_add(1);
                     if (spin & 0x3F) == 0 {
                         feed_rtc_wdt();
+                        poll_net();
                     }
                 }
             }
@@ -1756,6 +1773,7 @@ fn capture_live_hd_jpeg_with_diag(
                 spin = spin.wrapping_add(1);
                 if (spin & 0x3F) == 0 {
                     feed_rtc_wdt();
+                    poll_net();
                 }
             }
             let active_wait_start_ms = now_millis();
@@ -1763,6 +1781,7 @@ fn capture_live_hd_jpeg_with_diag(
                 spin = spin.wrapping_add(1);
                 if (spin & 0x3F) == 0 {
                     feed_rtc_wdt();
+                    poll_net();
                 }
             }
         }
@@ -1789,6 +1808,7 @@ fn capture_live_hd_jpeg_with_diag(
                     blank_spin = blank_spin.wrapping_add(1);
                     if (blank_spin & 0x3F) == 0 {
                         feed_rtc_wdt();
+                        poll_net();
                     }
                 }
 
@@ -1845,6 +1865,7 @@ fn capture_live_hd_jpeg_with_diag(
                             eof_cnt += 1;
                             if (eof_cnt & 7) == 0 {
                                 feed_rtc_wdt();
+                                poll_net();
                             }
                         } else {
                             let _ = i2s_cam.stop();
@@ -2226,10 +2247,7 @@ fn core1_camera_producer_loop() -> ! {
 
                     if is_first_chunk {
                         let scan_end = written.min(256);
-                        let has_soi = unpack_buf[..scan_end]
-                            .windows(3)
-                            .any(|w| w[0] == 0xFF && w[1] == 0xD8 && w[2] == 0xFF);
-                        if !has_soi {
+                        if verify_jpeg_soi(&unpack_buf[..scan_end]).is_none() {
                             aborted = true;
                             aligned_from_eof = false;
                             break 'frame_poll;
@@ -2838,13 +2856,8 @@ fn drain_core1_spsc_to_triple(
                     let dst = triple_fb.write_slot_mut();
                     let soi_window = written_len.min(256);
                     if let Some(soi_pos) = verify_jpeg_soi(&dst[..soi_window]) {
-                        let mut pos = written_len;
-                        while pos >= soi_pos + 2 {
-                            if dst[pos - 2] == 0xFF && dst[pos - 1] == 0xD9 {
-                                valid_bounds = Some((soi_pos, pos));
-                                break;
-                            }
-                            pos -= 1;
+                        if let Some(eoi_rel) = verify_jpeg_eoi(&dst[soi_pos..written_len], false) {
+                            valid_bounds = Some((soi_pos, soi_pos + eoi_rel + 2));
                         }
                     }
                 }
@@ -2884,7 +2897,7 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
     use esp_println::println;
     use esp_radio::wifi::{Interface as WifiInterface, PowerSaveMode};
     use klipper_cam_fw::{
-        parse_http_request, HttpMethod, KlipperCamServer, OtaDataManager, RoamBackoff,
+        parse_http_request, write_mjpeg_part_header, HttpMethod, OtaDataManager, RoamBackoff,
         RoamDecision, StreamSessionGuard, WeakLinkTimer, OTA_PARTITION_MAX_SIZE,
         ROAM_CHECK_INTERVAL_MS, ROAM_TRIGGER_RSSI_DBM, ROAM_WEAK_DURATION_MS,
     };
@@ -3119,7 +3132,6 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
     let mut p81_last_send_queue: usize = 0;
     let mut p81_hdr_len: usize = 0;
     let mut p81_jpeg_slice: &'static [u8] = &[];
-    let p81_tail_slice: &'static [u8] = &[];
     let mut p81_tx_off: usize = 0;
     let mut p81_tx_len: usize = 0;
 
@@ -3732,15 +3744,25 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                         }
 
                         if req_complete {
+                            // Core 1 must be parked in IRAM before any flash
+                            // access disables the cache; a failed pause means
+                            // the OTA request is refused rather than risked.
+                            let mut core1_parked = true;
                             if is_ota_post {
-                                pause_core1_camera_producer();
-                                let booted_slot = runtime.server.ota_manager.active_slot();
-                                if let Ok(loaded) =
-                                    OtaDataManager::load_from_flash(&mut flash_adapter)
-                                {
-                                    if loaded.active_slot() == booted_slot {
-                                        runtime.server.ota_manager = loaded;
+                                core1_parked = pause_core1_camera_producer();
+                                if core1_parked {
+                                    let booted_slot = runtime.server.ota_manager.active_slot();
+                                    if let Ok(loaded) =
+                                        OtaDataManager::load_from_flash(&mut flash_adapter)
+                                    {
+                                        if loaded.active_slot() == booted_slot {
+                                            runtime.server.ota_manager = loaded;
+                                        }
                                     }
+                                } else {
+                                    println!(
+                                        "[KLIPPER-CAM-RS] [CORE1] pause timeout; refusing OTA POST"
+                                    );
                                 }
                             }
                             if is_snapshot_req {
@@ -3765,15 +3787,26 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                                 &p80_hdr_bufs[idx][..st.req_len]
                             };
 
-                            let handle_res = runtime
-                                .server
-                                .handle_raw_request_with_flash(
-                                    ServerPort::Control,
-                                    req_slice,
+                            let handle_res = if core1_parked {
+                                runtime
+                                    .server
+                                    .handle_raw_request_with_flash(
+                                        ServerPort::Control,
+                                        req_slice,
+                                        p80_resp_bufs[idx],
+                                        &mut flash_adapter,
+                                    )
+                                    .map(|s| s.len())
+                            } else {
+                                write_http_error(
                                     p80_resp_bufs[idx],
-                                    &mut flash_adapter,
+                                    503,
+                                    "Service Unavailable",
+                                    "503 Camera core busy; retry OTA\n",
+                                    false,
                                 )
-                                .map(|s| s.len());
+                                .map(|s| s.len())
+                            };
 
                             if is_snapshot_req && p81_stream_owner.is_some() {
                                 runtime.server.camera.set_frame(
@@ -3843,7 +3876,7 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
         if p80_tx_active {
             poll_net_burst(&mut iface, &mut net_device, &mut sockets);
         } else if let Some(ctrl) = runtime.server.take_pending_control_update() {
-            pause_core1_camera_producer();
+            let _ = pause_core1_camera_producer();
             if let (Some(ref mut sccb), Some(ref mut ov)) = (&mut kept_sccb, &mut live_ov2640) {
                 let fs_changed = ctrl.framesize != last_applied_ctrl.framesize;
                 if fs_changed {
@@ -3963,7 +3996,6 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                             sock81,
                             &p81_hdr_buf[..p81_hdr_len],
                             p81_jpeg_slice,
-                            p81_tail_slice,
                             &mut p81_tx_off,
                         );
                         if p81_tx_off != prev_off {
@@ -3994,6 +4026,9 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                 };
 
                 if tx_drained {
+                    // `capture_live_hd_jpeg_with_diag` commits *and* promotes
+                    // internally, so a frame_seq change must also count as fresh.
+                    let seq_before_capture = triple_fb.frame_seq();
                     if !CORE1_ACTIVE.load(Ordering::Relaxed)
                         && ov2640_dma_ok
                         && !triple_fb.has_new_ready()
@@ -4017,20 +4052,20 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                         }
                     }
 
-                    let got_fresh = triple_fb.promote_ready_to_active();
+                    let got_fresh = triple_fb.promote_ready_to_active()
+                        || triple_fb.frame_seq() != seq_before_capture;
                     if got_fresh || (!ov2640_dma_ok && now_ms - last_p81_send_ms >= 200) {
                         let fresh_slice = active_triple_static_slice(triple_fb);
                         runtime
                             .server
                             .camera
                             .set_frame(fresh_slice, runtime.server.control_state.framesize);
-                        if let Ok(part_hdr_len) = KlipperCamServer::write_mjpeg_part_header_only(
-                            fresh_slice.len(),
-                            p81_hdr_buf,
-                        ) {
+                        if let Ok(part_hdr_len) =
+                            write_mjpeg_part_header(fresh_slice.len(), p81_hdr_buf).map(|h| h.len())
+                        {
                             p81_hdr_len = part_hdr_len;
                             p81_jpeg_slice = fresh_slice;
-                            p81_tx_len = p81_hdr_len + p81_jpeg_slice.len() + p81_tail_slice.len();
+                            p81_tx_len = p81_hdr_len + p81_jpeg_slice.len();
                             p81_tx_off = 0;
                             {
                                 let sock81 = sockets.get_mut::<TcpSocket>(tcp81_handles[idx]);
@@ -4038,7 +4073,6 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                                     sock81,
                                     &p81_hdr_buf[..p81_hdr_len],
                                     p81_jpeg_slice,
-                                    p81_tail_slice,
                                     &mut p81_tx_off,
                                 );
                                 let sent_ms = smol_now().total_millis();
@@ -4184,15 +4218,15 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                         let stream_hdr_res =
                             guard.write_stream_headers(p81_hdr_buf).map(|b| b.len());
                         if let Ok(stream_hdr_len) = stream_hdr_res {
-                            let part_hdr_res = KlipperCamServer::write_mjpeg_part_header_only(
+                            let part_hdr_res = write_mjpeg_part_header(
                                 initial_jpeg.len(),
                                 &mut p81_hdr_buf[stream_hdr_len..],
-                            );
+                            )
+                            .map(|h| h.len());
                             if let Ok(part_hdr_len) = part_hdr_res {
                                 p81_hdr_len = stream_hdr_len + part_hdr_len;
                                 p81_jpeg_slice = initial_jpeg;
-                                p81_tx_len =
-                                    p81_hdr_len + p81_jpeg_slice.len() + p81_tail_slice.len();
+                                p81_tx_len = p81_hdr_len + p81_jpeg_slice.len();
                                 p81_tx_off = 0;
                                 started_ok = true;
                             }
@@ -4210,7 +4244,6 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                             sock81,
                             &p81_hdr_buf[..p81_hdr_len],
                             p81_jpeg_slice,
-                            p81_tail_slice,
                             &mut p81_tx_off,
                         );
                         last_p81_send_ms = now_ms;
