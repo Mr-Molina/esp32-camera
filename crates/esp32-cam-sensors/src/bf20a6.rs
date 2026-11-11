@@ -225,23 +225,23 @@ impl Bf20a6 {
                 denoise: 0,
                 special_effect: 0,
                 wb_mode: 0,
-                awb: 1,
-                awb_gain: 1,
-                aec: 1,
-                aec2: 0,
+                awb: true,
+                awb_gain: true,
+                aec: true,
+                aec2: false,
                 ae_level: 0,
                 aec_value: 300,
-                agc: 1,
+                agc: true,
                 agc_gain: 0,
                 gainceiling: 0,
-                bpc: 0,
-                wpc: 1,
-                raw_gma: 1,
-                lenc: 1,
-                hmirror: 0,
-                vflip: 0,
-                dcw: 1,
-                colorbar: 0,
+                bpc: false,
+                wpc: true,
+                raw_gma: true,
+                lenc: true,
+                hmirror: false,
+                vflip: false,
+                dcw: true,
+                colorbar: false,
             },
             slv_addr: CameraSccbAddr::BF20A6,
             pixformat: PixelFormat::Yuv422,
@@ -342,24 +342,24 @@ impl<B: SccbBus> CameraSensor<B> for Bf20a6 {
         self.status.denoise = 0;
         self.status.ae_level = 0;
         self.status.gainceiling = bus.read_reg8(self.slv_addr, 0x13)?;
-        self.status.awb = 0;
-        self.status.dcw = 0;
-        self.status.agc = 0;
-        self.status.aec = 0;
-        self.status.hmirror = 0;
-        self.status.vflip = 0;
-        self.status.colorbar = 0;
-        self.status.bpc = 0;
-        self.status.wpc = 0;
-        self.status.raw_gma = 0;
-        self.status.lenc = 0;
+        self.status.awb = false;
+        self.status.dcw = false;
+        self.status.agc = false;
+        self.status.aec = false;
+        self.status.hmirror = false;
+        self.status.vflip = false;
+        self.status.colorbar = false;
+        self.status.bpc = false;
+        self.status.wpc = false;
+        self.status.raw_gma = false;
+        self.status.lenc = false;
         self.status.quality = 0;
         self.status.special_effect = 0;
         self.status.wb_mode = 0;
-        self.status.awb_gain = 0;
+        self.status.awb_gain = false;
         self.status.agc_gain = 0;
         self.status.aec_value = 0;
-        self.status.aec2 = 0;
+        self.status.aec2 = false;
         Ok(())
     }
 
@@ -425,19 +425,19 @@ impl<B: SccbBus> CameraSensor<B> for Bf20a6 {
     fn set_colorbar(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let val = u8::from(enable);
         bus.write_reg8(self.slv_addr, 0xB6, val)?;
-        self.status.colorbar = val;
+        self.status.colorbar = enable;
         Ok(())
     }
 
     fn set_hmirror(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let val = u8::from(enable);
-        self.status.hmirror = val;
+        self.status.hmirror = enable;
         set_reg_bits(bus, self.slv_addr, 0x4A, 3, 1, val)
     }
 
     fn set_vflip(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let val = u8::from(enable);
-        self.status.vflip = val;
+        self.status.vflip = enable;
         set_reg_bits(bus, self.slv_addr, 0x4A, 2, 1, val)
     }
 

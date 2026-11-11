@@ -258,23 +258,23 @@ impl Sc101Iot {
                 denoise: 0,
                 special_effect: 0,
                 wb_mode: 0,
-                awb: 1,
-                awb_gain: 1,
-                aec: 1,
-                aec2: 0,
+                awb: true,
+                awb_gain: true,
+                aec: true,
+                aec2: false,
                 ae_level: 0,
                 aec_value: 300,
-                agc: 1,
+                agc: true,
                 agc_gain: 0,
                 gainceiling: 0,
-                bpc: 0,
-                wpc: 1,
-                raw_gma: 1,
-                lenc: 1,
-                hmirror: 0,
-                vflip: 0,
-                dcw: 1,
-                colorbar: 0,
+                bpc: false,
+                wpc: true,
+                raw_gma: true,
+                lenc: true,
+                hmirror: false,
+                vflip: false,
+                dcw: true,
+                colorbar: false,
             },
             slv_addr: CameraSccbAddr::SC101IOT,
             pixformat: PixelFormat::Yuv422,
@@ -472,27 +472,27 @@ impl<B: SccbBus> CameraSensor<B> for Sc101Iot {
     fn set_colorbar(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let val = u8::from(enable);
         self.set_reg_bits(bus, 0x0100, 7, 1, val)?;
-        self.status.colorbar = val;
+        self.status.colorbar = enable;
         Ok(())
     }
 
     fn set_hmirror(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let bits = if enable { 0x03 } else { 0x00 };
         self.set_reg_bits(bus, 0x3221, 1, 2, bits)?;
-        self.status.hmirror = u8::from(enable);
+        self.status.hmirror = enable;
         Ok(())
     }
 
     fn set_vflip(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let bits = if enable { 0x03 } else { 0x00 };
         self.set_reg_bits(bus, 0x3221, 5, 2, bits)?;
-        self.status.vflip = u8::from(enable);
+        self.status.vflip = enable;
         Ok(())
     }
 
     fn set_awb_gain(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         self.set_reg_bits(bus, 0x00B0, 0, 1, u8::from(enable))?;
-        self.status.awb_gain = u8::from(enable);
+        self.status.awb_gain = enable;
         Ok(())
     }
 
@@ -517,7 +517,7 @@ impl<B: SccbBus> CameraSensor<B> for Sc101Iot {
     fn set_raw_gma(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let val = u8::from(enable);
         self.set_reg_bits(bus, 0x00F5, 1, 1, val)?;
-        self.status.raw_gma = val;
+        self.status.raw_gma = enable;
         Ok(())
     }
 

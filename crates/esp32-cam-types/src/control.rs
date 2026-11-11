@@ -81,23 +81,23 @@ pub struct CameraStatus {
     pub denoise: u8,
     pub special_effect: u8,
     pub wb_mode: u8,
-    pub awb: u8,
-    pub awb_gain: u8,
-    pub aec: u8,
-    pub aec2: u8,
+    pub awb: bool,
+    pub awb_gain: bool,
+    pub aec: bool,
+    pub aec2: bool,
     pub ae_level: i8,
     pub aec_value: u16,
-    pub agc: u8,
+    pub agc: bool,
     pub agc_gain: u8,
     pub gainceiling: u8,
-    pub bpc: u8,
-    pub wpc: u8,
-    pub raw_gma: u8,
-    pub lenc: u8,
-    pub hmirror: u8,
-    pub vflip: u8,
-    pub dcw: u8,
-    pub colorbar: u8,
+    pub bpc: bool,
+    pub wpc: bool,
+    pub raw_gma: bool,
+    pub lenc: bool,
+    pub hmirror: bool,
+    pub vflip: bool,
+    pub dcw: bool,
+    pub colorbar: bool,
 }
 
 /// Clamps a signed image adjustment level (`brightness`, `contrast`,
@@ -149,23 +149,23 @@ impl CameraStatus {
             denoise: 0,
             special_effect: 0,
             wb_mode: 0,
-            awb: 1,
-            awb_gain: 1,
-            aec: 1,
-            aec2: 0,
+            awb: true,
+            awb_gain: true,
+            aec: true,
+            aec2: false,
             ae_level: 0,
             aec_value: 300,
-            agc: 1,
+            agc: true,
             agc_gain: 0,
             gainceiling: 0,
-            bpc: 0,
-            wpc: 1,
-            raw_gma: 1,
-            lenc: 1,
-            hmirror: 0,
-            vflip: 0,
-            dcw: 1,
-            colorbar: 0,
+            bpc: false,
+            wpc: true,
+            raw_gma: true,
+            lenc: true,
+            hmirror: false,
+            vflip: false,
+            dcw: true,
+            colorbar: false,
         }
     }
 
@@ -235,8 +235,8 @@ impl CameraStatus {
         }
     }
 
-    /// Returns a copy with all numeric ranges and `0/1` boolean flags clamped
-    /// to valid hardware bounds.
+    /// Returns a copy with all numeric ranges clamped to valid hardware
+    /// bounds.
     #[must_use]
     pub const fn clamped(self) -> Self {
         Self {
@@ -267,27 +267,27 @@ impl CameraStatus {
             } else {
                 self.wb_mode
             },
-            awb: Self::clamp_flag(self.awb),
-            awb_gain: Self::clamp_flag(self.awb_gain),
-            aec: Self::clamp_flag(self.aec),
-            aec2: Self::clamp_flag(self.aec2),
+            awb: self.awb,
+            awb_gain: self.awb_gain,
+            aec: self.aec,
+            aec2: self.aec2,
             ae_level: clamp_level(self.ae_level),
             aec_value: Self::clamp_aec_value(self.aec_value),
-            agc: Self::clamp_flag(self.agc),
+            agc: self.agc,
             agc_gain: Self::clamp_agc_gain(self.agc_gain),
             gainceiling: if self.gainceiling > Self::MAX_GAINCEILING {
                 Self::MAX_GAINCEILING
             } else {
                 self.gainceiling
             },
-            bpc: Self::clamp_flag(self.bpc),
-            wpc: Self::clamp_flag(self.wpc),
-            raw_gma: Self::clamp_flag(self.raw_gma),
-            lenc: Self::clamp_flag(self.lenc),
-            hmirror: Self::clamp_flag(self.hmirror),
-            vflip: Self::clamp_flag(self.vflip),
-            dcw: Self::clamp_flag(self.dcw),
-            colorbar: Self::clamp_flag(self.colorbar),
+            bpc: self.bpc,
+            wpc: self.wpc,
+            raw_gma: self.raw_gma,
+            lenc: self.lenc,
+            hmirror: self.hmirror,
+            vflip: self.vflip,
+            dcw: self.dcw,
+            colorbar: self.colorbar,
         }
     }
 
@@ -308,19 +308,6 @@ impl CameraStatus {
             && self.aec_value <= Self::MAX_AEC_VALUE
             && self.agc_gain <= Self::MAX_AGC_GAIN
             && self.gainceiling <= Self::MAX_GAINCEILING
-            && Self::is_valid_flag(self.awb)
-            && Self::is_valid_flag(self.awb_gain)
-            && Self::is_valid_flag(self.aec)
-            && Self::is_valid_flag(self.aec2)
-            && Self::is_valid_flag(self.agc)
-            && Self::is_valid_flag(self.bpc)
-            && Self::is_valid_flag(self.wpc)
-            && Self::is_valid_flag(self.raw_gma)
-            && Self::is_valid_flag(self.lenc)
-            && Self::is_valid_flag(self.hmirror)
-            && Self::is_valid_flag(self.vflip)
-            && Self::is_valid_flag(self.dcw)
-            && Self::is_valid_flag(self.colorbar)
     }
 }
 
@@ -379,18 +366,30 @@ mod tests {
         assert!(!status.scale);
         assert!(!status.binning);
         assert_eq!(status.quality, 12);
-        assert_eq!(status.awb, 1);
-        assert_eq!(status.aec, 1);
-        assert_eq!(status.agc, 1);
+        assert!(status.awb);
+        assert!(status.awb_gain);
+        assert!(status.aec);
+        assert!(!status.aec2);
+        assert!(status.agc);
+        assert!(!status.bpc);
+        assert!(status.wpc);
+        assert!(status.raw_gma);
+        assert!(status.lenc);
+        assert!(!status.hmirror);
+        assert!(!status.vflip);
+        assert!(status.dcw);
+        assert!(!status.colorbar);
 
         status.framesize = FrameSize::Hd;
         status.quality = 10;
-        status.hmirror = 1;
-        status.vflip = 1;
+        status.hmirror = true;
+        status.vflip = true;
+        status.colorbar = true;
         assert_eq!(status.framesize, FrameSize::Hd);
         assert_eq!(status.quality, 10);
-        assert_eq!(status.hmirror, 1);
-        assert_eq!(status.vflip, 1);
+        assert!(status.hmirror);
+        assert!(status.vflip);
+        assert!(status.colorbar);
     }
 
     #[test]
@@ -400,6 +399,11 @@ mod tests {
 
         const CONST_STATUS: CameraStatus = CameraStatus::new();
         assert!(CONST_STATUS.is_valid());
+
+        assert!(CameraStatus::is_valid_flag(0));
+        assert!(CameraStatus::is_valid_flag(1));
+        assert!(!CameraStatus::is_valid_flag(2));
+        assert!(!CameraStatus::is_valid_flag(u8::MAX));
 
         let mut invalid = status;
         invalid.quality = 64;
@@ -441,14 +445,6 @@ mod tests {
         invalid_wb.wb_mode = 5;
         assert!(!invalid_wb.is_valid());
 
-        let mut invalid_awb = status;
-        invalid_awb.awb = 2;
-        assert!(!invalid_awb.is_valid());
-
-        let mut invalid_vflip = status;
-        invalid_vflip.vflip = 2;
-        assert!(!invalid_vflip.is_valid());
-
         let mut invalid_gainceiling = status;
         invalid_gainceiling.gainceiling = 7;
         assert!(!invalid_gainceiling.is_valid());
@@ -468,10 +464,6 @@ mod tests {
         let mut invalid_aec_value = status;
         invalid_aec_value.aec_value = 1201;
         assert!(!invalid_aec_value.is_valid());
-
-        let mut invalid_colorbar = status;
-        invalid_colorbar.colorbar = 2;
-        assert!(!invalid_colorbar.is_valid());
     }
 
     #[test]
@@ -499,6 +491,11 @@ mod tests {
         assert_eq!(CameraStatus::clamp_aec_value(1201), 1200);
         assert_eq!(CameraStatus::clamp_aec_value(u16::MAX), 1200);
 
+        assert_eq!(CameraStatus::clamp_flag(0), 0);
+        assert_eq!(CameraStatus::clamp_flag(1), 1);
+        assert_eq!(CameraStatus::clamp_flag(2), 1);
+        assert_eq!(CameraStatus::clamp_flag(u8::MAX), 1);
+
         assert_eq!(CameraStatus::decode_flag(0), Some(false));
         assert_eq!(CameraStatus::decode_flag(1), Some(true));
         assert_eq!(CameraStatus::decode_flag(2), None);
@@ -515,23 +512,23 @@ mod tests {
             denoise: 20,
             special_effect: 99,
             wb_mode: 12,
-            awb: 5,
-            awb_gain: 2,
-            aec: 9,
-            aec2: 3,
+            awb: false,
+            awb_gain: true,
+            aec: false,
+            aec2: true,
             ae_level: -10,
             aec_value: 5000,
-            agc: 4,
+            agc: false,
             agc_gain: 99,
             gainceiling: 20,
-            bpc: 2,
-            wpc: 3,
-            raw_gma: 4,
-            lenc: 5,
-            hmirror: 6,
-            vflip: 7,
-            dcw: 8,
-            colorbar: 9,
+            bpc: true,
+            wpc: false,
+            raw_gma: false,
+            lenc: true,
+            hmirror: true,
+            vflip: true,
+            dcw: false,
+            colorbar: true,
         };
         assert!(!out_of_bounds.is_valid());
 
@@ -549,9 +546,9 @@ mod tests {
         assert_eq!(sanitized.aec_value, 1200);
         assert_eq!(sanitized.agc_gain, 30);
         assert_eq!(sanitized.gainceiling, 6);
-        assert_eq!(sanitized.awb, 1);
-        assert_eq!(sanitized.hmirror, 1);
-        assert_eq!(sanitized.vflip, 1);
-        assert_eq!(sanitized.colorbar, 1);
+        assert!(!sanitized.awb);
+        assert!(sanitized.hmirror);
+        assert!(sanitized.vflip);
+        assert!(sanitized.colorbar);
     }
 }

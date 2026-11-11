@@ -15,7 +15,8 @@ pub use crate::bmp::{
 };
 pub use crate::jpeg_codec::{
     decode_jpeg_to_rgb565, decode_jpeg_to_rgb888, encode_grayscale_to_jpeg, encode_rgb888_to_jpeg,
-    encode_yuv422_to_jpeg, encode_yuv422_to_jpeg_subsampled, max_encoded_len, Subsampling,
+    encode_yuv422_to_jpeg, encode_yuv422_to_jpeg_subsampled, encode_yuv422_to_jpeg_with_range,
+    max_encoded_len, Subsampling,
 };
 pub use crate::jpeg_scan::{
     eoi_probe_window, extract_jpeg_payload, parse_jpeg_dimensions, validate_jpeg_frame,

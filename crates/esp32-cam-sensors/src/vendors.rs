@@ -48,9 +48,9 @@ mod tests {
         assert_eq!(sensor.set_framesize(&mut bus, FrameSize::Hd), Ok(()));
         assert_eq!(sensor.status().framesize, FrameSize::Hd);
         assert_eq!(sensor.set_hmirror(&mut bus, true), Ok(()));
-        assert_eq!(sensor.status().hmirror, 1);
+        assert!(sensor.status().hmirror);
         assert_eq!(sensor.set_vflip(&mut bus, true), Ok(()));
-        assert_eq!(sensor.status().vflip, 1);
+        assert!(sensor.status().vflip);
         assert_eq!(sensor.set_reg(&mut bus, 0x3022, 0xFF, 0x5A), Ok(()));
         assert_eq!(sensor.get_reg(&mut bus, 0x3022, 0xFF), Ok(0x5A));
     }
@@ -75,9 +75,9 @@ mod tests {
         assert_eq!(sensor.set_framesize(&mut bus, FrameSize::Qvga), Ok(()));
         assert_eq!(sensor.status().framesize, FrameSize::Qvga);
         assert_eq!(sensor.set_hmirror(&mut bus, true), Ok(()));
-        assert_eq!(sensor.status().hmirror, 1);
+        assert!(sensor.status().hmirror);
         assert_eq!(sensor.set_vflip(&mut bus, true), Ok(()));
-        assert_eq!(sensor.status().vflip, 1);
+        assert!(sensor.status().vflip);
         assert_eq!(sensor.set_reg(&mut bus, 0x14, 0xFF, 0x3C), Ok(()));
         assert_eq!(sensor.get_reg(&mut bus, 0x14, 0xFF), Ok(0x3C));
     }
@@ -103,9 +103,9 @@ mod tests {
         assert_eq!(sensor.set_framesize(&mut bus, FrameSize::Svga), Ok(()));
         assert_eq!(sensor.status().framesize, FrameSize::Svga);
         assert_eq!(sensor.set_hmirror(&mut bus, true), Ok(()));
-        assert_eq!(sensor.status().hmirror, 1);
+        assert!(sensor.status().hmirror);
         assert_eq!(sensor.set_vflip(&mut bus, true), Ok(()));
-        assert_eq!(sensor.status().vflip, 1);
+        assert!(sensor.status().vflip);
         assert_eq!(sensor.set_reg(&mut bus, 0x17, 0xFF, 0x15), Ok(()));
         assert_eq!(sensor.get_reg(&mut bus, 0x17, 0xFF), Ok(0x15));
     }
@@ -131,9 +131,9 @@ mod tests {
         assert_eq!(sensor.set_framesize(&mut bus, FrameSize::Vga), Ok(()));
         assert_eq!(sensor.status().framesize, FrameSize::Vga);
         assert_eq!(sensor.set_hmirror(&mut bus, true), Ok(()));
-        assert_eq!(sensor.status().hmirror, 1);
+        assert!(sensor.status().hmirror);
         assert_eq!(sensor.set_vflip(&mut bus, true), Ok(()));
-        assert_eq!(sensor.status().vflip, 1);
+        assert!(sensor.status().vflip);
         assert_eq!(sensor.set_reg(&mut bus, 0x44, 0xFF, 0x83), Ok(()));
         assert_eq!(sensor.get_reg(&mut bus, 0x44, 0xFF), Ok(0x83));
     }
@@ -159,9 +159,9 @@ mod tests {
         assert_eq!(sensor.set_framesize(&mut bus, FrameSize::Qvga), Ok(()));
         assert_eq!(sensor.status().framesize, FrameSize::Qvga);
         assert_eq!(sensor.set_hmirror(&mut bus, true), Ok(()));
-        assert_eq!(sensor.status().hmirror, 1);
+        assert!(sensor.status().hmirror);
         assert_eq!(sensor.set_vflip(&mut bus, true), Ok(()));
-        assert_eq!(sensor.status().vflip, 1);
+        assert!(sensor.status().vflip);
         assert_eq!(sensor.set_reg(&mut bus, 0x55, 0xFF, 0x42), Ok(()));
         assert_eq!(sensor.get_reg(&mut bus, 0x55, 0xFF), Ok(0x42));
     }
@@ -187,9 +187,9 @@ mod tests {
         assert_eq!(sensor.set_framesize(&mut bus, FrameSize::Vga), Ok(()));
         assert_eq!(sensor.status().framesize, FrameSize::Vga);
         assert_eq!(sensor.set_hmirror(&mut bus, true), Ok(()));
-        assert_eq!(sensor.status().hmirror, 1);
+        assert!(sensor.status().hmirror);
         assert_eq!(sensor.set_vflip(&mut bus, true), Ok(()));
-        assert_eq!(sensor.status().vflip, 1);
+        assert!(sensor.status().vflip);
         assert_eq!(sensor.set_reg(&mut bus, 0x70, 0xFF, 0x77), Ok(()));
         assert_eq!(sensor.get_reg(&mut bus, 0x70, 0xFF), Ok(0x77));
     }
@@ -219,9 +219,9 @@ mod tests {
         assert_eq!(sensor.set_framesize(&mut bus, FrameSize::Hd), Ok(()));
         assert_eq!(sensor.status().framesize, FrameSize::Hd);
         assert_eq!(sensor.set_hmirror(&mut bus, true), Ok(()));
-        assert_eq!(sensor.status().hmirror, 1);
+        assert!(sensor.status().hmirror);
         assert_eq!(sensor.set_vflip(&mut bus, true), Ok(()));
-        assert_eq!(sensor.status().vflip, 1);
+        assert!(sensor.status().vflip);
         assert_eq!(sensor.set_reg(&mut bus, 0x014B, 0xFF, 0x40), Ok(()));
         assert_eq!(sensor.get_reg(&mut bus, 0x014B, 0xFF), Ok(0x40));
     }
@@ -247,9 +247,9 @@ mod tests {
         assert_eq!(sensor.set_framesize(&mut bus, FrameSize::Vga), Ok(()));
         assert_eq!(sensor.status().framesize, FrameSize::Vga);
         assert_eq!(sensor.set_hmirror(&mut bus, true), Ok(()));
-        assert_eq!(sensor.status().hmirror, 1);
+        assert!(sensor.status().hmirror);
         assert_eq!(sensor.set_vflip(&mut bus, true), Ok(()));
-        assert_eq!(sensor.status().vflip, 1);
+        assert!(sensor.status().vflip);
         assert_eq!(sensor.set_reg(&mut bus, 0x014B, 0xFF, 0x33), Ok(()));
         assert_eq!(sensor.get_reg(&mut bus, 0x014B, 0xFF), Ok(0x33));
 
@@ -289,9 +289,9 @@ mod tests {
         assert_eq!(sensor.set_framesize(&mut bus, FrameSize::Vga), Ok(()));
         assert_eq!(sensor.status().framesize, FrameSize::Vga);
         assert_eq!(sensor.set_hmirror(&mut bus, true), Ok(()));
-        assert_eq!(sensor.status().hmirror, 1);
+        assert!(sensor.status().hmirror);
         assert_eq!(sensor.set_vflip(&mut bus, true), Ok(()));
-        assert_eq!(sensor.status().vflip, 1);
+        assert!(sensor.status().vflip);
         assert_eq!(sensor.set_reg(&mut bus, 0x3E01, 0xFF, 0x18), Ok(()));
         assert_eq!(sensor.get_reg(&mut bus, 0x3E01, 0xFF), Ok(0x18));
     }
@@ -317,9 +317,9 @@ mod tests {
         assert_eq!(sensor.set_framesize(&mut bus, FrameSize::Fhd), Ok(()));
         assert_eq!(sensor.status().framesize, FrameSize::Fhd);
         assert_eq!(sensor.set_hmirror(&mut bus, true), Ok(()));
-        assert_eq!(sensor.status().hmirror, 1);
+        assert!(sensor.status().hmirror);
         assert_eq!(sensor.set_vflip(&mut bus, true), Ok(()));
-        assert_eq!(sensor.status().vflip, 1);
+        assert!(sensor.status().vflip);
         assert_eq!(sensor.set_reg(&mut bus, 0x012A, 0xFF, 0x0A), Ok(()));
         assert_eq!(sensor.get_reg(&mut bus, 0x012A, 0xFF), Ok(0x0A));
         assert_eq!(
@@ -349,9 +349,9 @@ mod tests {
         assert_eq!(sensor.set_framesize(&mut bus, FrameSize::Hd), Ok(()));
         assert_eq!(sensor.status().framesize, FrameSize::Hd);
         assert_eq!(sensor.set_hmirror(&mut bus, true), Ok(()));
-        assert_eq!(sensor.status().hmirror, 1);
+        assert!(sensor.status().hmirror);
         assert_eq!(sensor.set_vflip(&mut bus, true), Ok(()));
-        assert_eq!(sensor.status().vflip, 1);
+        assert!(sensor.status().vflip);
         assert_eq!(sensor.set_lenc(&mut bus, true), Ok(()));
         assert_eq!(sensor.set_reg(&mut bus, 0x0018, 0xFF, 0x05), Ok(()));
         assert_eq!(sensor.get_reg(&mut bus, 0x0018, 0xFF), Ok(0x05));
@@ -382,9 +382,9 @@ mod tests {
         assert_eq!(sensor.set_framesize(&mut bus, FrameSize::Qvga), Ok(()));
         assert_eq!(sensor.status().framesize, FrameSize::Qvga);
         assert_eq!(sensor.set_hmirror(&mut bus, true), Ok(()));
-        assert_eq!(sensor.status().hmirror, 1);
+        assert!(sensor.status().hmirror);
         assert_eq!(sensor.set_vflip(&mut bus, true), Ok(()));
-        assert_eq!(sensor.status().vflip, 1);
+        assert!(sensor.status().vflip);
         assert_eq!(sensor.set_reg(&mut bus, 0x2034, 0xFF, 0x64), Ok(()));
         assert_eq!(sensor.get_reg(&mut bus, 0x2034, 0xFF), Ok(0x64));
     }

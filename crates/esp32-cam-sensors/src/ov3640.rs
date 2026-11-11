@@ -470,23 +470,23 @@ impl Ov3640 {
                 denoise: 0,
                 special_effect: 0,
                 wb_mode: 0,
-                awb: 1,
-                awb_gain: 1,
-                aec: 1,
-                aec2: 0,
+                awb: true,
+                awb_gain: true,
+                aec: true,
+                aec2: false,
                 ae_level: 0,
                 aec_value: 300,
-                agc: 1,
+                agc: true,
                 agc_gain: 0,
                 gainceiling: 0,
-                bpc: 0,
-                wpc: 1,
-                raw_gma: 1,
-                lenc: 1,
-                hmirror: 0,
-                vflip: 0,
-                dcw: 1,
-                colorbar: 0,
+                bpc: false,
+                wpc: true,
+                raw_gma: true,
+                lenc: true,
+                hmirror: false,
+                vflip: false,
+                dcw: true,
+                colorbar: false,
             },
             pixformat: PixelFormat::Rgb565,
             xclk_freq_hz: 20_000_000,
@@ -640,7 +640,7 @@ impl Ov3640 {
     }
 
     fn apply_mirror_flip<B: SccbBus>(&self, bus: &mut B) -> Result<(), CameraError> {
-        let (reg307c, reg3023, reg3090) = match (self.status.vflip != 0, self.status.hmirror != 0) {
+        let (reg307c, reg3023, reg3090) = match (self.status.vflip, self.status.hmirror) {
             (true, true) => (0x13u8, 0x09u8, 0xC8u8),
             (true, false) => (0x11u8, 0x09u8, 0xC0u8),
             (false, true) => (0x12u8, 0x0Au8, 0xC8u8),
@@ -715,10 +715,10 @@ impl Ov3640 {
             reg20 |= 0x40;
         }
 
-        if self.status.vflip != 0 {
+        if self.status.vflip {
             reg4514_test |= 1;
         }
-        if self.status.hmirror != 0 {
+        if self.status.hmirror {
             reg4514_test |= 2;
         }
 
@@ -820,46 +820,43 @@ impl<B: SccbBus> CameraSensor<B> for Ov3640 {
         }
         self.status.gainceiling = level;
 
-        self.status.dcw = u8::from(!self.check_reg_mask(bus, 0x5183, 0x80)?);
-        self.status.agc =
-            u8::from(!self.check_reg_mask(bus, AEC_PK_MANUAL, AEC_PK_MANUAL_AGC_MANUALEN)?);
-        self.status.aec =
-            u8::from(!self.check_reg_mask(bus, AEC_PK_MANUAL, AEC_PK_MANUAL_AEC_MANUALEN)?);
+        self.status.dcw = !self.check_reg_mask(bus, 0x5183, 0x80)?;
+        self.status.agc = !self.check_reg_mask(bus, AEC_PK_MANUAL, AEC_PK_MANUAL_AGC_MANUALEN)?;
+        self.status.aec = !self.check_reg_mask(bus, AEC_PK_MANUAL, AEC_PK_MANUAL_AEC_MANUALEN)?;
 
         let timing_mode = bus.read_reg16(self.slv_addr, OV3640_TIMING_CTRL)? & 0x1F;
         match timing_mode {
             0x11 => {
-                self.status.vflip = 1;
-                self.status.hmirror = 0;
+                self.status.vflip = true;
+                self.status.hmirror = false;
             }
             0x12 => {
-                self.status.vflip = 0;
-                self.status.hmirror = 1;
+                self.status.vflip = false;
+                self.status.hmirror = true;
             }
             0x13 => {
-                self.status.vflip = 1;
-                self.status.hmirror = 1;
+                self.status.vflip = true;
+                self.status.hmirror = true;
             }
             _ => {
-                self.status.vflip = 0;
-                self.status.hmirror = 0;
+                self.status.vflip = false;
+                self.status.hmirror = false;
             }
         }
 
-        self.status.colorbar =
-            u8::from(self.check_reg_mask(bus, PRE_ISP_TEST_SETTING_1, TEST_COLOR_BAR)?);
-        self.status.bpc = u8::from(self.check_reg_mask(bus, 0x5000, 0x04)?);
-        self.status.wpc = u8::from(self.check_reg_mask(bus, 0x5000, 0x02)?);
-        self.status.raw_gma = u8::from(self.check_reg_mask(bus, 0x5000, 0x20)?);
-        self.status.lenc = u8::from(self.check_reg_mask(bus, 0x5000, 0x80)?);
+        self.status.colorbar = self.check_reg_mask(bus, PRE_ISP_TEST_SETTING_1, TEST_COLOR_BAR)?;
+        self.status.bpc = self.check_reg_mask(bus, 0x5000, 0x04)?;
+        self.status.wpc = self.check_reg_mask(bus, 0x5000, 0x02)?;
+        self.status.raw_gma = self.check_reg_mask(bus, 0x5000, 0x20)?;
+        self.status.lenc = self.check_reg_mask(bus, 0x5000, 0x80)?;
         self.status.quality = bus.read_reg16(self.slv_addr, COMPRESSION_CTRL07)? & 0x3F;
         self.status.special_effect = 0;
         self.status.wb_mode = 0;
-        self.status.awb = u8::from(!self.check_reg_mask(bus, OV3640_AWB_CTRL, 0x08)?);
-        self.status.awb_gain = u8::from(bus.read_reg16(self.slv_addr, 0x3406)? == 0);
+        self.status.awb = !self.check_reg_mask(bus, OV3640_AWB_CTRL, 0x08)?;
+        self.status.awb_gain = bus.read_reg16(self.slv_addr, 0x3406)? == 0;
         self.status.agc_gain = self.get_agc_gain(bus)?;
         self.status.aec_value = self.get_aec_value(bus)?;
-        self.status.aec2 = u8::from(self.check_reg_mask(bus, 0x3A00, 0x04)?);
+        self.status.aec2 = self.check_reg_mask(bus, 0x3A00, 0x04)?;
         Ok(())
     }
 
@@ -1036,42 +1033,42 @@ impl<B: SccbBus> CameraSensor<B> for Ov3640 {
 
     fn set_colorbar(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         self.write_reg_bits(bus, PRE_ISP_TEST_SETTING_1, TEST_COLOR_BAR, enable)?;
-        self.status.colorbar = u8::from(enable);
+        self.status.colorbar = enable;
         Ok(())
     }
 
     fn set_whitebal(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let val = if enable { 0x00 } else { 0x08 };
         bus.write_reg16(self.slv_addr, OV3640_AWB_CTRL, val)?;
-        self.status.awb = u8::from(enable);
+        self.status.awb = enable;
         Ok(())
     }
 
     fn set_gain_ctrl(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         self.write_reg_bits(bus, AEC_PK_MANUAL, AEC_PK_MANUAL_AGC_MANUALEN, !enable)?;
-        self.status.agc = u8::from(enable);
+        self.status.agc = enable;
         Ok(())
     }
 
     fn set_exposure_ctrl(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         self.write_reg_bits(bus, AEC_PK_MANUAL, AEC_PK_MANUAL_AEC_MANUALEN, !enable)?;
-        self.status.aec = u8::from(enable);
+        self.status.aec = enable;
         Ok(())
     }
 
     fn set_hmirror(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.hmirror = u8::from(enable);
+        self.status.hmirror = enable;
         self.set_image_options(bus)
     }
 
     fn set_vflip(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.vflip = u8::from(enable);
+        self.status.vflip = enable;
         self.set_image_options(bus)
     }
 
     fn set_aec2(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         self.write_reg_bits(bus, 0x3A00, 0x04, enable)?;
-        self.status.aec2 = u8::from(enable);
+        self.status.aec2 = enable;
         Ok(())
     }
 
@@ -1080,7 +1077,7 @@ impl<B: SccbBus> CameraSensor<B> for Ov3640 {
         let mode = if enable { old_mode as i32 } else { 0 };
         self.set_wb_mode(bus, mode)?;
         self.status.wb_mode = old_mode;
-        self.status.awb_gain = u8::from(enable);
+        self.status.awb_gain = enable;
         Ok(())
     }
 
@@ -1140,7 +1137,7 @@ impl<B: SccbBus> CameraSensor<B> for Ov3640 {
             bus.write_reg16(self.slv_addr, OV3640_AWB_B_GAIN, p.awb_b)?;
         }
         self.status.wb_mode = mode as u8;
-        self.status.awb = u8::from(mode == 0);
+        self.status.awb = mode == 0;
         Ok(())
     }
 
@@ -1159,31 +1156,31 @@ impl<B: SccbBus> CameraSensor<B> for Ov3640 {
 
     fn set_dcw(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         self.write_reg_bits(bus, 0x5183, 0x80, !enable)?;
-        self.status.dcw = u8::from(enable);
+        self.status.dcw = enable;
         Ok(())
     }
 
     fn set_bpc(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         self.write_reg_bits(bus, 0x5000, 0x04, enable)?;
-        self.status.bpc = u8::from(enable);
+        self.status.bpc = enable;
         Ok(())
     }
 
     fn set_wpc(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         self.write_reg_bits(bus, 0x5000, 0x02, enable)?;
-        self.status.wpc = u8::from(enable);
+        self.status.wpc = enable;
         Ok(())
     }
 
     fn set_raw_gma(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         self.write_reg_bits(bus, 0x5000, 0x20, enable)?;
-        self.status.raw_gma = u8::from(enable);
+        self.status.raw_gma = enable;
         Ok(())
     }
 
     fn set_lenc(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         self.write_reg_bits(bus, 0x5000, 0x80, enable)?;
-        self.status.lenc = u8::from(enable);
+        self.status.lenc = enable;
         Ok(())
     }
 

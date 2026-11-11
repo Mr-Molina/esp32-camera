@@ -725,23 +725,23 @@ impl Ov2640 {
                 denoise: 0,
                 special_effect: 0,
                 wb_mode: 0,
-                awb: 1,
-                awb_gain: 1,
-                aec: 1,
-                aec2: 0,
+                awb: true,
+                awb_gain: true,
+                aec: true,
+                aec2: false,
                 ae_level: 0,
                 aec_value: 300,
-                agc: 1,
+                agc: true,
                 agc_gain: 0,
                 gainceiling: 0,
-                bpc: 0,
-                wpc: 1,
-                raw_gma: 1,
-                lenc: 1,
-                hmirror: 0,
-                vflip: 0,
-                dcw: 1,
-                colorbar: 0,
+                bpc: false,
+                wpc: true,
+                raw_gma: true,
+                lenc: true,
+                hmirror: false,
+                vflip: false,
+                dcw: true,
+                colorbar: false,
             },
             pixformat: PixelFormat::Rgb565,
             xclk_freq_hz: 20_000_000,
@@ -1053,19 +1053,19 @@ impl<B: SccbBus> CameraSensor<B> for Ov2640 {
         self.status.quality = self.read_reg(bus, Ov2640Bank::Dsp, QS)?;
         self.status.gainceiling = self.get_reg_bits(bus, Ov2640Bank::Sensor, COM9, 5, 0x07)?;
 
-        self.status.awb = self.get_reg_bits(bus, Ov2640Bank::Dsp, CTRL1, 3, 1)?;
-        self.status.awb_gain = self.get_reg_bits(bus, Ov2640Bank::Dsp, CTRL1, 2, 1)?;
-        self.status.aec = self.get_reg_bits(bus, Ov2640Bank::Sensor, COM8, 0, 1)?;
-        self.status.aec2 = self.get_reg_bits(bus, Ov2640Bank::Dsp, CTRL0, 6, 1)?;
-        self.status.agc = self.get_reg_bits(bus, Ov2640Bank::Sensor, COM8, 2, 1)?;
-        self.status.bpc = self.get_reg_bits(bus, Ov2640Bank::Dsp, CTRL3, 7, 1)?;
-        self.status.wpc = self.get_reg_bits(bus, Ov2640Bank::Dsp, CTRL3, 6, 1)?;
-        self.status.raw_gma = self.get_reg_bits(bus, Ov2640Bank::Dsp, CTRL1, 5, 1)?;
-        self.status.lenc = self.get_reg_bits(bus, Ov2640Bank::Dsp, CTRL1, 1, 1)?;
-        self.status.hmirror = self.get_reg_bits(bus, Ov2640Bank::Sensor, REG04, 7, 1)?;
-        self.status.vflip = self.get_reg_bits(bus, Ov2640Bank::Sensor, REG04, 6, 1)?;
-        self.status.dcw = self.get_reg_bits(bus, Ov2640Bank::Dsp, CTRL2, 5, 1)?;
-        self.status.colorbar = self.get_reg_bits(bus, Ov2640Bank::Sensor, COM7, 1, 1)?;
+        self.status.awb = self.get_reg_bits(bus, Ov2640Bank::Dsp, CTRL1, 3, 1)? != 0;
+        self.status.awb_gain = self.get_reg_bits(bus, Ov2640Bank::Dsp, CTRL1, 2, 1)? != 0;
+        self.status.aec = self.get_reg_bits(bus, Ov2640Bank::Sensor, COM8, 0, 1)? != 0;
+        self.status.aec2 = self.get_reg_bits(bus, Ov2640Bank::Dsp, CTRL0, 6, 1)? != 0;
+        self.status.agc = self.get_reg_bits(bus, Ov2640Bank::Sensor, COM8, 2, 1)? != 0;
+        self.status.bpc = self.get_reg_bits(bus, Ov2640Bank::Dsp, CTRL3, 7, 1)? != 0;
+        self.status.wpc = self.get_reg_bits(bus, Ov2640Bank::Dsp, CTRL3, 6, 1)? != 0;
+        self.status.raw_gma = self.get_reg_bits(bus, Ov2640Bank::Dsp, CTRL1, 5, 1)? != 0;
+        self.status.lenc = self.get_reg_bits(bus, Ov2640Bank::Dsp, CTRL1, 1, 1)? != 0;
+        self.status.hmirror = self.get_reg_bits(bus, Ov2640Bank::Sensor, REG04, 7, 1)? != 0;
+        self.status.vflip = self.get_reg_bits(bus, Ov2640Bank::Sensor, REG04, 6, 1)? != 0;
+        self.status.dcw = self.get_reg_bits(bus, Ov2640Bank::Dsp, CTRL2, 5, 1)? != 0;
+        self.status.colorbar = self.get_reg_bits(bus, Ov2640Bank::Sensor, COM7, 1, 1)? != 0;
 
         self.status.sharpness = 0;
         self.status.denoise = 0;
@@ -1205,27 +1205,27 @@ impl<B: SccbBus> CameraSensor<B> for Ov2640 {
     }
 
     fn set_colorbar(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.colorbar = u8::from(enable);
+        self.status.colorbar = enable;
         self.write_reg_bits(bus, Ov2640Bank::Sensor, COM7, COM7_COLOR_BAR, enable)
     }
 
     fn set_whitebal(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.awb = u8::from(enable);
+        self.status.awb = enable;
         self.set_reg_bits(bus, Ov2640Bank::Dsp, CTRL1, 3, 1, u8::from(enable))
     }
 
     fn set_gain_ctrl(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.agc = u8::from(enable);
+        self.status.agc = enable;
         self.write_reg_bits(bus, Ov2640Bank::Sensor, COM8, COM8_AGC_EN, enable)
     }
 
     fn set_exposure_ctrl(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.aec = u8::from(enable);
+        self.status.aec = enable;
         self.write_reg_bits(bus, Ov2640Bank::Sensor, COM8, COM8_AEC_EN, enable)
     }
 
     fn set_hmirror(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.hmirror = u8::from(enable);
+        self.status.hmirror = enable;
         self.write_reg_bits(bus, Ov2640Bank::Sensor, REG04, REG04_HFLIP_IMG, enable)
     }
 
@@ -1237,17 +1237,17 @@ impl<B: SccbBus> CameraSensor<B> for Ov2640 {
             REG04_VREF_EN | REG04_VFLIP_IMG,
             enable,
         )?;
-        self.status.vflip = u8::from(enable);
+        self.status.vflip = enable;
         Ok(())
     }
 
     fn set_aec2(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.aec2 = u8::from(enable);
+        self.status.aec2 = enable;
         self.set_reg_bits(bus, Ov2640Bank::Dsp, CTRL0, 6, 1, u8::from(enable))
     }
 
     fn set_awb_gain(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.awb_gain = u8::from(enable);
+        self.status.awb_gain = enable;
         self.set_reg_bits(bus, Ov2640Bank::Dsp, CTRL1, 2, 1, u8::from(enable))
     }
 
@@ -1330,27 +1330,27 @@ impl<B: SccbBus> CameraSensor<B> for Ov2640 {
     }
 
     fn set_dcw(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.dcw = u8::from(enable);
+        self.status.dcw = enable;
         self.set_reg_bits(bus, Ov2640Bank::Dsp, CTRL2, 5, 1, u8::from(enable))
     }
 
     fn set_bpc(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.bpc = u8::from(enable);
+        self.status.bpc = enable;
         self.set_reg_bits(bus, Ov2640Bank::Dsp, CTRL3, 7, 1, u8::from(enable))
     }
 
     fn set_wpc(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.wpc = u8::from(enable);
+        self.status.wpc = enable;
         self.set_reg_bits(bus, Ov2640Bank::Dsp, CTRL3, 6, 1, u8::from(enable))
     }
 
     fn set_raw_gma(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.raw_gma = u8::from(enable);
+        self.status.raw_gma = enable;
         self.set_reg_bits(bus, Ov2640Bank::Dsp, CTRL1, 5, 1, u8::from(enable))
     }
 
     fn set_lenc(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.lenc = u8::from(enable);
+        self.status.lenc = enable;
         self.set_reg_bits(bus, Ov2640Bank::Dsp, CTRL1, 1, 1, u8::from(enable))
     }
 

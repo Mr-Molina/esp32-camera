@@ -600,9 +600,9 @@ fn check_reg_mask<B: SccbBus>(
     slv_addr: u8,
     reg: u16,
     mask: u8,
-) -> Result<u8, CameraError> {
+) -> Result<bool, CameraError> {
     let val = bus.read_reg16(slv_addr, reg)?;
-    Ok(u8::from((val & mask) == mask))
+    Ok((val & mask) == mask)
 }
 
 fn write_reg_list<B: SccbBus>(
@@ -669,23 +669,23 @@ impl Hm0360 {
                 denoise: 0,
                 special_effect: 0,
                 wb_mode: 0,
-                awb: 1,
-                awb_gain: 1,
-                aec: 1,
-                aec2: 0,
+                awb: true,
+                awb_gain: true,
+                aec: true,
+                aec2: false,
                 ae_level: 0,
                 aec_value: 300,
-                agc: 1,
+                agc: true,
                 agc_gain: 0,
                 gainceiling: 0,
-                bpc: 0,
-                wpc: 1,
-                raw_gma: 1,
-                lenc: 1,
-                hmirror: 0,
-                vflip: 0,
-                dcw: 1,
-                colorbar: 0,
+                bpc: false,
+                wpc: true,
+                raw_gma: true,
+                lenc: true,
+                hmirror: false,
+                vflip: false,
+                dcw: true,
+                colorbar: false,
             },
             slv_addr: CameraSccbAddr::HM0360,
             pixformat: PixelFormat::Grayscale,
@@ -793,12 +793,12 @@ impl<B: SccbBus> CameraSensor<B> for Hm0360 {
         self.status.sharpness = 0;
         self.status.denoise = 0;
         self.status.ae_level = 0;
-        self.status.awb = 0;
-        self.status.aec = 0;
+        self.status.awb = false;
+        self.status.aec = false;
         self.status.hmirror = check_reg_mask(bus, self.slv_addr, IMAGE_ORIENTATION, 0x01)?;
         self.status.vflip = check_reg_mask(bus, self.slv_addr, IMAGE_ORIENTATION, 0x02)?;
-        self.status.lenc = 0;
-        self.status.awb_gain = 0;
+        self.status.lenc = false;
+        self.status.awb_gain = false;
         self.status.agc_gain = 0;
         self.status.aec_value = 0;
         Ok(())
@@ -858,7 +858,7 @@ impl<B: SccbBus> CameraSensor<B> for Hm0360 {
         let val = u8::from(enable);
         set_reg_bits(bus, self.slv_addr, TEST_PATTERN_MODE, 0, 0x01, val)?;
         bus.write_reg16(self.slv_addr, COMMAND_UPDATE, 0x01)?;
-        self.status.colorbar = val;
+        self.status.colorbar = enable;
         Ok(())
     }
 
@@ -866,7 +866,7 @@ impl<B: SccbBus> CameraSensor<B> for Hm0360 {
         let val = u8::from(enable);
         set_reg_bits(bus, self.slv_addr, AE_CTRL, 0, 0x01, val)?;
         bus.write_reg16(self.slv_addr, COMMAND_UPDATE, 0x01)?;
-        self.status.aec = val;
+        self.status.aec = enable;
         Ok(())
     }
 
@@ -874,7 +874,7 @@ impl<B: SccbBus> CameraSensor<B> for Hm0360 {
         let val = u8::from(enable);
         set_reg_bits(bus, self.slv_addr, IMAGE_ORIENTATION, 0, 0x01, val)?;
         bus.write_reg16(self.slv_addr, COMMAND_UPDATE, 0x01)?;
-        self.status.hmirror = val;
+        self.status.hmirror = enable;
         Ok(())
     }
 
@@ -882,7 +882,7 @@ impl<B: SccbBus> CameraSensor<B> for Hm0360 {
         let val = u8::from(enable);
         set_reg_bits(bus, self.slv_addr, IMAGE_ORIENTATION, 1, 0x01, val)?;
         bus.write_reg16(self.slv_addr, COMMAND_UPDATE, 0x01)?;
-        self.status.vflip = val;
+        self.status.vflip = enable;
         Ok(())
     }
 

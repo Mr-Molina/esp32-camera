@@ -5,7 +5,7 @@
 //! implementation (`#![forbid(unsafe_code)]`).
 
 use crate::bmp::{write_bmp_header, BMP_HEADER_LEN};
-use crate::yuv::rgb2yuv;
+use crate::yuv::{rgb2yuv, YuvRange};
 use esp32_cam_types::CameraError;
 
 /// Full-range JFIF YCbCr to RGB888 conversion (inverse of `jpge.cpp`'s
@@ -218,14 +218,14 @@ fn idct_2d(coeffs: &[i32; 64], out_pixels: &mut [u8; 64]) {
     // Pass 1: process rows
     for row in 0..8 {
         let base = row * 8;
-        let f0 = coeffs[base].clamp(-2048, 2047);
-        let f1 = coeffs[base + 1].clamp(-2048, 2047);
-        let f2 = coeffs[base + 2].clamp(-2048, 2047);
-        let f3 = coeffs[base + 3].clamp(-2048, 2047);
-        let f4 = coeffs[base + 4].clamp(-2048, 2047);
-        let f5 = coeffs[base + 5].clamp(-2048, 2047);
-        let f6 = coeffs[base + 6].clamp(-2048, 2047);
-        let f7 = coeffs[base + 7].clamp(-2048, 2047);
+        let f0 = coeffs[base].clamp(-2047, 2047);
+        let f1 = coeffs[base + 1].clamp(-2047, 2047);
+        let f2 = coeffs[base + 2].clamp(-2047, 2047);
+        let f3 = coeffs[base + 3].clamp(-2047, 2047);
+        let f4 = coeffs[base + 4].clamp(-2047, 2047);
+        let f5 = coeffs[base + 5].clamp(-2047, 2047);
+        let f6 = coeffs[base + 6].clamp(-2047, 2047);
+        let f7 = coeffs[base + 7].clamp(-2047, 2047);
 
         if (f1 | f2 | f3 | f4 | f5 | f6 | f7) == 0 {
             let dc_val = (f0 << ROW_BITS).clamp(-16384, 16384);
@@ -1032,6 +1032,20 @@ fn gather_yuv422_h2v1_mcu(
 }
 
 #[inline]
+fn expand_bt601_luma_block(block: &mut [i32; 64]) {
+    for sample in block.iter_mut() {
+        *sample = (((*sample + 112) * 255 + 109) / 219).clamp(0, 255) - 128;
+    }
+}
+
+#[inline]
+fn expand_bt601_chroma_block(block: &mut [i32; 64]) {
+    for sample in block.iter_mut() {
+        *sample = (((*sample + 112) * 255 + 112) / 224).clamp(0, 255) - 128;
+    }
+}
+
+#[inline]
 #[allow(clippy::too_many_arguments)]
 fn gather_yuv422_h2v2_mcu(
     src: &[u8],
@@ -1045,36 +1059,64 @@ fn gather_yuv422_h2v2_mcu(
 ) {
     let x0 = mcu_x * 16;
     let y0 = mcu_y * 16;
-    for cy in 0..8usize {
-        let py0 = (y0 + cy * 2).min(h - 1);
-        let py1 = (y0 + cy * 2 + 1).min(h - 1);
-        let v_blk = (cy >> 2) * 2;
-        let r0 = ((cy & 3) * 2) * 8;
-        let r1 = r0 + 8;
-        let c_row = cy * 8;
-        for cx in 0..8usize {
-            let px_even = (x0 + cx * 2).min(w - 2);
-            let off0 = (py0 * w + px_even) * 2;
-            let off1 = (py1 * w + px_even) * 2;
-            let p0 = &src[off0..off0 + 4];
-            let p1 = &src[off1..off1 + 4];
-            let px0 = (x0 + cx * 2).min(w - 1);
-            let px1 = (x0 + cx * 2 + 1).min(w - 1);
-            let blk = v_blk + (cx >> 2);
-            let lx = (cx & 3) * 2;
-            y_blocks[blk][r0 + lx] = i32::from(if (px0 & 1) == 0 { p0[0] } else { p0[2] }) - 128;
-            y_blocks[blk][r0 + lx + 1] =
-                i32::from(if (px1 & 1) == 0 { p0[0] } else { p0[2] }) - 128;
-            y_blocks[blk][r1 + lx] = i32::from(if (px0 & 1) == 0 { p1[0] } else { p1[2] }) - 128;
-            y_blocks[blk][r1 + lx + 1] =
-                i32::from(if (px1 & 1) == 0 { p1[0] } else { p1[2] }) - 128;
-            cb_block[c_row + cx] = ((i32::from(p0[1]) + i32::from(p1[1]) + 1) >> 1) - 128;
-            cr_block[c_row + cx] = ((i32::from(p0[3]) + i32::from(p1[3]) + 1) >> 1) - 128;
+    if x0 + 16 <= w && y0 + 16 <= h {
+        for cy in 0..8usize {
+            let off0 = ((y0 + cy * 2) * w + x0) * 2;
+            let off1 = ((y0 + cy * 2 + 1) * w + x0) * 2;
+            let (row0, _) = src[off0..off0 + 32].as_chunks::<4>();
+            let (row1, _) = src[off1..off1 + 32].as_chunks::<4>();
+            let v_blk = (cy >> 2) * 2;
+            let r0 = ((cy & 3) * 2) * 8;
+            let r1 = r0 + 8;
+            let c_row = cy * 8;
+            for cx in 0..8usize {
+                let [y00, u0, y01, v0] = row0[cx];
+                let [y10, u1, y11, v1] = row1[cx];
+                let blk = v_blk + (cx >> 2);
+                let lx = (cx & 3) * 2;
+                y_blocks[blk][r0 + lx] = i32::from(y00) - 128;
+                y_blocks[blk][r0 + lx + 1] = i32::from(y01) - 128;
+                y_blocks[blk][r1 + lx] = i32::from(y10) - 128;
+                y_blocks[blk][r1 + lx + 1] = i32::from(y11) - 128;
+                cb_block[c_row + cx] = ((i32::from(u0) + i32::from(u1) + 1) >> 1) - 128;
+                cr_block[c_row + cx] = ((i32::from(v0) + i32::from(v1) + 1) >> 1) - 128;
+            }
+        }
+    } else {
+        for cy in 0..8usize {
+            let py0 = (y0 + cy * 2).min(h - 1);
+            let py1 = (y0 + cy * 2 + 1).min(h - 1);
+            let v_blk = (cy >> 2) * 2;
+            let r0 = ((cy & 3) * 2) * 8;
+            let r1 = r0 + 8;
+            let c_row = cy * 8;
+            for cx in 0..8usize {
+                let px_even = (x0 + cx * 2).min(w - 2);
+                let off0 = (py0 * w + px_even) * 2;
+                let off1 = (py1 * w + px_even) * 2;
+                let p0 = &src[off0..off0 + 4];
+                let p1 = &src[off1..off1 + 4];
+                let px0 = (x0 + cx * 2).min(w - 1);
+                let px1 = (x0 + cx * 2 + 1).min(w - 1);
+                let blk = v_blk + (cx >> 2);
+                let lx = (cx & 3) * 2;
+                y_blocks[blk][r0 + lx] =
+                    i32::from(if (px0 & 1) == 0 { p0[0] } else { p0[2] }) - 128;
+                y_blocks[blk][r0 + lx + 1] =
+                    i32::from(if (px1 & 1) == 0 { p0[0] } else { p0[2] }) - 128;
+                y_blocks[blk][r1 + lx] =
+                    i32::from(if (px0 & 1) == 0 { p1[0] } else { p1[2] }) - 128;
+                y_blocks[blk][r1 + lx + 1] =
+                    i32::from(if (px1 & 1) == 0 { p1[0] } else { p1[2] }) - 128;
+                cb_block[c_row + cx] = ((i32::from(p0[1]) + i32::from(p1[1]) + 1) >> 1) - 128;
+                cr_block[c_row + cx] = ((i32::from(p0[3]) + i32::from(p1[3]) + 1) >> 1) - 128;
+            }
         }
     }
 }
 
 /// Chroma subsampling mode for 3-component JPEG encoding.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Subsampling {
     /// 4:4:4 subsampling (8x8 MCU: Y, Cb, Cr).
@@ -1208,8 +1250,8 @@ pub fn encode_grayscale_to_jpeg(
     Ok(writer.pos)
 }
 
-/// Encodes a packed YUV422 (YUYV: `[Y0, U, Y1, V]`) image into a baseline
-/// JFIF JPEG stream in `dst` using the requested chroma `subsampling`.
+/// Encodes a full-range packed YUV422 (YUYV: `[Y0, U, Y1, V]`) image into a
+/// baseline JFIF JPEG stream in `dst` using the requested `subsampling`.
 pub fn encode_yuv422_to_jpeg_subsampled(
     src: &[u8],
     dst: &mut [u8],
@@ -1217,6 +1259,37 @@ pub fn encode_yuv422_to_jpeg_subsampled(
     height: u16,
     quality: u8,
     subsampling: Subsampling,
+) -> Result<usize, CameraError> {
+    encode_yuv422_to_jpeg_with_range(
+        src,
+        dst,
+        width,
+        height,
+        quality,
+        subsampling,
+        YuvRange::Full,
+    )
+}
+
+/// Encodes a packed YUV422 (YUYV: `[Y0, U, Y1, V]`) image into a baseline
+/// JFIF JPEG stream in `dst` using `subsampling` and input `range`.
+///
+/// When `range` is [`YuvRange::Bt601Limited`], limited-range studio YCbCr
+/// (`Y` in `16..=235`, `Cb`/`Cr` in `16..=240`) is expanded to full-range
+/// JFIF (`0..=255`) prior to DCT quantization.
+///
+/// # Errors
+///
+/// Returns [`CameraError::InvalidArg`] if dimensions or input buffer length
+/// are invalid, or [`CameraError::BufferTooSmall`] if `dst` overflows.
+pub fn encode_yuv422_to_jpeg_with_range(
+    src: &[u8],
+    dst: &mut [u8],
+    width: u16,
+    height: u16,
+    quality: u8,
+    subsampling: Subsampling,
+    range: YuvRange,
 ) -> Result<usize, CameraError> {
     if (width & 1) != 0 {
         return Err(CameraError::InvalidArg);
@@ -1235,12 +1308,12 @@ pub fn encode_yuv422_to_jpeg_subsampled(
     let w = width as usize;
     let h = height as usize;
     let mut last_dc = [0i32; 3];
-    let mut y_blocks = [[0i32; 64]; 4];
     let mut cb_block = [0i32; 64];
     let mut cr_block = [0i32; 64];
 
     match subsampling {
         Subsampling::H1V1 => {
+            let mut y_block = [[0i32; 64]; 1];
             for by in 0..h.div_ceil(8) {
                 for bx in 0..w.div_ceil(8) {
                     gather_yuv422_h1v1_mcu(
@@ -1249,12 +1322,17 @@ pub fn encode_yuv422_to_jpeg_subsampled(
                         h,
                         bx,
                         by,
-                        &mut y_blocks[0],
+                        &mut y_block[0],
                         &mut cb_block,
                         &mut cr_block,
                     );
+                    if matches!(range, YuvRange::Bt601Limited) {
+                        expand_bt601_luma_block(&mut y_block[0]);
+                        expand_bt601_chroma_block(&mut cb_block);
+                        expand_bt601_chroma_block(&mut cr_block);
+                    }
                     writer.encode_yuv_mcu(
-                        &mut y_blocks[..1],
+                        &mut y_block,
                         &mut cb_block,
                         &mut cr_block,
                         &lum_q,
@@ -1265,12 +1343,28 @@ pub fn encode_yuv422_to_jpeg_subsampled(
             }
         }
         Subsampling::H2V1 => {
-            let y2: &mut [[i32; 64]; 2] = (&mut y_blocks[..2]).try_into().expect("2 blocks");
+            let mut y2 = [[0i32; 64]; 2];
             for by in 0..h.div_ceil(8) {
                 for bx in 0..w.div_ceil(16) {
-                    gather_yuv422_h2v1_mcu(src, w, h, bx, by, y2, &mut cb_block, &mut cr_block);
+                    gather_yuv422_h2v1_mcu(
+                        src,
+                        w,
+                        h,
+                        bx,
+                        by,
+                        &mut y2,
+                        &mut cb_block,
+                        &mut cr_block,
+                    );
+                    if matches!(range, YuvRange::Bt601Limited) {
+                        for blk in &mut y2 {
+                            expand_bt601_luma_block(blk);
+                        }
+                        expand_bt601_chroma_block(&mut cb_block);
+                        expand_bt601_chroma_block(&mut cr_block);
+                    }
                     writer.encode_yuv_mcu(
-                        y2.as_mut_slice(),
+                        &mut y2,
                         &mut cb_block,
                         &mut cr_block,
                         &lum_q,
@@ -1281,6 +1375,7 @@ pub fn encode_yuv422_to_jpeg_subsampled(
             }
         }
         Subsampling::H2V2 => {
+            let mut y_blocks = [[0i32; 64]; 4];
             for by in 0..h.div_ceil(16) {
                 for bx in 0..w.div_ceil(16) {
                     gather_yuv422_h2v2_mcu(
@@ -1293,6 +1388,13 @@ pub fn encode_yuv422_to_jpeg_subsampled(
                         &mut cb_block,
                         &mut cr_block,
                     );
+                    if matches!(range, YuvRange::Bt601Limited) {
+                        for blk in &mut y_blocks {
+                            expand_bt601_luma_block(blk);
+                        }
+                        expand_bt601_chroma_block(&mut cb_block);
+                        expand_bt601_chroma_block(&mut cr_block);
+                    }
                     writer.encode_yuv_mcu(
                         &mut y_blocks,
                         &mut cb_block,
@@ -1561,7 +1663,7 @@ impl<'a> JpegBitReader<'a> {
         *last_dc = dc_val;
         coeffs[0] = dc_val
             .saturating_mul(i32::from(qtable[0]))
-            .clamp(-32768, 32767);
+            .clamp(-2047, 2047);
 
         let mut last_k: usize = 0;
         let mut k = 1usize;
@@ -1588,7 +1690,7 @@ impl<'a> JpegBitReader<'a> {
             let ac_val = self.receive_extend(s)?;
             let ac_coeff = ac_val
                 .saturating_mul(i32::from(qtable[k]))
-                .clamp(-32768, 32767);
+                .clamp(-2047, 2047);
             coeffs[ZAG[k]] = ac_coeff;
             if ac_coeff != 0 {
                 last_k = k;
@@ -1597,7 +1699,7 @@ impl<'a> JpegBitReader<'a> {
         }
 
         if last_k == 0 {
-            let f0 = coeffs[0].clamp(-2048, 2047);
+            let f0 = coeffs[0].clamp(-2047, 2047);
             let w0 = (f0 << ROW_BITS).clamp(-16384, 16384);
             let shift = (CONST_BITS + ROW_BITS + 3) as u32;
             let px = (dct_descale_i32(w0 << CONST_BITS, shift) + 128).clamp(0, 255) as u8;
@@ -1707,6 +1809,7 @@ fn decode_jpeg_internal(
     src: &[u8],
     dst: &mut [u8],
     out_fmt: DecodeOutputFormat,
+    expected_dims: Option<(u16, u16)>,
 ) -> Result<(u16, u16, usize), CameraError> {
     if src.len() < 4 || src[0] != 0xFF || src[1] != M_SOI {
         return Err(CameraError::CorruptedFrame);
@@ -1836,6 +1939,11 @@ fn decode_jpeg_internal(
                     return Err(CameraError::CodecError);
                 }
                 sof_parsed = true;
+                if expected_dims
+                    .is_some_and(|(ew, eh)| (ew != 0 && ew != width) || (eh != 0 && eh != height))
+                {
+                    return Err(CameraError::InvalidArg);
+                }
                 for (idx, comp) in comps.iter_mut().take(num_components).enumerate() {
                     let id = src[cur];
                     let samp = src[cur + 1];
@@ -2101,7 +2209,7 @@ fn decode_jpeg_internal(
 /// Performs zero heap allocations and returns the number of bytes written
 /// to `dst` (`width * height * 3`).
 pub fn decode_jpeg_to_rgb888(src: &[u8], dst: &mut [u8]) -> Result<usize, CameraError> {
-    let (_w, _h, written) = decode_jpeg_internal(src, dst, DecodeOutputFormat::Rgb888)?;
+    let (_w, _h, written) = decode_jpeg_internal(src, dst, DecodeOutputFormat::Rgb888, None)?;
     Ok(written)
 }
 
@@ -2111,7 +2219,7 @@ pub fn decode_jpeg_to_rgb888(src: &[u8], dst: &mut [u8]) -> Result<usize, Camera
 /// Performs zero heap allocations and returns the number of bytes written
 /// to `dst` (`width * height * 2`).
 pub fn decode_jpeg_to_rgb565(src: &[u8], dst: &mut [u8]) -> Result<usize, CameraError> {
-    let (_w, _h, written) = decode_jpeg_internal(src, dst, DecodeOutputFormat::Rgb565)?;
+    let (_w, _h, written) = decode_jpeg_internal(src, dst, DecodeOutputFormat::Rgb565, None)?;
     Ok(written)
 }
 
@@ -2119,8 +2227,30 @@ pub fn decode_jpeg_to_rgb565(src: &[u8], dst: &mut [u8]) -> Result<usize, Camera
 /// in `dst`.
 ///
 /// Returns `(width, height, written_len)`.
+#[cfg(test)]
 pub(crate) fn jpeg_to_bmp(src: &[u8], dst: &mut [u8]) -> Result<(u16, u16, usize), CameraError> {
-    decode_jpeg_internal(src, dst, DecodeOutputFormat::Bmp24)
+    decode_jpeg_internal(src, dst, DecodeOutputFormat::Bmp24, None)
+}
+
+/// Decodes a baseline JPEG image from `src` directly into a 24-bit BMP image
+/// in `dst`, validating non-zero `expected_width` and `expected_height`
+/// against the `SOF0` header in a single pass before modifying `dst`
+/// (`CONV-18`).
+pub(crate) fn jpeg_to_bmp_checked(
+    src: &[u8],
+    dst: &mut [u8],
+    expected_width: u16,
+    expected_height: u16,
+) -> Result<usize, CameraError> {
+    let (dec_w, dec_h, written) = decode_jpeg_internal(
+        src,
+        dst,
+        DecodeOutputFormat::Bmp24,
+        Some((expected_width, expected_height)),
+    )?;
+    debug_assert!(expected_width == 0 || expected_width == dec_w);
+    debug_assert!(expected_height == 0 || expected_height == dec_h);
+    Ok(written)
 }
 
 #[cfg(test)]
@@ -2625,7 +2755,7 @@ mod tests {
         let mut out_i32 = [0u8; 64];
         let mut out_i64 = [0u8; 64];
 
-        for iter in 0..10_000usize {
+        for iter in 0..1_000_000usize {
             let mut block = [0i32; 64];
             for sample in &mut block {
                 rng ^= rng << 13;
@@ -4244,5 +4374,66 @@ mod tests {
             Err(CameraError::CorruptedFrame),
             "swapped RST1/RST0 markers must return CorruptedFrame"
         );
+    }
+
+    #[test]
+    fn test_conv09_encode_yuv422_with_bt601_limited_range() {
+        let mut black_yuv = [0u8; 16 * 16 * 2];
+        for pair in black_yuv.as_chunks_mut::<4>().0 {
+            *pair = [16, 128, 16, 128];
+        }
+        let mut white_yuv = [0u8; 16 * 16 * 2];
+        for pair in white_yuv.as_chunks_mut::<4>().0 {
+            *pair = [235, 128, 235, 128];
+        }
+
+        let mut jpeg = [0u8; 4096];
+        let mut rgb = [0u8; 16 * 16 * 3];
+
+        for mode in [Subsampling::H1V1, Subsampling::H2V1, Subsampling::H2V2] {
+            let black_len = encode_yuv422_to_jpeg_with_range(
+                &black_yuv,
+                &mut jpeg,
+                16,
+                16,
+                95,
+                mode,
+                YuvRange::Bt601Limited,
+            )
+            .expect("BT.601 studio black YUV422 encode must succeed");
+            assert_eq!(
+                decode_jpeg_to_rgb888(&jpeg[..black_len], &mut rgb),
+                Ok(rgb.len()),
+                "BT.601 studio black JPEG must decode cleanly for {mode:?}"
+            );
+            for &ch in &rgb {
+                assert!(
+                    ch <= 4,
+                    "studio black channel must expand to <= 4 for {mode:?}, got {ch}"
+                );
+            }
+
+            let white_len = encode_yuv422_to_jpeg_with_range(
+                &white_yuv,
+                &mut jpeg,
+                16,
+                16,
+                95,
+                mode,
+                YuvRange::Bt601Limited,
+            )
+            .expect("BT.601 studio white YUV422 encode must succeed");
+            assert_eq!(
+                decode_jpeg_to_rgb888(&jpeg[..white_len], &mut rgb),
+                Ok(rgb.len()),
+                "BT.601 studio white JPEG must decode cleanly for {mode:?}"
+            );
+            for &ch in &rgb {
+                assert!(
+                    ch >= 251,
+                    "studio white channel must expand to >= 251 for {mode:?}, got {ch}"
+                );
+            }
+        }
     }
 }

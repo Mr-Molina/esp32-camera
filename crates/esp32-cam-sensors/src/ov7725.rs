@@ -294,23 +294,23 @@ impl Ov7725 {
                 denoise: 0,
                 special_effect: 0,
                 wb_mode: 0,
-                awb: 1,
-                awb_gain: 1,
-                aec: 1,
-                aec2: 0,
+                awb: true,
+                awb_gain: true,
+                aec: true,
+                aec2: false,
                 ae_level: 0,
                 aec_value: 0,
-                agc: 1,
+                agc: true,
                 agc_gain: 0,
                 gainceiling: 0,
-                bpc: 0,
-                wpc: 0,
-                raw_gma: 0,
-                lenc: 0,
-                hmirror: 0,
-                vflip: 0,
-                dcw: 0,
-                colorbar: 0,
+                bpc: false,
+                wpc: false,
+                raw_gma: false,
+                lenc: false,
+                hmirror: false,
+                vflip: false,
+                dcw: false,
+                colorbar: false,
             },
             pixformat: PixelFormat::Yuv422,
             xclk_freq_hz: 20_000_000,
@@ -426,19 +426,19 @@ impl<B: SccbBus> CameraSensor<B> for Ov7725 {
         let aec_h = bus.read_reg8(self.slv_addr, AECH)? as u16;
         self.status.aec_value = aec_l | (aec_h << 8);
         self.status.gainceiling = self.get_reg_bits(bus, COM9, 4, 3)?;
-        self.status.awb = self.get_reg_bits(bus, COM8, 1, 1)?;
-        self.status.awb_gain = self.get_reg_bits(bus, AWB_CTRL0, 7, 1)?;
-        self.status.aec = self.get_reg_bits(bus, COM8, 0, 1)?;
-        self.status.aec2 = self.get_reg_bits(bus, COM8, 7, 1)?;
-        self.status.agc = self.get_reg_bits(bus, COM8, 2, 1)?;
-        self.status.bpc = self.get_reg_bits(bus, DSP_CTRL1, 1, 1)?;
-        self.status.wpc = self.get_reg_bits(bus, DSP_CTRL1, 0, 1)?;
-        self.status.raw_gma = self.get_reg_bits(bus, DSP_CTRL1, 2, 1)?;
-        self.status.lenc = self.get_reg_bits(bus, LC_CTR, 0, 1)?;
-        self.status.hmirror = self.get_reg_bits(bus, COM3, 6, 1)?;
-        self.status.vflip = self.get_reg_bits(bus, COM3, 7, 1)?;
-        self.status.dcw = self.get_reg_bits(bus, DSP_CTRL2, 2, 1)?;
-        self.status.colorbar = self.get_reg_bits(bus, COM3, 0, 1)?;
+        self.status.awb = self.get_reg_bits(bus, COM8, 1, 1)? != 0;
+        self.status.awb_gain = self.get_reg_bits(bus, AWB_CTRL0, 7, 1)? != 0;
+        self.status.aec = self.get_reg_bits(bus, COM8, 0, 1)? != 0;
+        self.status.aec2 = self.get_reg_bits(bus, COM8, 7, 1)? != 0;
+        self.status.agc = self.get_reg_bits(bus, COM8, 2, 1)? != 0;
+        self.status.bpc = self.get_reg_bits(bus, DSP_CTRL1, 1, 1)? != 0;
+        self.status.wpc = self.get_reg_bits(bus, DSP_CTRL1, 0, 1)? != 0;
+        self.status.raw_gma = self.get_reg_bits(bus, DSP_CTRL1, 2, 1)? != 0;
+        self.status.lenc = self.get_reg_bits(bus, LC_CTR, 0, 1)? != 0;
+        self.status.hmirror = self.get_reg_bits(bus, COM3, 6, 1)? != 0;
+        self.status.vflip = self.get_reg_bits(bus, COM3, 7, 1)? != 0;
+        self.status.dcw = self.get_reg_bits(bus, DSP_CTRL2, 2, 1)? != 0;
+        self.status.colorbar = self.get_reg_bits(bus, COM3, 0, 1)? != 0;
         self.status.sharpness = self.get_reg_bits(bus, EDGE0, 0, 5)? as i8;
         self.status.denoise = bus.read_reg8(self.slv_addr, DNSTH)?;
         Ok(())
@@ -538,56 +538,56 @@ impl<B: SccbBus> CameraSensor<B> for Ov7725 {
         let dsp3 = (bus.read_reg8(self.slv_addr, DSP_CTRL3)? & 0xDF) | (bit << 5);
         bus.write_reg8(self.slv_addr, DSP_CTRL3, dsp3)?;
 
-        self.status.colorbar = bit;
+        self.status.colorbar = enable;
         Ok(())
     }
 
     fn set_whitebal(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let bit = u8::from(enable);
         self.set_reg_bits(bus, COM8, 1, 1, bit)?;
-        self.status.awb = bit;
+        self.status.awb = enable;
         Ok(())
     }
 
     fn set_gain_ctrl(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let bit = u8::from(enable);
         self.set_reg_bits(bus, COM8, 2, 1, bit)?;
-        self.status.agc = bit;
+        self.status.agc = enable;
         Ok(())
     }
 
     fn set_exposure_ctrl(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let bit = u8::from(enable);
         self.set_reg_bits(bus, COM8, 0, 1, bit)?;
-        self.status.aec = bit;
+        self.status.aec = enable;
         Ok(())
     }
 
     fn set_hmirror(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let bit = u8::from(enable);
         self.set_reg_bits(bus, COM3, 6, 1, bit)?;
-        self.status.hmirror = bit;
+        self.status.hmirror = enable;
         Ok(())
     }
 
     fn set_vflip(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let bit = u8::from(enable);
         self.set_reg_bits(bus, COM3, 7, 1, bit)?;
-        self.status.vflip = bit;
+        self.status.vflip = enable;
         Ok(())
     }
 
     fn set_aec2(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let bit = u8::from(enable);
         self.set_reg_bits(bus, COM8, 7, 1, bit)?;
-        self.status.aec2 = bit;
+        self.status.aec2 = enable;
         Ok(())
     }
 
     fn set_awb_gain(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let bit = u8::from(enable);
         self.set_reg_bits(bus, AWB_CTRL0, 7, 1, bit)?;
-        self.status.awb_gain = bit;
+        self.status.awb_gain = enable;
         Ok(())
     }
 
@@ -614,35 +614,35 @@ impl<B: SccbBus> CameraSensor<B> for Ov7725 {
 
     fn set_dcw(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         self.set_reg_bits(bus, DSP_CTRL2, 2, 1, u8::from(!enable))?;
-        self.status.dcw = u8::from(enable);
+        self.status.dcw = enable;
         Ok(())
     }
 
     fn set_bpc(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let bit = u8::from(enable);
         self.set_reg_bits(bus, DSP_CTRL1, 1, 1, bit)?;
-        self.status.bpc = bit;
+        self.status.bpc = enable;
         Ok(())
     }
 
     fn set_wpc(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let bit = u8::from(enable);
         self.set_reg_bits(bus, DSP_CTRL1, 0, 1, bit)?;
-        self.status.wpc = bit;
+        self.status.wpc = enable;
         Ok(())
     }
 
     fn set_raw_gma(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let bit = u8::from(enable);
         self.set_reg_bits(bus, DSP_CTRL1, 2, 1, bit)?;
-        self.status.raw_gma = bit;
+        self.status.raw_gma = enable;
         Ok(())
     }
 
     fn set_lenc(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let bit = u8::from(enable);
         self.set_reg_bits(bus, LC_CTR, 0, 1, bit)?;
-        self.status.lenc = bit;
+        self.status.lenc = enable;
         Ok(())
     }
 

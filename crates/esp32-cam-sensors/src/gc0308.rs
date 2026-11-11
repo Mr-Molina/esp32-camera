@@ -422,9 +422,9 @@ fn check_reg_mask<B: SccbBus>(
     slv_addr: u8,
     reg: u8,
     mask: u8,
-) -> Result<u8, CameraError> {
+) -> Result<bool, CameraError> {
     let val = bus.read_reg8(slv_addr, reg)?;
-    Ok(u8::from((val & mask) == mask))
+    Ok((val & mask) == mask)
 }
 
 fn write_reg_list<B: SccbBus>(bus: &mut B, slv_addr: u8, regs: &[Reg8]) -> Result<(), CameraError> {
@@ -483,23 +483,23 @@ impl Gc0308 {
                 denoise: 0,
                 special_effect: 0,
                 wb_mode: 0,
-                awb: 1,
-                awb_gain: 1,
-                aec: 1,
-                aec2: 0,
+                awb: true,
+                awb_gain: true,
+                aec: true,
+                aec2: false,
                 ae_level: 0,
                 aec_value: 300,
-                agc: 1,
+                agc: true,
                 agc_gain: 0,
                 gainceiling: 0,
-                bpc: 0,
-                wpc: 1,
-                raw_gma: 1,
-                lenc: 1,
-                hmirror: 0,
-                vflip: 0,
-                dcw: 1,
-                colorbar: 0,
+                bpc: false,
+                wpc: true,
+                raw_gma: true,
+                lenc: true,
+                hmirror: false,
+                vflip: false,
+                dcw: true,
+                colorbar: false,
             },
             slv_addr: CameraSccbAddr::GC0308,
             pixformat: PixelFormat::Rgb565,
@@ -613,14 +613,14 @@ impl<B: SccbBus> CameraSensor<B> for Gc0308 {
         self.status.awb = check_reg_mask(bus, self.slv_addr, AAAA_EN, AWB_ENABLE)?;
         self.status.agc = check_reg_mask(bus, self.slv_addr, AAAA_EN, AGC_ENABLE)?;
         self.status.aec = check_reg_mask(bus, self.slv_addr, AAAA_EN, AEC_ENABLE)?;
-        self.status.dcw = 0;
+        self.status.dcw = false;
         self.status.hmirror = check_reg_mask(bus, self.slv_addr, CISCTL_MODE1, HMIRROR_MASK)?;
         self.status.vflip = check_reg_mask(bus, self.slv_addr, CISCTL_MODE1, VFLIP_MASK)?;
         self.status.colorbar = check_reg_mask(bus, self.slv_addr, OUT_CTRL, 0x01)?;
-        self.status.bpc = 0;
-        self.status.wpc = 0;
-        self.status.raw_gma = 0;
-        self.status.lenc = 0;
+        self.status.bpc = false;
+        self.status.wpc = false;
+        self.status.raw_gma = false;
+        self.status.lenc = false;
         self.status.quality = 0;
 
         let effect_bits = bus.read_reg8(self.slv_addr, SPECIAL_EFFECT)? & 0x03;
@@ -631,7 +631,7 @@ impl<B: SccbBus> CameraSensor<B> for Gc0308 {
             _ => 0,
         };
 
-        if self.status.awb != 0 {
+        if self.status.awb {
             self.status.wb_mode = 0;
         } else {
             let r = bus.read_reg8(self.slv_addr, AWB_R_GAIN)?;
@@ -662,14 +662,14 @@ impl<B: SccbBus> CameraSensor<B> for Gc0308 {
             }
         }
 
-        self.status.awb_gain = 0;
+        self.status.awb_gain = false;
         let gain_raw = bus.read_reg8(self.slv_addr, GLOBAL_GAIN)? as u16;
         self.status.agc_gain = ((gain_raw * 30) / 63).min(30) as u8;
 
         let exp_high = bus.read_reg8(self.slv_addr, EXPOSURE_HIGH)? as u16;
         let exp_low = bus.read_reg8(self.slv_addr, EXPOSURE_LOW)? as u16;
         self.status.aec_value = ((exp_high << 4) | ((exp_low >> 4) & 0x0F)).min(1200);
-        self.status.aec2 = 0;
+        self.status.aec2 = false;
 
         Ok(())
     }
@@ -792,42 +792,42 @@ impl<B: SccbBus> CameraSensor<B> for Gc0308 {
     fn set_colorbar(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         bus.write_reg8(self.slv_addr, 0xFE, 0x00)?;
         set_reg_bits(bus, self.slv_addr, OUT_CTRL, 0, 0x01, u8::from(enable))?;
-        self.status.colorbar = u8::from(enable);
+        self.status.colorbar = enable;
         Ok(())
     }
 
     fn set_whitebal(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         bus.write_reg8(self.slv_addr, 0xFE, 0x00)?;
         set_reg_bits(bus, self.slv_addr, AAAA_EN, 1, 0x01, u8::from(enable))?;
-        self.status.awb = u8::from(enable);
+        self.status.awb = enable;
         Ok(())
     }
 
     fn set_gain_ctrl(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         bus.write_reg8(self.slv_addr, 0xFE, 0x00)?;
         set_reg_bits(bus, self.slv_addr, AAAA_EN, 2, 0x01, u8::from(enable))?;
-        self.status.agc = u8::from(enable);
+        self.status.agc = enable;
         Ok(())
     }
 
     fn set_exposure_ctrl(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         bus.write_reg8(self.slv_addr, 0xFE, 0x00)?;
         set_reg_bits(bus, self.slv_addr, AAAA_EN, 0, 0x01, u8::from(enable))?;
-        self.status.aec = u8::from(enable);
+        self.status.aec = enable;
         Ok(())
     }
 
     fn set_hmirror(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         bus.write_reg8(self.slv_addr, 0xFE, 0x00)?;
         set_reg_bits(bus, self.slv_addr, CISCTL_MODE1, 0, 0x01, u8::from(enable))?;
-        self.status.hmirror = u8::from(enable);
+        self.status.hmirror = enable;
         Ok(())
     }
 
     fn set_vflip(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         bus.write_reg8(self.slv_addr, 0xFE, 0x00)?;
         set_reg_bits(bus, self.slv_addr, CISCTL_MODE1, 1, 0x01, u8::from(enable))?;
-        self.status.vflip = u8::from(enable);
+        self.status.vflip = enable;
         Ok(())
     }
 

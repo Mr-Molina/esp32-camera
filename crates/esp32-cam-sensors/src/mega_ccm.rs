@@ -89,23 +89,23 @@ impl MegaCcm {
                 denoise: 0,
                 special_effect: 0,
                 wb_mode: 0,
-                awb: 1,
-                awb_gain: 1,
-                aec: 1,
-                aec2: 0,
+                awb: true,
+                awb_gain: true,
+                aec: true,
+                aec2: false,
                 ae_level: 0,
                 aec_value: 300,
-                agc: 1,
+                agc: true,
                 agc_gain: 0,
                 gainceiling: 0,
-                bpc: 0,
-                wpc: 1,
-                raw_gma: 1,
-                lenc: 1,
-                hmirror: 0,
-                vflip: 0,
-                dcw: 1,
-                colorbar: 0,
+                bpc: false,
+                wpc: true,
+                raw_gma: true,
+                lenc: true,
+                hmirror: false,
+                vflip: false,
+                dcw: true,
+                colorbar: false,
             },
             slv_addr: CameraSccbAddr::MEGA_CCM,
             pixformat: PixelFormat::Jpeg,
@@ -205,24 +205,24 @@ impl<B: SccbBus> CameraSensor<B> for MegaCcm {
         self.status.denoise = 0;
         self.status.ae_level = 0;
         self.status.gainceiling = 0;
-        self.status.awb = 0;
-        self.status.dcw = 0;
-        self.status.agc = 0;
-        self.status.aec = 0;
-        self.status.hmirror = 0;
-        self.status.vflip = 0;
-        self.status.colorbar = 0;
-        self.status.bpc = 0;
-        self.status.wpc = 0;
-        self.status.raw_gma = 0;
-        self.status.lenc = 0;
+        self.status.awb = false;
+        self.status.dcw = false;
+        self.status.agc = false;
+        self.status.aec = false;
+        self.status.hmirror = false;
+        self.status.vflip = false;
+        self.status.colorbar = false;
+        self.status.bpc = false;
+        self.status.wpc = false;
+        self.status.raw_gma = false;
+        self.status.lenc = false;
         self.status.quality = 0;
         self.status.special_effect = 0;
         self.status.wb_mode = 0;
-        self.status.awb_gain = 0;
+        self.status.awb_gain = false;
         self.status.agc_gain = 0;
         self.status.aec_value = 0;
-        self.status.aec2 = 0;
+        self.status.aec2 = false;
         Ok(())
     }
 
@@ -321,21 +321,21 @@ impl<B: SccbBus> CameraSensor<B> for MegaCcm {
     fn set_hmirror(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let val = u8::from(enable);
         bus.write_reg16(self.slv_addr, IMAGE_MIRROR_REG, val)?;
-        self.status.hmirror = val;
+        self.status.hmirror = enable;
         Ok(())
     }
 
     fn set_vflip(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let val = u8::from(enable);
         bus.write_reg16(self.slv_addr, IMAGE_FLIP_REG, val)?;
-        self.status.vflip = val;
+        self.status.vflip = enable;
         Ok(())
     }
 
     fn set_aec2(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let val = u8::from(enable);
         bus.write_reg16(self.slv_addr, AGC_MODE_REG, val)?;
-        self.status.aec2 = val;
+        self.status.aec2 = enable;
         Ok(())
     }
 

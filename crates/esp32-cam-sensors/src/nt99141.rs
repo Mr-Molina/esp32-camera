@@ -600,9 +600,9 @@ fn check_reg_mask<B: SccbBus>(
     slv_addr: u8,
     reg: u16,
     mask: u8,
-) -> Result<u8, CameraError> {
+) -> Result<bool, CameraError> {
     let val = bus.read_reg16(slv_addr, reg)?;
-    Ok(u8::from((val & mask) == mask))
+    Ok((val & mask) == mask)
 }
 
 #[inline]
@@ -663,23 +663,23 @@ impl Nt99141 {
                 denoise: 0,
                 special_effect: 0,
                 wb_mode: 0,
-                awb: 1,
-                awb_gain: 1,
-                aec: 1,
-                aec2: 0,
+                awb: true,
+                awb_gain: true,
+                aec: true,
+                aec2: false,
                 ae_level: 0,
                 aec_value: 300,
-                agc: 1,
+                agc: true,
                 agc_gain: 0,
                 gainceiling: 0,
-                bpc: 0,
-                wpc: 1,
-                raw_gma: 1,
-                lenc: 1,
-                hmirror: 0,
-                vflip: 0,
-                dcw: 1,
-                colorbar: 0,
+                bpc: false,
+                wpc: true,
+                raw_gma: true,
+                lenc: true,
+                hmirror: false,
+                vflip: false,
+                dcw: true,
+                colorbar: false,
             },
             slv_addr: CameraSccbAddr::NT99141,
             pixformat: PixelFormat::Jpeg,
@@ -754,10 +754,10 @@ impl Nt99141 {
 
     fn set_image_options<B: SccbBus>(&self, bus: &mut B) -> Result<(), CameraError> {
         let mut bits = 0u8;
-        if self.status.vflip != 0 {
+        if self.status.vflip {
             bits |= TIMING_TC_REG20_VFLIP;
         }
-        if self.status.hmirror != 0 {
+        if self.status.hmirror {
             bits |= TIMING_TC_REG21_HMIRROR;
         }
         set_reg_bits(bus, self.slv_addr, TIMING_TC_REG20, 0, 0x03, bits)
@@ -799,23 +799,19 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
         self.status.ae_level = 0;
         self.status.gainceiling = bus.read_reg16(self.slv_addr, 0x32F0)?;
         self.status.awb = check_reg_mask(bus, self.slv_addr, ISP_CONTROL_01, 0x10)?;
-        self.status.dcw = u8::from(check_reg_mask(bus, self.slv_addr, 0x5183, 0x80)? == 0);
-        self.status.agc = u8::from(
-            check_reg_mask(
-                bus,
-                self.slv_addr,
-                AEC_PK_MANUAL,
-                AEC_PK_MANUAL_AGC_MANUALEN,
-            )? == 0,
-        );
-        self.status.aec = u8::from(
-            check_reg_mask(
-                bus,
-                self.slv_addr,
-                AEC_PK_MANUAL,
-                AEC_PK_MANUAL_AEC_MANUALEN,
-            )? == 0,
-        );
+        self.status.dcw = !check_reg_mask(bus, self.slv_addr, 0x5183, 0x80)?;
+        self.status.agc = !check_reg_mask(
+            bus,
+            self.slv_addr,
+            AEC_PK_MANUAL,
+            AEC_PK_MANUAL_AGC_MANUALEN,
+        )?;
+        self.status.aec = !check_reg_mask(
+            bus,
+            self.slv_addr,
+            AEC_PK_MANUAL,
+            AEC_PK_MANUAL_AEC_MANUALEN,
+        )?;
         self.status.hmirror =
             check_reg_mask(bus, self.slv_addr, TIMING_TC_REG21, TIMING_TC_REG21_HMIRROR)?;
         self.status.vflip =
@@ -960,18 +956,18 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
             TEST_COLOR_BAR,
             enable,
         )?;
-        self.status.colorbar = u8::from(enable);
+        self.status.colorbar = enable;
         Ok(())
     }
 
     fn set_whitebal(&mut self, _bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.awb = u8::from(enable);
+        self.status.awb = enable;
         Ok(())
     }
 
     fn set_gain_ctrl(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         write_reg_bits(bus, self.slv_addr, 0x32BB, 0x87, enable)?;
-        self.status.agc = u8::from(enable);
+        self.status.agc = enable;
         Ok(())
     }
 
@@ -983,22 +979,22 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
             data & !(1 << 5)
         };
         bus.write_reg16(self.slv_addr, 0x3201, next)?;
-        self.status.aec = u8::from(enable);
+        self.status.aec = enable;
         Ok(())
     }
 
     fn set_hmirror(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.hmirror = u8::from(enable);
+        self.status.hmirror = enable;
         self.set_image_options(bus)
     }
 
     fn set_vflip(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.vflip = u8::from(enable);
+        self.status.vflip = enable;
         self.set_image_options(bus)
     }
 
     fn set_aec2(&mut self, _bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.aec2 = u8::from(enable);
+        self.status.aec2 = enable;
         Ok(())
     }
 
@@ -1007,7 +1003,7 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
         let mode = if enable { old_mode as i32 } else { 0 };
         self.set_wb_mode(bus, mode)?;
         self.status.wb_mode = old_mode;
-        self.status.awb_gain = u8::from(enable);
+        self.status.awb_gain = enable;
         Ok(())
     }
 
@@ -1084,27 +1080,27 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
     }
 
     fn set_dcw(&mut self, _bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.dcw = u8::from(enable);
+        self.status.dcw = enable;
         Ok(())
     }
 
     fn set_bpc(&mut self, _bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.bpc = u8::from(enable);
+        self.status.bpc = enable;
         Ok(())
     }
 
     fn set_wpc(&mut self, _bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.wpc = u8::from(enable);
+        self.status.wpc = enable;
         Ok(())
     }
 
     fn set_raw_gma(&mut self, _bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.raw_gma = u8::from(enable);
+        self.status.raw_gma = enable;
         Ok(())
     }
 
     fn set_lenc(&mut self, _bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.lenc = u8::from(enable);
+        self.status.lenc = enable;
         Ok(())
     }
 

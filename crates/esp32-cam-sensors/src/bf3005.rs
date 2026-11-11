@@ -205,23 +205,23 @@ impl Bf3005 {
                 denoise: 0,
                 special_effect: 0,
                 wb_mode: 0,
-                awb: 1,
-                awb_gain: 1,
-                aec: 1,
-                aec2: 0,
+                awb: true,
+                awb_gain: true,
+                aec: true,
+                aec2: false,
                 ae_level: 0,
                 aec_value: 300,
-                agc: 1,
+                agc: true,
                 agc_gain: 0,
                 gainceiling: 0,
-                bpc: 0,
-                wpc: 1,
-                raw_gma: 1,
-                lenc: 1,
-                hmirror: 0,
-                vflip: 0,
-                dcw: 1,
-                colorbar: 0,
+                bpc: false,
+                wpc: true,
+                raw_gma: true,
+                lenc: true,
+                hmirror: false,
+                vflip: false,
+                dcw: true,
+                colorbar: false,
             },
             slv_addr: CameraSccbAddr::BF3005,
             pixformat: PixelFormat::Yuv422,
@@ -334,15 +334,15 @@ impl<B: SccbBus> CameraSensor<B> for Bf3005 {
         self.status.saturation = 0;
         self.status.ae_level = 0;
         self.status.gainceiling = bus.read_reg8(self.slv_addr, 0x87)?;
-        self.status.awb = get_reg_bits(bus, self.slv_addr, 0x13, 1, 1)?;
-        self.status.awb_gain = bus.read_reg8(self.slv_addr, 0xA6)?;
-        self.status.aec = get_reg_bits(bus, self.slv_addr, 0x13, 0, 1)?;
-        self.status.agc = get_reg_bits(bus, self.slv_addr, 0x13, 2, 1)?;
-        self.status.raw_gma = u8::from(get_reg_bits(bus, self.slv_addr, 0xF1, 1, 1)? == 0);
-        self.status.lenc = u8::from(get_reg_bits(bus, self.slv_addr, 0xF1, 0, 1)? == 0);
-        self.status.hmirror = get_reg_bits(bus, self.slv_addr, 0x1E, 5, 1)?;
-        self.status.vflip = get_reg_bits(bus, self.slv_addr, 0x1E, 4, 1)?;
-        self.status.colorbar = bus.read_reg8(self.slv_addr, 0xB9)?;
+        self.status.awb = get_reg_bits(bus, self.slv_addr, 0x13, 1, 1)? != 0;
+        self.status.awb_gain = bus.read_reg8(self.slv_addr, 0xA6)? != 0;
+        self.status.aec = get_reg_bits(bus, self.slv_addr, 0x13, 0, 1)? != 0;
+        self.status.agc = get_reg_bits(bus, self.slv_addr, 0x13, 2, 1)? != 0;
+        self.status.raw_gma = get_reg_bits(bus, self.slv_addr, 0xF1, 1, 1)? == 0;
+        self.status.lenc = get_reg_bits(bus, self.slv_addr, 0xF1, 0, 1)? == 0;
+        self.status.hmirror = get_reg_bits(bus, self.slv_addr, 0x1E, 5, 1)? != 0;
+        self.status.vflip = get_reg_bits(bus, self.slv_addr, 0x1E, 4, 1)? != 0;
+        self.status.colorbar = bus.read_reg8(self.slv_addr, 0xB9)? != 0;
         self.status.sharpness = bus.read_reg8(self.slv_addr, 0x70)? as i8;
         Ok(())
     }
@@ -422,49 +422,49 @@ impl<B: SccbBus> CameraSensor<B> for Bf3005 {
 
     fn set_colorbar(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let val = u8::from(enable);
-        self.status.colorbar = val;
+        self.status.colorbar = enable;
         bus.write_reg8(self.slv_addr, 0xB9, val)
     }
 
     fn set_whitebal(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let val = u8::from(enable);
         set_reg_bits(bus, self.slv_addr, 0x13, 1, 1, val)?;
-        self.status.awb = val;
+        self.status.awb = enable;
         Ok(())
     }
 
     fn set_gain_ctrl(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let val = u8::from(enable);
         set_reg_bits(bus, self.slv_addr, 0x13, 2, 1, val)?;
-        self.status.agc = val;
+        self.status.agc = enable;
         Ok(())
     }
 
     fn set_exposure_ctrl(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let val = u8::from(enable);
         set_reg_bits(bus, self.slv_addr, 0x13, 0, 1, val)?;
-        self.status.aec = val;
+        self.status.aec = enable;
         Ok(())
     }
 
     fn set_hmirror(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let val = u8::from(enable);
         set_reg_bits(bus, self.slv_addr, 0x1E, 5, 1, val)?;
-        self.status.hmirror = val;
+        self.status.hmirror = enable;
         Ok(())
     }
 
     fn set_vflip(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let val = u8::from(enable);
         set_reg_bits(bus, self.slv_addr, 0x1E, 4, 1, val)?;
-        self.status.vflip = val;
+        self.status.vflip = enable;
         Ok(())
     }
 
     fn set_awb_gain(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let val = u8::from(enable);
         bus.write_reg8(self.slv_addr, 0xA6, val)?;
-        self.status.awb_gain = val;
+        self.status.awb_gain = enable;
         Ok(())
     }
 
@@ -478,14 +478,14 @@ impl<B: SccbBus> CameraSensor<B> for Bf3005 {
     fn set_raw_gma(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let inv = u8::from(!enable);
         set_reg_bits(bus, self.slv_addr, 0xF1, 1, 1, inv)?;
-        self.status.raw_gma = u8::from(enable);
+        self.status.raw_gma = enable;
         Ok(())
     }
 
     fn set_lenc(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let inv = u8::from(!enable);
         set_reg_bits(bus, self.slv_addr, 0xF1, 0, 1, inv)?;
-        self.status.lenc = u8::from(enable);
+        self.status.lenc = enable;
         Ok(())
     }
 

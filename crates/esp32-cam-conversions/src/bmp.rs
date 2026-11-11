@@ -5,7 +5,6 @@
 //! unaligned packed struct pointer casts and integer overflow vulnerabilities.
 
 use crate::jpeg_codec;
-use crate::jpeg_scan;
 use crate::yuv;
 use esp32_cam_types::{CameraError, PixelFormat};
 
@@ -302,9 +301,9 @@ pub fn yuv422_to_bmp(
 /// [`PixelFormat::Grayscale`], [`PixelFormat::Yuv422`], and
 /// [`PixelFormat::Jpeg`].
 ///
-/// For [`PixelFormat::Jpeg`], skips the pre-decode SOF header scan entirely
-/// when `width == 0 && height == 0`, and otherwise validates expected SOF
-/// dimensions once up front before `dst` is touched (`CONV-18`).
+/// For [`PixelFormat::Jpeg`], validates any non-zero `width` or `height`
+/// directly inside the decoder's `SOF0` parser in a single pass before `dst`
+/// is touched (`CONV-18`).
 pub fn frame_to_bmp(
     src: &[u8],
     dst: &mut [u8],
@@ -317,19 +316,7 @@ pub fn frame_to_bmp(
         PixelFormat::Rgb565 => rgb565_to_bmp(src, dst, width, height),
         PixelFormat::Grayscale => grayscale_to_bmp(src, dst, width, height),
         PixelFormat::Yuv422 => yuv422_to_bmp(src, dst, width, height),
-        PixelFormat::Jpeg => {
-            if width != 0 || height != 0 {
-                let (jw, jh) =
-                    jpeg_scan::parse_jpeg_dimensions(src).ok_or(CameraError::CorruptedFrame)?;
-                if (width != 0 && width != jw) || (height != 0 && height != jh) {
-                    return Err(CameraError::InvalidArg);
-                }
-            }
-            let (dec_w, dec_h, written) = jpeg_codec::jpeg_to_bmp(src, dst)?;
-            debug_assert!(width == 0 || width == dec_w);
-            debug_assert!(height == 0 || height == dec_h);
-            Ok(written)
-        }
+        PixelFormat::Jpeg => jpeg_codec::jpeg_to_bmp_checked(src, dst, width, height),
         _ => Err(CameraError::InvalidFormat),
     }
 }
@@ -591,5 +578,30 @@ mod tests {
             gray_written,
             BMP_HEADER_LEN + BMP_GRAYSCALE_PALETTE_LEN + 8 * 3
         );
+    }
+
+    #[test]
+    fn test_conv_18_single_pass_sof0_mismatch_preserves_0xaa_dst() {
+        // CONV-18: Validate expected_dims inside M_SOF0 without a separate
+        // pre-decode scan and without mutating a 0xAA-filled dst buffer.
+        let rgb_in = [0x55u8; 8 * 8 * 3];
+        let mut jpeg_buf = [0u8; 2048];
+        let jpeg_len = jpeg_codec::encode_rgb888_to_jpeg(&rgb_in, &mut jpeg_buf, 8, 8, 85)
+            .expect("8x8 JPEG encode should succeed");
+        let jpeg_slice = &jpeg_buf[..jpeg_len];
+
+        let mut dst = [0xAAu8; BMP_HEADER_LEN + 16 * 16 * 3];
+
+        for (bad_w, bad_h) in [(9u16, 8u16), (9, 0), (8, 9), (0, 9)] {
+            assert_eq!(
+                frame_to_bmp(jpeg_slice, &mut dst, bad_w, bad_h, PixelFormat::Jpeg),
+                Err(CameraError::InvalidArg),
+                "expected InvalidArg for mismatched dims ({bad_w}, {bad_h})"
+            );
+            assert!(
+                dst.iter().all(|&b| b == 0xAA),
+                "dst buffer was mutated on mismatch ({bad_w}, {bad_h})"
+            );
+        }
     }
 }

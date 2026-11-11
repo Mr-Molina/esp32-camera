@@ -282,7 +282,8 @@ pub struct SensorInfo {
     pub support_jpeg: bool,
 }
 
-const SENSOR_INFO_TABLE: [SensorInfo; CameraModel::COUNT] = [
+/// Global sensor metadata lookup table indexed by `CameraModel as usize`.
+pub static CAMERA_SENSOR_INFO: [SensorInfo; CameraModel::COUNT] = [
     SensorInfo {
         model: CameraModel::Ov7725,
         name: "OV7725",
@@ -429,16 +430,13 @@ const SENSOR_INFO_TABLE: [SensorInfo; CameraModel::COUNT] = [
     },
 ];
 
-/// Master table of all 18 camera sensors (`camera_sensor[CAMERA_MODEL_MAX]`).
-pub static CAMERA_SENSOR_INFO: [SensorInfo; 18] = SENSOR_INFO_TABLE;
-
-/// Alias for [`CAMERA_SENSOR_INFO`].
-pub static SENSOR_INFO: [SensorInfo; 18] = SENSOR_INFO_TABLE;
+/// Alias for [`CAMERA_SENSOR_INFO`] preserving legacy table naming.
+pub use self::CAMERA_SENSOR_INFO as SENSOR_INFO;
 
 const _: () = {
     let mut i = 0;
-    while i < SENSOR_INFO_TABLE.len() {
-        assert!(SENSOR_INFO_TABLE[i].model as usize == i);
+    while i < CAMERA_SENSOR_INFO.len() {
+        assert!(CAMERA_SENSOR_INFO[i].model as usize == i);
         i += 1;
     }
 };
@@ -457,8 +455,8 @@ pub struct SensorId {
 #[must_use]
 pub const fn esp_camera_sensor_get_info(id: &SensorId) -> Option<&'static SensorInfo> {
     let mut i = 0;
-    while i < SENSOR_INFO_TABLE.len() {
-        if SENSOR_INFO_TABLE[i].pid.matches_pid(id.pid) {
+    while i < CAMERA_SENSOR_INFO.len() {
+        if CAMERA_SENSOR_INFO[i].pid.matches_pid(id.pid) {
             return Some(&CAMERA_SENSOR_INFO[i]);
         }
         i += 1;

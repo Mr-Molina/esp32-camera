@@ -315,23 +315,23 @@ impl Ov7670 {
                 denoise: 0,
                 special_effect: 0,
                 wb_mode: 0,
-                awb: 0,
-                awb_gain: 0,
-                aec: 0,
-                aec2: 0,
+                awb: false,
+                awb_gain: false,
+                aec: false,
+                aec2: false,
                 ae_level: 0,
                 aec_value: 0,
-                agc: 0,
+                agc: false,
                 agc_gain: 0,
                 gainceiling: 0,
-                bpc: 0,
-                wpc: 0,
-                raw_gma: 0,
-                lenc: 0,
-                hmirror: 0,
-                vflip: 0,
-                dcw: 0,
-                colorbar: 0,
+                bpc: false,
+                wpc: false,
+                raw_gma: false,
+                lenc: false,
+                hmirror: false,
+                vflip: false,
+                dcw: false,
+                colorbar: false,
             },
             pixformat: PixelFormat::Yuv422,
             clkrc: 0x01,
@@ -437,16 +437,16 @@ impl<B: SccbBus> CameraSensor<B> for Ov7670 {
 
     fn init_status(&mut self, bus: &mut B) -> Result<(), CameraError> {
         let com8 = bus.read_reg8(self.slv_addr, COM8)?;
-        self.status.aec = com8 & 0x01;
-        self.status.awb = (com8 >> 1) & 0x01;
-        self.status.agc = (com8 >> 2) & 0x01;
+        self.status.aec = (com8 & 0x01) != 0;
+        self.status.awb = ((com8 >> 1) & 0x01) != 0;
+        self.status.agc = ((com8 >> 2) & 0x01) != 0;
 
         let mvfp = bus.read_reg8(self.slv_addr, MVFP)?;
-        self.status.vflip = (mvfp >> 4) & 0x01;
-        self.status.hmirror = (mvfp >> 5) & 0x01;
+        self.status.vflip = ((mvfp >> 4) & 0x01) != 0;
+        self.status.hmirror = ((mvfp >> 5) & 0x01) != 0;
 
         let ysc = bus.read_reg8(self.slv_addr, SCALING_YSC)?;
-        self.status.colorbar = (ysc >> 7) & 0x01;
+        self.status.colorbar = ((ysc >> 7) & 0x01) != 0;
         Ok(())
     }
 
@@ -507,7 +507,7 @@ impl<B: SccbBus> CameraSensor<B> for Ov7670 {
         let ysc = (bus.read_reg8(self.slv_addr, SCALING_YSC)? & 0x7F) | (bit << 7);
         bus.write_reg8(self.slv_addr, SCALING_YSC, ysc)?;
 
-        self.status.colorbar = bit;
+        self.status.colorbar = enable;
         Ok(())
     }
 
@@ -515,7 +515,7 @@ impl<B: SccbBus> CameraSensor<B> for Ov7670 {
         let bit = u8::from(enable);
         let reg = (bus.read_reg8(self.slv_addr, COM8)? & 0xFD) | (bit << 1);
         bus.write_reg8(self.slv_addr, COM8, reg)?;
-        self.status.awb = bit;
+        self.status.awb = enable;
         Ok(())
     }
 
@@ -523,7 +523,7 @@ impl<B: SccbBus> CameraSensor<B> for Ov7670 {
         let bit = u8::from(enable);
         let reg = (bus.read_reg8(self.slv_addr, COM8)? & 0xFB) | (bit << 2);
         bus.write_reg8(self.slv_addr, COM8, reg)?;
-        self.status.agc = bit;
+        self.status.agc = enable;
         Ok(())
     }
 
@@ -531,7 +531,7 @@ impl<B: SccbBus> CameraSensor<B> for Ov7670 {
         let bit = u8::from(enable);
         let reg = (bus.read_reg8(self.slv_addr, COM8)? & 0xFE) | bit;
         bus.write_reg8(self.slv_addr, COM8, reg)?;
-        self.status.aec = bit;
+        self.status.aec = enable;
         Ok(())
     }
 
@@ -539,7 +539,7 @@ impl<B: SccbBus> CameraSensor<B> for Ov7670 {
         let bit = u8::from(enable);
         let reg = (bus.read_reg8(self.slv_addr, MVFP)? & 0xDF) | (bit << 5);
         bus.write_reg8(self.slv_addr, MVFP, reg)?;
-        self.status.hmirror = bit;
+        self.status.hmirror = enable;
         Ok(())
     }
 
@@ -547,7 +547,7 @@ impl<B: SccbBus> CameraSensor<B> for Ov7670 {
         let bit = u8::from(enable);
         let reg = (bus.read_reg8(self.slv_addr, MVFP)? & 0xEF) | (bit << 4);
         bus.write_reg8(self.slv_addr, MVFP, reg)?;
-        self.status.vflip = bit;
+        self.status.vflip = enable;
         Ok(())
     }
 }

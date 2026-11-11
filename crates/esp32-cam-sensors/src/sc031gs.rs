@@ -338,23 +338,23 @@ impl Sc031Gs {
                 denoise: 0,
                 special_effect: 0,
                 wb_mode: 0,
-                awb: 1,
-                awb_gain: 1,
-                aec: 1,
-                aec2: 0,
+                awb: true,
+                awb_gain: true,
+                aec: true,
+                aec2: false,
                 ae_level: 0,
                 aec_value: 300,
-                agc: 1,
+                agc: true,
                 agc_gain: 0,
                 gainceiling: 0,
-                bpc: 0,
-                wpc: 1,
-                raw_gma: 1,
-                lenc: 1,
-                hmirror: 0,
-                vflip: 0,
-                dcw: 1,
-                colorbar: 0,
+                bpc: false,
+                wpc: true,
+                raw_gma: true,
+                lenc: true,
+                hmirror: false,
+                vflip: false,
+                dcw: true,
+                colorbar: false,
             },
             slv_addr: CameraSccbAddr::SC031GS,
             pixformat: PixelFormat::Grayscale,
@@ -556,21 +556,21 @@ impl<B: SccbBus> CameraSensor<B> for Sc031Gs {
         set_reg_bits(bus, self.slv_addr, 0x4501, 3, 1, val)?;
         set_reg_bits(bus, self.slv_addr, 0x3902, 6, 1, val)?;
         set_reg_bits(bus, self.slv_addr, 0x3E06, 0, 2, if enable { 3 } else { 0 })?;
-        self.status.colorbar = val;
+        self.status.colorbar = enable;
         Ok(())
     }
 
     fn set_hmirror(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let bits = if enable { 0x03 } else { 0x00 };
         set_reg_bits(bus, self.slv_addr, 0x3221, 1, 2, bits)?;
-        self.status.hmirror = u8::from(enable);
+        self.status.hmirror = enable;
         Ok(())
     }
 
     fn set_vflip(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         let bits = if enable { 0x03 } else { 0x00 };
         set_reg_bits(bus, self.slv_addr, 0x3221, 5, 2, bits)?;
-        self.status.vflip = u8::from(enable);
+        self.status.vflip = enable;
         Ok(())
     }
 

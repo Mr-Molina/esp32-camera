@@ -439,9 +439,9 @@ fn check_reg_mask<B: SccbBus>(
     slv_addr: u8,
     reg: u8,
     mask: u8,
-) -> Result<u8, CameraError> {
+) -> Result<bool, CameraError> {
     let val = bus.read_reg8(slv_addr, reg)?;
-    Ok(u8::from((val & mask) == mask))
+    Ok((val & mask) == mask)
 }
 
 fn write_reg_list<B: SccbBus>(
@@ -508,23 +508,23 @@ impl Gc032a {
                 denoise: 0,
                 special_effect: 0,
                 wb_mode: 0,
-                awb: 1,
-                awb_gain: 1,
-                aec: 1,
-                aec2: 0,
+                awb: true,
+                awb_gain: true,
+                aec: true,
+                aec2: false,
                 ae_level: 0,
                 aec_value: 300,
-                agc: 1,
+                agc: true,
                 agc_gain: 0,
                 gainceiling: 0,
-                bpc: 0,
-                wpc: 1,
-                raw_gma: 1,
-                lenc: 1,
-                hmirror: 0,
-                vflip: 0,
-                dcw: 1,
-                colorbar: 0,
+                bpc: false,
+                wpc: true,
+                raw_gma: true,
+                lenc: true,
+                hmirror: false,
+                vflip: false,
+                dcw: true,
+                colorbar: false,
             },
             slv_addr: CameraSccbAddr::GC032A,
             pixformat: PixelFormat::Rgb565,
@@ -630,24 +630,24 @@ impl<B: SccbBus> CameraSensor<B> for Gc032a {
         self.status.denoise = 0;
         self.status.ae_level = 0;
         self.status.gainceiling = 0;
-        self.status.awb = 0;
-        self.status.dcw = 0;
-        self.status.agc = 0;
-        self.status.aec = 0;
+        self.status.awb = false;
+        self.status.dcw = false;
+        self.status.agc = false;
+        self.status.aec = false;
         self.status.hmirror = check_reg_mask(bus, self.slv_addr, P0_CISCTL_MODE1, 0x01)?;
         self.status.vflip = check_reg_mask(bus, self.slv_addr, P0_CISCTL_MODE1, 0x02)?;
-        self.status.colorbar = 0;
-        self.status.bpc = 0;
-        self.status.wpc = 0;
-        self.status.raw_gma = 0;
-        self.status.lenc = 0;
+        self.status.colorbar = false;
+        self.status.bpc = false;
+        self.status.wpc = false;
+        self.status.raw_gma = false;
+        self.status.lenc = false;
         self.status.quality = 0;
         self.status.special_effect = 0;
         self.status.wb_mode = 0;
-        self.status.awb_gain = 0;
+        self.status.awb_gain = false;
         self.status.agc_gain = 0;
         self.status.aec_value = 0;
-        self.status.aec2 = 0;
+        self.status.aec2 = false;
         Ok(())
     }
 
@@ -713,12 +713,12 @@ impl<B: SccbBus> CameraSensor<B> for Gc032a {
             0x01,
             u8::from(enable),
         )?;
-        self.status.colorbar = u8::from(enable);
+        self.status.colorbar = enable;
         Ok(())
     }
 
     fn set_hmirror(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.hmirror = u8::from(enable);
+        self.status.hmirror = enable;
         bus.write_reg8(self.slv_addr, 0xFE, 0x00)?;
         set_reg_bits(
             bus,
@@ -731,7 +731,7 @@ impl<B: SccbBus> CameraSensor<B> for Gc032a {
     }
 
     fn set_vflip(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.vflip = u8::from(enable);
+        self.status.vflip = enable;
         bus.write_reg8(self.slv_addr, 0xFE, 0x00)?;
         set_reg_bits(
             bus,

@@ -332,7 +332,7 @@ mod tests {
         bus.preset_reg16(CameraSccbAddr::OV3640, 0x3406, 0x00); // awb_gain = 1
         assert_eq!(sensor.init_status(&mut bus), Ok(()));
         assert_eq!(sensor.status().sharpness, -5);
-        assert_eq!(sensor.status().awb_gain, 1);
+        assert!(sensor.status().awb_gain);
     }
 
     #[test]
@@ -593,12 +593,12 @@ mod tests {
         bus.preset_reg8(CameraSccbAddr::OV7670, ov7670::MVFP, 0b0011_0000); // hmirror=1, vflip=1
         bus.preset_reg8(CameraSccbAddr::OV7670, ov7670::SCALING_YSC, 0x80); // colorbar=1
         assert_eq!(sensor.init_status(&mut bus), Ok(()));
-        assert_eq!(sensor.status().aec, 1);
-        assert_eq!(sensor.status().awb, 1);
-        assert_eq!(sensor.status().agc, 1);
-        assert_eq!(sensor.status().hmirror, 1);
-        assert_eq!(sensor.status().vflip, 1);
-        assert_eq!(sensor.status().colorbar, 1);
+        assert!(sensor.status().aec);
+        assert!(sensor.status().awb);
+        assert!(sensor.status().agc);
+        assert!(sensor.status().hmirror);
+        assert!(sensor.status().vflip);
+        assert!(sensor.status().colorbar);
 
         assert_eq!(sensor.set_whitebal(&mut bus, true), Ok(()));
         assert_eq!(sensor.set_gain_ctrl(&mut bus, true), Ok(()));

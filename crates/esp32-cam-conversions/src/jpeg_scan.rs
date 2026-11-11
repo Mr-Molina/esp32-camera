@@ -1,5 +1,5 @@
-//! Safe `#![no_std]` JPEG SOI/EOI marker scanner (with unified 4-byte SWAR
-//! `0xFF` scan kernel) and strict `SOF0`..`SOF2` frame dimension parser.
+//! Safe `#![no_std]` JPEG SOI/EOI marker scanner (using slice-window iterator
+//! helpers) and strict `SOF0`..`SOF2` frame dimension parser.
 //!
 //! Replaces `cam_verify_jpeg_soi`, `cam_verify_jpeg_eoi`, and
 //! `eoi_probe_window` from `driver/cam_hal.c`.
@@ -14,98 +14,23 @@ pub(crate) const JPEG_SOI_2BYTE_MARKER: [u8; 2] = [0xFF, 0xD8];
 /// JPEG End-Of-Image marker (`0xFF, 0xD9`).
 pub const JPEG_EOI_MARKER: [u8; 2] = [0xFF, 0xD9];
 
-const SWAR_ONE: u32 = 0x0101_0101;
-const SWAR_HIGH: u32 = 0x8080_8080;
-
-/// Returns a bitmask with `0x80` set in every byte lane of `word` equal to
-/// `0xFF` (Mycroft zero-byte detector applied to `!word`).
-///
-/// A `0xFE` lane immediately above a `0xFF` borrow may also set `0x80` as a
-/// benign false positive; callers always verify the full marker slice.
+/// Scans `inbuf` forward for the earliest 2-byte marker `[0xFF, second]`.
 #[inline]
-const fn swar_ff_mask(word: u32) -> u32 {
-    let inv = !word;
-    (word & inv.wrapping_sub(SWAR_ONE)) & SWAR_HIGH
+fn scan_marker_2_forward(inbuf: &[u8], second: u8) -> Option<usize> {
+    inbuf.windows(2).position(|w| w == [0xFF, second])
 }
 
-/// Scans `buf` forward using 4-byte SWAR `0xFF` candidate detection for the
-/// earliest occurrence of `marker` (whose leading byte must be `0xFF`).
+/// Scans `inbuf` backward for the last 2-byte marker `[0xFF, second]`.
 #[inline]
-fn scan_ff_marker_forward<const N: usize>(buf: &[u8], marker: &[u8; N]) -> Option<usize> {
-    debug_assert!(N >= 2 && marker[0] == 0xFF);
-    let length = buf.len();
-    if length < N {
-        return None;
-    }
-
-    let last_start = length - N;
-    let marker_slice = marker.as_slice();
-    let mut i = 0usize;
-
-    while i + 4 <= length {
-        let word = u32::from_le_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]);
-        let mut mask = swar_ff_mask(word);
-        while mask != 0 {
-            let pos = i + ((mask.trailing_zeros() >> 3) as usize);
-            if pos <= last_start && &buf[pos..pos + N] == marker_slice {
-                return Some(pos);
-            }
-            mask &= mask.wrapping_sub(1);
-        }
-        i += 4;
-    }
-
-    while i <= last_start {
-        if &buf[i..i + N] == marker_slice {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
+fn scan_marker_2_backward(inbuf: &[u8], second: u8) -> Option<usize> {
+    inbuf.windows(2).rposition(|w| w == [0xFF, second])
 }
 
-/// Scans `buf` backward using 4-byte SWAR `0xFF` candidate detection for the
-/// last occurrence of `marker` (whose leading byte must be `0xFF`).
+/// Scans `inbuf` forward for the earliest 3-byte [`JPEG_SOI_MARKER`]
+/// (`[0xFF, 0xD8, 0xFF]`).
 #[inline]
-fn scan_ff_marker_backward<const N: usize>(buf: &[u8], marker: &[u8; N]) -> Option<usize> {
-    debug_assert!(N >= 2 && marker[0] == 0xFF);
-    let length = buf.len();
-    if length < N {
-        return None;
-    }
-
-    let last_start = length - N;
-    let marker_slice = marker.as_slice();
-    if length >= 4 {
-        let mut i = length - 4;
-        loop {
-            let word = u32::from_le_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]);
-            let mut mask = swar_ff_mask(word);
-            while mask != 0 {
-                let bit = 31 - mask.leading_zeros();
-                let pos = i + ((bit >> 3) as usize);
-                if pos <= last_start && &buf[pos..pos + N] == marker_slice {
-                    return Some(pos);
-                }
-                mask ^= 1u32 << bit;
-            }
-            if i == 0 {
-                return None;
-            }
-            i = i.saturating_sub(4);
-        }
-    }
-
-    let mut pos = last_start;
-    loop {
-        if &buf[pos..pos + N] == marker_slice {
-            return Some(pos);
-        }
-        if pos == 0 {
-            return None;
-        }
-        pos -= 1;
-    }
+fn scan_soi_3_forward(inbuf: &[u8]) -> Option<usize> {
+    inbuf.windows(3).position(|w| w == JPEG_SOI_MARKER)
 }
 
 /// Computes the PSRAM cache-invalidation and scan window for JPEG EOI
@@ -127,8 +52,8 @@ pub const fn eoi_probe_window(half: usize, frame_len: usize) -> usize {
 /// Scans `buf` forward for the 3-byte [`JPEG_SOI_MARKER`]
 /// (`[0xFF, 0xD8, 0xFF]`).
 ///
-/// Uses the unified 4-byte SWAR `0xFF` scan kernel (`CONV-11`) to locate
-/// candidate marker positions across words.
+/// Uses slice-window iteration (`CONV-11`) to locate the earliest SOI marker
+/// prefix.
 ///
 /// Returns `Some(offset)` of the first match, or `None` if `buf.len() < 3` or
 /// no SOI marker is present. Matches `cam_verify_jpeg_soi` in
@@ -136,31 +61,31 @@ pub const fn eoi_probe_window(half: usize, frame_len: usize) -> usize {
 #[inline]
 #[must_use]
 pub fn verify_jpeg_soi(buf: &[u8]) -> Option<usize> {
-    scan_ff_marker_forward(buf, &JPEG_SOI_MARKER)
+    scan_soi_3_forward(buf)
 }
 
 /// Scans `buf` forward for the 2-byte [`JPEG_SOI_2BYTE_MARKER`]
-/// (`[0xFF, 0xD8]`) using the unified SWAR `0xFF` scan kernel.
+/// (`[0xFF, 0xD8]`) using slice-window iteration.
 #[cfg(test)]
 #[inline]
 #[must_use]
 pub(crate) fn verify_jpeg_soi_2byte(buf: &[u8]) -> Option<usize> {
-    scan_ff_marker_forward(buf, &JPEG_SOI_2BYTE_MARKER)
+    scan_marker_2_forward(buf, JPEG_SOI_2BYTE_MARKER[1])
 }
 
 /// Scans `buf` for the 2-byte [`JPEG_EOI_MARKER`] (`[0xFF, 0xD9]`).
 ///
-/// - When `search_forward` is `true`, scans forward via the unified 4-byte
-///   SWAR `0xFF` kernel to locate the earliest `0xFF, 0xD9` marker in `buf`.
+/// - When `search_forward` is `true`, scans forward via `windows(2).position`
+///   to locate the earliest `0xFF, 0xD9` marker in `buf`.
 /// - When `search_forward` is `false`, scans backward from the end of `buf`
-///   via the 4-byte SWAR `0xFF` kernel to find the last `0xFF, 0xD9` marker.
+///   via `windows(2).rposition` to find the last `0xFF, 0xD9` marker.
 #[inline]
 #[must_use]
 pub fn verify_jpeg_eoi(buf: &[u8], search_forward: bool) -> Option<usize> {
     if search_forward {
-        scan_ff_marker_forward(buf, &JPEG_EOI_MARKER)
+        scan_marker_2_forward(buf, JPEG_EOI_MARKER[1])
     } else {
-        scan_ff_marker_backward(buf, &JPEG_EOI_MARKER)
+        scan_marker_2_backward(buf, JPEG_EOI_MARKER[1])
     }
 }
 

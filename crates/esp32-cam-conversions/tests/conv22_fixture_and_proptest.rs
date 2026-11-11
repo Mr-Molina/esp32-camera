@@ -1,14 +1,18 @@
-//! Integration tests for `CONV-22`: 4:2:2 (`H2V1`) JPEG fixture PSNR
-//! verification, SWAR scanner `proptest` equivalence, and untrusted input
-//! mutation-fuzzing.
+//! Integration tests for `CONV-22`: external JPEG fixture verification,
+//! SWAR scanner `proptest` equivalence, and untrusted input mutation-fuzzing.
+//!
+//! All checked-in JPEG fixtures in `tests/fixtures/` originate from external
+//! encoders (`Pillow`/`libjpeg` and historical upstream `a364a6a` test
+//! captures) so decoder verification is never circular against our encoder.
+//! Live `172.22.1.52` OV2640 hardware capture remains gated on `[HIL]` network
+//! reachability (`README §2.1 Rule 5`).
 
 #[cfg(test)]
 mod conv22_tests {
     use esp32_cam_conversions::{
-        decode_jpeg_to_rgb888, encode_rgb888_to_jpeg, encode_yuv422_to_jpeg_subsampled,
-        frame_to_bmp, max_encoded_len, parse_jpeg_dimensions, rgb2yuv_with_range,
-        validate_jpeg_frame, verify_jpeg_eoi, verify_jpeg_soi, PixelFormat, Subsampling, YuvRange,
-        BMP_HEADER_LEN, JPEG_EOI_MARKER, JPEG_SOI_MARKER,
+        decode_jpeg_to_rgb888, encode_rgb888_to_jpeg, frame_to_bmp, parse_jpeg_dimensions,
+        validate_jpeg_frame, verify_jpeg_eoi, verify_jpeg_soi, PixelFormat, BMP_HEADER_LEN,
+        JPEG_EOI_MARKER, JPEG_SOI_MARKER,
     };
     use proptest::prelude::{any, ProptestConfig};
     use proptest::{collection, prop_assert_eq, proptest, sample};
@@ -16,47 +20,60 @@ mod conv22_tests {
     const FIXTURE_W: u16 = 160;
     const FIXTURE_H: u16 = 120;
     const RGB_LEN: usize = (FIXTURE_W as usize) * (FIXTURE_H as usize) * 3;
-    const YUYV_LEN: usize = (FIXTURE_W as usize) * (FIXTURE_H as usize) * 2;
-    const OV2640_QQVGA_H2V1_FIXTURE: &[u8] = include_bytes!("fixtures/ov2640_qqvga_h2v1.jpg");
 
-    fn build_reference_rgb_and_yuyv() -> (Vec<u8>, Vec<u8>) {
+    const OV2640_QQVGA_H2V1_FIXTURE: &[u8] = include_bytes!("fixtures/ov2640_qqvga_h2v1.jpg");
+    const ESP32_CAM_INSIDE_QVGA_FIXTURE: &[u8] =
+        include_bytes!("fixtures/esp32_cam_test_inside_qvga.jpg");
+    const LIBJPEG_ODD_227X149_FIXTURE: &[u8] = include_bytes!("fixtures/libjpeg_odd_227x149.jpg");
+
+    fn build_reference_rgb() -> Vec<u8> {
         let w = usize::from(FIXTURE_W);
         let h = usize::from(FIXTURE_H);
         let mut rgb = vec![0u8; RGB_LEN];
-        let mut yuyv = vec![0u8; YUYV_LEN];
         for y in 0..h {
-            for x_pair in 0..(w / 2) {
-                let x0 = x_pair * 2;
-                let x1 = x0 + 1;
-                let r0 = ((x0 * 255) / (w - 1)) as u8;
-                let g0 = ((y * 255) / (h - 1)) as u8;
-                let b0 = (((x0 + y) * 127) / (w + h - 2)) as u8;
-                let r1 = ((x1 * 255) / (w - 1)) as u8;
-                let g1 = g0;
-                let b1 = (((x1 + y) * 127) / (w + h - 2)) as u8;
-
-                let rgb0 = (y * w + x0) * 3;
-                rgb[rgb0] = r0;
-                rgb[rgb0 + 1] = g0;
-                rgb[rgb0 + 2] = b0;
-                let rgb1 = (y * w + x1) * 3;
-                rgb[rgb1] = r1;
-                rgb[rgb1 + 1] = g1;
-                rgb[rgb1 + 2] = b1;
-
-                let (y0, u0, v0) = rgb2yuv_with_range(r0, g0, b0, YuvRange::Full);
-                let (y1, u1, v1) = rgb2yuv_with_range(r1, g1, b1, YuvRange::Full);
-                let u_avg = (u16::from(u0) + u16::from(u1)).div_ceil(2) as u8;
-                let v_avg = (u16::from(v0) + u16::from(v1)).div_ceil(2) as u8;
-
-                let yuyv_idx = (y * w + x0) * 2;
-                yuyv[yuyv_idx] = y0;
-                yuyv[yuyv_idx + 1] = u_avg;
-                yuyv[yuyv_idx + 2] = y1;
-                yuyv[yuyv_idx + 3] = v_avg;
+            for x in 0..w {
+                let r = ((x * 255) / (w - 1)) as u8;
+                let g = ((y * 255) / (h - 1)) as u8;
+                let b = (((x + y) * 127) / (w + h - 2)) as u8;
+                let idx = (y * w + x) * 3;
+                rgb[idx] = r;
+                rgb[idx + 1] = g;
+                rgb[idx + 2] = b;
             }
         }
-        (rgb, yuyv)
+        rgb
+    }
+
+    fn collect_collapsed_header_markers(jpeg: &[u8]) -> Vec<u8> {
+        assert!(
+            jpeg.len() >= 4 && jpeg[0] == 0xFF && jpeg[1] == 0xD8,
+            "JPEG buffer must start with SOI"
+        );
+        let mut out = vec![0xD8u8];
+        let mut idx = 2usize;
+        while idx < jpeg.len() {
+            assert_eq!(jpeg[idx], 0xFF, "expected marker prefix 0xFF at {idx}");
+            while idx < jpeg.len() && jpeg[idx] == 0xFF {
+                idx += 1;
+            }
+            assert!(idx < jpeg.len(), "truncated marker byte at end of header");
+            let marker = jpeg[idx];
+            idx += 1;
+            if out.last().copied() != Some(marker) {
+                out.push(marker);
+            }
+            if marker == 0xDA || marker == 0xD9 {
+                break;
+            }
+            assert!(
+                idx + 2 <= jpeg.len(),
+                "marker 0xFF{marker:02X} missing segment length"
+            );
+            let seg_len = usize::from(u16::from_be_bytes([jpeg[idx], jpeg[idx + 1]]));
+            assert!(seg_len >= 2, "segment length {seg_len} must be >= 2");
+            idx += seg_len;
+        }
+        out
     }
 
     fn compute_psnr(ref_rgb: &[u8], dec_rgb: &[u8]) -> f64 {
@@ -83,28 +100,21 @@ mod conv22_tests {
 
     #[test]
     fn test_ov2640_qqvga_h2v1_fixture_psnr_and_headers() {
-        let (ref_rgb, yuyv) = build_reference_rgb_and_yuyv();
-        let cap =
-            max_encoded_len(FIXTURE_W, FIXTURE_H, 3).expect("QQVGA max_encoded_len must succeed");
-        let mut regen = vec![0u8; cap];
-        let regen_len = encode_yuv422_to_jpeg_subsampled(
-            &yuyv,
-            &mut regen,
-            FIXTURE_W,
-            FIXTURE_H,
-            90,
-            Subsampling::H2V1,
-        )
-        .expect("encode_yuv422_to_jpeg_subsampled must succeed");
+        let ref_rgb = build_reference_rgb();
         assert_eq!(
-            OV2640_QQVGA_H2V1_FIXTURE,
-            &regen[..regen_len],
-            "checked-in 4:2:2 fixture must match deterministic H2V1 encoding"
+            collect_collapsed_header_markers(OV2640_QQVGA_H2V1_FIXTURE),
+            vec![0xD8, 0xDB, 0xC0, 0xC4, 0xDA],
+            "APP0-stripped OV2640-layout fixture must follow SOI->DQT->SOF0->DHT->SOS"
+        );
+        assert_eq!(
+            verify_jpeg_eoi(OV2640_QQVGA_H2V1_FIXTURE, false),
+            Some(OV2640_QQVGA_H2V1_FIXTURE.len() - 2),
+            "OV2640-layout fixture must terminate with EOI"
         );
         assert_eq!(
             validate_jpeg_frame(OV2640_QQVGA_H2V1_FIXTURE),
             Some((FIXTURE_W, FIXTURE_H)),
-            "checked-in 4:2:2 fixture must pass validate_jpeg_frame"
+            "external Pillow/libjpeg 4:2:2 fixture must pass validate_jpeg_frame"
         );
         assert_eq!(
             parse_jpeg_dimensions(OV2640_QQVGA_H2V1_FIXTURE),
@@ -123,12 +133,73 @@ mod conv22_tests {
 
         let mut decoded = vec![0u8; RGB_LEN];
         let dec_len = decode_jpeg_to_rgb888(OV2640_QQVGA_H2V1_FIXTURE, &mut decoded)
-            .expect("decode_jpeg_to_rgb888 must succeed on H2V1 fixture");
+            .expect("decode_jpeg_to_rgb888 must succeed on external H2V1 fixture");
         assert_eq!(dec_len, RGB_LEN, "decoded RGB888 byte length must match");
         let psnr = compute_psnr(&ref_rgb, &decoded);
         assert!(
             psnr > 30.0,
-            "H2V1 fixture PSNR must exceed 30 dB, got {psnr:.2} dB"
+            "external H2V1 fixture PSNR must exceed 30 dB, got {psnr:.2} dB"
+        );
+    }
+
+    #[test]
+    fn test_upstream_esp32_cam_inside_qvga_fixture() {
+        assert_eq!(
+            ESP32_CAM_INSIDE_QVGA_FIXTURE.len(),
+            18_832,
+            "upstream test_inside.jpeg fixture must match 18,832-byte payload"
+        );
+        let markers = collect_collapsed_header_markers(ESP32_CAM_INSIDE_QVGA_FIXTURE);
+        assert!(
+            markers.contains(&0xE0) && markers.contains(&0xE1),
+            "upstream camera capture must exercise APP0 + APP1 Exif segments: {markers:?}"
+        );
+        assert_eq!(
+            parse_jpeg_dimensions(ESP32_CAM_INSIDE_QVGA_FIXTURE),
+            Some((320, 240)),
+            "upstream camera fixture dimensions must parse as 320x240 QVGA"
+        );
+        assert_eq!(
+            validate_jpeg_frame(ESP32_CAM_INSIDE_QVGA_FIXTURE),
+            Some((320, 240)),
+            "upstream camera fixture must pass validate_jpeg_frame"
+        );
+
+        let expected_len = 320 * 240 * 3;
+        let mut decoded = vec![0u8; expected_len];
+        let dec_len = decode_jpeg_to_rgb888(ESP32_CAM_INSIDE_QVGA_FIXTURE, &mut decoded)
+            .expect("decode_jpeg_to_rgb888 must decode upstream 320x240 camera capture");
+        assert_eq!(
+            dec_len, expected_len,
+            "decoded QVGA RGB888 byte length must equal 320x240x3"
+        );
+    }
+
+    #[test]
+    fn test_upstream_libjpeg_odd_227x149_fixture() {
+        assert_eq!(
+            LIBJPEG_ODD_227X149_FIXTURE.len(),
+            5_764,
+            "upstream libjpeg testimg.jpeg fixture must match 5,764-byte payload"
+        );
+        assert_eq!(
+            parse_jpeg_dimensions(LIBJPEG_ODD_227X149_FIXTURE),
+            Some((227, 149)),
+            "upstream libjpeg odd-MCU fixture dimensions must parse as 227x149"
+        );
+        assert_eq!(
+            validate_jpeg_frame(LIBJPEG_ODD_227X149_FIXTURE),
+            Some((227, 149)),
+            "upstream libjpeg 227x149 fixture must pass validate_jpeg_frame"
+        );
+
+        let expected_len = 227 * 149 * 3;
+        let mut decoded = vec![0u8; expected_len];
+        let dec_len = decode_jpeg_to_rgb888(LIBJPEG_ODD_227X149_FIXTURE, &mut decoded)
+            .expect("decode_jpeg_to_rgb888 must decode 227x149 odd-MCU libjpeg fixture");
+        assert_eq!(
+            dec_len, expected_len,
+            "decoded 227x149 RGB888 byte length must equal 227x149x3"
         );
     }
 

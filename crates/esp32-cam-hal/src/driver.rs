@@ -23,11 +23,6 @@ use crate::frame_pool::{FrameGuard, FramePool};
 /// `driver/cam_hal.c:161`).
 pub const JPEG_SOI_MARKER: [u8; 3] = ::esp32_cam_conversions::JPEG_SOI_MARKER;
 
-/// Marker compatibility alias for `JPEG_SOI_MARKER`.
-pub mod esp32_cam_conversions {
-    pub use super::JPEG_SOI_MARKER;
-}
-
 /// JPEG End-Of-Image (`EOI`) 2-byte marker (`0xFF, 0xD9` in
 /// `driver/cam_hal.c:163`).
 pub const JPEG_EOI_MARKER: [u8; 2] = ::esp32_cam_conversions::JPEG_EOI_MARKER;
@@ -277,6 +272,13 @@ impl HalOv2640Sensor {
             pixformat: PixelFormat::Jpeg,
         })
     }
+
+    /// Returns a shared reference to the sensor's [`CameraStatus`].
+    #[inline]
+    #[must_use]
+    pub const fn status(&self) -> &CameraStatus {
+        &self.status
+    }
 }
 
 #[cfg(not(feature = "sensors"))]
@@ -349,7 +351,7 @@ impl<B: SccbBus> HalCameraSensor<B> for HalOv2640Sensor {
         bus.write_reg8(self.slv_addr, 0xFF, 0x00)?;
         let val = if enable { 0x04 } else { 0x00 };
         bus.write_reg8_mask(self.slv_addr, 0xC3, 0x04, val)?;
-        self.status.bpc = u8::from(enable);
+        self.status.bpc = enable;
         Ok(())
     }
 
@@ -357,7 +359,7 @@ impl<B: SccbBus> HalCameraSensor<B> for HalOv2640Sensor {
         bus.write_reg8(self.slv_addr, 0xFF, 0x00)?;
         let val = if enable { 0x02 } else { 0x00 };
         bus.write_reg8_mask(self.slv_addr, 0xC3, 0x02, val)?;
-        self.status.wpc = u8::from(enable);
+        self.status.wpc = enable;
         Ok(())
     }
 
@@ -365,7 +367,7 @@ impl<B: SccbBus> HalCameraSensor<B> for HalOv2640Sensor {
         bus.write_reg8(self.slv_addr, 0xFF, 0x00)?;
         let val = if enable { 0x01 } else { 0x00 };
         bus.write_reg8_mask(self.slv_addr, 0xC3, 0x01, val)?;
-        self.status.lenc = u8::from(enable);
+        self.status.lenc = enable;
         Ok(())
     }
 
@@ -373,7 +375,7 @@ impl<B: SccbBus> HalCameraSensor<B> for HalOv2640Sensor {
         bus.write_reg8(self.slv_addr, 0xFF, 0x01)?;
         let val = if enable { 0x80 } else { 0x00 };
         bus.write_reg8_mask(self.slv_addr, 0x04, 0x80, val)?;
-        self.status.hmirror = u8::from(enable);
+        self.status.hmirror = enable;
         Ok(())
     }
 
@@ -381,7 +383,7 @@ impl<B: SccbBus> HalCameraSensor<B> for HalOv2640Sensor {
         bus.write_reg8(self.slv_addr, 0xFF, 0x01)?;
         let val = if enable { 0x50 } else { 0x00 };
         bus.write_reg8_mask(self.slv_addr, 0x04, 0x50, val)?;
-        self.status.vflip = u8::from(enable);
+        self.status.vflip = enable;
         Ok(())
     }
 }
@@ -460,7 +462,7 @@ impl<B: SccbBus> esp32_cam_sensors::CameraSensor<B> for HalOv2640Sensor {
         bus.write_reg8(self.slv_addr, 0xFF, 0x00)?;
         let val = if enable { 0x04 } else { 0x00 };
         bus.write_reg8_mask(self.slv_addr, 0xC3, 0x04, val)?;
-        self.status.bpc = u8::from(enable);
+        self.status.bpc = enable;
         Ok(())
     }
 
@@ -468,7 +470,7 @@ impl<B: SccbBus> esp32_cam_sensors::CameraSensor<B> for HalOv2640Sensor {
         bus.write_reg8(self.slv_addr, 0xFF, 0x00)?;
         let val = if enable { 0x02 } else { 0x00 };
         bus.write_reg8_mask(self.slv_addr, 0xC3, 0x02, val)?;
-        self.status.wpc = u8::from(enable);
+        self.status.wpc = enable;
         Ok(())
     }
 
@@ -476,7 +478,7 @@ impl<B: SccbBus> esp32_cam_sensors::CameraSensor<B> for HalOv2640Sensor {
         bus.write_reg8(self.slv_addr, 0xFF, 0x00)?;
         let val = if enable { 0x01 } else { 0x00 };
         bus.write_reg8_mask(self.slv_addr, 0xC3, 0x01, val)?;
-        self.status.lenc = u8::from(enable);
+        self.status.lenc = enable;
         Ok(())
     }
 
@@ -484,7 +486,7 @@ impl<B: SccbBus> esp32_cam_sensors::CameraSensor<B> for HalOv2640Sensor {
         bus.write_reg8(self.slv_addr, 0xFF, 0x01)?;
         let val = if enable { 0x80 } else { 0x00 };
         bus.write_reg8_mask(self.slv_addr, 0x04, 0x80, val)?;
-        self.status.hmirror = u8::from(enable);
+        self.status.hmirror = enable;
         Ok(())
     }
 
@@ -492,7 +494,7 @@ impl<B: SccbBus> esp32_cam_sensors::CameraSensor<B> for HalOv2640Sensor {
         bus.write_reg8(self.slv_addr, 0xFF, 0x01)?;
         let val = if enable { 0x50 } else { 0x00 };
         bus.write_reg8_mask(self.slv_addr, 0x04, 0x50, val)?;
-        self.status.vflip = u8::from(enable);
+        self.status.vflip = enable;
         Ok(())
     }
 }
@@ -971,14 +973,8 @@ impl<
             self.sensor
                 .set_quality(&mut self.bus, saved.status.quality as i32),
         )?;
-        ignore_not_supported(
-            self.sensor
-                .set_hmirror(&mut self.bus, saved.status.hmirror != 0),
-        )?;
-        ignore_not_supported(
-            self.sensor
-                .set_vflip(&mut self.bus, saved.status.vflip != 0),
-        )?;
+        ignore_not_supported(self.sensor.set_hmirror(&mut self.bus, saved.status.hmirror))?;
+        ignore_not_supported(self.sensor.set_vflip(&mut self.bus, saved.status.vflip))?;
         Ok(())
     }
 
@@ -1151,7 +1147,7 @@ fn assemble_and_lease_frame<
             total_written += written;
 
             // Check for JPEG SOI at offset 0 of the first half-buffer (`cam_hal.c:350-393`)
-            if is_jpeg && cnt == 0 && !fb_buf.starts_with(&esp32_cam_conversions::JPEG_SOI_MARKER) {
+            if is_jpeg && cnt == 0 && !fb_buf.starts_with(&JPEG_SOI_MARKER) {
                 return Err(CameraError::CorruptedFrame);
             }
         }
@@ -1412,13 +1408,25 @@ mod tests {
         let mut init = driver.init().expect("driver init");
         assert_eq!(init.config.frame_size, FrameSize::Vga);
 
-        // Load new settings with Qvga frame size
+        // Load new settings with Qvga frame size and toggled orientation flags
         let mut saved = init.save_settings();
+        assert!(!saved.status.bpc, "OV2640 init disables bpc");
+        assert!(saved.status.wpc, "OV2640 init enables wpc");
+        assert!(saved.status.lenc, "OV2640 init enables lenc");
+        assert!(!saved.status.hmirror, "hmirror defaults to false");
+        assert!(!saved.status.vflip, "vflip defaults to false");
         saved.status.framesize = FrameSize::Qvga;
+        saved.status.hmirror = true;
+        saved.status.vflip = true;
         init.load_settings(&saved).expect("load settings");
 
-        // config.frame_size MUST be updated to target_fs (Qvga)
+        // config.frame_size and boolean status flags MUST reflect loaded settings
         assert_eq!(init.config.frame_size, FrameSize::Qvga);
+        assert!(
+            init.sensor().status().hmirror,
+            "hmirror restored from saved"
+        );
+        assert!(init.sensor().status().vflip, "vflip restored from saved");
     }
 
     #[test]
