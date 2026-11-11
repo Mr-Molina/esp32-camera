@@ -51,7 +51,8 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use esp_hal::system::{CpuControl, Stack};
 #[cfg(target_arch = "xtensa")]
 use klipper_cam_fw::telemetry::{
-    ccount, format_sha256_hex, measure_stack_hwm_volatile, paint_stack_sentinel, FwStats,
+    ccount, format_sha256_hex, measure_stack_hwm_volatile, paint_stack_sentinel,
+    reset_reason_label, FwStats,
 };
 #[cfg(target_arch = "xtensa")]
 use klipper_cam_fw::{
@@ -2256,7 +2257,7 @@ fn core1_camera_producer_loop() -> ! {
     loop {
         if CORE1_PAUSE_REQ.load(Ordering::Acquire) {
             if !i2s_cam.stop() {
-                FW_STATS.inc_c0_validation_failures();
+                FW_STATS.inc_i2s_stop_timeouts();
             }
             aligned_from_eof = false;
             CORE1_IS_PAUSED.store(true, Ordering::Release);
@@ -2533,7 +2534,9 @@ fn core1_camera_producer_loop() -> ! {
             core::hint::spin_loop();
         }
 
-        let _ = i2s_cam.stop();
+        if !i2s_cam.stop() {
+            FW_STATS.inc_i2s_stop_timeouts();
+        }
 
         if aborted || is_first_chunk || total_bytes < 64 {
             if !c1_drop_counted {
@@ -4029,7 +4032,7 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                                 cached_wifi_rssi,
                             );
                             runtime.server.set_diagnostics(
-                                BOOT_RESET_REASON.load(Ordering::Relaxed),
+                                reset_reason_label(BOOT_RESET_REASON.load(Ordering::Relaxed)),
                                 boot_app_sha256_str(),
                                 free_dram,
                                 core1_stack_hwm,
@@ -4434,7 +4437,10 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                                             &p81_req_bufs[idx][..st.req_len],
                                             err_buf,
                                         ) {
-                                            let _ = sock81.send_slice(resp);
+                                            match sock81.send_slice(resp) {
+                                                Ok(sent) if sent == resp.len() => {}
+                                                Ok(_) | Err(_) => FW_STATS.inc_send_partial(),
+                                            }
                                         }
                                         sock81.close();
                                         st.closing = true;
@@ -4708,8 +4714,7 @@ fn main() -> ! {
 
     let bc_prev = record_boot_breadcrumb_rtc_init(reset_reason);
     let ota_manager = detect_booted_ota_manager_from_mmu();
-    let mut flash_adapter = EspFlashAdapter(esp_storage::FlashStorage::new(peripherals.FLASH));
-    init_boot_app_sha256(&mut flash_adapter, ota_manager.active_slot());
+    let active_ota_slot = ota_manager.active_slot();
     feed_rtc_wdt();
 
     // Initialize internal DRAM heap for esp-rtos and esp-radio Wi-Fi STA
@@ -4794,6 +4799,10 @@ fn main() -> ! {
     else {
         quiesce_psram_and_software_reset();
     };
+    feed_rtc_wdt();
+
+    let mut flash_adapter = EspFlashAdapter(esp_storage::FlashStorage::new(peripherals.FLASH));
+    init_boot_app_sha256(&mut flash_adapter, active_ota_slot);
     feed_rtc_wdt();
 
     run_post_wifi_server_loop(

@@ -1,8 +1,32 @@
 //! Lock-free telemetry, cycle counters, stack watermark tracking, and SHA-256
 //! formatting for Klipper camera firmware.
 
-use core::sync::atomic::AtomicU32;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU32, Ordering};
+
+/// Maps the 6-bit PRO_CPU reset cause in `RTC_CNTL_RESET_STATE_REG`
+/// (`0x3FF4_8034`, `raw_reg & 0x3F`) to its canonical ESP32 ROM label.
+#[must_use]
+#[inline]
+pub const fn reset_reason_label(raw_reg: u32) -> &'static str {
+    match raw_reg & 0x3F {
+        1 => "poweron",
+        3 => "sw_reset",
+        4 => "owdt_reset",
+        5 => "deepsleep",
+        6 => "sdio_reset",
+        7 => "tg0wdt_sys",
+        8 => "tg1wdt_sys",
+        9 => "rtcwdt_sys",
+        10 => "intrusion",
+        11 => "tgwdt_cpu",
+        12 => "sw_cpu_reset",
+        13 => "rtcwdt_cpu",
+        14 => "ext_cpu",
+        15 => "brownout",
+        16 => "rtcwdt_rtc",
+        _ => "unknown",
+    }
+}
 
 #[cfg(target_arch = "xtensa")]
 /// Reads hardware cycle count register `rsr.ccount` on Xtensa targets.
@@ -62,6 +86,7 @@ pub struct FwStatsSnapshot {
     pub sccb_errors: u32,
     pub send_partial: u32,
     pub ring_build_failures: u32,
+    pub i2s_stop_timeouts: u32,
 }
 
 /// Lock-free firmware statistics counters and EWMA estimators.
@@ -84,6 +109,7 @@ pub struct FwStats {
     sccb_errors: AtomicU32,
     send_partial: AtomicU32,
     ring_build_failures: AtomicU32,
+    i2s_stop_timeouts: AtomicU32,
 }
 
 impl FwStats {
@@ -108,6 +134,7 @@ impl FwStats {
             sccb_errors: AtomicU32::new(0),
             send_partial: AtomicU32::new(0),
             ring_build_failures: AtomicU32::new(0),
+            i2s_stop_timeouts: AtomicU32::new(0),
         }
     }
 
@@ -132,6 +159,7 @@ impl FwStats {
             sccb_errors: self.sccb_errors.load(Ordering::Relaxed),
             send_partial: self.send_partial.load(Ordering::Relaxed),
             ring_build_failures: self.ring_build_failures.load(Ordering::Relaxed),
+            i2s_stop_timeouts: self.i2s_stop_timeouts.load(Ordering::Relaxed),
         }
     }
 
@@ -257,6 +285,11 @@ impl FwStats {
     pub fn inc_ring_build_failures(&self) {
         self.ring_build_failures.fetch_add(1, Ordering::Relaxed);
     }
+
+    #[inline]
+    pub fn inc_i2s_stop_timeouts(&self) {
+        self.i2s_stop_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 impl Default for FwStats {
@@ -288,6 +321,7 @@ impl FwStatsSnapshot {
             sccb_errors: 0,
             send_partial: 0,
             ring_build_failures: 0,
+            i2s_stop_timeouts: 0,
         }
     }
 }
@@ -295,27 +329,30 @@ impl FwStatsSnapshot {
 /// Paints stack sentinel pattern (`0xA5`) across the buffer.
 ///
 /// # Safety
-/// Caller must ensure `base` is valid for writes of `len` bytes and non-null.
+/// Caller must ensure `base` is valid for writes of `len` bytes when non-null
+/// and `len > 0`.
 // JUSTIFICATION: Stack sentinel painting requires raw pointer volatile writes
 // to prevent the compiler from eliding stack pattern initialization.
 // SAFETY:
-// 1. Preconditions: `base` is non-null and valid for writes of `len` bytes.
+// 1. Preconditions: `base` is valid for writes of `len` bytes when non-null.
 // 2. Alignment: `u8` requires alignment 1, so any non-null pointer is aligned.
 // 3. Provenance & Lifetime: Pointer points to allocated task stack storage.
 // 4. Aliasing: Caller guarantees exclusive access during stack sentinel paint.
 // 5. Volatile Semantics: `write_volatile` guarantees writes are not elided.
 // 6. Panic Safety: Operations are non-panicking byte writes.
 pub unsafe fn paint_stack_sentinel(base: *mut u8, len: usize) {
+    if base.is_null() || len == 0 {
+        return;
+    }
     let mut i = 0usize;
     while i < len {
         // JUSTIFICATION: Volatile write required for stack memory painting.
         // SAFETY:
-        // 1. Preconditions: `base` is non-null and valid for writes of `len` bytes.
+        // 1. Preconditions: `base` is non-null and valid for `len` bytes.
         // 2. Alignment: `u8` alignment 1; `base.add(i)` remains aligned.
-        // 3. Provenance & Lifetime: `i < len` ensures pointer remains in
-        //    allocated range.
+        // 3. Provenance & Lifetime: `i < len` keeps pointer in allocated range.
         // 4. Aliasing: Caller guarantees exclusive access.
-        // 5. Volatile Semantics: `write_volatile` writes raw byte without reordering.
+        // 5. Volatile Semantics: `write_volatile` writes byte without elision.
         // 6. Panic Safety: Addition and write cannot panic or unwind.
         unsafe {
             core::ptr::write_volatile(base.add(i), 0xA5);
@@ -328,12 +365,13 @@ pub unsafe fn paint_stack_sentinel(base: *mut u8, len: usize) {
 /// modified byte using volatile reads.
 ///
 /// # Safety
-/// Caller must ensure `base` is valid for reads of `len` bytes and non-null.
+/// Caller must ensure `base` is valid for reads of `len` bytes when non-null
+/// and `len > 0`.
 // JUSTIFICATION: Stack HWM inspection reads task stack memory using volatile
 // raw pointers without forming invalid references to live or uninitialized
 // stack frames.
 // SAFETY:
-// 1. Preconditions: `base` is non-null and valid for reads of `len` bytes.
+// 1. Preconditions: `base` is valid for reads of `len` bytes when non-null.
 // 2. Alignment: `u8` has alignment 1; valid for any non-null byte address.
 // 3. Provenance & Lifetime: Points to allocated task stack memory.
 // 4. Aliasing: Raw pointer read does not create `&[u8]` references.
@@ -363,39 +401,32 @@ pub unsafe fn measure_stack_hwm_volatile(base: *const u8, len: usize) -> u32 {
     (len - unused) as u32
 }
 
-/// Measures stack high water mark (used bytes) from bottom up to first
-/// modified byte.
+/// Measures stack high water mark (used bytes) by delegating to
+/// [`measure_stack_hwm_volatile`].
 ///
 /// # Safety
-/// Caller must ensure `base` is valid for reads of `len` bytes and non-null.
-// JUSTIFICATION: Stack HWM inspection reads task stack memory using volatile
-// raw pointers without forming invalid references to uninitialized space.
+/// Caller must ensure `base` is valid for reads of `len` bytes when non-null
+/// and `len > 0`.
+// JUSTIFICATION: Preserves public crate API while delegating directly to the
+// single null-guarded volatile stack canary scanner.
 // SAFETY:
-// 1. Preconditions: `base` is non-null and valid for reads of `len` bytes.
+// 1. Preconditions: Caller upholds `base` validity for reads of `len` bytes.
 // 2. Alignment: `u8` has alignment 1; valid for any non-null byte address.
-// 3. Provenance & Lifetime: Points to allocated task stack memory.
-// 4. Aliasing: Raw pointer read does not create `&[u8]` references.
-// 5. Volatile Semantics: `read_volatile` prevents dead-code optimization.
-// 6. Panic Safety: Loop only performs non-panicking pointer arithmetic and
-//    volatile reads.
+// 3. Provenance & Lifetime: Forwarded to `measure_stack_hwm_volatile`.
+// 4. Aliasing: Raw volatile reads create zero Rust references.
+// 5. Volatile Semantics: Delegated to `read_volatile` scan loop.
+// 6. Panic Safety: Non-panicking delegation.
+#[inline]
 pub unsafe fn measure_stack_hwm(base: *const u8, len: usize) -> u32 {
-    let mut untouched = 0usize;
-    while untouched < len {
-        // JUSTIFICATION: Raw volatile read of stack canary sentinel.
-        // SAFETY:
-        // 1. Preconditions: `base` is valid for reads of `len` bytes.
-        // 2. Alignment: `u8` alignment 1; `base.add(untouched)` is aligned.
-        // 3. Provenance & Lifetime: `untouched < len` keeps pointer in range.
-        // 4. Aliasing: No references are constructed; raw pointer reads are read-only.
-        // 5. Volatile Semantics: `read_volatile` fetches memory state accurately.
-        // 6. Panic Safety: Non-panicking pointer arithmetic and read.
-        let val = unsafe { core::ptr::read_volatile(base.add(untouched)) };
-        if val != 0xA5 {
-            break;
-        }
-        untouched += 1;
-    }
-    (len.saturating_sub(untouched)) as u32
+    // JUSTIFICATION: Forward caller safety invariants to volatile HWM scanner.
+    // SAFETY:
+    // 1. Preconditions: Caller guarantees `base` is valid for `len` bytes.
+    // 2. Alignment: `u8` alignment 1 is satisfied for all byte pointers.
+    // 3. Provenance & Lifetime: Preserved across direct pointer forwarding.
+    // 4. Aliasing: No references constructed.
+    // 5. Volatile Semantics: Handled by `measure_stack_hwm_volatile`.
+    // 6. Panic Safety: Cannot panic or unwind.
+    unsafe { measure_stack_hwm_volatile(base, len) }
 }
 
 const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
@@ -461,6 +492,7 @@ mod tests {
         stats.inc_sccb_errors();
         stats.inc_send_partial();
         stats.inc_ring_build_failures();
+        stats.inc_i2s_stop_timeouts();
 
         let snap = stats.snapshot();
         assert_eq!(snap.c1_pushed, 1);
@@ -478,37 +510,99 @@ mod tests {
         assert_eq!(snap.sccb_errors, 1);
         assert_eq!(snap.send_partial, 1);
         assert_eq!(snap.ring_build_failures, 1);
+        assert_eq!(snap.i2s_stop_timeouts, 1);
+    }
+
+    #[test]
+    fn test_reset_reason_label_mapping_and_masking() {
+        assert_eq!(reset_reason_label(0), "unknown");
+        assert_eq!(reset_reason_label(1), "poweron");
+        assert_eq!(reset_reason_label(2), "unknown");
+        assert_eq!(reset_reason_label(3), "sw_reset");
+        assert_eq!(reset_reason_label(4), "owdt_reset");
+        assert_eq!(reset_reason_label(5), "deepsleep");
+        assert_eq!(reset_reason_label(6), "sdio_reset");
+        assert_eq!(reset_reason_label(7), "tg0wdt_sys");
+        assert_eq!(reset_reason_label(8), "tg1wdt_sys");
+        assert_eq!(reset_reason_label(9), "rtcwdt_sys");
+        assert_eq!(reset_reason_label(10), "intrusion");
+        assert_eq!(reset_reason_label(11), "tgwdt_cpu");
+        assert_eq!(reset_reason_label(12), "sw_cpu_reset");
+        assert_eq!(reset_reason_label(13), "rtcwdt_cpu");
+        assert_eq!(reset_reason_label(14), "ext_cpu");
+        assert_eq!(reset_reason_label(15), "brownout");
+        assert_eq!(reset_reason_label(16), "rtcwdt_rtc");
+        assert_eq!(reset_reason_label(17), "unknown");
+        assert_eq!(reset_reason_label(63), "unknown");
+        assert_eq!(reset_reason_label((0xDEAD_BEE0 & !0x3F) | 1), "poweron");
+        assert_eq!(reset_reason_label(0xFFFF_FFC0 | 12), "sw_cpu_reset");
     }
 
     #[test]
     fn test_stack_sentinel_and_measure_hwm() {
         let mut stack = [0u8; 128];
         // JUSTIFICATION: Test initializes stack memory for canary verification.
-        // SAFETY: Stack buffer is stack-allocated, non-null, with length 128.
+        // SAFETY:
+        // 1. Preconditions: `stack` is non-null with length 128.
+        // 2. Alignment: `u8` requires alignment 1.
+        // 3. Provenance & Lifetime: Local `stack` lives for test scope.
+        // 4. Aliasing: Exclusive mutable pointer before slice reads.
+        // 5. Volatile Semantics: `write_volatile` paints 0xA5 pattern.
+        // 6. Panic Safety: Bounded write loop cannot panic or unwind.
         unsafe {
             paint_stack_sentinel(stack.as_mut_ptr(), 128);
         }
-        for byte in stack.iter() {
+        for byte in &stack {
             assert_eq!(*byte, 0xA5);
         }
 
+        // Null and zero-length guards return 0 safely.
+        // JUSTIFICATION: Test verifies null and zero-length safety guards.
+        // SAFETY:
+        // 1. Preconditions: Null/zero inputs hit early return before deref.
+        // 2. Alignment: No dereference occurs when null or `len == 0`.
+        // 3. Provenance & Lifetime: No memory accessed.
+        // 4. Aliasing: No references created.
+        // 5. Volatile Semantics: Returns prior to `read_volatile`.
+        // 6. Panic Safety: Early return cannot panic.
+        let hwm_null = unsafe { measure_stack_hwm(core::ptr::null(), 128) };
+        assert_eq!(hwm_null, 0);
+
         // Initially 0 bytes used
         // JUSTIFICATION: Test inspects pristine canary pattern.
-        // SAFETY: Buffer is valid and initialized.
+        // SAFETY:
+        // 1. Preconditions: `stack` is non-null and valid for 128 bytes.
+        // 2. Alignment: `u8` requires alignment 1.
+        // 3. Provenance & Lifetime: Local `stack` array lives for test scope.
+        // 4. Aliasing: Raw pointer read forms no conflicting references.
+        // 5. Volatile Semantics: `read_volatile` reads initialized stack bytes.
+        // 6. Panic Safety: Bounded scan cannot panic or unwind.
         let hwm0 = unsafe { measure_stack_hwm(stack.as_ptr(), 128) };
         assert_eq!(hwm0, 0);
 
         // Dirty upper 32 bytes (indices 96..128)
         stack[96..128].fill(0x55);
         // JUSTIFICATION: Test inspects partially dirty canary pattern.
-        // SAFETY: Buffer is valid for reads of 128 bytes.
+        // SAFETY:
+        // 1. Preconditions: `stack` is non-null and valid for 128 bytes.
+        // 2. Alignment: `u8` requires alignment 1.
+        // 3. Provenance & Lifetime: Local `stack` array lives for test scope.
+        // 4. Aliasing: Raw pointer read forms no conflicting references.
+        // 5. Volatile Semantics: `read_volatile` reads initialized stack bytes.
+        // 6. Panic Safety: Bounded scan cannot panic or unwind.
         let hwm1 = unsafe { measure_stack_hwm(stack.as_ptr(), 128) };
         assert_eq!(hwm1, 32);
 
         // Dirty from byte 10 onwards
         stack[10] = 0xAA;
         // JUSTIFICATION: Test inspects deeply modified stack canary pattern.
-        // SAFETY: Buffer is valid for reads of 128 bytes.
+        // SAFETY:
+        // 1. Preconditions: `stack` is non-null and valid for 128 bytes.
+        // 2. Alignment: `u8` requires alignment 1.
+        // 3. Provenance & Lifetime: Local `stack` array lives for test scope.
+        // 4. Aliasing: Raw pointer read forms no conflicting references.
+        // 5. Volatile Semantics: `read_volatile` reads initialized stack bytes.
+        // 6. Panic Safety: Bounded scan cannot panic or unwind.
         let hwm2 = unsafe { measure_stack_hwm(stack.as_ptr(), 128) };
         assert_eq!(hwm2, 118);
         // JUSTIFICATION: Test verifies volatile stack HWM scanner parity.

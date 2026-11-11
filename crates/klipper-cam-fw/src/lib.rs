@@ -9,6 +9,7 @@
 //! - `examples/camera_example/main/camera_pinout.h`
 
 #![no_std]
+#![deny(unsafe_code)]
 #![cfg_attr(target_arch = "xtensa", feature(asm_experimental_arch))]
 
 #[cfg(test)]
@@ -21,6 +22,7 @@ pub mod http;
 pub mod ota;
 pub mod runtime;
 pub mod spsc_ring;
+#[allow(unsafe_code)]
 pub mod telemetry;
 
 pub use ap_select::{
@@ -88,5 +90,6 @@ pub use spsc_ring::{
     SPSC_FLAG_SOF,
 };
 pub use telemetry::{
-    ccount, format_sha256_hex, measure_stack_hwm, paint_stack_sentinel, FwStats, FwStatsSnapshot,
+    ccount, format_sha256_hex, measure_stack_hwm, measure_stack_hwm_volatile, paint_stack_sentinel,
+    reset_reason_label, FwStats, FwStatsSnapshot,
 };

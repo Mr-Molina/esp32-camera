@@ -469,8 +469,9 @@ pub struct TelemetrySnapshot<'a> {
     pub framesize: &'a str,
     /// Whether a client is actively streaming on Port 81 (`s_stream_active`).
     pub stream_active: bool,
-    /// Reset reason code (`esp_reset_reason()`).
-    pub reset_reason: u32,
+    /// Reset reason label mapped from `RTC_CNTL_RESET_STATE_REG` (`"poweron"`,
+    /// `"sw_cpu_reset"`, `"unknown"`, etc.).
+    pub reset_reason: &'a str,
     /// Hex-encoded SHA-256 digest of active application binary.
     pub app_sha256: &'a str,
     /// Free internal DRAM heap in bytes.
@@ -491,7 +492,7 @@ impl Default for TelemetrySnapshot<'static> {
             active_partition: "ota_0",
             framesize: "1280x720",
             stream_active: false,
-            reset_reason: 0,
+            reset_reason: "unknown",
             app_sha256: "0000000000000000000000000000000000000000000000000000000000000000",
             free_dram: 184_320,
             core1_stack_hwm: 0,
@@ -520,17 +521,24 @@ fn sanitize_status_json_field<'a>(field: &'a str, buf: &'a mut [u8; 64]) -> &'a 
 }
 
 /// Formats the JSON telemetry payload into a 1024-byte stack buffer.
-/// Sanitizes `active_partition`, `framesize`, and `app_sha256` to prevent
-/// JSON injection (`SEC-202`).
+/// Sanitizes `active_partition`, `framesize`, `reset_reason`, and `app_sha256`
+/// to prevent JSON injection (`SEC-202`).
 pub fn format_status_json<'a>(
     telemetry: &TelemetrySnapshot<'_>,
     stack_buf: &'a mut [u8; STATUS_JSON_BUF_LEN],
 ) -> Result<&'a str, HttpError> {
     let mut p_buf = [0u8; 64];
     let mut f_buf = [0u8; 64];
+    let mut r_buf = [0u8; 64];
     let mut s_buf = [0u8; 64];
     let safe_part = sanitize_status_json_field(telemetry.active_partition, &mut p_buf);
     let safe_framesize = sanitize_status_json_field(telemetry.framesize, &mut f_buf);
+    let raw_reset = if telemetry.reset_reason.trim().is_empty() {
+        "unknown"
+    } else {
+        telemetry.reset_reason
+    };
+    let safe_reset = sanitize_status_json_field(raw_reset, &mut r_buf);
     let safe_sha = sanitize_status_json_field(telemetry.app_sha256, &mut s_buf);
 
     let mut writer = SliceWriter::new(stack_buf);
@@ -550,7 +558,7 @@ pub fn format_status_json<'a>(
     writeln!(
         writer,
         ",\"active_partition\":\"{}\",\"framesize\":\"{}\",\"stream_active\":{},\
-        \"reset_reason\":{},\"app_sha256\":\"{}\",\"free_dram\":{},\
+        \"reset_reason\":\"{}\",\"app_sha256\":\"{}\",\"free_dram\":{},\
         \"core1_stack_hwm\":{},\
         \"sensor_frame_period_us\":{},\"frame_bytes\":{},\"c1_pushed\":{},\
         \"c1_dropped\":{},\"ring_full_events\":{},\"soi_miss\":{},\
@@ -558,7 +566,7 @@ pub fn format_status_json<'a>(
         \"c0_p80_cycles\":{},\"c0_p81_cycles\":{},\"max_loop_latency_us\":{},\
         \"p81_frames_sent\":{},\"p81_frames_superseded\":{},\
         \"c0_validation_failures\":{},\"sccb_errors\":{},\"send_partial\":{},\
-        \"ring_build_failures\":{}}}",
+        \"ring_build_failures\":{},\"i2s_stop_timeouts\":{}}}",
         safe_part,
         safe_framesize,
         if telemetry.stream_active {
@@ -566,7 +574,7 @@ pub fn format_status_json<'a>(
         } else {
             "false"
         },
-        telemetry.reset_reason,
+        safe_reset,
         safe_sha,
         telemetry.free_dram,
         telemetry.core1_stack_hwm,
@@ -588,6 +596,7 @@ pub fn format_status_json<'a>(
         telemetry.fw_stats.sccb_errors,
         telemetry.fw_stats.send_partial,
         telemetry.fw_stats.ring_build_failures,
+        telemetry.fw_stats.i2s_stop_timeouts,
     )
     .map_err(|_| HttpError::BufferTooSmall)?;
 
@@ -1100,7 +1109,7 @@ pub struct KlipperCamServer<'a> {
     free_heap: u32,
     free_psram: u32,
     wifi_rssi: Option<i32>,
-    reset_reason: u32,
+    reset_reason: &'a str,
     app_sha256: &'a str,
     free_dram: u32,
     core1_stack_hwm: u32,
@@ -1124,7 +1133,7 @@ impl<'a> KlipperCamServer<'a> {
             free_heap: 184_320,
             free_psram: 4_128_768,
             wifi_rssi: Some(-48),
-            reset_reason: 0,
+            reset_reason: "unknown",
             app_sha256: "0000000000000000000000000000000000000000000000000000000000000000",
             free_dram: 184_320,
             core1_stack_hwm: 0,
@@ -1193,7 +1202,7 @@ impl<'a> KlipperCamServer<'a> {
     /// Updates firmware diagnostics and performance counters.
     pub fn set_diagnostics(
         &mut self,
-        reset_reason: u32,
+        reset_reason: &'a str,
         app_sha256: &'a str,
         free_dram: u32,
         core1_stack_hwm: u32,
@@ -2091,7 +2100,7 @@ mod tests {
             "{\"uptime_ms\":42500,\"free_heap\":192000,\"free_psram\":4100000,\
             \"wifi_rssi\":-51,\"active_partition\":\"ota_0\",\
             \"framesize\":\"1280x720\",\"stream_active\":false,\
-            \"reset_reason\":0,\
+            \"reset_reason\":\"unknown\",\
             \"app_sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\",\
             \"free_dram\":184320,\"core1_stack_hwm\":0,\
             \"sensor_frame_period_us\":0,\"frame_bytes\":0,\"c1_pushed\":0,\
@@ -2100,8 +2109,44 @@ mod tests {
             \"c0_p80_cycles\":0,\"c0_p81_cycles\":0,\"max_loop_latency_us\":0,\
             \"p81_frames_sent\":0,\"p81_frames_superseded\":0,\
             \"c0_validation_failures\":0,\"sccb_errors\":0,\"send_partial\":0,\
-            \"ring_build_failures\":0}\n"
+            \"ring_build_failures\":0,\"i2s_stop_timeouts\":0}\n"
         );
+
+        let mut stats = FwStatsSnapshot::new();
+        stats.i2s_stop_timeouts = 7;
+        server.set_diagnostics(
+            "poweron",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            176_000,
+            2048,
+            stats,
+        );
+        let resp_diag = server
+            .handle_raw_request(ServerPort::Control, raw_req, &mut resp_buf)
+            .expect("diagnostics status request");
+        let view_diag = HttpResponseView::parse(resp_diag).expect("valid HTTP response");
+        let body_diag = core::str::from_utf8(view_diag.body).expect("valid UTF-8 JSON");
+        assert!(body_diag.contains("\"reset_reason\":\"poweron\""));
+        assert!(body_diag.contains("\"i2s_stop_timeouts\":7"));
+    }
+
+    #[test]
+    fn test_status_json_reset_reason_sanitization_and_empty_fallback() {
+        let injected = TelemetrySnapshot {
+            reset_reason: "sw_reset\"evil\\\n",
+            ..TelemetrySnapshot::default()
+        };
+        let mut buf = [0u8; STATUS_JSON_BUF_LEN];
+        let json_inj = format_status_json(&injected, &mut buf).expect("sanitized status");
+        assert!(json_inj.contains("\"reset_reason\":\"sw_reset_evil__\""));
+
+        let blank = TelemetrySnapshot {
+            reset_reason: "   ",
+            ..TelemetrySnapshot::default()
+        };
+        let mut buf2 = [0u8; STATUS_JSON_BUF_LEN];
+        let json_blank = format_status_json(&blank, &mut buf2).expect("blank fallback");
+        assert!(json_blank.contains("\"reset_reason\":\"unknown\""));
     }
 
     #[test]
@@ -2130,7 +2175,7 @@ mod tests {
             active_partition: "ota_1_long_custom_label_with_extra_chars_to_limit",
             framesize: "2560x1440_uhd_maximum_resolution_extended_mode_long_name",
             stream_active: false,
-            reset_reason: u32::MAX,
+            reset_reason: "sw_cpu_reset",
             app_sha256: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
             free_dram: u32::MAX,
             core1_stack_hwm: u32::MAX,
@@ -2153,13 +2198,16 @@ mod tests {
                 sccb_errors: u32::MAX,
                 send_partial: u32::MAX,
                 ring_build_failures: u32::MAX,
+                i2s_stop_timeouts: u32::MAX,
             },
         };
 
         let mut buf = [0u8; STATUS_JSON_BUF_LEN];
         let json_str = format_status_json(&max_snap, &mut buf)
             .expect("worst-case maximum-width values must fit inside 1024 bytes");
-        assert!(json_str.len() <= STATUS_JSON_BUF_LEN);
+        assert!(json_str.len() + 32 <= STATUS_JSON_BUF_LEN);
+        assert!(json_str.contains("\"reset_reason\":\"sw_cpu_reset\""));
+        assert!(json_str.contains("\"i2s_stop_timeouts\":4294967295"));
 
         let expected_prefixes = [
             "\"uptime_ms\":",
