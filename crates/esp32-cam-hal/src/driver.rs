@@ -21,7 +21,7 @@ use crate::frame_pool::{FrameGuard, FramePool};
 
 /// JPEG Start-Of-Image (`SOI`) 3-byte marker (`0xFF, 0xD8, 0xFF` in
 /// `driver/cam_hal.c:161`).
-pub const JPEG_SOI_MARKER: [u8; 3] = [0xFF, 0xD8, 0xFF];
+pub const JPEG_SOI_MARKER: [u8; 3] = ::esp32_cam_conversions::JPEG_SOI_MARKER;
 
 /// Marker compatibility alias for `JPEG_SOI_MARKER`.
 pub mod esp32_cam_conversions {
@@ -30,7 +30,7 @@ pub mod esp32_cam_conversions {
 
 /// JPEG End-Of-Image (`EOI`) 2-byte marker (`0xFF, 0xD9` in
 /// `driver/cam_hal.c:163`).
-pub const JPEG_EOI_MARKER: [u8; 2] = [0xFF, 0xD9];
+pub const JPEG_EOI_MARKER: [u8; 2] = ::esp32_cam_conversions::JPEG_EOI_MARKER;
 
 /// Default byte count probed at the start of a PSRAM JPEG frame for `SOI`
 /// (`CAM_SOI_PROBE_BYTES`).
@@ -39,34 +39,18 @@ pub const CAM_SOI_PROBE_BYTES: usize = 32;
 /// Computes the scan window for JPEG `EOI` detection in PSRAM
 /// (`eoi_probe_window` in `driver/cam_hal.c:167-171`).
 #[inline]
+#[must_use]
 pub const fn eoi_probe_window(half_buf_size: usize, frame_len: usize) -> usize {
-    let w = half_buf_size.saturating_add(JPEG_EOI_MARKER.len() - 1);
-    if w > frame_len {
-        frame_len
-    } else {
-        w
-    }
+    ::esp32_cam_conversions::eoi_probe_window(half_buf_size, frame_len)
 }
 
 /// Searches `inbuf` for the 3-byte JPEG Start-Of-Image marker
 /// (`0xFF, 0xD8, 0xFF`), returning its byte offset (`cam_verify_jpeg_soi` in
 /// `driver/cam_hal.c:173-192`).
+#[inline]
+#[must_use]
 pub fn verify_jpeg_soi(inbuf: &[u8]) -> Option<usize> {
-    if inbuf.len() < JPEG_SOI_MARKER.len() {
-        return None;
-    }
-    let limit = inbuf.len() - JPEG_SOI_MARKER.len();
-    let mut i = 0;
-    while i <= limit {
-        if inbuf[i] == JPEG_SOI_MARKER[0]
-            && inbuf[i + 1] == JPEG_SOI_MARKER[1]
-            && inbuf[i + 2] == JPEG_SOI_MARKER[2]
-        {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
+    ::esp32_cam_conversions::verify_jpeg_soi(inbuf)
 }
 
 /// Searches `inbuf` for the 2-byte JPEG End-Of-Image marker (`0xFF, 0xD9`),
@@ -77,33 +61,10 @@ pub fn verify_jpeg_soi(inbuf: &[u8]) -> Option<usize> {
 ///   earliest `EOI` offset.
 /// - When `search_forward == false` (SRAM filtered buffer), scans backward from
 ///   the end of `inbuf`.
+#[inline]
+#[must_use]
 pub fn verify_jpeg_eoi(inbuf: &[u8], search_forward: bool) -> Option<usize> {
-    if inbuf.len() < JPEG_EOI_MARKER.len() {
-        return None;
-    }
-    let last_start = inbuf.len() - JPEG_EOI_MARKER.len();
-    if search_forward {
-        let mut i = 0;
-        while i <= last_start {
-            if inbuf[i] == JPEG_EOI_MARKER[0] && inbuf[i + 1] == JPEG_EOI_MARKER[1] {
-                return Some(i);
-            }
-            i += 1;
-        }
-        None
-    } else {
-        let mut i = last_start;
-        loop {
-            if inbuf[i] == JPEG_EOI_MARKER[0] && inbuf[i + 1] == JPEG_EOI_MARKER[1] {
-                return Some(i);
-            }
-            if i == 0 {
-                break;
-            }
-            i -= 1;
-        }
-        None
-    }
+    ::esp32_cam_conversions::verify_jpeg_eoi(inbuf, search_forward)
 }
 
 /// Hardware-agnostic sensor interface consumed by [`CameraDriver`].

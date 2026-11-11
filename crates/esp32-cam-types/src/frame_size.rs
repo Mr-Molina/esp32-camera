@@ -74,37 +74,58 @@ impl FrameSize {
     pub const F5Mp: Self = Self::Size5Mp;
     pub const FiveMp: Self = Self::Size5Mp;
 
+    /// Returns the raw `u8` discriminant (`0..25`) for this [`FrameSize`].
+    #[must_use]
+    #[inline]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
     /// Returns the table index (`0..25`) for this [`FrameSize`].
+    #[must_use]
     #[inline]
     pub const fn index(self) -> usize {
         self as usize
     }
 
     /// Returns the [`ResolutionInfo`] entry from [`RESOLUTION_TABLE`].
+    #[must_use]
     #[inline]
     pub const fn resolution(self) -> ResolutionInfo {
         RESOLUTION_TABLE[self as usize]
     }
 
+    /// Returns `(width, height)` in pixels for this frame size.
+    #[must_use]
+    #[inline]
+    pub const fn dimensions(self) -> (u16, u16) {
+        let res = &RESOLUTION_TABLE[self as usize];
+        (res.width, res.height)
+    }
+
     /// Returns the horizontal width in pixels.
+    #[must_use]
     #[inline]
     pub const fn width(self) -> u16 {
         RESOLUTION_TABLE[self as usize].width
     }
 
     /// Returns the vertical height in pixels.
+    #[must_use]
     #[inline]
     pub const fn height(self) -> u16 {
         RESOLUTION_TABLE[self as usize].height
     }
 
     /// Returns the [`AspectRatio`] for this frame size.
+    #[must_use]
     #[inline]
     pub const fn aspect_ratio(self) -> AspectRatio {
         RESOLUTION_TABLE[self as usize].aspect_ratio
     }
 
     /// Returns the total pixel count (`width * height`) for this frame size.
+    #[must_use]
     #[inline]
     pub const fn pixel_count(self) -> usize {
         let res = &RESOLUTION_TABLE[self as usize];
@@ -114,6 +135,7 @@ impl FrameSize {
     /// Returns the uncompressed frame buffer size in bytes for the given
     /// [`PixelFormat`], or `None` if the format has variable compressed
     /// size (e.g. [`PixelFormat::Jpeg`]) or on arithmetic overflow.
+    #[must_use]
     #[inline]
     pub const fn checked_byte_size(self, format: PixelFormat) -> Option<usize> {
         let pixels = self.pixel_count();
@@ -133,14 +155,42 @@ impl FrameSize {
     }
 
     /// Converts a raw index (`0..25`) into a [`FrameSize`].
+    #[must_use]
     #[inline]
-    pub fn from_u8(val: u8) -> Option<Self> {
-        ALL_FRAMESIZES.get(val as usize).copied()
+    pub const fn from_u8(val: u8) -> Option<Self> {
+        match val {
+            0 => Some(Self::Size96x96),
+            1 => Some(Self::Qqvga),
+            2 => Some(Self::Size128x128),
+            3 => Some(Self::Qcif),
+            4 => Some(Self::Hqvga),
+            5 => Some(Self::Size240x240),
+            6 => Some(Self::Qvga),
+            7 => Some(Self::Size320x320),
+            8 => Some(Self::Cif),
+            9 => Some(Self::Hvga),
+            10 => Some(Self::Vga),
+            11 => Some(Self::Svga),
+            12 => Some(Self::Xga),
+            13 => Some(Self::Hd),
+            14 => Some(Self::Sxga),
+            15 => Some(Self::Uxga),
+            16 => Some(Self::Fhd),
+            17 => Some(Self::PHd),
+            18 => Some(Self::P3Mp),
+            19 => Some(Self::Qxga),
+            20 => Some(Self::Qhd),
+            21 => Some(Self::Wqxga),
+            22 => Some(Self::PFhd),
+            23 => Some(Self::Qsxga),
+            24 => Some(Self::Size5Mp),
+            _ => None,
+        }
     }
 }
 
 /// All 25 [`FrameSize`] variants in index order.
-pub const ALL_FRAMESIZES: [FrameSize; FrameSize::COUNT] = [
+pub static ALL_FRAMESIZES: [FrameSize; FrameSize::COUNT] = [
     FrameSize::Size96x96,
     FrameSize::Qqvga,
     FrameSize::Size128x128,
@@ -185,6 +235,9 @@ pub enum AspectRatio {
 
 #[allow(non_upper_case_globals)]
 impl AspectRatio {
+    /// Total number of [`AspectRatio`] variants (`0..9`).
+    pub const COUNT: usize = 9;
+
     pub const Ratio4X3: Self = Self::Ratio4x3;
     pub const Ratio3X2: Self = Self::Ratio3x2;
     pub const Ratio16X10: Self = Self::Ratio16x10;
@@ -194,6 +247,31 @@ impl AspectRatio {
     pub const Ratio5X4: Self = Self::Ratio5x4;
     pub const Ratio1X1: Self = Self::Ratio1x1;
     pub const Ratio9X16: Self = Self::Ratio9x16;
+
+    /// Returns the raw `u8` discriminant (`0..9`) for this [`AspectRatio`].
+    #[must_use]
+    #[inline]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// Converts a raw discriminant (`0..9`) into an [`AspectRatio`].
+    #[must_use]
+    #[inline]
+    pub const fn from_u8(val: u8) -> Option<Self> {
+        match val {
+            0 => Some(Self::Ratio4x3),
+            1 => Some(Self::Ratio3x2),
+            2 => Some(Self::Ratio16x10),
+            3 => Some(Self::Ratio5x3),
+            4 => Some(Self::Ratio16x9),
+            5 => Some(Self::Ratio21x9),
+            6 => Some(Self::Ratio5x4),
+            7 => Some(Self::Ratio1x1),
+            8 => Some(Self::Ratio9x16),
+            _ => None,
+        }
+    }
 }
 
 /// Resolution dimensions and aspect ratio from `driver/include/sensor.h`.
@@ -206,7 +284,7 @@ pub struct ResolutionInfo {
 }
 
 /// Master resolution table matching `resolution[FRAMESIZE_INVALID]`.
-pub const RESOLUTION_TABLE: [ResolutionInfo; 25] = [
+pub static RESOLUTION_TABLE: [ResolutionInfo; 25] = [
     // Size96x96
     ResolutionInfo {
         width: 96,
@@ -359,6 +437,18 @@ pub const RESOLUTION_TABLE: [ResolutionInfo; 25] = [
     },
 ];
 
+const _: () = {
+    assert!(ALL_FRAMESIZES.len() == FrameSize::COUNT);
+    assert!(RESOLUTION_TABLE.len() == FrameSize::COUNT);
+    let mut i = 0;
+    while i < FrameSize::COUNT {
+        assert!(ALL_FRAMESIZES[i] as usize == i);
+        assert!(RESOLUTION_TABLE[i].width > 0);
+        assert!(RESOLUTION_TABLE[i].height > 0);
+        i += 1;
+    }
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,6 +463,7 @@ mod tests {
         assert_eq!(hd.aspect_ratio, AspectRatio::Ratio16x9);
         assert_eq!(FrameSize::Hd.width(), 1280);
         assert_eq!(FrameSize::Hd.height(), 720);
+        assert_eq!(FrameSize::Hd.dimensions(), (1280, 720));
         assert_eq!(FrameSize::Hd.aspect_ratio(), AspectRatio::Ratio16x9);
 
         let uxga = FrameSize::Uxga.resolution();
@@ -436,9 +527,80 @@ mod tests {
         assert_eq!(FrameSize::from_u8(25), None);
         assert_eq!(FrameSize::from_u8(255), None);
 
+        const CONST_FROM_U8: Option<FrameSize> = FrameSize::from_u8(13);
+        const CONST_DIMS: (u16, u16) = FrameSize::Hd.dimensions();
+        const CONST_ASPECT: Option<AspectRatio> = AspectRatio::from_u8(4);
         const CONST_PIXELS: usize = FrameSize::Vga.pixel_count();
-        assert_eq!(CONST_PIXELS, 640 * 480);
         const CONST_BYTES: Option<usize> = FrameSize::Vga.checked_byte_size(PixelFormat::Rgb565);
+
+        assert_eq!(CONST_FROM_U8, Some(FrameSize::Hd));
+        assert_eq!(CONST_DIMS, (1280, 720));
+        assert_eq!(CONST_ASPECT, Some(AspectRatio::Ratio16x9));
+        assert_eq!(CONST_PIXELS, 640 * 480);
         assert_eq!(CONST_BYTES, Some(640 * 480 * 2));
+    }
+
+    #[test]
+    fn test_types05_order_invariant_across_all_25_entries() {
+        let expected: [(FrameSize, u16, u16, AspectRatio); FrameSize::COUNT] = [
+            (FrameSize::Size96x96, 96, 96, AspectRatio::Ratio1x1),
+            (FrameSize::Qqvga, 160, 120, AspectRatio::Ratio4x3),
+            (FrameSize::Size128x128, 128, 128, AspectRatio::Ratio1x1),
+            (FrameSize::Qcif, 176, 144, AspectRatio::Ratio5x4),
+            (FrameSize::Hqvga, 240, 176, AspectRatio::Ratio4x3),
+            (FrameSize::Size240x240, 240, 240, AspectRatio::Ratio1x1),
+            (FrameSize::Qvga, 320, 240, AspectRatio::Ratio4x3),
+            (FrameSize::Size320x320, 320, 320, AspectRatio::Ratio1x1),
+            (FrameSize::Cif, 400, 296, AspectRatio::Ratio4x3),
+            (FrameSize::Hvga, 480, 320, AspectRatio::Ratio3x2),
+            (FrameSize::Vga, 640, 480, AspectRatio::Ratio4x3),
+            (FrameSize::Svga, 800, 600, AspectRatio::Ratio4x3),
+            (FrameSize::Xga, 1024, 768, AspectRatio::Ratio4x3),
+            (FrameSize::Hd, 1280, 720, AspectRatio::Ratio16x9),
+            (FrameSize::Sxga, 1280, 1024, AspectRatio::Ratio5x4),
+            (FrameSize::Uxga, 1600, 1200, AspectRatio::Ratio4x3),
+            (FrameSize::Fhd, 1920, 1080, AspectRatio::Ratio16x9),
+            (FrameSize::PHd, 720, 1280, AspectRatio::Ratio9x16),
+            (FrameSize::P3Mp, 864, 1536, AspectRatio::Ratio9x16),
+            (FrameSize::Qxga, 2048, 1536, AspectRatio::Ratio4x3),
+            (FrameSize::Qhd, 2560, 1440, AspectRatio::Ratio16x9),
+            (FrameSize::Wqxga, 2560, 1600, AspectRatio::Ratio16x10),
+            (FrameSize::PFhd, 1088, 1920, AspectRatio::Ratio9x16),
+            (FrameSize::Qsxga, 2560, 1920, AspectRatio::Ratio4x3),
+            (FrameSize::Size5Mp, 2592, 1944, AspectRatio::Ratio4x3),
+        ];
+
+        for (idx, &(fs, w, h, ratio)) in expected.iter().enumerate() {
+            assert_eq!(ALL_FRAMESIZES[idx], fs);
+            assert_eq!(fs.index(), idx);
+            assert_eq!(fs.as_u8() as usize, idx);
+            assert_eq!(FrameSize::from_u8(idx as u8), Some(fs));
+            assert_eq!(
+                RESOLUTION_TABLE[idx],
+                ResolutionInfo {
+                    width: w,
+                    height: h,
+                    aspect_ratio: ratio,
+                }
+            );
+            assert_eq!(fs.resolution(), RESOLUTION_TABLE[idx]);
+            assert_eq!(fs.dimensions(), (w, h));
+            assert_eq!(fs.width(), w);
+            assert_eq!(fs.height(), h);
+            assert_eq!(fs.aspect_ratio(), ratio);
+            assert_eq!(fs.pixel_count(), (w as usize) * (h as usize));
+        }
+
+        for raw in (FrameSize::COUNT as u8)..=u8::MAX {
+            assert_eq!(FrameSize::from_u8(raw), None);
+        }
+
+        for raw in 0..(AspectRatio::COUNT as u8) {
+            let ratio = AspectRatio::from_u8(raw).expect("valid AspectRatio discriminant");
+            assert_eq!(ratio.as_u8(), raw);
+        }
+        for raw in (AspectRatio::COUNT as u8)..=u8::MAX {
+            assert_eq!(AspectRatio::from_u8(raw), None);
+        }
     }
 }

@@ -1,7 +1,7 @@
 //! Deterministic `#![no_std]` mock SCCB bus for unit testing sensor drivers.
 
 use core::fmt;
-use esp32_cam_types::CameraError;
+use esp32_cam_types::{CameraError, SccbPhase};
 
 use crate::bus::{is_valid_sccb_addr, SccbBus};
 
@@ -282,7 +282,7 @@ impl<const CAP: usize> SccbBus for MockSccbBus<CAP> {
         if self.strict_ack && !self.has_device(slv_addr) {
             return Err(CameraError::SccbNack {
                 slv_addr,
-                phase: "device_addr",
+                phase: SccbPhase::DeviceAddr,
             });
         }
         if let Some(err) = self.forced_error {
@@ -300,7 +300,7 @@ impl<const CAP: usize> SccbBus for MockSccbBus<CAP> {
         if self.strict_ack && !self.has_device(slv_addr) {
             return Err(CameraError::SccbNack {
                 slv_addr,
-                phase: "device_addr",
+                phase: SccbPhase::DeviceAddr,
             });
         }
         if let Some(err) = self.forced_error {
@@ -322,7 +322,7 @@ impl<const CAP: usize> SccbBus for MockSccbBus<CAP> {
         if self.strict_ack && !self.has_device(slv_addr) {
             return Err(CameraError::SccbNack {
                 slv_addr,
-                phase: "device_addr",
+                phase: SccbPhase::DeviceAddr,
             });
         }
         if let Some(err) = self.forced_error {
@@ -340,7 +340,7 @@ impl<const CAP: usize> SccbBus for MockSccbBus<CAP> {
         if self.strict_ack && !self.has_device(slv_addr) {
             return Err(CameraError::SccbNack {
                 slv_addr,
-                phase: "device_addr",
+                phase: SccbPhase::DeviceAddr,
             });
         }
         if let Some(err) = self.forced_error {
@@ -367,7 +367,7 @@ impl<const CAP: usize> SccbBus for MockSccbBus<CAP> {
         {
             return Err(CameraError::SccbNack {
                 slv_addr,
-                phase: "device_addr",
+                phase: SccbPhase::DeviceAddr,
             });
         }
         Ok(())
@@ -549,7 +549,7 @@ mod tests {
             bus.probe(CameraSccbAddr::OV7725),
             Err(CameraError::SccbNack {
                 slv_addr: CameraSccbAddr::OV7725,
-                phase: "device_addr",
+                phase: SccbPhase::DeviceAddr,
             })
         );
         assert_eq!(
@@ -576,28 +576,28 @@ mod tests {
             bus.read_reg8(0x30, 0x0A),
             Err(CameraError::SccbNack {
                 slv_addr: 0x30,
-                phase: "device_addr",
+                phase: SccbPhase::DeviceAddr,
             })
         );
         assert_eq!(
             bus.write_reg8(0x30, 0x0A, 0x12),
             Err(CameraError::SccbNack {
                 slv_addr: 0x30,
-                phase: "device_addr",
+                phase: SccbPhase::DeviceAddr,
             })
         );
         assert_eq!(
             bus.read_reg16(0x3C, 0x300A),
             Err(CameraError::SccbNack {
                 slv_addr: 0x3C,
-                phase: "device_addr",
+                phase: SccbPhase::DeviceAddr,
             })
         );
         assert_eq!(
             bus.write_reg16(0x3C, 0x300A, 0x56),
             Err(CameraError::SccbNack {
                 slv_addr: 0x3C,
-                phase: "device_addr",
+                phase: SccbPhase::DeviceAddr,
             })
         );
 

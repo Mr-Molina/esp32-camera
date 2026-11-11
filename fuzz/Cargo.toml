@@ -1,0 +1,36 @@
+[package]
+name = "esp32-cam-conversions-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+esp32-cam-conversions = { path = "../crates/esp32-cam-conversions" }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "parse_jpeg_dimensions"
+path = "fuzz_targets/parse_jpeg_dimensions.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "validate_jpeg_frame"
+path = "fuzz_targets/validate_jpeg_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_jpeg_to_rgb888"
+path = "fuzz_targets/decode_jpeg_to_rgb888.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

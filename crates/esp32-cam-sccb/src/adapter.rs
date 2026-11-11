@@ -1,18 +1,22 @@
 //! `embedded-hal` 1.0 adapter implementing [`SccbBus`] over I2C and Delay.
 
 use embedded_hal::delay::DelayNs;
-use embedded_hal::i2c::{ErrorKind, I2c};
-use esp32_cam_types::CameraError;
+use embedded_hal::i2c::{ErrorKind, I2c, NoAcknowledgeSource};
+use esp32_cam_types::{CameraError, SccbPhase};
 
 use crate::bus::{is_valid_sccb_addr, SccbBus};
 
 /// Maps an `embedded-hal` I2C error to [`CameraError`].
 fn map_i2c_error<E: embedded_hal::i2c::Error>(e: E, slv_addr: u8) -> CameraError {
     match embedded_hal::i2c::Error::kind(&e) {
-        ErrorKind::NoAcknowledge(_) => CameraError::SccbNack {
-            slv_addr,
-            phase: "device_addr",
-        },
+        ErrorKind::NoAcknowledge(source) => {
+            let phase = match source {
+                NoAcknowledgeSource::Address => SccbPhase::DeviceAddr,
+                NoAcknowledgeSource::Data => SccbPhase::Data,
+                NoAcknowledgeSource::Unknown => SccbPhase::Unknown,
+            };
+            CameraError::SccbNack { slv_addr, phase }
+        }
         ErrorKind::Bus | ErrorKind::ArbitrationLoss | ErrorKind::Overrun => CameraError::I2cError,
         _ => CameraError::SccbError,
     }
@@ -120,7 +124,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use embedded_hal::i2c::{Error, ErrorKind, ErrorType, NoAcknowledgeSource, Operation};
+    use embedded_hal::i2c::{Error, ErrorType, Operation};
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct MockI2cError(ErrorKind);
@@ -168,12 +172,30 @@ mod tests {
 
     #[test]
     fn test_map_i2c_error_variants() {
-        let nack_err = MockI2cError(ErrorKind::NoAcknowledge(NoAcknowledgeSource::Address));
+        let addr_nack = MockI2cError(ErrorKind::NoAcknowledge(NoAcknowledgeSource::Address));
         assert_eq!(
-            map_i2c_error(nack_err, 0x30),
+            map_i2c_error(addr_nack, 0x30),
             CameraError::SccbNack {
                 slv_addr: 0x30,
-                phase: "device_addr",
+                phase: SccbPhase::DeviceAddr,
+            }
+        );
+
+        let data_nack = MockI2cError(ErrorKind::NoAcknowledge(NoAcknowledgeSource::Data));
+        assert_eq!(
+            map_i2c_error(data_nack, 0x30),
+            CameraError::SccbNack {
+                slv_addr: 0x30,
+                phase: SccbPhase::Data,
+            }
+        );
+
+        let unknown_nack = MockI2cError(ErrorKind::NoAcknowledge(NoAcknowledgeSource::Unknown));
+        assert_eq!(
+            map_i2c_error(unknown_nack, 0x30),
+            CameraError::SccbNack {
+                slv_addr: 0x30,
+                phase: SccbPhase::Unknown,
             }
         );
 
@@ -206,20 +228,52 @@ mod tests {
         assert_eq!(adapter.write_reg16(0x30, 0x3000, 0x55), Ok(()));
         assert_eq!(adapter.probe(0x30), Ok(()));
 
-        // Test error propagation to SccbNack
+        // Test error propagation across NoAcknowledgeSource variants
         adapter.i2c_mut().err = Some(ErrorKind::NoAcknowledge(NoAcknowledgeSource::Address));
         assert_eq!(
             adapter.probe(0x30),
             Err(CameraError::SccbNack {
                 slv_addr: 0x30,
-                phase: "device_addr",
+                phase: SccbPhase::DeviceAddr,
             })
         );
         assert_eq!(
             adapter.write_reg8(0x30, 0x10, 0x55),
             Err(CameraError::SccbNack {
                 slv_addr: 0x30,
-                phase: "device_addr",
+                phase: SccbPhase::DeviceAddr,
+            })
+        );
+
+        adapter.i2c_mut().err = Some(ErrorKind::NoAcknowledge(NoAcknowledgeSource::Data));
+        assert_eq!(
+            adapter.write_reg8(0x30, 0x10, 0x55),
+            Err(CameraError::SccbNack {
+                slv_addr: 0x30,
+                phase: SccbPhase::Data,
+            })
+        );
+        assert_eq!(
+            adapter.write_reg16(0x30, 0x3000, 0x55),
+            Err(CameraError::SccbNack {
+                slv_addr: 0x30,
+                phase: SccbPhase::Data,
+            })
+        );
+
+        adapter.i2c_mut().err = Some(ErrorKind::NoAcknowledge(NoAcknowledgeSource::Unknown));
+        assert_eq!(
+            adapter.read_reg8(0x30, 0x10),
+            Err(CameraError::SccbNack {
+                slv_addr: 0x30,
+                phase: SccbPhase::Unknown,
+            })
+        );
+        assert_eq!(
+            adapter.read_reg16(0x30, 0x3000),
+            Err(CameraError::SccbNack {
+                slv_addr: 0x30,
+                phase: SccbPhase::Unknown,
             })
         );
 

@@ -4,6 +4,9 @@
 //! Replaces `conversions/to_bmp.c` (`CONV-101`..`CONV-105`), eliminating
 //! unaligned packed struct pointer casts and integer overflow vulnerabilities.
 
+use crate::jpeg_codec;
+use crate::jpeg_scan;
+use crate::yuv;
 use esp32_cam_types::{CameraError, PixelFormat};
 
 /// Standard Windows BITMAPFILEHEADER (14 bytes) + BITMAPINFOHEADER (40 bytes)
@@ -145,12 +148,9 @@ pub fn rgb888_to_bmp(
     let dst_rows = dst[BMP_HEADER_LEN..layout.total_size].chunks_exact_mut(row_stride);
 
     for (src_row, dst_row) in src_rows.zip(dst_rows) {
-        for (in_pix, out_pix) in src_row
-            .as_chunks::<3>()
-            .0
-            .iter()
-            .zip(dst_row[..layout.row_bytes].as_chunks_mut::<3>().0)
-        {
+        let (in_pixels, _) = src_row.as_chunks::<3>();
+        let (out_pixels, _) = dst_row[..layout.row_bytes].as_chunks_mut::<3>();
+        for (in_pix, out_pix) in in_pixels.iter().zip(out_pixels) {
             out_pix[0] = in_pix[2];
             out_pix[1] = in_pix[1];
             out_pix[2] = in_pix[0];
@@ -163,7 +163,9 @@ pub fn rgb888_to_bmp(
 
 /// Converts a 16-bit big-endian RGB565 buffer into a 24-bit BMP image in `dst`.
 ///
-/// Matches `conversions/to_bmp.c:330-339` and `373-386`.
+/// Unpacks each RGB565 pixel with full bit replication via
+/// [`yuv::unpack_rgb565_be_full`] (`CONV-15`) so `0xFFFF` maps to
+/// `(255, 255, 255)`.
 pub fn rgb565_to_bmp(
     src: &[u8],
     dst: &mut [u8],
@@ -186,17 +188,11 @@ pub fn rgb565_to_bmp(
     let dst_rows = dst[BMP_HEADER_LEN..layout.total_size].chunks_exact_mut(row_stride);
 
     for (src_row, dst_row) in src_rows.zip(dst_rows) {
-        for (in_pix, out_pix) in src_row
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .zip(dst_row[..layout.row_bytes].as_chunks_mut::<3>().0)
-        {
-            let hb = in_pix[0];
-            let lb = in_pix[1];
-            out_pix[0] = (lb & 0x1F) << 3;
-            out_pix[1] = ((hb & 0x07) << 5) | ((lb & 0xE0) >> 3);
-            out_pix[2] = hb & 0xF8;
+        let (in_pixels, _) = src_row.as_chunks::<2>();
+        let (out_pixels, _) = dst_row[..layout.row_bytes].as_chunks_mut::<3>();
+        for (in_pix, out_pix) in in_pixels.iter().zip(out_pixels) {
+            let (r, g, b) = yuv::unpack_rgb565_be_full(in_pix[0], in_pix[1]);
+            *out_pix = [b, g, r];
         }
         dst_row[layout.row_bytes..].fill(0);
     }
@@ -207,7 +203,9 @@ pub fn rgb565_to_bmp(
 /// Converts an 8-bit grayscale buffer into an 8-bit indexed BMP image with a
 /// 256-entry palette (`1024` bytes) in `dst`.
 ///
-/// Matches `conversions/to_bmp.c:277-321` and `387-395`.
+/// Matches `conversions/to_bmp.c:277-321` and `387-395`, emitting scanlines
+/// and 4-byte row alignment padding via `chunks_exact_mut` + `.fill(0)`
+/// (`CONV-18`).
 pub fn grayscale_to_bmp(
     src: &[u8],
     dst: &mut [u8],
@@ -231,27 +229,20 @@ pub fn grayscale_to_bmp(
         layout.palette_size,
     )?;
 
-    let mut out_off = BMP_HEADER_LEN;
-    for i in 0..256u16 {
+    let palette_end = BMP_HEADER_LEN + BMP_GRAYSCALE_PALETTE_LEN;
+    let (palette_entries, _) = dst[BMP_HEADER_LEN..palette_end].as_chunks_mut::<4>();
+    for (i, entry) in palette_entries.iter_mut().enumerate() {
         let v = i as u8;
-        dst[out_off] = v;
-        dst[out_off + 1] = v;
-        dst[out_off + 2] = v;
-        dst[out_off + 3] = 0;
-        out_off += 4;
+        *entry = [v, v, v, 0];
     }
 
-    let mut in_off = 0usize;
-    let h = height as usize;
-    for _y in 0..h {
-        dst[out_off..out_off + layout.row_bytes]
-            .copy_from_slice(&src[in_off..in_off + layout.row_bytes]);
-        out_off += layout.row_bytes;
-        in_off += layout.row_bytes;
-        for _p in 0..layout.padding {
-            dst[out_off] = 0;
-            out_off += 1;
-        }
+    let row_stride = layout.row_bytes + layout.padding;
+    let src_rows = src[..layout.src_required].chunks_exact(layout.row_bytes);
+    let dst_rows = dst[palette_end..layout.total_size].chunks_exact_mut(row_stride);
+
+    for (src_row, dst_row) in src_rows.zip(dst_rows) {
+        dst_row[..layout.row_bytes].copy_from_slice(src_row);
+        dst_row[layout.row_bytes..].fill(0);
     }
 
     Ok(layout.total_size)
@@ -286,14 +277,11 @@ pub fn yuv422_to_bmp(
     let dst_rows = dst[BMP_HEADER_LEN..layout.total_size].chunks_exact_mut(row_stride);
 
     for (src_row, dst_row) in src_rows.zip(dst_rows) {
-        for (chunk, out) in src_row
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .zip(dst_row[..layout.row_bytes].as_chunks_mut::<6>().0)
-        {
+        let (in_pairs, _) = src_row.as_chunks::<4>();
+        let (out_pairs, _) = dst_row[..layout.row_bytes].as_chunks_mut::<6>();
+        for (chunk, out) in in_pairs.iter().zip(out_pairs) {
             let ((r0, g0, b0), (r1, g1, b1)) =
-                crate::yuv::yuv422_pair_to_rgb(chunk[0], chunk[1], chunk[2], chunk[3]);
+                yuv::yuv422_pair_to_rgb(chunk[0], chunk[1], chunk[2], chunk[3]);
             out[0] = b0;
             out[1] = g0;
             out[2] = r0;
@@ -313,6 +301,10 @@ pub fn yuv422_to_bmp(
 /// Supports [`PixelFormat::Rgb888`], [`PixelFormat::Rgb565`],
 /// [`PixelFormat::Grayscale`], [`PixelFormat::Yuv422`], and
 /// [`PixelFormat::Jpeg`].
+///
+/// For [`PixelFormat::Jpeg`], skips the pre-decode SOF header scan entirely
+/// when `width == 0 && height == 0`, and otherwise validates expected SOF
+/// dimensions once up front before `dst` is touched (`CONV-18`).
 pub fn frame_to_bmp(
     src: &[u8],
     dst: &mut [u8],
@@ -326,15 +318,16 @@ pub fn frame_to_bmp(
         PixelFormat::Grayscale => grayscale_to_bmp(src, dst, width, height),
         PixelFormat::Yuv422 => yuv422_to_bmp(src, dst, width, height),
         PixelFormat::Jpeg => {
-            if let Some((jw, jh)) = crate::jpeg_scan::parse_jpeg_dimensions(src) {
+            if width != 0 || height != 0 {
+                let (jw, jh) =
+                    jpeg_scan::parse_jpeg_dimensions(src).ok_or(CameraError::CorruptedFrame)?;
                 if (width != 0 && width != jw) || (height != 0 && height != jh) {
                     return Err(CameraError::InvalidArg);
                 }
             }
-            let (dec_w, dec_h, written) = crate::jpeg_codec::jpeg_to_bmp(src, dst)?;
-            if (width != 0 && width != dec_w) || (height != 0 && height != dec_h) {
-                return Err(CameraError::InvalidArg);
-            }
+            let (dec_w, dec_h, written) = jpeg_codec::jpeg_to_bmp(src, dst)?;
+            debug_assert!(width == 0 || width == dec_w);
+            debug_assert!(height == 0 || height == dec_h);
             Ok(written)
         }
         _ => Err(CameraError::InvalidFormat),
@@ -348,16 +341,16 @@ mod tests {
     #[test]
     fn test_rgb888_to_bmp_with_padding() {
         // 3x2 image: row_bytes = 9, row_stride = 12 (3 bytes padding per row),
-        // image_size = 24
+        // image_size = 24.
         // CONV-002: Provide distinct [R, G, B] pixels to verify little-endian
-        // [B, G, R] output
+        // [B, G, R] output.
         let mut src = [0u8; 18];
         for i in 0..6 {
             src[i * 3] = 0x11; // R
             src[i * 3 + 1] = 0x22; // G
             src[i * 3 + 2] = 0x33; // B
         }
-        let mut dst = [0u8; BMP_HEADER_LEN + 24];
+        let mut dst = [0xFFu8; BMP_HEADER_LEN + 24];
         let written = rgb888_to_bmp(&src, &mut dst, 3, 2).expect("rgb888_to_bmp should succeed");
         assert_eq!(written, BMP_HEADER_LEN + 24);
         assert_eq!(&dst[0..2], b"BM");
@@ -366,38 +359,49 @@ mod tests {
         assert_eq!(i32::from_le_bytes([dst[18], dst[19], dst[20], dst[21]]), 3);
         assert_eq!(i32::from_le_bytes([dst[22], dst[23], dst[24], dst[25]]), -2);
         assert_eq!(u16::from_le_bytes([dst[28], dst[29]]), 24);
-        // SEC-061: clr_used is 0 when palette_size is 0
+        // SEC-061: clr_used is 0 when palette_size is 0.
         assert_eq!(u32::from_le_bytes([dst[46], dst[47], dst[48], dst[49]]), 0);
-        // Verify CONV-002: little-endian BMP pixel byte order is
-        // [B, G, R] = [0x33, 0x22, 0x11]
+        // Verify CONV-002: little-endian BMP pixel byte order is [B, G, R].
         assert_eq!(&dst[54..57], &[0x33, 0x22, 0x11]);
         assert_eq!(&dst[57..60], &[0x33, 0x22, 0x11]);
         assert_eq!(&dst[60..63], &[0x33, 0x22, 0x11]);
-        // Check row 0 padding bytes are 0
+        // Check both rows' padding bytes were zeroed over 0xFF sentinel.
         assert_eq!(&dst[63..66], &[0, 0, 0]);
+        assert_eq!(&dst[75..78], &[0, 0, 0]);
     }
 
     #[test]
     fn test_rgb565_and_yuv422_to_bmp() {
-        // 2x2 image: row_bytes = 6, row_stride = 8 (2 bytes padding), image_size = 16
+        // 2x2 image: row_bytes = 6, row_stride = 8 (2 bytes padding),
+        // image_size = 16.
         let rgb565 = [0xF8, 0x00, 0x07, 0xE0, 0x00, 0x1F, 0xFF, 0xFF];
-        let mut dst = [0u8; BMP_HEADER_LEN + 16];
+        let mut dst = [0xFFu8; BMP_HEADER_LEN + 16];
         let n = rgb565_to_bmp(&rgb565, &mut dst, 2, 2).expect("rgb565_to_bmp should succeed");
         assert_eq!(n, BMP_HEADER_LEN + 16);
-        // First pixel (0xF800 -> pure red) in BMP is BGR = [0, 0, 0xF8]
-        assert_eq!(&dst[54..57], &[0x00, 0x00, 0xF8]);
+        // Row 0: 0xF800 -> [0, 0, 255], 0x07E0 -> [0, 255, 0] (BGR).
+        assert_eq!(&dst[54..57], &[0x00, 0x00, 0xFF]);
+        assert_eq!(&dst[57..60], &[0x00, 0xFF, 0x00]);
+        assert_eq!(&dst[60..62], &[0, 0]);
+        // Row 1: 0x001F -> [255, 0, 0], 0xFFFF -> [255, 255, 255] (CONV-15).
+        assert_eq!(&dst[62..65], &[0xFF, 0x00, 0x00]);
+        assert_eq!(&dst[65..68], &[0xFF, 0xFF, 0xFF]);
+        assert_eq!(&dst[68..70], &[0, 0]);
 
         let yuv422 = [128u8; 8];
+        dst.fill(0xFF);
         let n_yuv = yuv422_to_bmp(&yuv422, &mut dst, 2, 2).expect("yuv422_to_bmp should succeed");
         assert_eq!(n_yuv, BMP_HEADER_LEN + 16);
         assert_eq!(&dst[54..60], &[130u8; 6]);
+        assert_eq!(&dst[60..62], &[0, 0]);
+        assert_eq!(&dst[68..70], &[0, 0]);
     }
 
     #[test]
     fn test_grayscale_to_bmp_palette() {
-        // 3x2 grayscale: row_bytes = 3, row_stride = 4, image_size = 8, palette = 1024
+        // 3x2 grayscale: row_bytes = 3, row_stride = 4, image_size = 8,
+        // palette = 1024.
         let gray = [10, 20, 30, 40, 50, 60];
-        let mut dst = [0u8; BMP_HEADER_LEN + BMP_GRAYSCALE_PALETTE_LEN + 8];
+        let mut dst = [0xFFu8; BMP_HEADER_LEN + BMP_GRAYSCALE_PALETTE_LEN + 8];
         let n = grayscale_to_bmp(&gray, &mut dst, 3, 2).expect("grayscale_to_bmp should succeed");
         assert_eq!(n, 54 + 1024 + 8);
         assert_eq!(
@@ -405,13 +409,13 @@ mod tests {
             54 + 1024
         );
         assert_eq!(u16::from_le_bytes([dst[28], dst[29]]), 8);
-        // SEC-061: clr_used is 256 (1024 / 4) for grayscale palette
+        // SEC-061: clr_used is 256 (1024 / 4) for grayscale palette.
         assert_eq!(
             u32::from_le_bytes([dst[46], dst[47], dst[48], dst[49]]),
             256
         );
 
-        // Verify 256-entry palette
+        // Verify 256-entry palette.
         for i in 0..256usize {
             let p = 54 + i * 4;
             assert_eq!(dst[p], i as u8);
@@ -423,6 +427,68 @@ mod tests {
         let pix_off = 54 + 1024;
         assert_eq!(&dst[pix_off..pix_off + 4], &[10, 20, 30, 0]);
         assert_eq!(&dst[pix_off + 4..pix_off + 8], &[40, 50, 60, 0]);
+    }
+
+    #[test]
+    fn test_odd_width_bmp_row_padding_all_alignments() {
+        // Verify grayscale, RGB888, and RGB565 row padding across odd and
+        // non-multiple-of-4 widths when dst starts filled with 0xEE sentinel.
+        for width in 1..=5u16 {
+            let height = 3u16;
+            let w = width as usize;
+            let h = height as usize;
+
+            // 8-bit grayscale: row_bytes = w, stride = (w + 3) & !3.
+            let gray_stride = (w + 3) & !3;
+            let mut gray_src = [0u8; 15];
+            for (idx, byte) in gray_src[..w * h].iter_mut().enumerate() {
+                *byte = (idx as u8) + 1;
+            }
+            let mut gray_dst = [0xEEu8; BMP_HEADER_LEN + BMP_GRAYSCALE_PALETTE_LEN + 64];
+            let expected_gray_len = BMP_HEADER_LEN + BMP_GRAYSCALE_PALETTE_LEN + gray_stride * h;
+            let written_gray = grayscale_to_bmp(&gray_src[..w * h], &mut gray_dst, width, height)
+                .expect("grayscale odd-width BMP should succeed");
+            assert_eq!(written_gray, expected_gray_len);
+            let pix_base = BMP_HEADER_LEN + BMP_GRAYSCALE_PALETTE_LEN;
+            for row in 0..h {
+                let row_slice = &gray_dst[pix_base + row * gray_stride..][..gray_stride];
+                assert_eq!(&row_slice[..w], &gray_src[row * w..(row + 1) * w]);
+                for &pad in &row_slice[w..] {
+                    assert_eq!(pad, 0, "grayscale pad not zeroed for width {width}");
+                }
+            }
+            assert!(gray_dst[expected_gray_len..].iter().all(|&b| b == 0xEE));
+
+            // 24-bit RGB888: row_bytes = w * 3, stride = (w * 3 + 3) & !3.
+            let rgb_row_bytes = w * 3;
+            let rgb_stride = (rgb_row_bytes + 3) & !3;
+            let rgb_src = [0x44u8; 45];
+            let mut rgb_dst = [0xEEu8; BMP_HEADER_LEN + 128];
+            let expected_rgb_len = BMP_HEADER_LEN + rgb_stride * h;
+            let written_rgb =
+                rgb888_to_bmp(&rgb_src[..rgb_row_bytes * h], &mut rgb_dst, width, height)
+                    .expect("rgb888 odd-width BMP should succeed");
+            assert_eq!(written_rgb, expected_rgb_len);
+            for row in 0..h {
+                let row_slice = &rgb_dst[BMP_HEADER_LEN + row * rgb_stride..][..rgb_stride];
+                assert!(row_slice[..rgb_row_bytes].iter().all(|&b| b == 0x44));
+                assert!(row_slice[rgb_row_bytes..].iter().all(|&b| b == 0));
+            }
+            assert!(rgb_dst[expected_rgb_len..].iter().all(|&b| b == 0xEE));
+
+            // 16-bit RGB565 -> 24-bit BMP: same output stride as RGB888.
+            let rgb565_src = [0x00u8; 30];
+            let mut rgb565_dst = [0xEEu8; BMP_HEADER_LEN + 128];
+            let written_565 =
+                rgb565_to_bmp(&rgb565_src[..w * 2 * h], &mut rgb565_dst, width, height)
+                    .expect("rgb565 odd-width BMP should succeed");
+            assert_eq!(written_565, expected_rgb_len);
+            for row in 0..h {
+                let row_slice = &rgb565_dst[BMP_HEADER_LEN + row * rgb_stride..][..rgb_stride];
+                assert!(row_slice.iter().all(|&b| b == 0));
+            }
+            assert!(rgb565_dst[expected_rgb_len..].iter().all(|&b| b == 0xEE));
+        }
     }
 
     #[test]
@@ -452,7 +518,7 @@ mod tests {
 
     #[test]
     fn test_yuv422_to_bmp_odd_width_rejection() {
-        // CONV-005: Reject odd width in yuv422_to_bmp
+        // CONV-005: Reject odd width in yuv422_to_bmp.
         let mut dst = [0u8; 128];
         assert_eq!(
             yuv422_to_bmp(&[128u8; 12], &mut dst, 3, 2),
@@ -461,28 +527,69 @@ mod tests {
     }
 
     #[test]
-    fn test_frame_to_bmp_jpeg_dimension_mismatch() {
-        // CONV-006: In frame_to_bmp(..., PixelFormat::Jpeg), verify caller width/height
-        let rgb_in = [100u8; 8 * 8 * 3];
+    fn test_frame_to_bmp_jpeg_dimension_mismatch_leaves_dst_untouched() {
+        // CONV-18: Verify single-pass SOF check rejects mismatches before
+        // touching dst, and odd-width JPEG -> BMP zero-pads scanlines.
+        let rgb_in = [100u8; 5 * 3 * 3];
         let mut jpeg_buf = [0u8; 2048];
-        let jpeg_len = crate::jpeg_codec::encode_rgb888_to_jpeg(&rgb_in, &mut jpeg_buf, 8, 8, 90)
+        let jpeg_len = jpeg_codec::encode_rgb888_to_jpeg(&rgb_in, &mut jpeg_buf, 5, 3, 90)
             .expect("encode should succeed");
         let jpeg_slice = &jpeg_buf[..jpeg_len];
 
-        let mut bmp_buf = [0u8; BMP_HEADER_LEN + 16 * 16 * 3];
-        // Mismatched width (16 instead of 8)
+        let mut bmp_buf = [0xA5u8; BMP_HEADER_LEN + 16 * 16 * 3];
+        // Mismatched width (16 instead of 5) leaves dst completely untouched.
         assert_eq!(
-            frame_to_bmp(jpeg_slice, &mut bmp_buf, 16, 8, PixelFormat::Jpeg),
+            frame_to_bmp(jpeg_slice, &mut bmp_buf, 16, 3, PixelFormat::Jpeg),
             Err(CameraError::InvalidArg)
         );
-        // Mismatched height (16 instead of 8)
+        assert!(bmp_buf.iter().all(|&b| b == 0xA5));
+
+        // Mismatched height (16 instead of 3) leaves dst completely untouched.
         assert_eq!(
-            frame_to_bmp(jpeg_slice, &mut bmp_buf, 8, 16, PixelFormat::Jpeg),
+            frame_to_bmp(jpeg_slice, &mut bmp_buf, 5, 16, PixelFormat::Jpeg),
             Err(CameraError::InvalidArg)
         );
-        // Matching dimensions succeed
-        assert!(frame_to_bmp(jpeg_slice, &mut bmp_buf, 8, 8, PixelFormat::Jpeg).is_ok());
-        // Unspecified dimensions (0, 0) succeed
-        assert!(frame_to_bmp(jpeg_slice, &mut bmp_buf, 0, 0, PixelFormat::Jpeg).is_ok());
+        assert!(bmp_buf.iter().all(|&b| b == 0xA5));
+
+        // Corrupt JPEG with expected dimensions leaves dst untouched.
+        assert_eq!(
+            frame_to_bmp(
+                &[0xFF, 0xD8, 0xFF, 0xD9],
+                &mut bmp_buf,
+                5,
+                3,
+                PixelFormat::Jpeg
+            ),
+            Err(CameraError::CorruptedFrame)
+        );
+        assert!(bmp_buf.iter().all(|&b| b == 0xA5));
+
+        // Matching odd dimensions (5x3 -> row_bytes = 15, stride = 16) succeed
+        // and zero-fill the 1-byte padding on each row.
+        let written = frame_to_bmp(jpeg_slice, &mut bmp_buf, 5, 3, PixelFormat::Jpeg)
+            .expect("matching odd-width JPEG should decode to BMP");
+        assert_eq!(written, BMP_HEADER_LEN + 16 * 3);
+        for row in 0..3usize {
+            assert_eq!(bmp_buf[BMP_HEADER_LEN + row * 16 + 15], 0);
+        }
+
+        // Unspecified dimensions (0, 0) take the direct single-pass decode path.
+        bmp_buf.fill(0xA5);
+        let written_auto = frame_to_bmp(jpeg_slice, &mut bmp_buf, 0, 0, PixelFormat::Jpeg)
+            .expect("auto-dimension JPEG should decode to BMP");
+        assert_eq!(written_auto, BMP_HEADER_LEN + 16 * 3);
+        for row in 0..3usize {
+            assert_eq!(bmp_buf[BMP_HEADER_LEN + row * 16 + 15], 0);
+        }
+
+        // Non-JPEG formats via frame_to_bmp also succeed.
+        let gray_src = [77u8; 5 * 3];
+        let mut gray_bmp = [0xA5u8; BMP_HEADER_LEN + BMP_GRAYSCALE_PALETTE_LEN + 8 * 3];
+        let gray_written = frame_to_bmp(&gray_src, &mut gray_bmp, 5, 3, PixelFormat::Grayscale)
+            .expect("frame_to_bmp grayscale should succeed");
+        assert_eq!(
+            gray_written,
+            BMP_HEADER_LEN + BMP_GRAYSCALE_PALETTE_LEN + 8 * 3
+        );
     }
 }

@@ -100,8 +100,42 @@ pub struct CameraStatus {
     pub colorbar: u8,
 }
 
+/// Clamps a signed image adjustment level (`brightness`, `contrast`,
+/// `saturation`, `sharpness`, `ae_level`) into `[-2, 2]`.
+#[must_use]
+#[inline]
+pub const fn clamp_level(level: i8) -> i8 {
+    if level < CameraStatus::LEVEL_MIN {
+        CameraStatus::LEVEL_MIN
+    } else if level > CameraStatus::LEVEL_MAX {
+        CameraStatus::LEVEL_MAX
+    } else {
+        level
+    }
+}
+
 impl CameraStatus {
+    /// Minimum permissible signed level (`brightness`, `contrast`, etc.).
+    pub const LEVEL_MIN: i8 = -2;
+    /// Maximum permissible signed level (`brightness`, `contrast`, etc.).
+    pub const LEVEL_MAX: i8 = 2;
+    /// Maximum permissible JPEG quality factor (`0..=63`).
+    pub const MAX_QUALITY: u8 = 63;
+    /// Maximum permissible denoise level (`0..=8`).
+    pub const MAX_DENOISE: u8 = 8;
+    /// Maximum permissible special effect index (`0..=6`).
+    pub const MAX_SPECIAL_EFFECT: u8 = 6;
+    /// Maximum permissible white-balance preset (`0..=4`).
+    pub const MAX_WB_MODE: u8 = 4;
+    /// Maximum permissible manual AGC gain (`0..=30`).
+    pub const MAX_AGC_GAIN: u8 = 30;
+    /// Maximum permissible manual AEC exposure value (`0..=1200`).
+    pub const MAX_AEC_VALUE: u16 = 1200;
+    /// Maximum permissible AGC gain ceiling index (`0..=6`).
+    pub const MAX_GAINCEILING: u8 = 6;
+
     /// Creates a new [`CameraStatus`] with default settings.
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             framesize: FrameSize::Qvga,
@@ -135,37 +169,158 @@ impl CameraStatus {
         }
     }
 
+    /// Clamps a signed adjustment level into
+    /// [`Self::LEVEL_MIN`]..=[`Self::LEVEL_MAX`].
+    #[must_use]
+    #[inline]
+    pub const fn clamp_level(level: i8) -> i8 {
+        clamp_level(level)
+    }
+
+    /// Returns `true` when `level` is within `-2..=2`.
+    #[must_use]
+    #[inline]
+    pub const fn is_valid_level(level: i8) -> bool {
+        level >= Self::LEVEL_MIN && level <= Self::LEVEL_MAX
+    }
+
+    /// Returns `true` when a C-style boolean control byte is `0` or `1`.
+    #[must_use]
+    #[inline]
+    pub const fn is_valid_flag(flag: u8) -> bool {
+        flag <= 1
+    }
+
+    /// Normalizes a C-style boolean control byte into `0` or `1`.
+    #[must_use]
+    #[inline]
+    pub const fn clamp_flag(flag: u8) -> u8 {
+        if flag == 0 {
+            0
+        } else {
+            1
+        }
+    }
+
+    /// Decodes a validated C-style boolean control byte (`0` or `1`) to `bool`.
+    #[must_use]
+    #[inline]
+    pub const fn decode_flag(flag: u8) -> Option<bool> {
+        match flag {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+
+    /// Clamps manual AGC gain into `0..=30`.
+    #[must_use]
+    #[inline]
+    pub const fn clamp_agc_gain(gain: u8) -> u8 {
+        if gain > Self::MAX_AGC_GAIN {
+            Self::MAX_AGC_GAIN
+        } else {
+            gain
+        }
+    }
+
+    /// Clamps manual AEC exposure value into `0..=1200`.
+    #[must_use]
+    #[inline]
+    pub const fn clamp_aec_value(val: u16) -> u16 {
+        if val > Self::MAX_AEC_VALUE {
+            Self::MAX_AEC_VALUE
+        } else {
+            val
+        }
+    }
+
+    /// Returns a copy with all numeric ranges and `0/1` boolean flags clamped
+    /// to valid hardware bounds.
+    #[must_use]
+    pub const fn clamped(self) -> Self {
+        Self {
+            framesize: self.framesize,
+            scale: self.scale,
+            binning: self.binning,
+            quality: if self.quality > Self::MAX_QUALITY {
+                Self::MAX_QUALITY
+            } else {
+                self.quality
+            },
+            brightness: clamp_level(self.brightness),
+            contrast: clamp_level(self.contrast),
+            saturation: clamp_level(self.saturation),
+            sharpness: clamp_level(self.sharpness),
+            denoise: if self.denoise > Self::MAX_DENOISE {
+                Self::MAX_DENOISE
+            } else {
+                self.denoise
+            },
+            special_effect: if self.special_effect > Self::MAX_SPECIAL_EFFECT {
+                Self::MAX_SPECIAL_EFFECT
+            } else {
+                self.special_effect
+            },
+            wb_mode: if self.wb_mode > Self::MAX_WB_MODE {
+                Self::MAX_WB_MODE
+            } else {
+                self.wb_mode
+            },
+            awb: Self::clamp_flag(self.awb),
+            awb_gain: Self::clamp_flag(self.awb_gain),
+            aec: Self::clamp_flag(self.aec),
+            aec2: Self::clamp_flag(self.aec2),
+            ae_level: clamp_level(self.ae_level),
+            aec_value: Self::clamp_aec_value(self.aec_value),
+            agc: Self::clamp_flag(self.agc),
+            agc_gain: Self::clamp_agc_gain(self.agc_gain),
+            gainceiling: if self.gainceiling > Self::MAX_GAINCEILING {
+                Self::MAX_GAINCEILING
+            } else {
+                self.gainceiling
+            },
+            bpc: Self::clamp_flag(self.bpc),
+            wpc: Self::clamp_flag(self.wpc),
+            raw_gma: Self::clamp_flag(self.raw_gma),
+            lenc: Self::clamp_flag(self.lenc),
+            hmirror: Self::clamp_flag(self.hmirror),
+            vflip: Self::clamp_flag(self.vflip),
+            dcw: Self::clamp_flag(self.dcw),
+            colorbar: Self::clamp_flag(self.colorbar),
+        }
+    }
+
     /// Validates that all fields are within their permissible hardware ranges.
+    #[must_use]
     #[inline]
     pub const fn is_valid(&self) -> bool {
-        self.quality <= 63
-            && self.brightness >= -2
-            && self.brightness <= 2
-            && self.contrast >= -2
-            && self.contrast <= 2
-            && self.saturation >= -2
-            && self.saturation <= 2
-            && self.sharpness >= -2
-            && self.sharpness <= 2
-            && self.ae_level >= -2
-            && self.ae_level <= 2
-            && self.denoise <= 8
-            && self.special_effect <= 6
-            && self.wb_mode <= 4
-            && self.awb <= 1
-            && self.awb_gain <= 1
-            && self.aec <= 1
-            && self.aec2 <= 1
-            && self.agc <= 1
-            && self.gainceiling <= 6
-            && self.bpc <= 1
-            && self.wpc <= 1
-            && self.raw_gma <= 1
-            && self.lenc <= 1
-            && self.hmirror <= 1
-            && self.vflip <= 1
-            && self.dcw <= 1
-            && self.colorbar <= 1
+        (self.framesize as usize) < FrameSize::COUNT
+            && self.quality <= Self::MAX_QUALITY
+            && Self::is_valid_level(self.brightness)
+            && Self::is_valid_level(self.contrast)
+            && Self::is_valid_level(self.saturation)
+            && Self::is_valid_level(self.sharpness)
+            && Self::is_valid_level(self.ae_level)
+            && self.denoise <= Self::MAX_DENOISE
+            && self.special_effect <= Self::MAX_SPECIAL_EFFECT
+            && self.wb_mode <= Self::MAX_WB_MODE
+            && self.aec_value <= Self::MAX_AEC_VALUE
+            && self.agc_gain <= Self::MAX_AGC_GAIN
+            && self.gainceiling <= Self::MAX_GAINCEILING
+            && Self::is_valid_flag(self.awb)
+            && Self::is_valid_flag(self.awb_gain)
+            && Self::is_valid_flag(self.aec)
+            && Self::is_valid_flag(self.aec2)
+            && Self::is_valid_flag(self.agc)
+            && Self::is_valid_flag(self.bpc)
+            && Self::is_valid_flag(self.wpc)
+            && Self::is_valid_flag(self.raw_gma)
+            && Self::is_valid_flag(self.lenc)
+            && Self::is_valid_flag(self.hmirror)
+            && Self::is_valid_flag(self.vflip)
+            && Self::is_valid_flag(self.dcw)
+            && Self::is_valid_flag(self.colorbar)
     }
 }
 
@@ -297,5 +452,106 @@ mod tests {
         let mut invalid_gainceiling = status;
         invalid_gainceiling.gainceiling = 7;
         assert!(!invalid_gainceiling.is_valid());
+
+        let mut valid_agc_max = status;
+        valid_agc_max.agc_gain = 30;
+        assert!(valid_agc_max.is_valid());
+
+        let mut invalid_agc_gain = status;
+        invalid_agc_gain.agc_gain = 31;
+        assert!(!invalid_agc_gain.is_valid());
+
+        let mut valid_aec_max = status;
+        valid_aec_max.aec_value = 1200;
+        assert!(valid_aec_max.is_valid());
+
+        let mut invalid_aec_value = status;
+        invalid_aec_value.aec_value = 1201;
+        assert!(!invalid_aec_value.is_valid());
+
+        let mut invalid_colorbar = status;
+        invalid_colorbar.colorbar = 2;
+        assert!(!invalid_colorbar.is_valid());
+    }
+
+    #[test]
+    fn test_clamp_level_and_status_clamping() {
+        assert_eq!(clamp_level(-128), -2);
+        assert_eq!(clamp_level(-3), -2);
+        assert_eq!(clamp_level(-2), -2);
+        assert_eq!(clamp_level(0), 0);
+        assert_eq!(clamp_level(2), 2);
+        assert_eq!(clamp_level(3), 2);
+        assert_eq!(clamp_level(127), 2);
+        assert_eq!(CameraStatus::clamp_level(-10), -2);
+        assert_eq!(CameraStatus::clamp_level(10), 2);
+
+        const CONST_CLAMPED: i8 = clamp_level(99);
+        assert_eq!(CONST_CLAMPED, 2);
+
+        assert_eq!(CameraStatus::clamp_agc_gain(0), 0);
+        assert_eq!(CameraStatus::clamp_agc_gain(30), 30);
+        assert_eq!(CameraStatus::clamp_agc_gain(31), 30);
+        assert_eq!(CameraStatus::clamp_agc_gain(255), 30);
+
+        assert_eq!(CameraStatus::clamp_aec_value(0), 0);
+        assert_eq!(CameraStatus::clamp_aec_value(1200), 1200);
+        assert_eq!(CameraStatus::clamp_aec_value(1201), 1200);
+        assert_eq!(CameraStatus::clamp_aec_value(u16::MAX), 1200);
+
+        assert_eq!(CameraStatus::decode_flag(0), Some(false));
+        assert_eq!(CameraStatus::decode_flag(1), Some(true));
+        assert_eq!(CameraStatus::decode_flag(2), None);
+
+        let out_of_bounds = CameraStatus {
+            framesize: FrameSize::Hd,
+            scale: true,
+            binning: false,
+            quality: 200,
+            brightness: -50,
+            contrast: 50,
+            saturation: -9,
+            sharpness: 9,
+            denoise: 20,
+            special_effect: 99,
+            wb_mode: 12,
+            awb: 5,
+            awb_gain: 2,
+            aec: 9,
+            aec2: 3,
+            ae_level: -10,
+            aec_value: 5000,
+            agc: 4,
+            agc_gain: 99,
+            gainceiling: 20,
+            bpc: 2,
+            wpc: 3,
+            raw_gma: 4,
+            lenc: 5,
+            hmirror: 6,
+            vflip: 7,
+            dcw: 8,
+            colorbar: 9,
+        };
+        assert!(!out_of_bounds.is_valid());
+
+        let sanitized = out_of_bounds.clamped();
+        assert!(sanitized.is_valid());
+        assert_eq!(sanitized.quality, 63);
+        assert_eq!(sanitized.brightness, -2);
+        assert_eq!(sanitized.contrast, 2);
+        assert_eq!(sanitized.saturation, -2);
+        assert_eq!(sanitized.sharpness, 2);
+        assert_eq!(sanitized.ae_level, -2);
+        assert_eq!(sanitized.denoise, 8);
+        assert_eq!(sanitized.special_effect, 6);
+        assert_eq!(sanitized.wb_mode, 4);
+        assert_eq!(sanitized.aec_value, 1200);
+        assert_eq!(sanitized.agc_gain, 30);
+        assert_eq!(sanitized.gainceiling, 6);
+        assert_eq!(sanitized.awb, 1);
+        assert_eq!(sanitized.hmirror, 1);
+        assert_eq!(sanitized.vflip, 1);
+        assert_eq!(sanitized.colorbar, 1);
     }
 }

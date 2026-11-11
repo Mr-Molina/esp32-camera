@@ -5,8 +5,19 @@
 
 use esp32_cam_types::CameraError;
 
+/// Luma and chroma excursion range for ITU-R BT.601 YUV conversions.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum YuvRange {
+    /// Full-range JFIF YCbCr (`Y` in `0..=255`, `U`/`V` in `0..=255`).
+    Full,
+    /// Studio-range ITU-R BT.601 (`Y` in `16..=235`, `U`/`V` in `16..=240`).
+    #[default]
+    Bt601Limited,
+}
+
 #[derive(Clone, Copy)]
-#[repr(C, align(16))]
+#[repr(C)]
 struct YuvTableRow {
     v_y: i16,
     v_vr: i16,
@@ -15,7 +26,10 @@ struct YuvTableRow {
     v_ub: i16,
 }
 
-/// Exact 256-entry lookup table from `conversions/yuv.c:25-283`.
+const _: () = assert!(core::mem::size_of::<YuvTableRow>() == 10);
+const _: () = assert!(core::mem::size_of::<[YuvTableRow; 256]>() == 2560);
+
+/// Exact 256-entry studio-range lookup table from `conversions/yuv.c:25-283`.
 static YUV_TABLE: [YuvTableRow; 256] = [
     YuvTableRow {
         v_y: -18,
@@ -1812,43 +1826,104 @@ static YUV_TABLE: [YuvTableRow; 256] = [
 ];
 
 /// Converts a single YUV pixel `(y, u, v)` to RGB `(r, g, b)` using the exact
-/// integer ITU-R BT.601 lookup table and clamping from `conversions/yuv.c`.
+/// studio-range (`YuvRange::Bt601Limited`) table from `conversions/yuv.c`.
+#[must_use]
 #[inline]
 pub fn yuv2rgb(y: u8, u: u8, v: u8) -> (u8, u8, u8) {
-    let y_row = YUV_TABLE[y as usize];
-    let u_row = YUV_TABLE[u as usize];
-    let v_row = YUV_TABLE[v as usize];
+    yuv2rgb_with_range(y, u, v, YuvRange::Bt601Limited)
+}
 
-    let ri = y_row.v_y + v_row.v_vr;
-    let gi = y_row.v_y + u_row.v_vg + v_row.v_ug;
-    let bi = y_row.v_y + u_row.v_ub;
+/// Converts a single YUV pixel `(y, u, v)` to RGB `(r, g, b)` using the
+/// specified [`YuvRange`].
+#[must_use]
+#[inline]
+pub fn yuv2rgb_with_range(y: u8, u: u8, v: u8, range: YuvRange) -> (u8, u8, u8) {
+    match range {
+        YuvRange::Bt601Limited => {
+            let y_row = YUV_TABLE[y as usize];
+            let u_row = YUV_TABLE[u as usize];
+            let v_row = YUV_TABLE[v as usize];
 
-    (
-        ri.clamp(0, 255) as u8,
-        gi.clamp(0, 255) as u8,
-        bi.clamp(0, 255) as u8,
-    )
+            let ri = y_row.v_y + v_row.v_vr;
+            let gi = y_row.v_y + u_row.v_vg + v_row.v_ug;
+            let bi = y_row.v_y + u_row.v_ub;
+
+            (
+                ri.clamp(0, 255) as u8,
+                gi.clamp(0, 255) as u8,
+                bi.clamp(0, 255) as u8,
+            )
+        }
+        YuvRange::Full => {
+            let yi = i32::from(y);
+            let cb = i32::from(u) - 128;
+            let cr = i32::from(v) - 128;
+
+            let r = clamp_u8(yi + ((91881 * cr + 32768) >> 16));
+            let g = clamp_u8(yi - ((22554 * cb + 46802 * cr + 32768) >> 16));
+            let b = clamp_u8(yi + ((116130 * cb + 32768) >> 16));
+            (r, g, b)
+        }
+    }
 }
 
 /// Converts a macropixel pair `(y0, u, y1, v)` to two RGB `(r, g, b)` pixels
-/// sharing chroma `u` and `v`, fetching table rows for `u` and `v` only once.
+/// using [`YuvRange::Bt601Limited`], fetching table rows for `u`/`v` once.
+#[must_use]
 #[inline]
 pub fn yuv422_pair_to_rgb(y0: u8, u: u8, y1: u8, v: u8) -> ((u8, u8, u8), (u8, u8, u8)) {
-    let u_row = YUV_TABLE[u as usize];
-    let v_row = YUV_TABLE[v as usize];
-    let uv_g = u_row.v_vg + v_row.v_ug;
+    yuv422_pair_to_rgb_with_range(y0, u, y1, v, YuvRange::Bt601Limited)
+}
 
-    let y0_row = YUV_TABLE[y0 as usize];
-    let r0 = (y0_row.v_y + v_row.v_vr).clamp(0, 255) as u8;
-    let g0 = (y0_row.v_y + uv_g).clamp(0, 255) as u8;
-    let b0 = (y0_row.v_y + u_row.v_ub).clamp(0, 255) as u8;
+/// Converts a macropixel pair `(y0, u, y1, v)` to two RGB `(r, g, b)` pixels
+/// sharing chroma `u` and `v` under the specified [`YuvRange`].
+#[must_use]
+#[inline]
+pub fn yuv422_pair_to_rgb_with_range(
+    y0: u8,
+    u: u8,
+    y1: u8,
+    v: u8,
+    range: YuvRange,
+) -> ((u8, u8, u8), (u8, u8, u8)) {
+    match range {
+        YuvRange::Bt601Limited => {
+            let u_row = YUV_TABLE[u as usize];
+            let v_row = YUV_TABLE[v as usize];
+            let uv_g = u_row.v_vg + v_row.v_ug;
 
-    let y1_row = YUV_TABLE[y1 as usize];
-    let r1 = (y1_row.v_y + v_row.v_vr).clamp(0, 255) as u8;
-    let g1 = (y1_row.v_y + uv_g).clamp(0, 255) as u8;
-    let b1 = (y1_row.v_y + u_row.v_ub).clamp(0, 255) as u8;
+            let y0_row = YUV_TABLE[y0 as usize];
+            let r0 = (y0_row.v_y + v_row.v_vr).clamp(0, 255) as u8;
+            let g0 = (y0_row.v_y + uv_g).clamp(0, 255) as u8;
+            let b0 = (y0_row.v_y + u_row.v_ub).clamp(0, 255) as u8;
 
-    ((r0, g0, b0), (r1, g1, b1))
+            let y1_row = YUV_TABLE[y1 as usize];
+            let r1 = (y1_row.v_y + v_row.v_vr).clamp(0, 255) as u8;
+            let g1 = (y1_row.v_y + uv_g).clamp(0, 255) as u8;
+            let b1 = (y1_row.v_y + u_row.v_ub).clamp(0, 255) as u8;
+
+            ((r0, g0, b0), (r1, g1, b1))
+        }
+        YuvRange::Full => {
+            let cb = i32::from(u) - 128;
+            let cr = i32::from(v) - 128;
+            let r_off = (91881 * cr + 32768) >> 16;
+            let g_off = (22554 * cb + 46802 * cr + 32768) >> 16;
+            let b_off = (116130 * cb + 32768) >> 16;
+
+            let yi0 = i32::from(y0);
+            let r0 = clamp_u8(yi0 + r_off);
+            let g0 = clamp_u8(yi0 - g_off);
+            let b0 = clamp_u8(yi0 + b_off);
+
+            let yi1 = i32::from(y1);
+            let r1 = clamp_u8(yi1 + r_off);
+            let g1 = clamp_u8(yi1 - g_off);
+            let b1 = clamp_u8(yi1 + b_off);
+
+            ((r0, g0, b0), (r1, g1, b1))
+        }
+    }
 }
 
 #[inline]
@@ -1862,32 +1937,43 @@ const fn clamp_u8(v: i32) -> u8 {
     }
 }
 
-/// Converts a single RGB888 pixel `(r, g, b)` to ITU-R BT.601 `(y, u, v)`.
+/// Converts a single RGB888 pixel `(r, g, b)` to ITU-R BT.601 `(y, u, v)`
+/// using the specified [`YuvRange`].
+#[must_use]
 #[inline]
-pub(crate) const fn rgb2yuv(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
+pub const fn rgb2yuv_with_range(r: u8, g: u8, b: u8, range: YuvRange) -> (u8, u8, u8) {
     let r = r as i32;
     let g = g as i32;
     let b = b as i32;
 
-    let y = clamp_u8((19595 * r + 38470 * g + 7471 * b + 32768) >> 16);
-    let u = clamp_u8(128 + ((-11059 * r - 21709 * g + 32768 * b + 32768) >> 16));
-    let v = clamp_u8(128 + ((32768 * r - 27439 * g - 5329 * b + 32768) >> 16));
-    (y, u, v)
+    match range {
+        YuvRange::Full => {
+            let y = clamp_u8((19595 * r + 38470 * g + 7471 * b + 32768) >> 16);
+            let u = clamp_u8(128 + ((-11059 * r - 21709 * g + 32768 * b + 32768) >> 16));
+            let v = clamp_u8(128 + ((32768 * r - 27439 * g - 5329 * b + 32768) >> 16));
+            (y, u, v)
+        }
+        YuvRange::Bt601Limited => {
+            let y = clamp_u8(16 + ((16829 * r + 33039 * g + 6416 * b + 32768) >> 16));
+            let u = clamp_u8(128 + ((-9714 * r - 19070 * g + 28784 * b + 32768) >> 16));
+            let v = clamp_u8(128 + ((28784 * r - 24103 * g - 4681 * b + 32768) >> 16));
+            (y, u, v)
+        }
+    }
 }
 
+/// Converts a single RGB888 pixel `(r, g, b)` to full-range JFIF `(y, cb, cr)`.
 #[inline]
-const fn unpack_rgb565_be(hb: u8, lb: u8) -> (u8, u8, u8) {
-    let r = hb & 0xF8;
-    let g = ((hb & 0x07) << 5) | ((lb & 0xE0) >> 3);
-    let b = (lb & 0x1F) << 3;
-    (r, g, b)
+pub(crate) const fn rgb2yuv(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
+    rgb2yuv_with_range(r, g, b, YuvRange::Full)
 }
 
 /// Unpacks a big-endian RGB565 pixel (`[b0, b1]`) into full-range 8-bit RGB888
-/// `(r, g, b)` using bit-replication (`LOGIC-063`).
+/// `(r, g, b)` using bit-replication (`LOGIC-063`, `CONV-15`).
 ///
 /// Maps 5-bit channels `[0..31]` to `[0..255]` via `(v << 3) | (v >> 2)` and
 /// 6-bit green `[0..63]` to `[0..255]` via `(v << 2) | (v >> 4)`.
+#[must_use]
 #[inline]
 pub const fn unpack_rgb565_be_full(b0: u8, b1: u8) -> (u8, u8, u8) {
     let r5 = b0 >> 3;
@@ -1903,9 +1989,17 @@ pub const fn unpack_rgb565_be_full(b0: u8, b1: u8) -> (u8, u8, u8) {
 }
 
 #[inline]
+const fn div255_u16(n: u16) -> u8 {
+    ((n + 1 + (n >> 8)) >> 8) as u8
+}
+
+#[inline]
 const fn pack_rgb565_raw(r: u8, g: u8, b: u8) -> (u8, u8) {
-    let hb = (r & 0xF8) | (g >> 5);
-    let lb = ((g & 0x1C) << 3) | (b >> 3);
+    let r5 = div255_u16(r as u16 * 31 + 127);
+    let g6 = div255_u16(g as u16 * 63 + 127);
+    let b5 = div255_u16(b as u16 * 31 + 127);
+    let hb = (r5 << 3) | (g6 >> 3);
+    let lb = ((g6 & 0x07) << 5) | b5;
     (hb, lb)
 }
 
@@ -1947,21 +2041,18 @@ pub fn yuv422_to_grayscale(
         return Err(CameraError::BufferTooSmall);
     }
 
-    for (chunk, out) in src[..src_len]
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .zip(dst[..dst_len].as_chunks_mut::<2>().0)
-    {
-        out[0] = chunk[0];
-        out[1] = chunk[2];
+    let src_chunks = src[..src_len].as_chunks::<4>().0;
+    let dst_chunks = dst[..dst_len].as_chunks_mut::<2>().0;
+
+    for (chunk, out) in src_chunks.iter().zip(dst_chunks.iter_mut()) {
+        *out = [chunk[0], chunk[2]];
     }
 
     Ok(dst_len)
 }
 
-/// Converts a big-endian RGB565 buffer into packed YUV422
-/// (YUYV: `[Y0, U, Y1, V]`).
+/// Converts a big-endian RGB565 buffer into packed studio-range YUV422
+/// (YUYV: `[Y0, U, Y1, V]`) using [`YuvRange::Bt601Limited`].
 ///
 /// Returns the number of bytes written to `dst` (`width * height * 2`).
 pub fn rgb565_to_yuv422(
@@ -1969,6 +2060,20 @@ pub fn rgb565_to_yuv422(
     dst: &mut [u8],
     width: u16,
     height: u16,
+) -> Result<usize, CameraError> {
+    rgb565_to_yuv422_with_range(src, dst, width, height, YuvRange::Bt601Limited)
+}
+
+/// Converts a big-endian RGB565 buffer into packed YUV422
+/// (YUYV: `[Y0, U, Y1, V]`) using the specified [`YuvRange`].
+///
+/// Returns the number of bytes written to `dst` (`width * height * 2`).
+pub fn rgb565_to_yuv422_with_range(
+    src: &[u8],
+    dst: &mut [u8],
+    width: u16,
+    height: u16,
+    range: YuvRange,
 ) -> Result<usize, CameraError> {
     let pixels = checked_pixel_count(width, height, 2)?;
     if (width & 1) != 0 {
@@ -1982,28 +2087,29 @@ pub fn rgb565_to_yuv422(
         return Err(CameraError::BufferTooSmall);
     }
 
-    for (chunk, out) in src[..byte_len]
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .zip(dst[..byte_len].as_chunks_mut::<4>().0)
-    {
-        let (r0, g0, b0) = unpack_rgb565_be(chunk[0], chunk[1]);
-        let (r1, g1, b1) = unpack_rgb565_be(chunk[2], chunk[3]);
+    let src_chunks = src[..byte_len].as_chunks::<4>().0;
+    let dst_chunks = dst[..byte_len].as_chunks_mut::<4>().0;
 
-        let (y0, u0, v0) = rgb2yuv(r0, g0, b0);
-        let (y1, u1, v1) = rgb2yuv(r1, g1, b1);
+    for (chunk, out) in src_chunks.iter().zip(dst_chunks.iter_mut()) {
+        let (r0, g0, b0) = unpack_rgb565_be_full(chunk[0], chunk[1]);
+        let (r1, g1, b1) = unpack_rgb565_be_full(chunk[2], chunk[3]);
 
-        out[0] = y0;
-        out[1] = ((u0 as u16 + u1 as u16) / 2) as u8;
-        out[2] = y1;
-        out[3] = ((v0 as u16 + v1 as u16) / 2) as u8;
+        let (y0, u0, v0) = rgb2yuv_with_range(r0, g0, b0, range);
+        let (y1, u1, v1) = rgb2yuv_with_range(r1, g1, b1, range);
+
+        *out = [
+            y0,
+            ((u16::from(u0) + u16::from(u1)) / 2) as u8,
+            y1,
+            ((u16::from(v0) + u16::from(v1)) / 2) as u8,
+        ];
     }
 
     Ok(byte_len)
 }
 
-/// Converts a packed YUV422 (YUYV: `[Y0, U, Y1, V]`) buffer into RGB565.
+/// Converts a packed YUV422 (YUYV: `[Y0, U, Y1, V]`) buffer into RGB565 using
+/// [`YuvRange::Bt601Limited`].
 ///
 /// When `byte_swap` is `false`, writes big-endian RGB565 (`[hb, lb]`);
 /// when `true`, swaps the byte order (`[lb, hb]`).
@@ -2014,6 +2120,23 @@ pub fn yuv422_to_rgb565(
     width: u16,
     height: u16,
     byte_swap: bool,
+) -> Result<usize, CameraError> {
+    yuv422_to_rgb565_with_range(src, dst, width, height, byte_swap, YuvRange::Bt601Limited)
+}
+
+/// Converts a packed YUV422 (YUYV: `[Y0, U, Y1, V]`) buffer into RGB565 using
+/// the specified [`YuvRange`].
+///
+/// When `byte_swap` is `false`, writes big-endian RGB565 (`[hb, lb]`);
+/// when `true`, swaps the byte order (`[lb, hb]`).
+/// Returns the number of bytes written to `dst` (`width * height * 2`).
+pub fn yuv422_to_rgb565_with_range(
+    src: &[u8],
+    dst: &mut [u8],
+    width: u16,
+    height: u16,
+    byte_swap: bool,
+    range: YuvRange,
 ) -> Result<usize, CameraError> {
     let pixels = checked_pixel_count(width, height, 2)?;
     if (width & 1) != 0 {
@@ -2033,24 +2156,18 @@ pub fn yuv422_to_rgb565(
     if byte_swap {
         for (chunk, out) in src_chunks.iter().zip(dst_chunks.iter_mut()) {
             let ((r0, g0, b0), (r1, g1, b1)) =
-                yuv422_pair_to_rgb(chunk[0], chunk[1], chunk[2], chunk[3]);
+                yuv422_pair_to_rgb_with_range(chunk[0], chunk[1], chunk[2], chunk[3], range);
             let (hb0, lb0) = pack_rgb565_raw(r0, g0, b0);
             let (hb1, lb1) = pack_rgb565_raw(r1, g1, b1);
-            out[0] = lb0;
-            out[1] = hb0;
-            out[2] = lb1;
-            out[3] = hb1;
+            *out = [lb0, hb0, lb1, hb1];
         }
     } else {
         for (chunk, out) in src_chunks.iter().zip(dst_chunks.iter_mut()) {
             let ((r0, g0, b0), (r1, g1, b1)) =
-                yuv422_pair_to_rgb(chunk[0], chunk[1], chunk[2], chunk[3]);
+                yuv422_pair_to_rgb_with_range(chunk[0], chunk[1], chunk[2], chunk[3], range);
             let (hb0, lb0) = pack_rgb565_raw(r0, g0, b0);
             let (hb1, lb1) = pack_rgb565_raw(r1, g1, b1);
-            out[0] = hb0;
-            out[1] = lb0;
-            out[2] = hb1;
-            out[3] = lb1;
+            *out = [hb0, lb0, hb1, lb1];
         }
     }
 
@@ -2058,7 +2175,7 @@ pub fn yuv422_to_rgb565(
 }
 
 /// Converts a packed YUV422 (YUYV: `[Y0, U, Y1, V]`) buffer into 24-bit
-/// RGB888 (`[R, G, B]`).
+/// RGB888 (`[R, G, B]`) using [`YuvRange::Bt601Limited`].
 ///
 /// Returns the number of bytes written to `dst` (`width * height * 3`).
 pub fn yuv422_to_rgb888(
@@ -2066,6 +2183,20 @@ pub fn yuv422_to_rgb888(
     dst: &mut [u8],
     width: u16,
     height: u16,
+) -> Result<usize, CameraError> {
+    yuv422_to_rgb888_with_range(src, dst, width, height, YuvRange::Bt601Limited)
+}
+
+/// Converts a packed YUV422 (YUYV: `[Y0, U, Y1, V]`) buffer into 24-bit
+/// RGB888 (`[R, G, B]`) using the specified [`YuvRange`].
+///
+/// Returns the number of bytes written to `dst` (`width * height * 3`).
+pub fn yuv422_to_rgb888_with_range(
+    src: &[u8],
+    dst: &mut [u8],
+    width: u16,
+    height: u16,
+    range: YuvRange,
 ) -> Result<usize, CameraError> {
     let pixels = checked_pixel_count(width, height, 3)?;
     if (width & 1) != 0 {
@@ -2080,20 +2211,13 @@ pub fn yuv422_to_rgb888(
         return Err(CameraError::BufferTooSmall);
     }
 
-    for (chunk, out) in src[..src_len]
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .zip(dst[..dst_len].as_chunks_mut::<6>().0)
-    {
+    let src_chunks = src[..src_len].as_chunks::<4>().0;
+    let dst_chunks = dst[..dst_len].as_chunks_mut::<6>().0;
+
+    for (chunk, out) in src_chunks.iter().zip(dst_chunks.iter_mut()) {
         let ((r0, g0, b0), (r1, g1, b1)) =
-            yuv422_pair_to_rgb(chunk[0], chunk[1], chunk[2], chunk[3]);
-        out[0] = r0;
-        out[1] = g0;
-        out[2] = b0;
-        out[3] = r1;
-        out[4] = g1;
-        out[5] = b1;
+            yuv422_pair_to_rgb_with_range(chunk[0], chunk[1], chunk[2], chunk[3], range);
+        *out = [r0, g0, b0, r1, g1, b1];
     }
 
     Ok(dst_len)
@@ -2129,36 +2253,39 @@ pub fn yuv422_to_yuv420(
     }
 
     let w = width as usize;
-    let h = height as usize;
-    let u_offset = pixels;
-    let v_offset = pixels + chroma_plane_len;
+    let half_w = w / 2;
+    let src_row_bytes = w * 2;
 
-    for by in 0..(h / 2) {
-        let row0 = by * 2;
-        let row1 = row0 + 1;
-        for bx in 0..(w / 2) {
-            let x0 = bx * 2;
-            let s0 = (row0 * w + x0) * 2;
-            let s1 = (row1 * w + x0) * 2;
+    let (y_plane, uv_planes) = dst[..dst_len].split_at_mut(pixels);
+    let (u_plane, v_plane) = uv_planes.split_at_mut(chroma_plane_len);
 
-            let y00 = src[s0];
-            let u0 = src[s0 + 1];
-            let y01 = src[s0 + 2];
-            let v0 = src[s0 + 3];
+    let row_iter = src[..src_len]
+        .chunks_exact(src_row_bytes * 2)
+        .zip(y_plane.chunks_exact_mut(w * 2))
+        .zip(u_plane.chunks_exact_mut(half_w))
+        .zip(v_plane.chunks_exact_mut(half_w));
 
-            let y10 = src[s1];
-            let u1 = src[s1 + 1];
-            let y11 = src[s1 + 2];
-            let v1 = src[s1 + 3];
+    for (((src_pair, y_pair), u_row), v_row) in row_iter {
+        let (src_r0, src_r1) = src_pair.split_at(src_row_bytes);
+        let (y_r0, y_r1) = y_pair.split_at_mut(w);
 
-            dst[row0 * w + x0] = y00;
-            dst[row0 * w + x0 + 1] = y01;
-            dst[row1 * w + x0] = y10;
-            dst[row1 * w + x0 + 1] = y11;
+        let block_iter = src_r0
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(src_r1.as_chunks::<4>().0.iter())
+            .zip(y_r0.as_chunks_mut::<2>().0.iter_mut())
+            .zip(y_r1.as_chunks_mut::<2>().0.iter_mut())
+            .zip(u_row.iter_mut())
+            .zip(v_row.iter_mut());
 
-            let uv_idx = by * (w / 2) + bx;
-            dst[u_offset + uv_idx] = ((u0 as u16 + u1 as u16) / 2) as u8;
-            dst[v_offset + uv_idx] = ((v0 as u16 + v1 as u16) / 2) as u8;
+        for (((((&[y00, u0, y01, v0], &[y10, u1, y11, v1]), y0_out), y1_out), u_out), v_out) in
+            block_iter
+        {
+            *y0_out = [y00, y01];
+            *y1_out = [y10, y11];
+            *u_out = ((u16::from(u0) + u16::from(u1)) / 2) as u8;
+            *v_out = ((u16::from(v0) + u16::from(v1)) / 2) as u8;
         }
     }
 
@@ -2168,6 +2295,33 @@ pub fn yuv422_to_yuv420(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn yuv422_to_yuv420_indexed_ref(src: &[u8], dst: &mut [u8], width: u16, height: u16) {
+        let w = width as usize;
+        let h = height as usize;
+        let pixels = w * h;
+        let u_offset = pixels;
+        let v_offset = pixels + pixels / 4;
+
+        for by in 0..(h / 2) {
+            let row0 = by * 2;
+            let row1 = row0 + 1;
+            for bx in 0..(w / 2) {
+                let x0 = bx * 2;
+                let s0 = (row0 * w + x0) * 2;
+                let s1 = (row1 * w + x0) * 2;
+
+                dst[row0 * w + x0] = src[s0];
+                dst[row0 * w + x0 + 1] = src[s0 + 2];
+                dst[row1 * w + x0] = src[s1];
+                dst[row1 * w + x0 + 1] = src[s1 + 2];
+
+                let uv_idx = by * (w / 2) + bx;
+                dst[u_offset + uv_idx] = ((src[s0 + 1] as u16 + src[s1 + 1] as u16) / 2) as u8;
+                dst[v_offset + uv_idx] = ((src[s0 + 3] as u16 + src[s1 + 3] as u16) / 2) as u8;
+            }
+        }
+    }
 
     #[test]
     fn test_yuv2rgb_bt601_table_values() {
@@ -2179,6 +2333,179 @@ mod tests {
         // Clamping at extremes
         assert_eq!(yuv2rgb(0, 0, 0), (0, 136, 0));
         assert_eq!(yuv2rgb(255, 255, 255), (255, 126, 255));
+    }
+
+    #[test]
+    fn test_conv12_yuv_table_size_and_all_24bit_inputs() {
+        assert_eq!(
+            core::mem::size_of::<YuvTableRow>(),
+            10,
+            "YuvTableRow should be 10 bytes without align(16) padding"
+        );
+        assert_eq!(
+            core::mem::size_of_val(&YUV_TABLE),
+            2560,
+            "YUV_TABLE should occupy 2560 bytes instead of 4096"
+        );
+
+        let mut vy = [0i16; 256];
+        let mut vvr = [0i16; 256];
+        let mut vvg = [0i16; 256];
+        let mut vug = [0i16; 256];
+        let mut vub = [0i16; 256];
+        for i in 0..256 {
+            vy[i] = YUV_TABLE[i].v_y;
+            vvr[i] = YUV_TABLE[i].v_vr;
+            vvg[i] = YUV_TABLE[i].v_vg;
+            vug[i] = YUV_TABLE[i].v_ug;
+            vub[i] = YUV_TABLE[i].v_ub;
+        }
+
+        // Exhaustively verify all 2^24 (y, u, v) combinations against split
+        // channel tables.
+        for u in 0..=255u8 {
+            let ub = vub[u as usize];
+            let ug_part = vvg[u as usize];
+            for v in 0..=255u8 {
+                let vr = vvr[v as usize];
+                let g_chroma = ug_part + vug[v as usize];
+                for y in 0..=255u8 {
+                    let yv = vy[y as usize];
+                    let expected = (
+                        (yv + vr).clamp(0, 255) as u8,
+                        (yv + g_chroma).clamp(0, 255) as u8,
+                        (yv + ub).clamp(0, 255) as u8,
+                    );
+                    assert_eq!(yuv2rgb(y, u, v), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_conv09_yuv_range_and_all_65536_rgb565_roundtrip() {
+        assert_eq!(YuvRange::default(), YuvRange::Bt601Limited);
+
+        // Full-range endpoints: black -> Y=0, white -> Y=255
+        assert_eq!(rgb2yuv_with_range(0, 0, 0, YuvRange::Full), (0, 128, 128));
+        assert_eq!(
+            rgb2yuv_with_range(255, 255, 255, YuvRange::Full),
+            (255, 128, 128)
+        );
+        assert_eq!(yuv2rgb_with_range(0, 128, 128, YuvRange::Full), (0, 0, 0));
+        assert_eq!(
+            yuv2rgb_with_range(255, 128, 128, YuvRange::Full),
+            (255, 255, 255)
+        );
+
+        // Studio-range endpoints: black -> Y=16, white -> Y=235 (v_y=254 in yuv.c)
+        assert_eq!(
+            rgb2yuv_with_range(0, 0, 0, YuvRange::Bt601Limited),
+            (16, 128, 128)
+        );
+        assert_eq!(
+            rgb2yuv_with_range(255, 255, 255, YuvRange::Bt601Limited),
+            (235, 128, 128)
+        );
+        assert_eq!(
+            yuv2rgb_with_range(16, 128, 128, YuvRange::Bt601Limited),
+            (0, 0, 0)
+        );
+        assert_eq!(
+            yuv2rgb_with_range(235, 128, 128, YuvRange::Bt601Limited),
+            (254, 254, 254)
+        );
+
+        // Exhaustive RGB565 -> YUV422 -> RGB565 roundtrip within +/-8 across
+        // all 65,536 colors for both Bt601Limited and Full ranges.
+        for range in [YuvRange::Bt601Limited, YuvRange::Full] {
+            let mut yuv_buf = [0u8; 4];
+            let mut out_buf = [0u8; 4];
+            for code in 0..=u16::MAX {
+                let [hb, lb] = code.to_be_bytes();
+                let rgb565_pair = [hb, lb, hb, lb];
+                let (r_in, g_in, b_in) = unpack_rgb565_be_full(hb, lb);
+
+                rgb565_to_yuv422_with_range(&rgb565_pair, &mut yuv_buf, 2, 1, range)
+                    .expect("rgb565_to_yuv422_with_range should succeed");
+                yuv422_to_rgb565_with_range(&yuv_buf, &mut out_buf, 2, 1, false, range)
+                    .expect("yuv422_to_rgb565_with_range should succeed");
+
+                let (r_out, g_out, b_out) = unpack_rgb565_be_full(out_buf[0], out_buf[1]);
+                let dr = (i32::from(r_out) - i32::from(r_in)).abs();
+                let dg = (i32::from(g_out) - i32::from(g_in)).abs();
+                let db = (i32::from(b_out) - i32::from(b_in)).abs();
+
+                assert!(
+                    dr <= 8 && dg <= 8 && db <= 8,
+                    "range={range:?} code={code:#06x} in=({r_in},{g_in},{b_in}) \
+                     out=({r_out},{g_out},{b_out})"
+                );
+                if range == YuvRange::Full {
+                    assert_eq!((out_buf[0], out_buf[1]), (hb, lb));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_conv15_unpack_rgb565_be_full_bit_exactness() {
+        assert_eq!(unpack_rgb565_be_full(0x00, 0x00), (0, 0, 0));
+        assert_eq!(unpack_rgb565_be_full(0xFF, 0xFF), (255, 255, 255));
+        assert_eq!(unpack_rgb565_be_full(0xF8, 0x00), (255, 0, 0));
+        assert_eq!(unpack_rgb565_be_full(0x07, 0xE0), (0, 255, 0));
+        assert_eq!(unpack_rgb565_be_full(0x00, 0x1F), (0, 0, 255));
+
+        for code in 0..=u16::MAX {
+            let [hb, lb] = code.to_be_bytes();
+            let (r, g, b) = unpack_rgb565_be_full(hb, lb);
+            assert_eq!(pack_rgb565_raw(r, g, b), (hb, lb));
+        }
+
+        // Verify rgb565_to_yuv422 uses full bit-replicated white (255,255,255)
+        let white_pair = [0xFFu8; 4];
+        let mut yuv_lim = [0u8; 4];
+        let mut yuv_full = [0u8; 4];
+        rgb565_to_yuv422(&white_pair, &mut yuv_lim, 2, 1)
+            .expect("studio rgb565_to_yuv422 should succeed");
+        rgb565_to_yuv422_with_range(&white_pair, &mut yuv_full, 2, 1, YuvRange::Full)
+            .expect("full rgb565_to_yuv422_with_range should succeed");
+        assert_eq!(yuv_lim, [235, 128, 235, 128]);
+        assert_eq!(yuv_full, [255, 128, 255, 128]);
+    }
+
+    #[test]
+    fn test_conv19_yuv422_to_yuv420_differential_64x32() {
+        let width = 64u16;
+        let height = 32u16;
+        let mut src = [0u8; 64 * 32 * 2];
+        let mut state = 0x9E37_79B9u32;
+        for byte in &mut src {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            *byte = (state & 0xFF) as u8;
+        }
+
+        let mut dst_actual = [0u8; (64 * 32 * 3) / 2];
+        let mut dst_expected = [0u8; (64 * 32 * 3) / 2];
+
+        let written = yuv422_to_yuv420(&src, &mut dst_actual, width, height)
+            .expect("64x32 yuv422_to_yuv420 should succeed");
+        yuv422_to_yuv420_indexed_ref(&src, &mut dst_expected, width, height);
+
+        assert_eq!(written, dst_expected.len());
+        assert_eq!(dst_actual, dst_expected);
+
+        // Reject odd height and undersized destination
+        assert_eq!(
+            yuv422_to_yuv420(&src[..24], &mut dst_actual, 4, 3),
+            Err(CameraError::InvalidArg)
+        );
+        assert_eq!(
+            yuv422_to_yuv420(&src[..16], &mut dst_actual[..5], 2, 2),
+            Err(CameraError::BufferTooSmall)
+        );
     }
 
     #[test]
@@ -2201,6 +2528,7 @@ mod tests {
             .expect("yuv422_to_rgb565 (LE) should succeed");
         assert_eq!(n_be, 16);
         assert_eq!(n_le, 16);
+        assert_eq!(rgb565_be, [0xFFu8; 16]);
 
         for i in 0..8 {
             assert_eq!(rgb565_be[i * 2], rgb565_le[i * 2 + 1]);
@@ -2219,6 +2547,12 @@ mod tests {
             .expect("yuv422_to_rgb888 should succeed");
         assert_eq!(written_rgb, 12);
         assert_eq!(rgb888, [130u8; 12]);
+
+        let written_rgb_full =
+            yuv422_to_rgb888_with_range(&yuv422, &mut rgb888, width, height, YuvRange::Full)
+                .expect("yuv422_to_rgb888_with_range(Full) should succeed");
+        assert_eq!(written_rgb_full, 12);
+        assert_eq!(rgb888, [128u8; 12]);
 
         let mut yuv420 = [0u8; 6];
         let written_420 = yuv422_to_yuv420(&yuv422, &mut yuv420, width, height)
