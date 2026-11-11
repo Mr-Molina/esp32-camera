@@ -20,11 +20,14 @@ else:
     fcntl = None  # type: ignore
     termios = None  # type: ignore
 
-SERIAL_PORT = "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
-STATUS_URL = "http://172.22.1.52/status"
+DEFAULT_SERIAL_PORT = os.environ.get("CAM_SERIAL_PORT", "/dev/ttyUSB-esp32")
+DEFAULT_HOST = os.environ.get("CAM_HOST", "")
+DEFAULT_STATUS_URL = f"http://{DEFAULT_HOST}/status" if DEFAULT_HOST else ""
 
 
-def get_camera_status(status_url: str = STATUS_URL, timeout: float = 3.0):
+def get_camera_status(status_url: str, timeout: float = 3.0):
+    if not status_url:
+        return None
     try:
         req = urllib.request.Request(status_url, headers={"Connection": "close"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -38,8 +41,8 @@ def get_camera_status(status_url: str = STATUS_URL, timeout: float = 3.0):
 
 
 def ensure_passive(
-    port_path: str = SERIAL_PORT,
-    status_url: str = STATUS_URL,
+    port_path: str = DEFAULT_SERIAL_PORT,
+    status_url: str = DEFAULT_STATUS_URL,
     timeout: float = 3.0,
     check_http: bool = True,
 ):
@@ -55,12 +58,14 @@ def ensure_passive(
         return 1
 
     pre_status = None
-    if check_http:
+    if check_http and status_url:
         pre_status = get_camera_status(status_url, timeout=timeout)
         if pre_status:
             print(
                 f"[STATUS-PRE] Camera online, uptime_ms={pre_status.get('uptime_ms')}, active_partition={pre_status.get('active_partition')}"
             )
+    elif check_http and not status_url:
+        print("[WARN] No camera host or status URL provided; skipping pre-check HTTP status.", file=sys.stderr)
 
     # 1. Open without controlling tty and without blocking directly (avoiding stty process invocation)
     fd = os.open(port_path, os.O_RDWR | os.O_NONBLOCK | os.O_NOCTTY)
@@ -91,7 +96,7 @@ def ensure_passive(
         os.close(fd)
 
     # 2. Verify camera remains online with non-zero, increasing uptime
-    if check_http:
+    if check_http and status_url:
         post_status = get_camera_status(status_url, timeout=timeout)
         if post_status:
             print(
@@ -112,9 +117,20 @@ def ensure_passive(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Ensure host CH340 serial port passivity.")
-    parser.add_argument("--port", default=SERIAL_PORT, help=f"Serial port path (default: {SERIAL_PORT})")
     parser.add_argument(
-        "--status-url", default=STATUS_URL, help=f"Camera HTTP status URL (default: {STATUS_URL})"
+        "--port",
+        default=DEFAULT_SERIAL_PORT,
+        help=f"Serial port path (default: {DEFAULT_SERIAL_PORT} or $CAM_SERIAL_PORT)",
+    )
+    parser.add_argument(
+        "--host",
+        default=DEFAULT_HOST,
+        help="Camera IP address (default: $CAM_HOST or <camera-ip>)",
+    )
+    parser.add_argument(
+        "--status-url",
+        default=DEFAULT_STATUS_URL,
+        help="Camera HTTP status URL (default: http://<camera-ip>/status or $CAM_HOST)",
     )
     parser.add_argument(
         "--no-http-check",
@@ -122,8 +138,20 @@ def main() -> int:
         help="Skip camera HTTP status checks (verify serial passivity only)",
     )
     args = parser.parse_args()
+
+    status_url = args.status_url
+    if not status_url and args.host:
+        status_url = f"http://{args.host}/status"
+
+    check_http = not args.no_http_check
+    if check_http and not status_url:
+        print("[WARN] No CAM_HOST or --status-url specified (<camera-ip>); skipping HTTP checks.")
+        check_http = False
+
     return ensure_passive(
-        port_path=args.port, status_url=args.status_url, check_http=not args.no_http_check
+        port_path=args.port,
+        status_url=status_url,
+        check_http=check_http,
     )
 
 

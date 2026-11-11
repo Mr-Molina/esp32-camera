@@ -116,5 +116,20 @@ jobs:
         with:
           python-version: "3.x"
 
+      - name: Install Python test & lint tooling
+        run: pip install -r scripts/requirements-dev.txt
+
+      - name: Lint Python scripts and tests
+        run: ruff check scripts tests
+
+      - name: Run script unit tests
+        run: pytest tests
+
       - name: Verify cold boot invariants
-        run: python3 scripts/verify_cold_boot_invariants.py
+        shell: bash
+        run: |
+          if [ -f firmware/bootloader_v554_gpio16.bin ]; then
+            python3 scripts/verify_cold_boot_invariants.py
+          else
+            python3 scripts/verify_cold_boot_invariants.py --allow-missing-bootloader
+          fi

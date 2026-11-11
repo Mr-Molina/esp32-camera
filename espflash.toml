@@ -1,11 +1,41 @@
+# espflash configuration for ESP32-WROVER camera firmware
+# Format: EspIdf standard partition and bootloader layout
+
 baudrate = 460800
 format = "EspIdf"
 
 [idf_format_args]
+# Relative repository-root paths (BUILD-03, BUILD-18)
+# All file paths are relative to the repository root; invoke espflash with cwd=REPO_ROOT.
+#
+# GPIO16 Bootloader Role (BUILD-03):
+# Requires the ESP-IDF v5.5.4 2nd-stage bootloader patched in `bootloader_before_init`
+# to configure IO_MUX_GPIO16_REG (0x3FF4_904C) with 0x2B00 (MCU_SEL=1 + FUN_PU).
+# This pulls the PSRAM CS line HIGH before SPI peripheral initialization, preventing
+# SPI bus contention and cold-boot hangs on ESP32-WROVER hardware.
 bootloader = "firmware/bootloader_v554_gpio16.bin"
+
+# Dual-Slot 0x1B0000 Partition Table:
+# Points to partitions_rust_ota.csv defining:
+#   nvs:      0x11000 (0x6000, 24 KB)
+#   otadata:  0x17000 (0x2000, 8 KB)
+#   phy_init: 0x19000 (0x1000, 4 KB)
+#   ota_0:    0x20000 (0x1B0000, 1769472 B / ~1.69 MB)
+#   ota_1:   0x1D0000 (0x1B0000, 1769472 B / ~1.69 MB)
+# Supports safe A/B dual-slot OTA firmware updates and rollback.
 partition_table = "partitions_rust_ota.csv"
 
 [flash]
+# Hardware Stability Settings (BUILD-03, BUILD-06):
+# mode: "dio" (Dual I/O) is required for ESP32-WROVER modules to prevent pin conflicts
+#       with integrated PSRAM (QIO mode contends with PSRAM SPI bus lines).
 mode = "dio"
+
+# size: "4MB" matches the physical SPI flash capacity of the ESP32-WROVER module.
 size = "4MB"
+
+# frequency: "40MHz" is an intentional hardware stability configuration matching
+#            PsramCacheSpeed::PsramCacheF40mS40m in main.rs. Operating flash and PSRAM
+#            at 40 MHz eliminates SPI bus timing jitter, signal degradation, and cache
+#            contention under concurrent high-throughput camera DMA and Wi-Fi load (BUILD-06).
 frequency = "40MHz"

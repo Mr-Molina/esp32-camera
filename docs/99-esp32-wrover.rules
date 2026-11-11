@@ -1,2 +1,8 @@
 # Deterministic binding and ModemManager exclusion for ESP32-WROVER-DEV (CH340 1a86:7523) — zero DTR/RTS manipulation on USB attach
-SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", ENV{ID_PATH}=="pci-0000:00:14.0-usb-0:12:1.0", SYMLINK+="ttyUSB-esp32", GROUP="dialout", MODE="0660", ENV{ID_MM_DEVICE_IGNORE}="1", ENV{ID_MM_CANDIDATE}="0"
+# Standardized symlink /dev/ttyUSB-esp32 without machine-specific ID_PATH filters (BUILD-26)
+#
+# Installation:
+#   sudo cp docs/99-esp32-wrover.rules /etc/udev/rules.d/99-esp32-wrover.rules
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", SYMLINK+="ttyUSB-esp32", GROUP="dialout", MODE="0660", ENV{ID_MM_DEVICE_IGNORE}="1", ENV{ID_MM_CANDIDATE}="0"

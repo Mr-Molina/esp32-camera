@@ -1,0 +1,4 @@
+# Python dev and CI tooling requirements
+# Requires Python >= 3.10
+pytest>=8.0.0
+ruff>=0.4.0

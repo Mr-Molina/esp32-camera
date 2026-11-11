@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 """Wireless Dual-Slot OTA Deployment & Staging Tool for Klipper Camera (ESP32-WROVER-DEV).
 
 Supports:
@@ -28,7 +28,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-DEFAULT_HOST = "172.22.1.52"
+DEFAULT_HOST = os.environ.get("CAM_HOST", "")
 DEFAULT_PORT = 80
 DEFAULT_ELF = str(REPO_ROOT / "target" / "xtensa-esp32-none-elf" / "release" / "klipper-cam-fw")
 DEFAULT_BIN = str(REPO_ROOT / "target" / "xtensa-esp32-none-elf" / "release" / "klipper-cam-fw.bin")
@@ -81,12 +81,24 @@ def stage_and_validate_image(elf_path: str, bin_path: str, host: str, port: int)
         "save-image",
         "--chip",
         "esp32",
+        "--flash-size",
+        "4mb",
+        "--flash-mode",
+        "dio",
+        "--flash-freq",
+        "40mhz",
         "--skip-update-check",
         elf_path,
         bin_path,
     ]
     res = subprocess.run(
-        cmd, capture_output=True, text=True, encoding="utf-8", check=False, timeout=120
+        cmd,
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+        timeout=120,
     )  # nosec B603
     if res.returncode != 0:
         raise RuntimeError(
@@ -132,7 +144,7 @@ def stage_and_validate_image(elf_path: str, bin_path: str, host: str, port: int)
             )
 
     sha256_hex = hashlib.sha256(payload).hexdigest()
-    target_url = f"http://{host}:{port}/update"
+    target_url = f"http://{host}:{port}/update" if host else "(staged locally; no host specified)"
 
     print("================================================================================")
     print("[OTA-STAGE] ESP32 Firmware Image Staged & Validated")
@@ -208,21 +220,13 @@ def fetch_snapshot_info(host: str, port: int, timeout: float = 10.0) -> tuple[in
         return len(data), has_soi, has_eoi, dims
 
 
-def stream_ota_post(host: str, port: int, token: str, payload: bytes, timeout: float = 60.0) -> str:
-    """Streams HTTP POST /update over a raw TCP socket in 4096-byte chunks."""
-    if any(c in host for c in ("\r", "\n")) or any(c in token for c in ("\r", "\n")):
-        raise ValueError("CRLF injection detected in host or token")
-
-    headers = (
-        f"POST /update HTTP/1.1\r\n"
-        f"Host: {host}:{port}\r\n"
-        f"X-OTA-Token: {token}\r\n"
-        f"Content-Type: application/octet-stream\r\n"
-        f"Content-Length: {len(payload)}\r\n"
-        f"Connection: close\r\n"
-        f"\r\n"
-    ).encode()
-
+def _stream_ota_post_once(
+    host: str,
+    port: int,
+    headers: bytes,
+    payload: bytes,
+    timeout: float,
+) -> str:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         sock.settimeout(timeout)
@@ -256,39 +260,82 @@ def stream_ota_post(host: str, port: int, token: str, payload: bytes, timeout: f
             f"({(sent / 1024.0) / max(upload_elapsed, 0.001):.1f} KB/s). Waiting for NOR flash write & HTTP response..."
         )
 
-        resp_chunks = []
-        content_length = None
-        header_done = False
-        while True:
-            try:
-                data = sock.recv(4096)
-                if not data:
+        return read_http_response(sock)
+
+
+def read_http_response(sock: socket.socket) -> str:
+    """Reads HTTP response until Content-Length bytes are received or EOF."""
+    resp_chunks = []
+    content_length = None
+    header_done = False
+    while True:
+        try:
+            data = sock.recv(4096)
+            if not data:
+                # Connection closed by server (EOF)
+                break
+            resp_chunks.append(data)
+            joined = b"".join(resp_chunks)
+            if not header_done and b"\r\n\r\n" in joined:
+                header_part, _ = joined.split(b"\r\n\r\n", 1)
+                header_done = True
+                for line in header_part.split(b"\r\n"):
+                    if line.lower().startswith(b"content-length:"):
+                        try:
+                            content_length = int(line.split(b":", 1)[1].strip())
+                        except ValueError:
+                            pass
+            if header_done:
+                _, body_part = joined.split(b"\r\n\r\n", 1)
+                if content_length is not None and len(body_part) >= content_length:
                     break
-                resp_chunks.append(data)
-                joined = b"".join(resp_chunks)
-                if not header_done and b"\r\n\r\n" in joined:
-                    header_part, _ = joined.split(b"\r\n\r\n", 1)
-                    header_done = True
-                    for line in header_part.split(b"\r\n"):
-                        if line.lower().startswith(b"content-length:"):
-                            try:
-                                content_length = int(line.split(b":", 1)[1].strip())
-                            except ValueError:
-                                pass
-                if header_done:
-                    _, body_part = joined.split(b"\r\n\r\n", 1)
-                    if content_length is not None and len(body_part) >= content_length:
-                        break
-                    if b"Rebooting..." in body_part or len(body_part) >= 40:
-                        break
-            except TimeoutError as exc:
-                raise RuntimeError("Timed out waiting for HTTP response from POST /update") from exc
+        except TimeoutError as exc:
+            raise RuntimeError("Timed out waiting for HTTP response from POST /update") from exc
 
     raw_resp = b"".join(resp_chunks).decode("utf-8", errors="replace")
     if "200 OK" not in raw_resp or "Firmware update successful! Rebooting..." not in raw_resp:
         raise RuntimeError(f"Unexpected HTTP response from POST /update:\n{raw_resp}")
 
     return raw_resp.strip()
+
+
+def stream_ota_post(
+    host: str,
+    port: int,
+    token: str,
+    payload: bytes,
+    timeout: float = 60.0,
+    max_retries: int = 1,
+) -> str:
+    """Streams HTTP POST /update over a raw TCP socket in 16384-byte (16 KB) chunks."""
+    if any(c in host for c in ("\r", "\n")) or any(c in token for c in ("\r", "\n")):
+        raise ValueError("CRLF injection detected in host or token")
+
+    headers = (
+        f"POST /update HTTP/1.1\r\n"
+        f"Host: {host}:{port}\r\n"
+        f"X-OTA-Token: {token}\r\n"
+        f"Content-Type: application/octet-stream\r\n"
+        f"Content-Length: {len(payload)}\r\n"
+        f"Connection: close\r\n"
+        f"\r\n"
+    ).encode()
+
+    last_error: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            if attempt > 0:
+                print(
+                    f"[OTA-RETRY] Retrying POST /update (attempt {attempt + 1}/{max_retries + 1}) after error: {last_error}",
+                    flush=True,
+                )
+                time.sleep(2.0)
+            return _stream_ota_post_once(host, port, headers, payload, timeout)
+        except (OSError, TimeoutError) as exc:
+            last_error = exc
+            if attempt >= max_retries:
+                raise
+    raise RuntimeError(f"POST /update failed after {max_retries + 1} attempts: {last_error}")
 
 
 def expected_next_slot(current_slot: str) -> str:
@@ -303,7 +350,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Stage and deploy bare-metal Rust OTA firmware to ESP32 Klipper Camera."
     )
-    parser.add_argument("--host", default=DEFAULT_HOST, help=f"Target IP (default: {DEFAULT_HOST})")
+    parser.add_argument(
+        "--host",
+        default=DEFAULT_HOST,
+        help="Target IP address (default: $CAM_HOST or <camera-ip>)",
+    )
     parser.add_argument(
         "--port", type=int, default=DEFAULT_PORT, help=f"Target HTTP port (default: {DEFAULT_PORT})"
     )
@@ -325,6 +376,13 @@ def main() -> int:
         help="Expected JPEG dimensions (e.g. '1280x720' or 'any', default: 1280x720)",
     )
     args = parser.parse_args()
+
+    if not args.stage_only and not args.host:
+        print(
+            "[OTA-ERROR] No camera host provided. Pass --host <camera-ip> or set CAM_HOST environment variable.",
+            file=sys.stderr,
+        )
+        return 1
 
     if not args.stage_only and not args.token:
         print(
@@ -351,7 +409,12 @@ def main() -> int:
 
     pre_slot = pre_status.get("active_partition", "")
     pre_uptime = pre_status.get("uptime_ms", -1)
-    target_slot = expected_next_slot(pre_slot)
+    try:
+        target_slot = expected_next_slot(pre_slot)
+    except ValueError as exc:
+        print(f"[OTA-ERROR] Cannot determine target OTA slot: {exc}", file=sys.stderr)
+        return 1
+
     print(
         f"[OTA-PRE] Current active_partition='{pre_slot}' (uptime_ms={pre_uptime}) -> Target passive slot='{target_slot}'"
     )
@@ -394,6 +457,24 @@ def main() -> int:
         f"[OTA-POST] Verified boot into active_partition='{post_slot}' "
         f"(uptime_ms={post_uptime}, framesize={post_status.get('framesize')}, wifi_rssi={post_status.get('wifi_rssi')} dBm)"
     )
+
+    if "app_sha256" in post_status:
+        reported_sha = str(post_status["app_sha256"]).strip().lower()
+        hash_appended = len(payload) >= ESP_IMAGE_HEADER_LEN + 32 and payload[23] == 1
+        expected_app_sha = (
+            hashlib.sha256(payload[:-32]).hexdigest().lower()
+            if hash_appended
+            else hashlib.sha256(payload).hexdigest().lower()
+        )
+        full_bin_sha = hashlib.sha256(payload).hexdigest().lower()
+        if reported_sha not in (expected_app_sha, full_bin_sha):
+            print(
+                f"[OTA-ERROR] Post-boot app_sha256 mismatch: device reported '{reported_sha}', "
+                f"expected '{expected_app_sha}' (or '{full_bin_sha}')",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"[OTA-VERIFY] Post-boot app_sha256 verified match: {reported_sha}")
 
     try:
         snap_len, has_soi, has_eoi, dims = fetch_snapshot_info(args.host, args.port, timeout=10.0)

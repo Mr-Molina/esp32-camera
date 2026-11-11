@@ -4,7 +4,7 @@
 Primarily functions as a static verification gate validating repository invariants (udev rules,
 firmware entrypoint main.rs MMIO/PSRAM/WDT/flash invariants, and bootloader binary GPIO 16 pull-up patch)
 without requiring physical hardware or network connectivity. Optionally performs live hardware runtime
-verification (querying `reset_reason`, `uptime_ms`, and `active_partition`) when an optional
+verification (querying `uptime_ms`, `active_partition`, and optional `reset_reason`) when an optional
 `--live-status-url` endpoint is supplied.
 
 Enforces Invariant 69 (PM-2026-1025-027), Invariant 70 (PM-2026-1025-028 / WO-RUST-FIX-CPP-PARITY-01),
@@ -26,16 +26,18 @@ Invariant 71 (PM-2026-1026-001), and Invariant 72 (PM-2026-1026-002 / INFRA-001)
    - Detects active booted OTA slot from `DPORT_PRO_FLASH_MMU_TABLE` (`0x3FF1_0000`) via
      `detect_booted_ota_manager_from_mmu()` (`LOGIC-003` / `FW-004`).
 3. `firmware/bootloader_v554_gpio16.bin` exists and contains the `0x3FF4_904C`
-   (`\\x4c\\x90\\xf4\\x3f`) and `0x2B00` (`\\x00\\x2b\\x00\\x00` or Xtensa `movi.n+slli`
-   `\\x2c\\xb9\\x80\\x99\\x11` / `\\x0c\\xb9\\x80\\x99\\x11` / `\\x80\\x99\\x11`) `bootloader_before_init`
-   `GPIO 16` pull-up initialization.
+   (`\\x4c\\x90\\xf4\\x3f`) and full 5-byte Xtensa instruction sequences / 32-bit `0x2B00`
+   (`\\x00\\x2b\\x00\\x00` or `\\x2c\\xb9\\x80\\x99\\x11` / `\\x0c\\xb9\\x80\\x99\\x11` /
+   `\\x2c\\xba\\x80\\xaa\\x11` / `\\x0c\\xba\\x80\\xaa\\x11` / `\\x2c\\xa9\\x80\\x88\\x11` /
+   `\\x0c\\xa9\\x80\\x88\\x11`) `bootloader_before_init` `GPIO 16` pull-up initialization.
 4. Optional Live Runtime Verification:
    - When `--live-status-url` is specified, verifies live camera HTTP status endpoint, ensuring
-     `reset_reason` is reported cleanly.
+     `uptime_ms` and `active_partition` are present, and validates `reset_reason` when present.
 """
 
 import argparse
 import json
+import os
 import re
 import sys
 import urllib.error
@@ -114,6 +116,23 @@ AUTHORITATIVE_MMIO_REGISTERS: dict[str, int] = {
 }
 
 
+def strip_rust_comments(src: str) -> str:
+    """Strips // line comments and /* ... */ block comments from Rust source while preserving strings."""
+    pattern = re.compile(
+        r'("(?:\\.|[^"\\])*")|(r#".*?"#)|(/\*.*?\*/)|(//[^\r\n]*)',
+        re.DOTALL,
+    )
+
+    def _replacer(match: re.Match) -> str:
+        if match.group(1) is not None:
+            return match.group(1)
+        if match.group(2) is not None:
+            return match.group(2)
+        return ""
+
+    return pattern.sub(_replacer, src)
+
+
 def verify_mmio_registers(src: str) -> list[str]:
     errors: list[str] = []
     reg_pattern = re.compile(
@@ -170,7 +189,8 @@ def verify_main_rs() -> list[str]:
     errors: list[str] = []
     if not MAIN_RS.is_file():
         return [f"Missing firmware entrypoint: {MAIN_RS}"]
-    src = MAIN_RS.read_text(encoding="utf-8")
+    raw_src = MAIN_RS.read_text(encoding="utf-8")
+    src = strip_rust_comments(raw_src)
 
     # 1. Zero SD0..SD3 (GPIO 7..10) bit-banging
     forbidden_sd_pins = (
@@ -262,29 +282,41 @@ def verify_main_rs() -> list[str]:
     return errors
 
 
-def verify_bootloader_bin() -> list[str]:
+def verify_bootloader_bin(
+    allow_missing: bool = False,
+    bootloader_path: Path | None = None,
+) -> list[str]:
+    target_path = bootloader_path or BOOTLOADER_BIN
     errors: list[str] = []
-    if not BOOTLOADER_BIN.is_file():
-        print(
-            "[INFO] Patched 2nd-stage bootloader binary not present in source checkout (skipping binary check)"
-        )
-        return []
-    data = BOOTLOADER_BIN.read_bytes()
+    if not target_path.is_file():
+        if allow_missing:
+            print(
+                f"[INFO] Patched 2nd-stage bootloader binary not present at {target_path} (skipped via --allow-missing-bootloader)"
+            )
+            return []
+        return [
+            f"Missing patched bootloader binary: {target_path} (pass --allow-missing-bootloader to bypass in dev environments)"
+        ]
+
+    data = target_path.read_bytes()
     if len(data) < 16384 or data[0] != 0xE9:
-        errors.append(f"Invalid ESP32 bootloader header or size ({len(data)} bytes) in {BOOTLOADER_BIN}")
+        errors.append(f"Invalid ESP32 bootloader header or size ({len(data)} bytes) in {target_path}")
     if b"\x4c\x90\xf4\x3f" not in data:
-        errors.append(f"{BOOTLOADER_BIN}: missing IO_MUX_GPIO16_REG literal 0x3FF4904C (\\x4c\\x90\\xf4\\x3f)")
-    if (
-        b"\x00\x2b\x00\x00" not in data
-        and b"\x2c\xb9\x80\x99\x11" not in data
-        and b"\x2c\xba\x80\xaa\x11" not in data
-        and b"\x0c\xa9\x80\x88\x11" not in data
-        and b"\x80\x99\x11" not in data
-        and b"\x80\xaa\x11" not in data
-        and b"\x80\x88\x11" not in data
-    ):
+        errors.append(f"{target_path}: missing IO_MUX_GPIO16_REG literal 0x3FF4904C (\\x4c\\x90\\xf4\\x3f)")
+
+    # Full 5-byte Xtensa instruction sequences or 32-bit constant literal 0x2B00 (BUILD-08 / WP-03)
+    valid_gpio16_patterns = (
+        b"\x00\x2b\x00\x00",      # 32-bit literal 0x00002B00
+        b"\x2c\xb9\x80\x99\x11",  # movi.n a9, 0x2b ; slli a9, a9, 8 (5-byte sequence)
+        b"\x0c\xb9\x80\x99\x11",  # movi.n a9 variant ; slli a9, a9, 8 (5-byte sequence)
+        b"\x2c\xba\x80\xaa\x11",  # movi.n a10, 0x2b ; slli a10, a10, 8 (5-byte sequence)
+        b"\x0c\xba\x80\xaa\x11",  # movi.n a10 variant ; slli a10, a10, 8 (5-byte sequence)
+        b"\x2c\xa9\x80\x88\x11",  # movi.n a8, 0x2b ; slli a8, a8, 8 (5-byte sequence)
+        b"\x0c\xa9\x80\x88\x11",  # movi.n a8 variant ; slli a8, a8, 8 (5-byte sequence)
+    )
+    if not any(pat in data for pat in valid_gpio16_patterns):
         errors.append(
-            f"{BOOTLOADER_BIN}: missing GPIO 16 pull-up constant 0x2B00 in bootloader_before_init"
+            f"{target_path}: missing GPIO 16 pull-up constant 0x2B00 full 5-byte instruction sequence in bootloader_before_init"
         )
     for reg_label, reg_bytes in (
         ("RTC_CNTL_HOLD_FORCE_REG 0x3FF480C8", b"\xc8\x80\xf4\x3f"),
@@ -294,7 +326,7 @@ def verify_bootloader_bin() -> list[str]:
         ("GPIO_ENABLE_W1TS_REG 0x3FF44024", b"\x24\x40\xf4\x3f"),
     ):
         if reg_bytes not in data:
-            errors.append(f"{BOOTLOADER_BIN}: missing {reg_label} in bootloader_before_init")
+            errors.append(f"{target_path}: missing {reg_label} in bootloader_before_init")
     return errors
 
 
@@ -315,14 +347,25 @@ def verify_live_status(url: str) -> list[str]:
                 return errors
             raw = resp.read().decode("utf-8")
             data = json.loads(raw)
+
+            uptime = data.get("uptime_ms")
+            partition = data.get("active_partition")
+            if uptime is None:
+                errors.append(f"Live status from {url} missing 'uptime_ms'")
+            if partition is None:
+                errors.append(f"Live status from {url} missing 'active_partition'")
+
             reset_reason = data.get("reset_reason")
-            if reset_reason is None:
-                errors.append(f"Live status from {url} missing 'reset_reason'")
-            else:
-                uptime = data.get("uptime_ms", 0)
-                partition = data.get("active_partition", "unknown")
+            if reset_reason is not None:
+                if not isinstance(reset_reason, str) or not reset_reason.strip():
+                    errors.append(f"Live status from {url} has invalid 'reset_reason': {reset_reason!r}")
+                else:
+                    print(f"[INFO] Verified reset_reason='{reset_reason}' from live status")
+
+            if uptime is not None and partition is not None:
+                reset_suffix = f", reset_reason='{reset_reason}'" if reset_reason is not None else ""
                 print(
-                    f"[PASS] Live status from {url}: reset_reason='{reset_reason}', uptime_ms={uptime}, partition='{partition}'"
+                    f"[PASS] Live status from {url}: uptime_ms={uptime}, partition='{partition}'{reset_suffix}"
                 )
     except (OSError, urllib.error.URLError, TimeoutError, ValueError) as exc:
         errors.append(f"Failed to query live status from {url}: {exc}")
@@ -336,7 +379,8 @@ def verify_esp32_i2s_rs() -> list[str]:
         errors.append(f"Missing esp32_i2s.rs at {ESP32_I2S_RS}")
         return errors
 
-    content = ESP32_I2S_RS.read_text(encoding="utf-8")
+    raw_content = ESP32_I2S_RS.read_text(encoding="utf-8")
+    content = strip_rust_comments(raw_content)
     if "I2S_SAMPLE_RATE_CONF_REG_OFFSET" not in content:
         errors.append("esp32_i2s.rs does not reference I2S_SAMPLE_RATE_CONF_REG_OFFSET")
     if "& !(0x3F << 18)" not in content:
@@ -353,17 +397,25 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Static & Live Verification Gate for ESP32-WROVER Standalone Cold-Boot Invariants."
     )
+    cam_host = os.environ.get("CAM_HOST")
+    default_live_url = os.environ.get("CAM_STATUS_URL") or (f"http://{cam_host}/status" if cam_host else None)
     parser.add_argument(
         "--live-status-url",
-        default=None,
-        help="Optional live camera HTTP status URL (e.g. http://172.22.1.52/status) to verify reset_reason and uptime",
+        default=default_live_url,
+        help="Optional live camera HTTP status URL (e.g. http://<camera-ip>/status or via CAM_HOST/CAM_STATUS_URL env) to verify uptime, partition, and reset_reason",
+    )
+    parser.add_argument(
+        "--allow-missing-bootloader",
+        action="store_true",
+        default=False,
+        help="Allow verification to pass when firmware/bootloader_v554_gpio16.bin is missing from disk",
     )
     args = parser.parse_args()
 
     all_errors: list[str] = []
     all_errors.extend(verify_udev_rules())
     all_errors.extend(verify_main_rs())
-    all_errors.extend(verify_bootloader_bin())
+    all_errors.extend(verify_bootloader_bin(allow_missing=args.allow_missing_bootloader))
     all_errors.extend(verify_esp32_i2s_rs())
     if args.live_status_url:
         all_errors.extend(verify_live_status(args.live_status_url))
@@ -376,7 +428,7 @@ def main() -> int:
     print("[PASS] Invariant 69: /etc/udev/rules.d/99-esp32-wrover.rules & docs/99-esp32-wrover.rules are clean (zero RUN+=/stty/TIOCM* hooks).")
     print("[PASS] Invariant 70/71/72 (main.rs): zero SD0..SD3 bit-banging, arm_rtc_wdt_15s(), hardware SPI1 0xF5+0x35 (PsramCacheF40mS40m), zero boot-time FlashStorage I/O, zero GPIO 4 output contention, MMU active OTA slot detection, and authoritative ESP-IDF v5.5.4 MMIO register map verified.")
     if BOOTLOADER_BIN.is_file():
-        print(f"[PASS] Invariant 70 (bootloader): {BOOTLOADER_BIN} ({BOOTLOADER_BIN.stat().st_size} B) contains 0x3FF4_904C & 0x2B00 GPIO 16 pull-up.")
+        print(f"[PASS] Invariant 70 (bootloader): {BOOTLOADER_BIN} ({BOOTLOADER_BIN.stat().st_size} B) contains 0x3FF4_904C & full 5-byte 0x2B00 GPIO 16 pull-up.")
     if args.live_status_url:
         print(f"[PASS] Live device cold-boot / runtime status verified via {args.live_status_url}.")
     return 0
