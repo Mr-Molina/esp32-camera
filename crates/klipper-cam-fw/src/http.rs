@@ -18,6 +18,7 @@ use crate::ota::{
     validate_ota_image_header, NoOpFlashStorage, OtaDataManager, OtaError, OtaFlashStorage,
     OtaSlot, OTA_PARTITION_MAX_SIZE,
 };
+use crate::telemetry::FwStatsSnapshot;
 
 /// Multipart boundary string used by the Port 81 MJPEG stream (`PART_BOUNDARY`
 /// in `klipper_cam.c`).
@@ -31,9 +32,8 @@ pub const MJPEG_CONTENT_TYPE: &str =
 /// `APP-013`).
 pub const MAX_URL_QUERY_LEN: usize = 256;
 
-/// Stack buffer size for `GET /status` JSON serialization (`384` bytes,
-/// `klipper_cam.c`).
-pub const STATUS_JSON_BUF_LEN: usize = 384;
+/// Stack buffer size for `GET /status` JSON serialization (`1024` bytes).
+pub const STATUS_JSON_BUF_LEN: usize = 1024;
 
 /// Stack buffer size for `GET /control` JSON serialization (`384` bytes).
 pub const CONTROL_JSON_BUF_LEN: usize = 384;
@@ -461,14 +461,24 @@ pub struct TelemetrySnapshot<'a> {
     /// Free external PSRAM heap in bytes
     /// (`heap_caps_get_free_size(MALLOC_CAP_SPIRAM)`).
     pub free_psram: u32,
-    /// Connected AP RSSI in dBm (`ap_info.rssi`).
-    pub wifi_rssi: i32,
+    /// Connected AP RSSI in dBm (`ap_info.rssi`), or `None` if disconnected.
+    pub wifi_rssi: Option<i32>,
     /// Currently running OTA partition label (`"ota_0"` or `"ota_1"`).
     pub active_partition: &'a str,
     /// Active frame resolution string (`"1280x720"`).
     pub framesize: &'a str,
     /// Whether a client is actively streaming on Port 81 (`s_stream_active`).
     pub stream_active: bool,
+    /// Reset reason code (`esp_reset_reason()`).
+    pub reset_reason: u32,
+    /// Hex-encoded SHA-256 digest of active application binary.
+    pub app_sha256: &'a str,
+    /// Free internal DRAM heap in bytes.
+    pub free_dram: u32,
+    /// Core 1 camera task stack high-water mark in bytes.
+    pub core1_stack_hwm: u32,
+    /// Firmware operational counters and cycle metrics.
+    pub fw_stats: FwStatsSnapshot,
 }
 
 impl Default for TelemetrySnapshot<'static> {
@@ -477,10 +487,15 @@ impl Default for TelemetrySnapshot<'static> {
             uptime_ms: 12_345,
             free_heap: 184_320,
             free_psram: 4_128_768,
-            wifi_rssi: -52,
+            wifi_rssi: Some(-52),
             active_partition: "ota_0",
             framesize: "1280x720",
             stream_active: false,
+            reset_reason: 0,
+            app_sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+            free_dram: 184_320,
+            core1_stack_hwm: 0,
+            fw_stats: FwStatsSnapshot::new(),
         }
     }
 }
@@ -504,35 +519,75 @@ fn sanitize_status_json_field<'a>(field: &'a str, buf: &'a mut [u8; 64]) -> &'a 
     core::str::from_utf8(&buf[..len]).unwrap_or("unknown")
 }
 
-/// Formats the exact 7-key JSON telemetry payload into a 384-byte stack buffer
-/// (`klipper_cam.c`).
-/// Sanitizes `active_partition` and `framesize` to prevent JSON structure
-/// breakage (`SEC-202`).
+/// Formats the JSON telemetry payload into a 1024-byte stack buffer.
+/// Sanitizes `active_partition`, `framesize`, and `app_sha256` to prevent
+/// JSON injection (`SEC-202`).
 pub fn format_status_json<'a>(
     telemetry: &TelemetrySnapshot<'_>,
     stack_buf: &'a mut [u8; STATUS_JSON_BUF_LEN],
 ) -> Result<&'a str, HttpError> {
     let mut p_buf = [0u8; 64];
     let mut f_buf = [0u8; 64];
+    let mut s_buf = [0u8; 64];
     let safe_part = sanitize_status_json_field(telemetry.active_partition, &mut p_buf);
     let safe_framesize = sanitize_status_json_field(telemetry.framesize, &mut f_buf);
+    let safe_sha = sanitize_status_json_field(telemetry.app_sha256, &mut s_buf);
 
     let mut writer = SliceWriter::new(stack_buf);
+    write!(
+        writer,
+        "{{\"uptime_ms\":{},\"free_heap\":{},\"free_psram\":{},\"wifi_rssi\":",
+        telemetry.uptime_ms, telemetry.free_heap, telemetry.free_psram,
+    )
+    .map_err(|_| HttpError::BufferTooSmall)?;
+
+    match telemetry.wifi_rssi {
+        Some(rssi) => write!(writer, "{}", rssi),
+        None => write!(writer, "null"),
+    }
+    .map_err(|_| HttpError::BufferTooSmall)?;
+
     writeln!(
         writer,
-        "{{\"uptime_ms\":{},\"free_heap\":{},\"free_psram\":{},\"wifi_rssi\":{},\
-        \"active_partition\":\"{}\",\"framesize\":\"{}\",\"stream_active\":{}}}",
-        telemetry.uptime_ms,
-        telemetry.free_heap,
-        telemetry.free_psram,
-        telemetry.wifi_rssi,
+        ",\"active_partition\":\"{}\",\"framesize\":\"{}\",\"stream_active\":{},\
+        \"reset_reason\":{},\"app_sha256\":\"{}\",\"free_dram\":{},\
+        \"core1_stack_hwm\":{},\
+        \"sensor_frame_period_us\":{},\"frame_bytes\":{},\"c1_pushed\":{},\
+        \"c1_dropped\":{},\"ring_full_events\":{},\"soi_miss\":{},\
+        \"overflow_aborts\":{},\"c0_spsc_cycles\":{},\"c0_net_cycles\":{},\
+        \"c0_p80_cycles\":{},\"c0_p81_cycles\":{},\"max_loop_latency_us\":{},\
+        \"p81_frames_sent\":{},\"p81_frames_superseded\":{},\
+        \"c0_validation_failures\":{},\"sccb_errors\":{},\"send_partial\":{},\
+        \"ring_build_failures\":{}}}",
         safe_part,
         safe_framesize,
         if telemetry.stream_active {
             "true"
         } else {
             "false"
-        }
+        },
+        telemetry.reset_reason,
+        safe_sha,
+        telemetry.free_dram,
+        telemetry.core1_stack_hwm,
+        telemetry.fw_stats.sensor_frame_period_us,
+        telemetry.fw_stats.frame_bytes,
+        telemetry.fw_stats.c1_pushed,
+        telemetry.fw_stats.c1_dropped,
+        telemetry.fw_stats.ring_full_events,
+        telemetry.fw_stats.soi_miss,
+        telemetry.fw_stats.overflow_aborts,
+        telemetry.fw_stats.c0_spsc_cycles,
+        telemetry.fw_stats.c0_net_cycles,
+        telemetry.fw_stats.c0_p80_cycles,
+        telemetry.fw_stats.c0_p81_cycles,
+        telemetry.fw_stats.max_loop_latency_us,
+        telemetry.fw_stats.p81_frames_sent,
+        telemetry.fw_stats.p81_frames_superseded,
+        telemetry.fw_stats.c0_validation_failures,
+        telemetry.fw_stats.sccb_errors,
+        telemetry.fw_stats.send_partial,
+        telemetry.fw_stats.ring_build_failures,
     )
     .map_err(|_| HttpError::BufferTooSmall)?;
 
@@ -1044,7 +1099,12 @@ pub struct KlipperCamServer<'a> {
     uptime_ms: i64,
     free_heap: u32,
     free_psram: u32,
-    wifi_rssi: i32,
+    wifi_rssi: Option<i32>,
+    reset_reason: u32,
+    app_sha256: &'a str,
+    free_dram: u32,
+    core1_stack_hwm: u32,
+    fw_stats: FwStatsSnapshot,
     last_ota_bytes_written: usize,
     last_ota_target_slot: Option<OtaSlot>,
     reboot_scheduled: bool,
@@ -1063,7 +1123,12 @@ impl<'a> KlipperCamServer<'a> {
             uptime_ms: 15_000,
             free_heap: 184_320,
             free_psram: 4_128_768,
-            wifi_rssi: -48,
+            wifi_rssi: Some(-48),
+            reset_reason: 0,
+            app_sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+            free_dram: 184_320,
+            core1_stack_hwm: 0,
+            fw_stats: FwStatsSnapshot::new(),
             last_ota_bytes_written: 0,
             last_ota_target_slot: None,
             reboot_scheduled: false,
@@ -1108,7 +1173,37 @@ impl<'a> KlipperCamServer<'a> {
         self.uptime_ms = uptime_ms;
         self.free_heap = free_heap;
         self.free_psram = free_psram;
+        self.wifi_rssi = Some(wifi_rssi);
+    }
+
+    /// Updates extended live system telemetry metrics including optional RSSI.
+    pub fn set_extended_telemetry(
+        &mut self,
+        uptime_ms: i64,
+        free_heap: u32,
+        free_psram: u32,
+        wifi_rssi: Option<i32>,
+    ) {
+        self.uptime_ms = uptime_ms;
+        self.free_heap = free_heap;
+        self.free_psram = free_psram;
         self.wifi_rssi = wifi_rssi;
+    }
+
+    /// Updates firmware diagnostics and performance counters.
+    pub fn set_diagnostics(
+        &mut self,
+        reset_reason: u32,
+        app_sha256: &'a str,
+        free_dram: u32,
+        core1_stack_hwm: u32,
+        fw_stats: FwStatsSnapshot,
+    ) {
+        self.reset_reason = reset_reason;
+        self.app_sha256 = app_sha256;
+        self.free_dram = free_dram;
+        self.core1_stack_hwm = core1_stack_hwm;
+        self.fw_stats = fw_stats;
     }
 
     /// Returns `true` if a client is currently streaming on Port 81
@@ -1347,6 +1442,11 @@ impl<'a> KlipperCamServer<'a> {
             active_partition: active_label,
             framesize: framesize_label(self.control_state.framesize),
             stream_active: self.is_stream_active(),
+            reset_reason: self.reset_reason,
+            app_sha256: self.app_sha256,
+            free_dram: self.free_dram,
+            core1_stack_hwm: self.core1_stack_hwm,
+            fw_stats: self.fw_stats,
         };
 
         let mut json_stack = [0u8; STATUS_JSON_BUF_LEN];
@@ -1968,15 +2068,13 @@ mod tests {
 
     /// Challenger Scenario 1: Port 80 `GET /status` returns `200 OK`
     /// `application/json`
-    /// with the exact 7-key JSON telemetry schema (`uptime_ms`, `free_heap`,
-    /// `free_psram`,
-    /// `wifi_rssi`, `active_partition`, `framesize`, `stream_active`).
+    /// with all 7 original JSON telemetry keys first, followed by diagnostics.
     #[test]
     fn test_challenger_1_port80_status_7_key_json() {
         let mut server = KlipperCamServer::new_default();
         server.set_telemetry(42_500, 192_000, 4_100_000, -51);
 
-        let mut resp_buf = [0u8; 1024];
+        let mut resp_buf = [0u8; 1536];
         let raw_req = b"GET /status HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n";
         let resp_bytes = server
             .handle_raw_request(ServerPort::Control, raw_req, &mut resp_buf)
@@ -1992,8 +2090,92 @@ mod tests {
             body_str,
             "{\"uptime_ms\":42500,\"free_heap\":192000,\"free_psram\":4100000,\
             \"wifi_rssi\":-51,\"active_partition\":\"ota_0\",\
-            \"framesize\":\"1280x720\",\"stream_active\":false}\n"
+            \"framesize\":\"1280x720\",\"stream_active\":false,\
+            \"reset_reason\":0,\
+            \"app_sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\",\
+            \"free_dram\":184320,\"core1_stack_hwm\":0,\
+            \"sensor_frame_period_us\":0,\"frame_bytes\":0,\"c1_pushed\":0,\
+            \"c1_dropped\":0,\"ring_full_events\":0,\"soi_miss\":0,\
+            \"overflow_aborts\":0,\"c0_spsc_cycles\":0,\"c0_net_cycles\":0,\
+            \"c0_p80_cycles\":0,\"c0_p81_cycles\":0,\"max_loop_latency_us\":0,\
+            \"p81_frames_sent\":0,\"p81_frames_superseded\":0,\
+            \"c0_validation_failures\":0,\"sccb_errors\":0,\"send_partial\":0,\
+            \"ring_build_failures\":0}\n"
         );
+    }
+
+    #[test]
+    fn test_status_json_wifi_rssi_null_vs_some() {
+        let mut snap = TelemetrySnapshot {
+            wifi_rssi: None,
+            ..TelemetrySnapshot::default()
+        };
+        let mut buf = [0u8; STATUS_JSON_BUF_LEN];
+        let json_null = format_status_json(&snap, &mut buf).expect("format status null");
+        assert!(json_null.contains("\"wifi_rssi\":null"));
+
+        snap.wifi_rssi = Some(-62);
+        let mut buf2 = [0u8; STATUS_JSON_BUF_LEN];
+        let json_some = format_status_json(&snap, &mut buf2).expect("format status some");
+        assert!(json_some.contains("\"wifi_rssi\":-62"));
+    }
+
+    #[test]
+    fn test_status_json_worst_case_max_width_values_fit_buffer() {
+        let max_snap = TelemetrySnapshot {
+            uptime_ms: i64::MIN,
+            free_heap: u32::MAX,
+            free_psram: u32::MAX,
+            wifi_rssi: Some(i32::MIN),
+            active_partition: "ota_1_long_custom_label_with_extra_chars_to_limit",
+            framesize: "2560x1440_uhd_maximum_resolution_extended_mode_long_name",
+            stream_active: false,
+            reset_reason: u32::MAX,
+            app_sha256: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            free_dram: u32::MAX,
+            core1_stack_hwm: u32::MAX,
+            fw_stats: FwStatsSnapshot {
+                sensor_frame_period_us: u32::MAX,
+                frame_bytes: u32::MAX,
+                c1_pushed: u32::MAX,
+                c1_dropped: u32::MAX,
+                ring_full_events: u32::MAX,
+                soi_miss: u32::MAX,
+                overflow_aborts: u32::MAX,
+                c0_spsc_cycles: u32::MAX,
+                c0_net_cycles: u32::MAX,
+                c0_p80_cycles: u32::MAX,
+                c0_p81_cycles: u32::MAX,
+                max_loop_latency_us: u32::MAX,
+                p81_frames_sent: u32::MAX,
+                p81_frames_superseded: u32::MAX,
+                c0_validation_failures: u32::MAX,
+                sccb_errors: u32::MAX,
+                send_partial: u32::MAX,
+                ring_build_failures: u32::MAX,
+            },
+        };
+
+        let mut buf = [0u8; STATUS_JSON_BUF_LEN];
+        let json_str = format_status_json(&max_snap, &mut buf)
+            .expect("worst-case maximum-width values must fit inside 1024 bytes");
+        assert!(json_str.len() <= STATUS_JSON_BUF_LEN);
+
+        let expected_prefixes = [
+            "\"uptime_ms\":",
+            "\"free_heap\":",
+            "\"free_psram\":",
+            "\"wifi_rssi\":",
+            "\"active_partition\":",
+            "\"framesize\":",
+            "\"stream_active\":",
+        ];
+        let mut prev_pos = 0;
+        for key in expected_prefixes.iter() {
+            let pos = json_str.find(key).expect("key must exist in json");
+            assert!(pos >= prev_pos, "keys must be in original order");
+            prev_pos = pos;
+        }
     }
 
     /// Challenger Scenario 2: Port 80 `GET /snapshot` and `GET /?action=snapshot`
@@ -2172,7 +2354,7 @@ Content-Type: image/jpeg\r\nContent-Length: 43\r\n\r\n";
 
         // Concurrent Port 80 GET /status while Client 1 is streaming ->
         // "stream_active":true
-        let mut status_buf = [0u8; 512];
+        let mut status_buf = [0u8; 1536];
         let status_resp = server
             .handle_status(&mut status_buf)
             .expect("concurrent status must succeed");

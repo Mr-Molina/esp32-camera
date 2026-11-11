@@ -46,9 +46,13 @@ use klipper_cam_fw::{
 };
 
 #[cfg(target_arch = "xtensa")]
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 #[cfg(target_arch = "xtensa")]
 use esp_hal::system::{CpuControl, Stack};
+#[cfg(target_arch = "xtensa")]
+use klipper_cam_fw::telemetry::{
+    ccount, format_sha256_hex, measure_stack_hwm_volatile, paint_stack_sentinel, FwStats,
+};
 #[cfg(target_arch = "xtensa")]
 use klipper_cam_fw::{
     write_http_error, Core1JpegSpsc, TripleFrameBuffer, JPEG_SPSC_CHUNK_BYTES, SPSC_FLAG_ABORT,
@@ -360,7 +364,10 @@ static mut I2S_DMA_DESC: [Lldesc; 16] = [Lldesc::empty(); 16];
 static mut I2S_DMA_BUF: AlignedDmaBuf = AlignedDmaBuf([0u8; 32768]);
 
 #[cfg(target_arch = "xtensa")]
-static mut APP_CORE_STACK: Stack<4096> = Stack::new();
+static mut APP_CORE_STACK: Stack<8192> = Stack::new();
+
+#[cfg(target_arch = "xtensa")]
+static FW_STATS: FwStats = FwStats::new();
 
 #[cfg(target_arch = "xtensa")]
 static CORE1_SPSC: Core1JpegSpsc<32> = Core1JpegSpsc::new();
@@ -480,6 +487,123 @@ impl klipper_cam_fw::OtaFlashStorage for EspFlashAdapter<'_> {
         feed_rtc_wdt();
         res
     }
+}
+
+#[cfg(target_arch = "xtensa")]
+static BOOT_RESET_REASON: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(target_arch = "xtensa")]
+static mut APP_SHA256_HEX: [u8; 64] = [0u8; 64];
+
+#[cfg(target_arch = "xtensa")]
+static APP_SHA256_VALID: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_arch = "xtensa")]
+fn init_boot_app_sha256(flash: &mut EspFlashAdapter<'_>, slot: OtaSlot) {
+    use klipper_cam_fw::OtaFlashStorage as _;
+
+    #[repr(C, align(4))]
+    struct AlignedFlashBuf32([u8; 32]);
+
+    let base_off: u32 = match slot {
+        OtaSlot::Ota0 => 0x0002_0000,
+        OtaSlot::Ota1 => 0x001D_0000,
+    };
+
+    let mut hdr_buf = AlignedFlashBuf32([0u8; 32]);
+    if flash.read_aligned(base_off, &mut hdr_buf.0[..24]).is_err() {
+        return;
+    }
+    let hdr = &hdr_buf.0[..24];
+    let seg_count = hdr[1];
+    if hdr[0] != 0xE9 || seg_count == 0 || seg_count > 16 || hdr[23] != 1 {
+        return;
+    }
+
+    let mut pos: u32 = 24;
+    let mut seg_idx: u8 = 0;
+    while seg_idx < seg_count {
+        let Some(abs_off) = base_off.checked_add(pos) else {
+            return;
+        };
+        let aligned_off = abs_off & !3;
+        let shift = (abs_off & 3) as usize;
+        let read_len = if shift == 0 { 8usize } else { 12usize };
+        let mut seg_buf = AlignedFlashBuf32([0u8; 32]);
+        if flash
+            .read_aligned(aligned_off, &mut seg_buf.0[..read_len])
+            .is_err()
+        {
+            return;
+        }
+        let seg_hdr = &seg_buf.0[shift..shift + 8];
+        let _load_addr = u32::from_le_bytes([seg_hdr[0], seg_hdr[1], seg_hdr[2], seg_hdr[3]]);
+        let data_len = u32::from_le_bytes([seg_hdr[4], seg_hdr[5], seg_hdr[6], seg_hdr[7]]);
+        if data_len > klipper_cam_fw::OTA_0_SIZE {
+            return;
+        }
+        let Some(after_hdr) = pos.checked_add(8) else {
+            return;
+        };
+        let Some(after_seg) = after_hdr.checked_add(data_len) else {
+            return;
+        };
+        if after_seg > klipper_cam_fw::OTA_0_SIZE {
+            return;
+        }
+        pos = after_seg;
+        seg_idx += 1;
+    }
+
+    let sha_off = (pos + 1 + 15) & !15;
+    let Some(sha_end) = sha_off.checked_add(32) else {
+        return;
+    };
+    if sha_end > klipper_cam_fw::OTA_0_SIZE {
+        return;
+    }
+    let Some(abs_sha_off) = base_off.checked_add(sha_off) else {
+        return;
+    };
+    let mut digest_buf = AlignedFlashBuf32([0u8; 32]);
+    if flash.read_aligned(abs_sha_off, &mut digest_buf.0).is_err() {
+        return;
+    }
+
+    // JUSTIFICATION: Populate static 64-byte SHA-256 hex buffer once at
+    // single-threaded boot before starting Core 1 or the HTTP server loop.
+    // SAFETY:
+    // 1. Preconditions: Executed once during early single-core boot init.
+    // 2. Alignment: `[u8; 64]` has alignment 1 and is statically allocated.
+    // 3. Provenance & Lifetime: `APP_SHA256_HEX` lives in `.bss` for `'static`.
+    // 4. Aliasing: No shared references exist before `APP_SHA256_VALID` is set.
+    // 5. Volatile Semantics: Published via `Ordering::Release` on `AtomicBool`.
+    // 6. Panic Safety: `format_sha256_hex` writes bounded indices `0..64`.
+    let ok = unsafe {
+        let hex_out = &mut *core::ptr::addr_of_mut!(APP_SHA256_HEX);
+        format_sha256_hex(&digest_buf.0, hex_out).len() == 64
+    };
+    if ok {
+        APP_SHA256_VALID.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(target_arch = "xtensa")]
+fn boot_app_sha256_str() -> &'static str {
+    if !APP_SHA256_VALID.load(Ordering::Acquire) {
+        return "unknown";
+    }
+    // JUSTIFICATION: Borrow immutable `'static` SHA-256 hex buffer after
+    // one-time boot initialization ordered by `APP_SHA256_VALID`.
+    // SAFETY:
+    // 1. Preconditions: `APP_SHA256_VALID` is `true` via `Acquire` load.
+    // 2. Alignment: `[u8; 64]` has 1-byte alignment.
+    // 3. Provenance & Lifetime: Static `.bss` buffer lives for `'static`.
+    // 4. Aliasing: Never mutated after `APP_SHA256_VALID` Release store.
+    // 5. Volatile Semantics: Synchronized via Acquire/Release atomic flag.
+    // 6. Panic Safety: Fallible `from_utf8` match cannot panic or unwind.
+    let bytes: &'static [u8; 64] = unsafe { &*core::ptr::addr_of!(APP_SHA256_HEX) };
+    core::str::from_utf8(bytes).unwrap_or("unknown")
 }
 
 #[cfg(target_arch = "xtensa")]
@@ -862,7 +986,11 @@ fn enqueue_tcp_sliding_window(
         let max_send = TCP_MAX_INFLIGHT_BYTES - queued;
         let chunk_end = (*tx_off + max_send).min(limit);
         if chunk_end > *tx_off {
-            if let Ok(sent) = sock.send_slice(&buf[*tx_off..chunk_end]) {
+            let seg = &buf[*tx_off..chunk_end];
+            if let Ok(sent) = sock.send_slice(seg) {
+                if sent > 0 && sent < seg.len() {
+                    FW_STATS.inc_send_partial();
+                }
                 *tx_off += sent;
             }
         }
@@ -897,7 +1025,12 @@ fn enqueue_p81_zero_copy(
         }
         match sock.send_slice(seg) {
             Ok(0) | Err(_) => break,
-            Ok(sent) => *tx_off += sent,
+            Ok(sent) => {
+                if sent < seg.len() {
+                    FW_STATS.inc_send_partial();
+                }
+                *tx_off += sent;
+            }
         }
     }
 }
@@ -908,6 +1041,7 @@ fn poll_net_burst(
     net_device: &mut SmoltcpWifiDevice,
     sockets: &mut smoltcp::iface::SocketSet<'_>,
 ) {
+    let t0 = ccount();
     for _ in 0..16u8 {
         let now = smol_now();
         let _ = iface.poll(now, net_device, sockets);
@@ -915,6 +1049,7 @@ fn poll_net_burst(
             break;
         }
     }
+    FW_STATS.add_c0_net_cycles(ccount().wrapping_sub(t0));
 }
 
 #[cfg(target_arch = "xtensa")]
@@ -1721,7 +1856,9 @@ fn capture_live_hd_jpeg_with_diag(
             &mut (*core::ptr::addr_of_mut!(I2S_DMA_BUF)).0,
         )
     };
-    let _ = build_circular_ring(desc_slice, dma_slice, 2048);
+    if build_circular_ring(desc_slice, dma_slice, 2048).is_err() {
+        FW_STATS.inc_ring_build_failures();
+    }
 
     let slot_cap = triple_fb.write_slot_mut().len();
     let dma_cfg = esp32_cam_ll::DmaSizeConfig {
@@ -1767,7 +1904,9 @@ fn capture_live_hd_jpeg_with_diag(
                 }
             }
         } else {
-            let _ = build_circular_ring(desc_slice, dma_slice, 2048);
+            if build_circular_ring(desc_slice, dma_slice, 2048).is_err() {
+                FW_STATS.inc_ring_build_failures();
+            }
             let sync_start_ms = now_millis();
             while !read_vsync() && (now_millis().saturating_sub(sync_start_ms) < 100) {
                 spin = spin.wrapping_add(1);
@@ -2058,7 +2197,9 @@ fn core1_camera_producer_loop() -> ! {
     };
 
     dma_slice.fill(0);
-    let _ = build_circular_ring(desc_slice, dma_slice, 2048);
+    if build_circular_ring(desc_slice, dma_slice, 2048).is_err() {
+        FW_STATS.inc_ring_build_failures();
+    }
 
     let dma_cfg = esp32_cam_ll::DmaSizeConfig {
         dma_bytes_per_item: 4,
@@ -2109,11 +2250,14 @@ fn core1_camera_producer_loop() -> ! {
 
     let mut unpack_buf = [0u8; JPEG_SPSC_CHUNK_BYTES];
     let mut aligned_from_eof = false;
+    let mut last_vsync_cycles = 0u32;
     let rearm_flags = Lldesc::pack_flags(2048, 0, 0, false, false, true);
 
     loop {
         if CORE1_PAUSE_REQ.load(Ordering::Acquire) {
-            let _ = i2s_cam.stop();
+            if !i2s_cam.stop() {
+                FW_STATS.inc_c0_validation_failures();
+            }
             aligned_from_eof = false;
             CORE1_IS_PAUSED.store(true, Ordering::Release);
             while CORE1_PAUSE_REQ.load(Ordering::Acquire) {
@@ -2154,7 +2298,16 @@ fn core1_camera_producer_loop() -> ! {
             }
         }
 
-        let _ = build_circular_ring(desc_slice, dma_slice, 2048);
+        let vsync_cycles = ccount();
+        if last_vsync_cycles != 0 {
+            let delta = vsync_cycles.wrapping_sub(last_vsync_cycles);
+            FW_STATS.record_sensor_period_us(delta / 240);
+        }
+        last_vsync_cycles = vsync_cycles;
+
+        if build_circular_ring(desc_slice, dma_slice, 2048).is_err() {
+            FW_STATS.inc_ring_build_failures();
+        }
         // JUSTIFICATION: Clear stale I2S0 EOF interrupt flag before arming DMA.
         // SAFETY:
         // 1. Alignment & Non-null: `0x3FF4_F018` is 4-byte aligned I2S0 MMIO.
@@ -2177,6 +2330,7 @@ fn core1_camera_producer_loop() -> ! {
         let mut aborted = false;
         let mut seen_vsync_high = false;
         let mut idle_spins = 0u32;
+        let mut c1_drop_counted = false;
 
         'frame_poll: loop {
             if (idle_spins & 0x3FF) == 0 && CORE1_PAUSE_REQ.load(Ordering::Relaxed) {
@@ -2248,6 +2402,9 @@ fn core1_camera_producer_loop() -> ! {
                     if is_first_chunk {
                         let scan_end = written.min(256);
                         if verify_jpeg_soi(&unpack_buf[..scan_end]).is_none() {
+                            FW_STATS.inc_soi_miss();
+                            FW_STATS.inc_c1_dropped();
+                            c1_drop_counted = true;
                             aborted = true;
                             aligned_from_eof = false;
                             break 'frame_poll;
@@ -2255,6 +2412,9 @@ fn core1_camera_producer_loop() -> ! {
                     }
 
                     if total_bytes + written > 128 * 1024 {
+                        FW_STATS.inc_overflow_aborts();
+                        FW_STATS.inc_c1_dropped();
+                        c1_drop_counted = true;
                         aborted = true;
                         aligned_from_eof = false;
                         break 'frame_poll;
@@ -2268,6 +2428,9 @@ fn core1_camera_producer_loop() -> ! {
                     };
 
                     if !push_spsc_bounded(&unpack_buf[..written], flags, 8_000) {
+                        FW_STATS.inc_ring_full_events();
+                        FW_STATS.inc_c1_dropped();
+                        c1_drop_counted = true;
                         aborted = true;
                         aligned_from_eof = false;
                         break 'frame_poll;
@@ -2317,9 +2480,18 @@ fn core1_camera_producer_loop() -> ! {
                         );
                         dma_slice[half_off..half_off + 4096].fill(0);
                         half_idx = (half_idx + 1) & 7;
-                        if total_bytes + written > 128 * 1024
-                            || !push_spsc_bounded(&unpack_buf[..written], 0, 8_000)
-                        {
+                        if total_bytes + written > 128 * 1024 {
+                            FW_STATS.inc_overflow_aborts();
+                            FW_STATS.inc_c1_dropped();
+                            c1_drop_counted = true;
+                            aborted = true;
+                            aligned_from_eof = false;
+                            break;
+                        }
+                        if !push_spsc_bounded(&unpack_buf[..written], 0, 8_000) {
+                            FW_STATS.inc_ring_full_events();
+                            FW_STATS.inc_c1_dropped();
+                            c1_drop_counted = true;
                             aborted = true;
                             aligned_from_eof = false;
                             break;
@@ -2336,6 +2508,9 @@ fn core1_camera_producer_loop() -> ! {
                         dma_slice[tail_off..tail_off + 4096].fill(0);
                         if unpack_buf[..written].iter().any(|&b| b != 0) {
                             if !push_spsc_bounded(&unpack_buf[..written], 0, 8_000) {
+                                FW_STATS.inc_ring_full_events();
+                                FW_STATS.inc_c1_dropped();
+                                c1_drop_counted = true;
                                 aborted = true;
                                 aligned_from_eof = false;
                             } else {
@@ -2349,6 +2524,8 @@ fn core1_camera_producer_loop() -> ! {
 
             idle_spins = idle_spins.wrapping_add(1);
             if idle_spins >= 4_000_000 {
+                FW_STATS.inc_c1_dropped();
+                c1_drop_counted = true;
                 aborted = true;
                 aligned_from_eof = false;
                 break 'frame_poll;
@@ -2359,14 +2536,21 @@ fn core1_camera_producer_loop() -> ! {
         let _ = i2s_cam.stop();
 
         if aborted || is_first_chunk || total_bytes < 64 {
+            if !c1_drop_counted {
+                FW_STATS.inc_c1_dropped();
+            }
             dma_slice.fill(0);
             if !is_first_chunk {
                 let _ = push_spsc_bounded(&[], SPSC_FLAG_ABORT, 8_000);
             }
             CORE1_SPSC.record_frame_dropped();
         } else if push_spsc_bounded(&[], SPSC_FLAG_EOF, 32_000) {
+            FW_STATS.inc_c1_pushed();
+            FW_STATS.record_frame_bytes(total_bytes as u32);
             CORE1_SPSC.record_frame_pushed();
         } else {
+            FW_STATS.inc_ring_full_events();
+            FW_STATS.inc_c1_dropped();
             let _ = push_spsc_bounded(&[], SPSC_FLAG_ABORT, 8_000);
             CORE1_SPSC.record_frame_dropped();
         }
@@ -2809,6 +2993,7 @@ fn drain_core1_spsc_to_triple(
     current_fs: FrameSize,
     p81_active: bool,
 ) {
+    let t0 = ccount();
     for _ in 0..64u8 {
         let mut frame_done_len: Option<usize> = None;
         // JUSTIFICATION: Core 0 is the sole SPSC consumer on `CORE1_SPSC`.
@@ -2867,17 +3052,27 @@ fn drain_core1_spsc_to_triple(
                         if soi_pos > 0 {
                             triple_fb.write_slot_mut().copy_within(soi_pos..eoi_end, 0);
                         }
+                        if triple_fb.has_new_ready() {
+                            FW_STATS.inc_p81_frames_superseded();
+                        }
                         if triple_fb.commit_write_slot(exact_len).is_ok()
                             && !p81_active
                             && triple_fb.promote_ready_to_active()
                         {
                             camera.set_frame(active_triple_static_slice(triple_fb), current_fs);
                         }
+                    } else {
+                        FW_STATS.inc_c0_validation_failures();
                     }
+                } else {
+                    FW_STATS.inc_c0_validation_failures();
                 }
+            } else {
+                FW_STATS.inc_c0_validation_failures();
             }
         }
     }
+    FW_STATS.add_c0_spsc_cycles(ccount().wrapping_sub(t0));
 }
 
 #[cfg(target_arch = "xtensa")]
@@ -3152,23 +3347,46 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
     // Spacing between roam scans; grows while scans find no better AP.
     let mut roam_backoff = RoamBackoff::new();
     let mut spsc_asm = Core0SpscAssembler::new();
+    let mut cached_wifi_rssi: Option<i32> = if wifi_controller.is_connected() {
+        wifi_controller.rssi().ok()
+    } else {
+        None
+    };
+    let mut core1_stack_base: *const u8 = core::ptr::null();
+    let mut core1_stack_len: usize = 0;
 
     if ov2640_dma_ok {
         let mut cpu_ctrl = CpuControl::new(cpu_ctrl_peri);
         CORE1_ACTIVE.store(true, Ordering::Release);
-        // JUSTIFICATION: Hand exclusive 16-byte aligned 4 KB internal DRAM
+        let stack_raw_mut = core::ptr::addr_of_mut!(APP_CORE_STACK).cast::<u8>();
+        let stack_bytes = core::mem::size_of::<Stack<8192>>();
+        // JUSTIFICATION: Paint 0xA5 canary across the 8 KB Core 1 stack prior
+        // to booting APP_CPU so `/status` can measure live stack HWM.
+        // SAFETY:
+        // 1. Preconditions: `stack_raw_mut` points to 8192-byte static stack.
+        // 2. Alignment: `Stack<8192>` is 16-byte aligned; `u8` requires 1.
+        // 3. Provenance & Lifetime: Static `.bss` storage valid for `'static`.
+        // 4. Aliasing: Core 1 is still parked in reset before `start_app_core`.
+        // 5. Volatile Semantics: `paint_stack_sentinel` uses `write_volatile`.
+        // 6. Panic Safety: Bounded byte loop cannot panic or unwind.
+        unsafe {
+            paint_stack_sentinel(stack_raw_mut, stack_bytes);
+        }
+        // JUSTIFICATION: Hand exclusive 16-byte aligned 8 KB internal DRAM
         // stack to APP_CPU (`Core 1`).
         // SAFETY:
-        // 1. Alignment & Non-null: `APP_CORE_STACK` is `Stack<4096>` (`align(16)`).
-        // 2. Layout: Static 4 KB `MaybeUninit` stack in `.bss`.
+        // 1. Alignment & Non-null: `APP_CORE_STACK` is `Stack<8192>` (`align(16)`).
+        // 2. Layout: Static 8 KB `MaybeUninit` stack in `.bss`.
         // 3. Provenance: Lives for `'static` and `AppCoreGuard` is forgotten.
-        // 4. Aliasing: Core 0 never references `APP_CORE_STACK` again.
+        // 4. Aliasing: Core 0 never forms references to `APP_CORE_STACK` again.
         // 5. Synchronization: `start_app_core` orders stack pointers via Release.
         // 6. Unwind safety: Core 1 entry diverges (`-> !`).
         let app_stack = unsafe { &mut *core::ptr::addr_of_mut!(APP_CORE_STACK) };
         if let Ok(guard) = cpu_ctrl.start_app_core(app_stack, || core1_camera_producer_loop()) {
             // CRITICAL: Never drop AppCoreGuard or esp-hal parks APP_CPU!
             core::mem::forget(guard);
+            core1_stack_base = core::ptr::addr_of!(APP_CORE_STACK).cast::<u8>();
+            core1_stack_len = stack_bytes;
             println!("[KLIPPER-CAM-RS] [CORE1] APP_CPU continuous I2S0 camera producer started");
         } else {
             CORE1_ACTIVE.store(false, Ordering::Release);
@@ -3176,6 +3394,7 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
     }
 
     loop {
+        let loop_t0 = ccount();
         feed_rtc_wdt();
         drain_core1_spsc_to_triple(
             &mut spsc_asm,
@@ -3189,13 +3408,15 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
 
         if wifi_controller.is_connected() {
             last_wifi_connected_ms = now_ms;
+            if cached_wifi_rssi.is_none() {
+                cached_wifi_rssi = wifi_controller.rssi().ok();
+            }
             let now_u64 = u64::try_from(now_ms).unwrap_or(0);
             if now_u64.saturating_sub(last_roam_check_ms) >= ROAM_CHECK_INTERVAL_MS {
                 last_roam_check_ms = now_u64;
-                let rssi = wifi_controller
-                    .rssi()
-                    .ok()
-                    .and_then(|raw| i8::try_from(raw).ok());
+                let raw_rssi = wifi_controller.rssi().ok();
+                cached_wifi_rssi = raw_rssi;
+                let rssi = raw_rssi.and_then(|raw| i8::try_from(raw).ok());
                 let weak_ms = match rssi {
                     Some(r) => weak_link_timer.update(now_u64, r, ROAM_TRIGGER_RSSI_DBM),
                     None => 0,
@@ -3241,6 +3462,7 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                                         info.channel, info.aid
                                     );
                                     current_bssid = Some(info.bssid);
+                                    cached_wifi_rssi = wifi_controller.rssi().ok();
                                     connect_ms = smol_now().total_millis();
                                     last_wifi_connected_ms = connect_ms;
                                     // The roam blocked the loop for seconds;
@@ -3266,6 +3488,7 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                                         "base config restored, reconnect path will recover"
                                     ));
                                     current_bssid = None;
+                                    cached_wifi_rssi = None;
                                 }
                             }
                             roam_backoff.reset();
@@ -3284,6 +3507,7 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                 }
             }
         } else {
+            cached_wifi_rssi = None;
             if now_ms - last_wifi_connected_ms >= 90_000
                 && ota_accum_owner.is_none()
                 && !runtime.server.is_reboot_scheduled()
@@ -3315,6 +3539,7 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                     connect_ms = smol_now().total_millis();
                     last_wifi_connected_ms = connect_ms;
                     current_bssid = Some(info.bssid);
+                    cached_wifi_rssi = wifi_controller.rssi().ok();
                     weak_link_timer.reset();
                     roam_backoff.reset();
                     let announce_ip = ip_configured.then_some([172, 22, 1, 52]);
@@ -3483,6 +3708,7 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
         // ============================================================
         // Port 80 4-Socket Listener Pool (Control / Snapshot / Status / OTA)
         // ============================================================
+        let p80_t0 = ccount();
         for idx in 0..PORT80_SOCKET_COUNT {
             let sock80 = sockets.get_mut::<TcpSocket>(tcp80_handles[idx]);
             let st = &mut p80_states[idx];
@@ -3776,10 +4002,39 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                             let free_dram = esp_alloc::HEAP
                                 .free_caps(esp_alloc::MemoryCapability::Internal.into())
                                 as u32;
-                            let rssi = wifi_controller.rssi().unwrap_or(-50);
-                            runtime
-                                .server
-                                .set_telemetry(now_ms, free_dram, free_psram_bytes, rssi);
+                            let core1_stack_hwm = if !core1_stack_base.is_null()
+                                && core1_stack_len > 0
+                            {
+                                // JUSTIFICATION: Volatile byte-level scan of Core 1's
+                                // downward-growing stack canary without forming `&[u8]`
+                                // references that would alias `&mut Stack<8192>`.
+                                // SAFETY:
+                                // 1. Preconditions: `core1_stack_base` and `core1_stack_len`
+                                //    were captured from `APP_CORE_STACK` (`8192` bytes).
+                                // 2. Alignment: `u8` has alignment 1.
+                                // 3. Provenance & Lifetime: `'static` `.bss` stack memory.
+                                // 4. Aliasing: Raw volatile byte reads form zero references.
+                                // 5. Volatile Semantics: `read_volatile` reads SRAM directly.
+                                // 6. Panic Safety: Bounded scan cannot panic or unwind.
+                                unsafe {
+                                    measure_stack_hwm_volatile(core1_stack_base, core1_stack_len)
+                                }
+                            } else {
+                                0
+                            };
+                            runtime.server.set_extended_telemetry(
+                                now_ms,
+                                free_dram,
+                                free_psram_bytes,
+                                cached_wifi_rssi,
+                            );
+                            runtime.server.set_diagnostics(
+                                BOOT_RESET_REASON.load(Ordering::Relaxed),
+                                boot_app_sha256_str(),
+                                free_dram,
+                                core1_stack_hwm,
+                                FW_STATS.snapshot(),
+                            );
 
                             let req_slice: &[u8] = if st.using_ota_accum {
                                 &http80_ota_accum[..st.req_len]
@@ -3868,6 +4123,7 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                 }
             }
         }
+        FW_STATS.add_c0_p80_cycles(ccount().wrapping_sub(p80_t0));
 
         // Apply any pending live camera control updates from
         // GET /control?var=...&val=...
@@ -3879,41 +4135,63 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
             let _ = pause_core1_camera_producer();
             if let (Some(ref mut sccb), Some(ref mut ov)) = (&mut kept_sccb, &mut live_ov2640) {
                 let fs_changed = ctrl.framesize != last_applied_ctrl.framesize;
-                if fs_changed {
-                    let _ = ov.set_framesize(sccb, ctrl.framesize);
+                if fs_changed && ov.set_framesize(sccb, ctrl.framesize).is_err() {
+                    FW_STATS.inc_sccb_errors();
                 }
-                if fs_changed || ctrl.quality != last_applied_ctrl.quality {
-                    let _ = ov.set_quality(sccb, ctrl.quality);
+                if (fs_changed || ctrl.quality != last_applied_ctrl.quality)
+                    && ov.set_quality(sccb, ctrl.quality).is_err()
+                {
+                    FW_STATS.inc_sccb_errors();
                 }
-                if fs_changed || ctrl.brightness != last_applied_ctrl.brightness {
-                    let _ = ov.set_brightness(sccb, ctrl.brightness);
+                if (fs_changed || ctrl.brightness != last_applied_ctrl.brightness)
+                    && ov.set_brightness(sccb, ctrl.brightness).is_err()
+                {
+                    FW_STATS.inc_sccb_errors();
                 }
-                if fs_changed || ctrl.contrast != last_applied_ctrl.contrast {
-                    let _ = ov.set_contrast(sccb, ctrl.contrast);
+                if (fs_changed || ctrl.contrast != last_applied_ctrl.contrast)
+                    && ov.set_contrast(sccb, ctrl.contrast).is_err()
+                {
+                    FW_STATS.inc_sccb_errors();
                 }
-                if fs_changed || ctrl.saturation != last_applied_ctrl.saturation {
-                    let _ = ov.set_saturation(sccb, ctrl.saturation);
+                if (fs_changed || ctrl.saturation != last_applied_ctrl.saturation)
+                    && ov.set_saturation(sccb, ctrl.saturation).is_err()
+                {
+                    FW_STATS.inc_sccb_errors();
                 }
-                if fs_changed || ctrl.special_effect != last_applied_ctrl.special_effect {
-                    let _ = ov.set_special_effect(sccb, ctrl.special_effect);
+                if (fs_changed || ctrl.special_effect != last_applied_ctrl.special_effect)
+                    && ov.set_special_effect(sccb, ctrl.special_effect).is_err()
+                {
+                    FW_STATS.inc_sccb_errors();
                 }
-                if fs_changed || ctrl.hmirror != last_applied_ctrl.hmirror {
-                    let _ = ov.set_hmirror(sccb, ctrl.hmirror);
+                if (fs_changed || ctrl.hmirror != last_applied_ctrl.hmirror)
+                    && ov.set_hmirror(sccb, ctrl.hmirror).is_err()
+                {
+                    FW_STATS.inc_sccb_errors();
                 }
-                if fs_changed || ctrl.vflip != last_applied_ctrl.vflip {
-                    let _ = ov.set_vflip(sccb, ctrl.vflip);
+                if (fs_changed || ctrl.vflip != last_applied_ctrl.vflip)
+                    && ov.set_vflip(sccb, ctrl.vflip).is_err()
+                {
+                    FW_STATS.inc_sccb_errors();
                 }
-                if fs_changed || ctrl.awb != last_applied_ctrl.awb {
-                    let _ = ov.set_whitebal(sccb, ctrl.awb);
+                if (fs_changed || ctrl.awb != last_applied_ctrl.awb)
+                    && ov.set_whitebal(sccb, ctrl.awb).is_err()
+                {
+                    FW_STATS.inc_sccb_errors();
                 }
-                if fs_changed || ctrl.agc != last_applied_ctrl.agc {
-                    let _ = ov.set_gain_ctrl(sccb, ctrl.agc);
+                if (fs_changed || ctrl.agc != last_applied_ctrl.agc)
+                    && ov.set_gain_ctrl(sccb, ctrl.agc).is_err()
+                {
+                    FW_STATS.inc_sccb_errors();
                 }
-                if fs_changed || ctrl.aec != last_applied_ctrl.aec {
-                    let _ = ov.set_exposure_ctrl(sccb, ctrl.aec);
+                if (fs_changed || ctrl.aec != last_applied_ctrl.aec)
+                    && ov.set_exposure_ctrl(sccb, ctrl.aec).is_err()
+                {
+                    FW_STATS.inc_sccb_errors();
                 }
-                if fs_changed || ctrl.ae_level != last_applied_ctrl.ae_level {
-                    let _ = ov.set_ae_level(sccb, ctrl.ae_level);
+                if (fs_changed || ctrl.ae_level != last_applied_ctrl.ae_level)
+                    && ov.set_ae_level(sccb, ctrl.ae_level).is_err()
+                {
+                    FW_STATS.inc_sccb_errors();
                 }
             }
             spsc_asm = Core0SpscAssembler::new();
@@ -3942,6 +4220,7 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
         // ============================================================
         // Port 81 2-Socket Symmetric MJPEG Stream Pool (/stream & /)
         // ============================================================
+        let p81_t0 = ccount();
         if let Some(owner) = p81_stream_owner {
             let sock = sockets.get_mut::<TcpSocket>(tcp81_handles[owner]);
             let cur_q = sock.send_queue();
@@ -4063,6 +4342,7 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                         if let Ok(part_hdr_len) =
                             write_mjpeg_part_header(fresh_slice.len(), p81_hdr_buf).map(|h| h.len())
                         {
+                            FW_STATS.inc_p81_frames_sent();
                             p81_hdr_len = part_hdr_len;
                             p81_jpeg_slice = fresh_slice;
                             p81_tx_len = p81_hdr_len + p81_jpeg_slice.len();
@@ -4238,6 +4518,7 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
 
                     let sock81 = sockets.get_mut::<TcpSocket>(tcp81_handles[idx]);
                     if started_ok {
+                        FW_STATS.inc_p81_frames_sent();
                         p81_stream_owner = Some(idx);
                         p81_states[idx] = Port81WorkerState::default();
                         enqueue_p81_zero_copy(
@@ -4257,6 +4538,7 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                 }
             }
         }
+        FW_STATS.add_c0_p81_cycles(ccount().wrapping_sub(p81_t0));
 
         poll_net_burst(&mut iface, &mut net_device, &mut sockets);
 
@@ -4277,6 +4559,9 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                 CORE1_SPSC.frames_dropped()
             );
         }
+
+        let loop_delta = ccount().wrapping_sub(loop_t0);
+        FW_STATS.update_max_loop_latency_us(loop_delta / 240);
     }
 }
 
@@ -4412,6 +4697,7 @@ fn main() -> ! {
     // JUSTIFICATION: Read RTC controller reset state register during cold boot.
     // SAFETY: RTC_CNTL_RESET_STATE_REG is a valid MMIO register address.
     let reset_reason = unsafe { core::ptr::read_volatile(RTC_CNTL_RESET_STATE_REG) };
+    BOOT_RESET_REASON.store(reset_reason, Ordering::Relaxed);
     hold_psram_cs_high_safe();
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::_240MHz);
@@ -4422,7 +4708,8 @@ fn main() -> ! {
 
     let bc_prev = record_boot_breadcrumb_rtc_init(reset_reason);
     let ota_manager = detect_booted_ota_manager_from_mmu();
-    let flash_adapter = EspFlashAdapter(esp_storage::FlashStorage::new(peripherals.FLASH));
+    let mut flash_adapter = EspFlashAdapter(esp_storage::FlashStorage::new(peripherals.FLASH));
+    init_boot_app_sha256(&mut flash_adapter, ota_manager.active_slot());
     feed_rtc_wdt();
 
     // Initialize internal DRAM heap for esp-rtos and esp-radio Wi-Fi STA

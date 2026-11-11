@@ -9,7 +9,7 @@
 //! - `examples/camera_example/main/camera_pinout.h`
 
 #![no_std]
-#![deny(unsafe_code)]
+#![cfg_attr(target_arch = "xtensa", feature(asm_experimental_arch))]
 
 #[cfg(test)]
 extern crate alloc;
@@ -21,6 +21,7 @@ pub mod http;
 pub mod ota;
 pub mod runtime;
 pub mod spsc_ring;
+pub mod telemetry;
 
 pub use ap_select::{
     roam_decision, ApCandidate, ApTracker, RoamBackoff, RoamDecision, WeakLinkTimer,
@@ -67,7 +68,7 @@ pub use http::{
     HttpError, HttpMethod, HttpRequest, HttpResponseView, KlipperCamServer, ServerPort,
     SliceWriter, StreamSessionGuard, TelemetrySnapshot, CONTROL_JSON_BUF_LEN,
     KLIPPER_CONTROL_PANEL_HTML, KLIPPER_ROOT_STATUS_PAGE, MJPEG_BOUNDARY, MJPEG_CONTENT_TYPE,
-    SYNTHETIC_HD_JFIF_FRAME,
+    STATUS_JSON_BUF_LEN, SYNTHETIC_HD_JFIF_FRAME,
 };
 pub use ota::{
     crc32_ieee, find_partition_by_label, validate_ota_image_header, verify_ota_token,
@@ -85,4 +86,7 @@ pub use runtime::{
 pub use spsc_ring::{
     Core1JpegSpsc, JpegSpscSlot, JPEG_SPSC_CHUNK_BYTES, SPSC_FLAG_ABORT, SPSC_FLAG_EOF,
     SPSC_FLAG_SOF,
+};
+pub use telemetry::{
+    ccount, format_sha256_hex, measure_stack_hwm, paint_stack_sentinel, FwStats, FwStatsSnapshot,
 };
