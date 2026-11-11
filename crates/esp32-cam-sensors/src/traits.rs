@@ -37,26 +37,81 @@ impl Reg16 {
     }
 }
 
-/// Writes a slice of [`Reg8`] register/value pairs to `slv_addr` over `bus`.
+const MAX_TABLE_SEQ_CHUNK: usize = 64;
+
+/// Writes a slice of 8-bit register entries sequentially, coalescing
+/// contiguous ascending register runs into [`SccbBus::write_reg8_seq`].
+///
+/// Bank-select register `0xFF` (used by sensors such as OV2640) is never
+/// coalesced into an adjacent multi-byte burst.
+///
+/// # Errors
+///
+/// Returns any [`CameraError`] reported by the underlying [`SccbBus`].
 pub fn write_regs8<B: SccbBus>(
     bus: &mut B,
     slv_addr: u8,
     regs: &[Reg8],
 ) -> Result<(), CameraError> {
-    for entry in regs {
-        bus.write_reg8(slv_addr, entry.reg, entry.val)?;
+    let mut idx = 0;
+    while idx < regs.len() {
+        let first = regs[idx];
+        let mut buf = [0u8; MAX_TABLE_SEQ_CHUNK];
+        buf[0] = first.val;
+        let mut run_len = 1usize;
+        while idx + run_len < regs.len() && run_len < MAX_TABLE_SEQ_CHUNK {
+            let prev_reg = regs[idx + run_len - 1].reg;
+            let cand = regs[idx + run_len];
+            if prev_reg.checked_add(1) == Some(cand.reg) && cand.reg != 0xFF {
+                buf[run_len] = cand.val;
+                run_len += 1;
+            } else {
+                break;
+            }
+        }
+        if run_len == 1 {
+            bus.write_reg8(slv_addr, first.reg, first.val)?;
+        } else {
+            bus.write_reg8_seq(slv_addr, first.reg, &buf[..run_len])?;
+        }
+        idx += run_len;
     }
     Ok(())
 }
 
-/// Writes a slice of [`Reg16`] register/value pairs to `slv_addr` over `bus`.
+/// Writes a slice of 16-bit register entries sequentially, coalescing
+/// contiguous ascending register runs into [`SccbBus::write_reg16_seq`].
+///
+/// # Errors
+///
+/// Returns any [`CameraError`] reported by the underlying [`SccbBus`].
 pub fn write_regs16<B: SccbBus>(
     bus: &mut B,
     slv_addr: u8,
     regs: &[Reg16],
 ) -> Result<(), CameraError> {
-    for entry in regs {
-        bus.write_reg16(slv_addr, entry.reg, entry.val)?;
+    let mut idx = 0;
+    while idx < regs.len() {
+        let first = regs[idx];
+        let mut buf = [0u8; MAX_TABLE_SEQ_CHUNK];
+        buf[0] = first.val;
+        let mut run_len = 1usize;
+        while idx + run_len < regs.len() && run_len < MAX_TABLE_SEQ_CHUNK {
+            let prev_reg = regs[idx + run_len - 1].reg;
+            let cand = regs[idx + run_len];
+            if prev_reg.checked_add(1) == Some(cand.reg) {
+                buf[run_len] = cand.val;
+                run_len += 1;
+            } else {
+                break;
+            }
+        }
+        if run_len == 1 {
+            bus.write_reg16(slv_addr, first.reg, first.val)?;
+        } else {
+            bus.write_reg16_seq(slv_addr, first.reg, &buf[..run_len])?;
+        }
+        idx += run_len;
     }
     Ok(())
 }

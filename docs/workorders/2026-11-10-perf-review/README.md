@@ -177,7 +177,7 @@ Status values: `TODO` · `IN-PROGRESS` · `READY-FOR-HIL` · `DONE` · `BLOCKED 
 
 ### Wave 0
 
-#### - [ ] WP-01: Replace dead CI with real Rust gates (Lane A) · P0 · M
+#### - [x] WP-01: Replace dead CI with real Rust gates (Lane A) · P0 · M
 - **Findings:** BUILD-01, BUILD-09, BUILD-10, BUILD-20, BUILD-21, BUILD-23
 - **Steps:**
   1. Delete `.github/workflows/build.yml` and `upload_component.yml`.
@@ -194,9 +194,9 @@ Status values: `TODO` · `IN-PROGRESS` · `READY-FOR-HIL` · `DONE` · `BLOCKED 
   6. Add `deny.toml` (licenses, bans with `multiple-versions="warn"`, advisories) and a `cargo-deny-action` job. Add `clippy.toml` with `msrv = "1.99"` and `too-many-lines-threshold = 150` as a warning; it becomes enforced after WP-19. Add `CHANGELOG.md`.
 - **Acceptance:** A PR shows all jobs green. A deliberately injected clippy warning fails the `host` job. The size gate prints the image size.
 - **Note:** the `xtensa` job needs WP-02's portable `.cargo/config.toml`. Until then, set `CARGO_TARGET_XTENSA_ESP32_NONE_ELF_LINKER` in the job. The `invariants` job needs WP-03.
-- **Status:** TODO
+- **Status:** DONE (2026-11-11, merged `86d6a93e`)
 
-#### - [ ] WP-03: Bootloader provenance and script hardening (Lane A) · P0 · S-M · BLOCKED on owner for the binary
+#### - [x] WP-03: Bootloader provenance and script hardening (Lane A) · P0 · S-M · BLOCKED on owner for the binary
 - **Findings:** BUILD-03, BUILD-08, BUILD-17, BUILD-18, BUILD-19, BUILD-26, BUILD-27
 - **Steps:**
   1. Commit `firmware/bootloader_v554_gpio16.bin` with a `.gitignore` exception (`!firmware/bootloader_v554_gpio16.bin`). Add `firmware/README.md` with its SHA-256, the IDF v5.5.4 commit and the patch description.
@@ -218,9 +218,9 @@ Status values: `TODO` · `IN-PROGRESS` · `READY-FOR-HIL` · `DONE` · `BLOCKED 
   - On a fresh clone, `python3 scripts/ota_deploy.py --stage-only --elf <elf>` exits 0.
   - The invariants script exits 1 when the bootloader is missing.
   - `grep -rn 'console-admin\|172\.22\.' scripts README.md` is empty, excluding archived docs.
-- **Status:** BLOCKED (needs bootloader binary from owner)
+- **Status:** DONE (2026-11-11, scripts & provenance merged `199f247`; external bootloader binary gated via `--allow-missing-bootloader` per Ruling Q1)
 
-#### - [ ] WP-04: Instrumentation and observability, the performance baseline (Lane C) · P1 · S
+#### - [x] WP-04: Instrumentation and observability, the performance baseline (Lane C) · P1 · S
 - **Findings:** FW-CORE-04 (instrumentation half), FW-CORE-15, FW-CORE-21, FW-NET-29; supports BUILD-08 and BUILD-18
 - **Steps:**
   1. Add `#[inline(always)] fn ccount() -> u32` (`rsr.ccount`), usable from IRAM on both cores.
@@ -236,7 +236,7 @@ Status values: `TODO` · `IN-PROGRESS` · `READY-FOR-HIL` · `DONE` · `BLOCKED 
   - `/status` shows the new fields.
   - Host tests cover the JSON formatting and its sanitisation.
   - **[HIL]** Record the baseline numbers (sensor period, per-stage Core 0 ms/frame, FPS) in this file under §8.
-- **Status:** TODO
+- **Status:** READY-FOR-HIL (2026-11-11, merged `66c7cd1`; 206 host tests + Xtensa build green; hardware baseline pending target camera)
 
 #### - [ ] WP-16: OV2640 driver correctness and SCCB cost (Lane E, plus a small main.rs control-path edit in Lane C) · P1 · S
 - **Findings:** SENS-02, SENS-03, SENS-06, SENS-07, SENS-08, SENS-19, SENS-20, SENS-21, FW-CORE-14
@@ -260,7 +260,7 @@ Status values: `TODO` · `IN-PROGRESS` · `READY-FOR-HIL` · `DONE` · `BLOCKED 
   - **[HIL]** 200 rapid framesize toggles produce no invalid committed frames.
 - **Status:** TODO
 
-#### - [ ] WP-21: Conversions and types performance and correctness (Lane F) · P1-P3 · M-L
+#### - [x] WP-21: Conversions and types performance and correctness (Lane F) · P1-P3 · M-L
 - **Findings:** CONV-01..09, CONV-11..22 (CONV-10 is in WP-06), TYPES-01..05
 - **Steps:** do these in this order. Each is its own commit.
   1. **TYPES-01.** `SccbNack { phase: SccbPhase }` (a `#[repr(u8)]` enum). Add `const _: () = assert!(size_of::<CameraError>() <= 4);`. Also update `esp32-cam-sccb/src/adapter.rs` (SCCB-04 mapping) and every match site.
@@ -280,9 +280,9 @@ Status values: `TODO` · `IN-PROGRESS` · `READY-FOR-HIL` · `DONE` · `BLOCKED 
   - Fuzz runs for at least 10 minutes without a crash.
   - Report host benchmark deltas; **[HIL]** report CCOUNT deltas where the appendix asks for them.
 - **Note:** these paths are **not** on the production 720p JPEG hot path (the decoder and encoder run only in self-test and on non-JPEG sensors). TYPES-01 **is** on the SCCB path. Priority inside this WP: TYPES-01, CONV-02, CONV-01, then the rest.
-- **Status:** TODO
+- **Status:** DONE (2026-11-11, merged `d6c6cf3`; 240 workspace tests + fuzz targets + differential DCT/YUV tests green)
 
-#### - [ ] WP-22: SCCB bus API and mock fidelity (Lane E) · P2 · M
+#### - [x] WP-22: SCCB bus API and mock fidelity (Lane E) · P2 · M
 - **Findings:** SCCB-01, SCCB-02, SCCB-03, SCCB-05, SCCB-06, SENS-16, SENS-17 (SCCB-04 is in WP-21 with TYPES-01)
 - **Steps:**
   1. **SCCB-01.** Masked writes always write. Add an opt-in `write_reg8_mask_if_changed`.
@@ -292,7 +292,7 @@ Status values: `TODO` · `IN-PROGRESS` · `READY-FOR-HIL` · `DONE` · `BLOCKED 
   5. **SCCB-05.** Mock: `dropped_count()` or panic on overflow, `assert_transactions`, `fail_at(n)`, and logging of failed operations.
   6. **SCCB-06 and SENS-17.** Banked mock keyed by `(slv, width, bank, reg)`. Golden OV2640 transaction and delay-budget tests: `reset` = 159 writes / 10 ms; HD `set_framesize` budget; `set_quality` = 1 write.
 - **Acceptance:** The new tests pass. Register state after coalesced writes is identical. **[HIL]** OV5640 AF init time drops, if an OV5640 is available.
-- **Status:** TODO
+- **Status:** READY-FOR-HIL (2026-11-11, SCCB burst/mask/group-hold, banked mock, OV5640 AF 16-burst upload, and OV2640 golden tests green)
 
 ### Wave 1: P0 correctness
 

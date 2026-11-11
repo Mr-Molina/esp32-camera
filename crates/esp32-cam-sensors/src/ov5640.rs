@@ -850,12 +850,15 @@ impl Ov5640Af {
     /// `OV5640_FW_STATUS_IDLE` (`ov5640_af_init`).
     pub fn init<B: SccbBus>(&self, bus: &mut B, timeout_ms: u32) -> Result<(), CameraError> {
         bus.write_reg16(self.slv_addr, 0x3000, 0x20)?;
-        for (i, &byte) in OV5640_AF_FIRMWARE.iter().enumerate() {
-            bus.write_reg16(
-                self.slv_addr,
-                OV5640_AF_FW_BASE_ADDR.wrapping_add(i as u16),
-                byte,
-            )?;
+        const AF_BURST_CHUNK: usize = 256;
+        let mut offset = 0usize;
+        while offset < OV5640_AF_FIRMWARE.len() {
+            let end = (offset + AF_BURST_CHUNK).min(OV5640_AF_FIRMWARE.len());
+            let start_reg = OV5640_AF_FW_BASE_ADDR
+                .checked_add(offset as u16)
+                .ok_or(CameraError::InvalidArg)?;
+            bus.write_reg16_seq(self.slv_addr, start_reg, &OV5640_AF_FIRMWARE[offset..end])?;
+            offset = end;
         }
         bus.write_reg16(self.slv_addr, OV5640_CMD_MAIN, 0x00)?;
         bus.write_reg16(self.slv_addr, OV5640_CMD_ACK, 0x00)?;
