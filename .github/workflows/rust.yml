@@ -1,0 +1,120 @@
+name: Rust CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  host:
+    name: Host Checks & Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.1"
+          components: rustfmt, clippy
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Unit & Integration tests
+        run: cargo test --workspace --locked
+
+      - name: Cargo deny check
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  miri:
+    name: Miri Undefined Behavior Checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Nightly Rust with Miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - name: Run Miri tests
+        run: cargo miri test -p esp32-cam-ll -p esp32-cam-conversions -p esp32-cam-types
+
+  xtensa:
+    name: Xtensa ESP32 Build & Size Gate
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_XTENSA_ESP32_NONE_ELF_LINKER: xtensa-esp32-elf-gcc
+      RUSTUP_TOOLCHAIN: esp
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Xtensa toolchain
+        uses: esp-rs/xtensa-toolchain@v1.6
+        with:
+          default: true
+          buildtargets: esp32
+          version: "1.97.0.0"
+          ldproxy: false
+
+      - name: Install espflash
+        uses: taiki-e/install-action@v2
+        with:
+          tool: espflash
+
+      - name: Xtensa Clippy
+        run: cargo clippy --target xtensa-esp32-none-elf -Zbuild-std=core,alloc --workspace --release -- -D warnings
+
+      - name: Xtensa Release Build
+        run: cargo build --target xtensa-esp32-none-elf -Zbuild-std=core,alloc -p klipper-cam-fw --release
+
+      - name: Generate firmware binary
+        run: espflash save-image --chip esp32 target/xtensa-esp32-none-elf/release/klipper-cam-fw fw.bin
+
+      - name: Enforce firmware size gate (<= 0x1B0000 / 1,769,472 B)
+        shell: bash
+        run: |
+          SIZE=$(stat -c %s fw.bin)
+          MAX_SIZE=$((0x1B0000))
+          echo "Firmware image size: $SIZE bytes (max allowed: $MAX_SIZE bytes / 0x1B0000)"
+          if [ "$SIZE" -gt "$MAX_SIZE" ]; then
+            echo "ERROR: Firmware size ($SIZE B) exceeds partition limit of 0x1B0000 ($MAX_SIZE B)"
+            exit 1
+          fi
+
+      - name: Upload firmware binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: klipper-cam-fw-bin
+          path: fw.bin
+          if-no-files-found: error
+
+  invariants:
+    name: Cold Boot Invariants Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Verify cold boot invariants
+        run: python3 scripts/verify_cold_boot_invariants.py
