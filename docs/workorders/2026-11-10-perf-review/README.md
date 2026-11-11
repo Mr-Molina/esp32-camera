@@ -309,7 +309,7 @@ Status values: `TODO` · `IN-PROGRESS` · `READY-FOR-HIL` · `DONE` · `BLOCKED 
   - **[HIL]** Stream, snapshot and control behave as before. A forced Core 1 panic (debug feature) resets within 1 ms.
 - **Status:** READY-FOR-HIL
 
-#### - [ ] WP-05: OTA multicore safety and real rollback (Lanes C+G) · P0 · S-M
+#### - [x] WP-05: OTA multicore safety and real rollback (Lanes C+G) · P0 · S-M
 - **Findings:** FW-CORE-01, FW-NET-01, FW-NET-02, FW-NET-12, FW-NET-08, FW-NET-09
 - **Steps:**
   1. **FW-CORE-01.** Construct the flash adapter with `unsafe { FlashStorage::new(..).multicore_ignore() }`. Add an RAII `Core1PauseGuard`: `new()` pauses Core 1 and fails with `OtaError::FlashWriteError` on timeout; `Drop` resumes it. Acquire the guard in every `EspFlashAdapter` erase, write and read, or once per OTA / cancel-rollback operation. **Do not use `multicore_auto_park()`.** Remove the ad-hoc pause at main.rs:3752.
@@ -326,7 +326,7 @@ Status values: `TODO` · `IN-PROGRESS` · `READY-FOR-HIL` · `DONE` · `BLOCKED 
   - **[HIL]**
     - With the camera streaming, `POST /update` returns 200, the device reboots into the other slot, and it stays there after two power cycles.
     - A new image built with a wrong SSID rolls back after reset, provided the bootloader has rollback enabled (§7, question 2).
-- **Status:** TODO
+- **Status:** READY-FOR-HIL
 
 #### - [ ] WP-06: Correct DMA half-buffer draining with one shared drain implementation (Lanes D+C) · P0 · M
 - **Findings:** FW-CORE-02, LL-05, LL-06, LL-07, LL-15, LL-21, CONV-10

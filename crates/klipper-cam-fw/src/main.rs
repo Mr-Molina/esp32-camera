@@ -450,6 +450,25 @@ fn ensure_spi1_flash_cs0_only() {
 }
 
 #[cfg(target_arch = "xtensa")]
+struct XtensaCore1Park;
+
+#[cfg(target_arch = "xtensa")]
+impl klipper_cam_fw::Core1ParkControl for XtensaCore1Park {
+    fn pause_core1(&self) -> bool {
+        pause_core1_camera_producer()
+    }
+
+    fn resume_core1(&self) -> bool {
+        let ok = resume_core1_camera_producer();
+        if !ok {
+            FW_STATS.inc_sccb_errors();
+            esp_println::println!("camera: Core 1 resume timed out after flash op");
+        }
+        ok
+    }
+}
+
+#[cfg(target_arch = "xtensa")]
 struct EspFlashAdapter<'d>(esp_storage::FlashStorage<'d>);
 
 #[cfg(target_arch = "xtensa")]
@@ -459,6 +478,7 @@ impl klipper_cam_fw::OtaFlashStorage for EspFlashAdapter<'_> {
         offset: u32,
         buf: &mut [u8],
     ) -> Result<(), klipper_cam_fw::OtaError> {
+        let _guard = klipper_cam_fw::Core1PauseGuard::new(&XtensaCore1Park)?;
         ensure_spi1_flash_cs0_only();
         feed_rtc_wdt();
         let res = self
@@ -471,6 +491,7 @@ impl klipper_cam_fw::OtaFlashStorage for EspFlashAdapter<'_> {
 
     fn erase_range(&mut self, from: u32, to: u32) -> Result<(), klipper_cam_fw::OtaError> {
         const ERASE_CHUNK_BYTES: u32 = 64 * 1024;
+        let _guard = klipper_cam_fw::Core1PauseGuard::new(&XtensaCore1Park)?;
         ensure_spi1_flash_cs0_only();
         let mut cur = from;
         while cur < to {
@@ -486,6 +507,7 @@ impl klipper_cam_fw::OtaFlashStorage for EspFlashAdapter<'_> {
     }
 
     fn write_aligned(&mut self, offset: u32, data: &[u8]) -> Result<(), klipper_cam_fw::OtaError> {
+        let _guard = klipper_cam_fw::Core1PauseGuard::new(&XtensaCore1Park)?;
         ensure_spi1_flash_cs0_only();
         feed_rtc_wdt();
         let res = self
@@ -616,10 +638,18 @@ fn boot_app_sha256_str() -> &'static str {
 
 #[cfg(target_arch = "xtensa")]
 #[esp_hal::ram]
-fn detect_booted_ota_manager_from_mmu() -> klipper_cam_fw::OtaDataManager {
+fn detect_booted_ota_manager_from_mmu() -> OtaSlot {
     const DPORT_PRO_FLASH_MMU_TABLE: *const u32 = 0x3FF1_0000 as *const u32;
-    // JUSTIFICATION: Hardware MMU table read to detect active OTA flash mapping.
-    // SAFETY: DPORT_PRO_FLASH_MMU_TABLE entries 1 and 2 are valid MMIO addresses.
+    // JUSTIFICATION: Read hardware MMU table entries for DROM and IROM to
+    // identify which OTA flash partition (`ota_0` vs `ota_1`) is mapped, with
+    // zero SPI NOR flash commands during early cold boot.
+    // SAFETY:
+    // 1. Preconditions: PRO_CPU MMU table is active while executing this code.
+    // 2. Alignment: `0x3FF1_0000` and `+77 * 4` are 4-byte aligned `u32` MMIO.
+    // 3. Provenance & Lifetime: Fixed ESP32 DPORT MMIO aperture.
+    // 4. Aliasing: Read-only volatile MMIO inspection forms no Rust references.
+    // 5. Synchronization: Single-core read of immutable boot MMU mapping.
+    // 6. Unwind safety: Volatile register reads cannot panic or unwind.
     let (drom_entry, irom_entry) = unsafe {
         (
             core::ptr::read_volatile(DPORT_PRO_FLASH_MMU_TABLE),
@@ -629,13 +659,54 @@ fn detect_booted_ota_manager_from_mmu() -> klipper_cam_fw::OtaDataManager {
     let drom_is_ota1 = (drom_entry & 0x100) == 0 && (drom_entry & 0xFF) >= 0x1D;
     let irom_is_ota1 = (irom_entry & 0x100) == 0 && (irom_entry & 0xFF) >= 0x1D;
     if drom_is_ota1 || irom_is_ota1 {
-        klipper_cam_fw::OtaDataManager::from_sectors(
-            klipper_cam_fw::OtaDataSelect::new(1, klipper_cam_fw::OtaImgState::Valid),
-            klipper_cam_fw::OtaDataSelect::new(2, klipper_cam_fw::OtaImgState::Valid),
-        )
+        OtaSlot::Ota1
     } else {
-        klipper_cam_fw::OtaDataManager::new_booted_ota0()
+        OtaSlot::Ota0
     }
+}
+
+#[cfg(target_arch = "xtensa")]
+#[inline(never)]
+fn load_boot_otadata_and_sha256(flash_adapter: &mut EspFlashAdapter<'_>, mmu_booted_slot: OtaSlot) {
+    use esp_println::println;
+
+    let active_ota_slot = match klipper_cam_fw::OtaDataManager::load_from_flash(flash_adapter) {
+        Ok(loaded) => {
+            let flash_slot = loaded.active_slot();
+            if flash_slot != mmu_booted_slot {
+                println!(
+                    "[KLIPPER-CAM-RS] [OTA] Warning: otadata slot {:?} != MMU {:?}; flash wins",
+                    flash_slot, mmu_booted_slot
+                );
+            }
+            // JUSTIFICATION: Install flash-loaded `OtaDataManager` into static
+            // `FIRMWARE_RUNTIME` on Core 0 before Core 1 or HTTP loop starts.
+            // SAFETY:
+            // 1. Alignment & Non-null: `addr_of_mut!(FIRMWARE_RUNTIME)` is a
+            //    valid aligned static in `.bss`.
+            // 2. Layout: `Option<FirmwareRuntime>` was initialized to `Some` in
+            //    `capture_boot_dma_and_init_runtime`.
+            // 3. Provenance & Lifetime: Static lives for `'static`.
+            // 4. Aliasing: No other references to `FIRMWARE_RUNTIME` exist at
+            //    this single-core boot point before `run_post_wifi_server_loop`.
+            // 5. Synchronization: Single-threaded execution on Core 0 prior to
+            //    spawning Core 1.
+            // 6. Unwind safety: Bare-metal firmware builds with `panic = abort`.
+            if let Some(rt) = unsafe { (*core::ptr::addr_of_mut!(FIRMWARE_RUNTIME)).as_mut() } {
+                rt.server.ota_manager = loaded;
+            }
+            flash_slot
+        }
+        Err(err) => {
+            FW_STATS.inc_sccb_errors();
+            println!(
+                "[KLIPPER-CAM-RS] [OTA] Failed to load otadata ({:?}); using MMU {:?}",
+                err, mmu_booted_slot
+            );
+            mmu_booted_slot
+        }
+    };
+    init_boot_app_sha256(flash_adapter, active_ota_slot);
 }
 
 #[cfg(target_arch = "xtensa")]
@@ -1652,9 +1723,9 @@ fn roam_to_candidate(
 }
 
 /// Post-association steps shared by the reconnect and roam paths: mark the
-/// STA connected, disable power save, restore max TX power, run the
-/// OTA got-IP rollback check, and (once the IP is configured) send a
-/// gratuitous ARP announce.
+/// STA connected, disable power save, restore max TX power, arm static-IP ARP
+/// confirmation if IP is not yet confirmed, and (once the IP is configured)
+/// send a gratuitous ARP announce.
 ///
 /// `announce_ip` is `Some(ip)` once the static IP is configured; `None`
 /// skips the ARP announce.
@@ -1662,7 +1733,7 @@ fn roam_to_candidate(
 fn after_sta_associated(
     wifi_controller: &mut esp_radio::wifi::WifiController<'_>,
     runtime: &mut FirmwareRuntime,
-    flash_adapter: &mut EspFlashAdapter<'_>,
+    static_ip_arp_pending: &mut bool,
     net_device: &mut SmoltcpWifiDevice,
     mac: [u8; 6],
     announce_ip: Option<[u8; 4]>,
@@ -1670,8 +1741,14 @@ fn after_sta_associated(
     runtime.on_wifi_sta_connected();
     let _ = wifi_controller.set_power_saving(esp_radio::wifi::PowerSaveMode::None);
     let _ = wifi_controller.set_max_tx_power(WIFI_MAX_TX_POWER_QDBM);
-    handle_wifi_got_ip_rollback(runtime, flash_adapter, Ipv4Addr::new(172, 22, 1, 52));
     if let Some(ip) = announce_ip {
+        if !runtime.ip_confirmed {
+            *static_ip_arp_pending = true;
+        }
+        runtime.wifi_state = klipper_cam_fw::WifiStaState::ConnectedGotIp {
+            ip: Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]),
+        };
+        runtime.webservers_started = true;
         send_arp_announce(net_device, mac, ip, [172, 22, 1, 1]);
     }
 }
@@ -2570,18 +2647,39 @@ fn core1_camera_producer_loop() -> ! {
 
 #[cfg(target_arch = "xtensa")]
 #[inline(never)]
-fn handle_wifi_got_ip_rollback(
+fn poll_deferred_rollback_cancel(
     runtime: &mut FirmwareRuntime,
     flash_adapter: &mut EspFlashAdapter<'_>,
-    ip: Ipv4Addr,
+    now_ms: u64,
+    last_retry_ms: &mut u64,
 ) {
-    use klipper_cam_fw::OtaImgState;
-    let s0 = runtime.server.ota_manager.sector_0.state();
-    let s1 = runtime.server.ota_manager.sector_1.state();
-    if s0 == OtaImgState::PendingVerify || s1 == OtaImgState::PendingVerify {
-        let _ = runtime.on_wifi_got_ip_with_flash(ip, flash_adapter);
-    } else {
-        let _ = runtime.on_wifi_got_ip(ip);
+    use esp_println::println;
+
+    if runtime.server.is_reboot_scheduled() {
+        return;
+    }
+    if runtime.ip_confirmed
+        && runtime.first_http_served
+        && !runtime.rollback_cancelled
+        && (*last_retry_ms == 0 || now_ms.saturating_sub(*last_retry_ms) >= 2_000)
+    {
+        *last_retry_ms = now_ms;
+        match runtime.try_cancel_rollback_with_flash(flash_adapter) {
+            Ok(true) => {
+                println!(
+                    "[KLIPPER-CAM-RS] [OTA] Rollback cancelled; slot {:?} marked Valid",
+                    runtime.server.ota_manager.active_slot()
+                );
+            }
+            Ok(false) => {}
+            Err(err) => {
+                FW_STATS.inc_sccb_errors();
+                println!(
+                    "[KLIPPER-CAM-RS] [OTA] Rollback cancel failed ({:?}); will retry",
+                    err
+                );
+            }
+        }
     }
 }
 
@@ -2862,11 +2960,7 @@ fn init_psram_and_run_hil(psram_ptr: *mut u8, psram_len: usize, xclk_hw_ok: bool
 
 #[cfg(target_arch = "xtensa")]
 #[inline(never)]
-fn capture_boot_dma_and_init_runtime(
-    ov2640_hw_ok: bool,
-    bc_prev: BreadcrumbPrevSummary,
-    ota_manager: klipper_cam_fw::OtaDataManager,
-) -> bool {
+fn capture_boot_dma_and_init_runtime(ov2640_hw_ok: bool, bc_prev: BreadcrumbPrevSummary) -> bool {
     use esp_hal::delay::Delay;
     use esp_println::println;
 
@@ -2963,7 +3057,7 @@ fn capture_boot_dma_and_init_runtime(
     );
 
     let mut runtime = FirmwareRuntime::new(KlipperCamConfig::WROVER_KIT_HD, camera);
-    runtime.server.ota_manager = ota_manager;
+    runtime.server.ota_manager = klipper_cam_fw::OtaDataManager::new();
     // JUSTIFICATION: Initialize static FIRMWARE_RUNTIME global singleton.
     // SAFETY:
     // 1. Alignment & Non-null: addr_of_mut!(FIRMWARE_RUNTIME) points to static.
@@ -3137,9 +3231,9 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
     use esp_println::println;
     use esp_radio::wifi::{Interface as WifiInterface, PowerSaveMode};
     use klipper_cam_fw::{
-        parse_http_request, write_mjpeg_part_header, HttpMethod, OtaDataManager, RoamBackoff,
-        RoamDecision, StreamSessionGuard, WeakLinkTimer, OTA_PARTITION_MAX_SIZE,
-        ROAM_CHECK_INTERVAL_MS, ROAM_TRIGGER_RSSI_DBM, ROAM_WEAK_DURATION_MS,
+        parse_http_request, write_mjpeg_part_header, HttpMethod, RoamBackoff, RoamDecision,
+        StreamSessionGuard, WeakLinkTimer, OTA_PARTITION_MAX_SIZE, ROAM_CHECK_INTERVAL_MS,
+        ROAM_TRIGGER_RSSI_DBM, ROAM_WEAK_DURATION_MS,
     };
     use smoltcp::iface::{Config as IfaceConfig, Interface as NetInterface, SocketSet};
     use smoltcp::socket::dhcpv4;
@@ -3340,6 +3434,8 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
     let mut p81_tx_len: usize = 0;
 
     let mut ip_configured = false;
+    let mut static_ip_arp_pending = false;
+    let mut last_rollback_retry_ms: u64 = 0;
     let mut connect_ms = smol_now().total_millis();
     let mut last_wifi_connected_ms = connect_ms;
     let mut last_reconnect_attempt_ms = connect_ms;
@@ -3482,7 +3578,7 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                                     after_sta_associated(
                                         &mut wifi_controller,
                                         runtime,
-                                        &mut flash_adapter,
+                                        &mut static_ip_arp_pending,
                                         &mut net_device,
                                         mac,
                                         announce_ip,
@@ -3555,7 +3651,7 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                     after_sta_associated(
                         &mut wifi_controller,
                         runtime,
-                        &mut flash_adapter,
+                        &mut static_ip_arp_pending,
                         &mut net_device,
                         mac,
                         announce_ip,
@@ -3596,7 +3692,8 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                     let _ = iface.routes_mut().add_default_ipv4_route(gw);
                     let fw_ip = Ipv4Addr::new(172, 22, 1, 52);
                     runtime.on_wifi_sta_connected();
-                    handle_wifi_got_ip_rollback(runtime, &mut flash_adapter, fw_ip);
+                    runtime.on_wifi_ip_confirmed(fw_ip);
+                    static_ip_arp_pending = false;
                     ip_configured = true;
                     let _ = wifi_controller.set_power_saving(esp_radio::wifi::PowerSaveMode::None);
                     let _ = wifi_controller.set_max_tx_power(WIFI_MAX_TX_POWER_QDBM);
@@ -3643,7 +3740,9 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
             if wifi_controller.is_connected() {
                 runtime.on_wifi_sta_connected();
             }
-            handle_wifi_got_ip_rollback(runtime, &mut flash_adapter, fw_ip);
+            static_ip_arp_pending = true;
+            runtime.wifi_state = klipper_cam_fw::WifiStaState::ConnectedGotIp { ip: fw_ip };
+            runtime.webservers_started = true;
             ip_configured = true;
             let _ = wifi_controller.set_power_saving(esp_radio::wifi::PowerSaveMode::None);
             let _ = wifi_controller.set_max_tx_power(WIFI_MAX_TX_POWER_QDBM);
@@ -3855,7 +3954,10 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                                         );
                                         st.last_send_queue = sock80.send_queue();
                                     }
-                                } else if parsed.ota_token != Some(runtime.server.ota_token()) {
+                                } else if !klipper_cam_fw::http::constant_time_eq(
+                                    parsed.ota_token.unwrap_or(b""),
+                                    runtime.server.ota_token(),
+                                ) {
                                     if let Ok(err) = write_http_error(
                                         p80_resp_bufs[idx],
                                         401,
@@ -3992,7 +4094,9 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                                 if core1_parked {
                                     let booted_slot = runtime.server.ota_manager.active_slot();
                                     if let Ok(loaded) =
-                                        OtaDataManager::load_from_flash(&mut flash_adapter)
+                                        klipper_cam_fw::OtaDataManager::load_from_flash(
+                                            &mut flash_adapter,
+                                        )
                                     {
                                         if loaded.active_slot() == booted_slot {
                                             runtime.server.ota_manager = loaded;
@@ -4141,6 +4245,12 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
             }
         }
         FW_STATS.add_c0_p80_cycles(ccount().wrapping_sub(p80_t0));
+        poll_deferred_rollback_cancel(
+            runtime,
+            &mut flash_adapter,
+            u64::try_from(now_ms).unwrap_or(0),
+            &mut last_rollback_retry_ms,
+        );
 
         // Apply any pending live camera control updates from
         // GET /control?var=...&val=...
@@ -4750,8 +4860,7 @@ fn main() -> ! {
     let delay = Delay::new();
 
     let bc_prev = record_boot_breadcrumb_rtc_init(reset_reason);
-    let ota_manager = detect_booted_ota_manager_from_mmu();
-    let active_ota_slot = ota_manager.active_slot();
+    let mmu_booted_slot = detect_booted_ota_manager_from_mmu();
     feed_rtc_wdt();
 
     // Initialize internal DRAM heap for esp-rtos and esp-radio Wi-Fi STA
@@ -4821,8 +4930,7 @@ fn main() -> ! {
     delay.delay_millis(80);
 
     // 5. Capture initial 1280x720 JPEG frame and initialize FirmwareRuntime
-    let ov2640_dma_ok = capture_boot_dma_and_init_runtime(ov2640_hw_ok, bc_prev, ota_manager);
-
+    let ov2640_dma_ok = capture_boot_dma_and_init_runtime(ov2640_hw_ok, bc_prev);
     // 6. Release Wi-Fi/RF force power-down, start esp-rtos scheduler,
     //    and initialize esp-radio Wi-Fi Station
     esp_rtc_wifi_force_pd(false);
@@ -4837,11 +4945,20 @@ fn main() -> ! {
         quiesce_psram_and_software_reset();
     };
     feed_rtc_wdt();
-
-    let mut flash_adapter = EspFlashAdapter(esp_storage::FlashStorage::new(peripherals.FLASH));
-    init_boot_app_sha256(&mut flash_adapter, active_ota_slot);
+    // JUSTIFICATION: Wrap FlashStorage with multicore_ignore; Core1PauseGuard
+    // parks APP_CPU in IRAM before every flash cache disable.
+    // SAFETY:
+    // 1. Preconditions: Runs after WifiController::new before APP_CPU starts.
+    // 2. Alignment: FlashStorage takes ownership of peripheral singleton.
+    // 3. Provenance & Lifetime: `peripherals.FLASH` has `'static` lifetime.
+    // 4. Aliasing: Exclusively owned by `EspFlashAdapter` on Core 0.
+    // 5. Synchronization: `Core1PauseGuard` parks Core 1 on all flash ops.
+    // 6. Unwind safety: Bare-metal firmware builds with `panic = "abort"`.
+    let mut flash_adapter = EspFlashAdapter(unsafe {
+        esp_storage::FlashStorage::new(peripherals.FLASH).multicore_ignore()
+    });
+    load_boot_otadata_and_sha256(&mut flash_adapter, mmu_booted_slot);
     feed_rtc_wdt();
-
     run_post_wifi_server_loop(
         wifi_controller,
         sta_cfg,

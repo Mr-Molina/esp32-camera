@@ -1964,11 +1964,11 @@ xhr.send(file);}</script></body></html>";
 
     /// Handles `POST /update` on Port 80 (`klipper_cam.c` lines 350-466):
     /// 1. Constant-time `X-OTA-Token` authentication (`401 Unauthorized` without
-    ///    CORS on failure).
-    /// 2. `Content-Length` validation (`> 0` and `<= 0x1B0000`).
+    ///    CORS on failure, `FW-NET-08`).
+    /// 2. `Content-Length` validation (`> 0` and `<= 0x1B0000`, `FW-NET-09`).
     /// 3. ESP32 `0xE9` image magic and segment count validation (`1..=16`).
-    /// 4. 1024-byte chunked write loop to passive OTA slot + `otadata` CRC32 update
-    /// + reboot flag.
+    /// 4. 1024-byte chunked write loop to passive OTA slot + `otadata` CRC32
+    ///    update + reboot flag (`FW-NET-12`).
     fn handle_ota_post<'b, F: OtaFlashStorage>(
         &mut self,
         req: &HttpRequest<'_>,
@@ -2046,12 +2046,27 @@ xhr.send(file);}</script></body></html>";
 
         let written_slot = match self.ota_manager.write_ota_image_to_flash(flash, payload) {
             Ok(slot) => slot,
-            Err(_) => {
+            Err(
+                OtaError::InvalidOtaDataCrc
+                | OtaError::RollbackStateInvalid
+                | OtaError::NoPassivePartition
+                | OtaError::SequenceOverflow
+                | OtaError::FlashWriteError,
+            ) => {
                 return write_http_error(
                     out_buf,
                     500,
                     "Internal Server Error",
                     "Failed to update boot partition",
+                    false,
+                );
+            }
+            Err(_) => {
+                return write_http_error(
+                    out_buf,
+                    400,
+                    "Bad Request",
+                    "Firmware image validation failed",
                     false,
                 );
             }

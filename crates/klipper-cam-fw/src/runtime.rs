@@ -155,6 +155,8 @@ pub struct FirmwareRuntime<'a> {
     pub webservers_started: bool,
     pub gpio4_flash_led_held_low: bool,
     pub rollback_cancelled: bool,
+    pub ip_confirmed: bool,
+    pub first_http_served: bool,
 }
 
 impl<'a> FirmwareRuntime<'a> {
@@ -169,6 +171,8 @@ impl<'a> FirmwareRuntime<'a> {
             webservers_started: false,
             gpio4_flash_led_held_low: gpio4_low,
             rollback_cancelled: false,
+            ip_confirmed: false,
+            first_http_served: false,
         }
     }
 
@@ -195,6 +199,7 @@ impl<'a> FirmwareRuntime<'a> {
     /// Handles `WIFI_EVENT_STA_DISCONNECTED`: schedules the non-blocking
     /// 2-second reconnect timer (`APP-009`).
     pub fn on_wifi_sta_disconnected(&mut self) {
+        self.ip_confirmed = false;
         self.wifi_state = WifiStaState::DisconnectedReconnectScheduled {
             delay_ms: self.server.config.network.reconnect_delay_ms,
         };
@@ -221,6 +226,7 @@ impl<'a> FirmwareRuntime<'a> {
         ip: Ipv4Addr,
         flash: &mut F,
     ) -> Result<(), OtaError> {
+        self.ip_confirmed = true;
         if !self.rollback_cancelled {
             let _ = self.server.on_wifi_got_ip_with_flash(flash)?;
             self.rollback_cancelled = true;
@@ -228,6 +234,40 @@ impl<'a> FirmwareRuntime<'a> {
         self.wifi_state = WifiStaState::ConnectedGotIp { ip };
         self.webservers_started = true;
         Ok(())
+    }
+
+    /// Records a confirmed station IPv4 address (DHCP `Configured` or static IP
+    /// with verified ARP/peer reachability) and enables HTTP servers without
+    /// cancelling OTA rollback until the first HTTP request is served
+    /// (`FW-NET-02`).
+    pub fn on_wifi_ip_confirmed(&mut self, ip: Ipv4Addr) {
+        self.ip_confirmed = true;
+        self.wifi_state = WifiStaState::ConnectedGotIp { ip };
+        self.webservers_started = true;
+    }
+
+    /// Marks that at least one HTTP response has been served (`FW-NET-02`).
+    pub fn on_http_request_served(&mut self) {
+        self.first_http_served = true;
+    }
+
+    /// Cancels OTA rollback in `flash` once both `ip_confirmed` and
+    /// `first_http_served` are true (`FW-NET-02`). Leaves `rollback_cancelled`
+    /// `false` on error so the caller can log and retry.
+    pub fn try_cancel_rollback_with_flash<F: OtaFlashStorage>(
+        &mut self,
+        flash: &mut F,
+    ) -> Result<bool, OtaError> {
+        if !self.ip_confirmed || !self.first_http_served || self.rollback_cancelled {
+            return Ok(false);
+        }
+        if !self.server.ota_manager.has_pending_rollback() {
+            self.rollback_cancelled = true;
+            return Ok(false);
+        }
+        let changed = self.server.on_wifi_got_ip_with_flash(flash)?;
+        self.rollback_cancelled = true;
+        Ok(changed)
     }
 }
 

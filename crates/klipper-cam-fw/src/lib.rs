@@ -74,13 +74,14 @@ pub use http::{
 };
 pub use ota::{
     crc32_ieee, find_partition_by_label, validate_ota_image_header, verify_ota_token,
-    verify_partition_table_integrity, AlignedFlashChunk, AlignedOtaBuf, EspImageHeader,
-    MockNorFlash, NoOpFlashStorage, OtaDataManager, OtaDataSelect, OtaError, OtaFlashStorage,
-    OtaImgState, OtaSlot, PartitionEntry, PartitionSubType, PartitionType, ESP_IMAGE_HEADER_LEN,
-    ESP_IMAGE_HEADER_MAGIC, ESP_IMAGE_MAX_SEGMENTS, ESP_IMAGE_MIN_SEGMENTS, FLASH_SECTOR_SIZE,
-    NVS_OFFSET, NVS_SIZE, OTADATA_OFFSET, OTADATA_SECTOR_0_OFFSET, OTADATA_SECTOR_1_OFFSET,
-    OTADATA_SIZE, OTA_0_OFFSET, OTA_0_SIZE, OTA_1_OFFSET, OTA_1_SIZE, OTA_CHUNK_SIZE,
-    OTA_PARTITION_MAX_SIZE, PARTITION_TABLE, PHY_INIT_OFFSET, PHY_INIT_SIZE,
+    verify_partition_table_integrity, AlignedFlashChunk, AlignedOtaBuf, Core1ParkControl,
+    Core1PauseGuard, EspImageHeader, GuardedFlashStorage, MockNorFlash, NoOpFlashStorage,
+    OtaDataManager, OtaDataSelect, OtaError, OtaFlashStorage, OtaImgState, OtaSlot, PartitionEntry,
+    PartitionSubType, PartitionType, ESP_IMAGE_HEADER_LEN, ESP_IMAGE_HEADER_MAGIC,
+    ESP_IMAGE_MAX_SEGMENTS, ESP_IMAGE_MIN_SEGMENTS, FLASH_SECTOR_SIZE, NVS_OFFSET, NVS_SIZE,
+    OTADATA_OFFSET, OTADATA_SECTOR_0_OFFSET, OTADATA_SECTOR_1_OFFSET, OTADATA_SIZE, OTA_0_OFFSET,
+    OTA_0_SIZE, OTA_1_OFFSET, OTA_1_SIZE, OTA_CHUNK_SIZE, OTA_PARTITION_MAX_SIZE, PARTITION_TABLE,
+    PHY_INIT_OFFSET, PHY_INIT_SIZE,
 };
 pub use runtime::{
     FirmwareRuntime, SensorHalAdapter, TakePictureRunner, WifiLifecycleState, WifiStaState,
