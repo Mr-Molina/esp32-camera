@@ -296,7 +296,7 @@ Status values: `TODO` · `IN-PROGRESS` · `READY-FOR-HIL` · `DONE` · `BLOCKED 
 
 ### Wave 1: P0 correctness
 
-#### - [ ] WP-07: Remove aliasing UB and `static mut` laundering (Lane C) · P0 · S
+#### - [x] WP-07: Remove aliasing UB and `static mut` laundering (Lane C) · P0 · S
 - **Findings:** FW-CORE-03, FW-CORE-19; the first half of FW-CORE-08
 - **Steps:**
   1. Change `capture_live_hd_jpeg_with_diag` to take `camera: &mut CameraDriver<'static>` and the framesize as parameters. Delete its `FIRMWARE_RUNTIME.as_mut()`.
@@ -307,7 +307,7 @@ Status values: `TODO` · `IN-PROGRESS` · `READY-FOR-HIL` · `DONE` · `BLOCKED 
   - Xtensa clippy is clean with `static_mut_refs` no longer allowed.
   - `grep -n from_raw_parts_mut main.rs` shows only the PSRAM carve.
   - **[HIL]** Stream, snapshot and control behave as before. A forced Core 1 panic (debug feature) resets within 1 ms.
-- **Status:** TODO
+- **Status:** READY-FOR-HIL
 
 #### - [ ] WP-05: OTA multicore safety and real rollback (Lanes C+G) · P0 · S-M
 - **Findings:** FW-CORE-01, FW-NET-01, FW-NET-02, FW-NET-12, FW-NET-08, FW-NET-09

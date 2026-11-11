@@ -17,11 +17,11 @@
     target_arch = "xtensa",
     allow(
         unsafe_op_in_unsafe_fn,
-        static_mut_refs,
         clippy::undocumented_unsafe_blocks,
         clippy::unwrap_used
     )
 )]
+#![deny(static_mut_refs)]
 
 #[cfg(target_arch = "xtensa")]
 extern crate alloc;
@@ -48,7 +48,7 @@ use klipper_cam_fw::{
 #[cfg(target_arch = "xtensa")]
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 #[cfg(target_arch = "xtensa")]
-use esp_hal::system::{CpuControl, Stack};
+use esp_hal::system::{Cpu, CpuControl, Stack};
 #[cfg(target_arch = "xtensa")]
 use klipper_cam_fw::telemetry::{
     ccount, format_sha256_hex, measure_stack_hwm_volatile, paint_stack_sentinel,
@@ -391,6 +391,9 @@ static CORE1_ACTIVE: AtomicBool = AtomicBool::new(false);
 #[cfg(target_arch = "xtensa")]
 #[esp_hal::ram]
 fn pause_core1_camera_producer() -> bool {
+    if Cpu::current() == Cpu::AppCpu {
+        return true;
+    }
     if !CORE1_ACTIVE.load(Ordering::Acquire) {
         return true;
     }
@@ -1451,6 +1454,17 @@ fn ensure_psram_qpi_mode_spi1() {
 #[esp_hal::ram]
 fn quiesce_psram_and_software_reset() -> ! {
     let _ = pause_core1_camera_producer();
+    // JUSTIFICATION: Halt I2S0 DMA engine immediately before PSRAM pin release.
+    // SAFETY:
+    // 1. Alignment & Non-null: Direct MMIO register write via validated HAL.
+    // 2. Layout: Target I2S0 peripheral registers exist on ESP32 silicon.
+    // 3. Provenance: MMIO base address is mapped and valid for SoC lifecycle.
+    // 4. Aliasing: Producer is parked; exclusive hardware access during reset.
+    // 5. Volatile/Atomics: Peripheral registers are volatile MMIO.
+    // 6. Unwind safety: C-ABI HAL function does not unwind or panic.
+    unsafe {
+        esp32_cam_ll::emergency_stop_i2s0_hw();
+    }
     release_psram_cs_and_exit_qpi();
     // JUSTIFICATION: Mask interrupts at CPU level 15 prior to software reset.
     // SAFETY: Inline assembly modifies only processor interrupt priority.
@@ -1844,6 +1858,8 @@ type Port81SocketState = Port81WorkerState;
 fn capture_live_hd_jpeg_with_diag(
     i2s_cam: &mut Esp32I2sCamera,
     triple_fb: &mut TripleFrameBuffer<'_>,
+    camera: &mut CameraDriver<'static>,
+    current_fs: FrameSize,
     poll_net: &mut dyn FnMut(),
 ) -> Result<usize, (u32, usize, u8, u8, u8, u32)> {
     const GPIO_IN_REG: *const u32 = 0x3FF4_403C as *const u32;
@@ -2096,20 +2112,8 @@ fn capture_live_hd_jpeg_with_diag(
     if let Some(exact_len) = commit_len {
         if triple_fb.commit_write_slot(exact_len).is_ok() {
             let _ = triple_fb.promote_ready_to_active();
-            // JUSTIFICATION: Boot/fallback capture updates active runtime frame
-            // on Core 0.
-            // SAFETY:
-            // 1. Alignment & Non-null: FIRMWARE_RUNTIME is an aligned static.
-            // 2. Layout: Option<FirmwareRuntime> is initialized if Some.
-            // 3. Provenance: Static lives for entire firmware execution.
-            // 4. Aliasing: Only Core 0 accesses FIRMWARE_RUNTIME.
-            // 5. Volatile/Atomics: Not MMIO; single-core access on Core 0.
-            // 6. Unwind safety: Bare-metal panic = custom_halt, no unwinding.
-            if let Some(runtime) = unsafe { FIRMWARE_RUNTIME.as_mut() } {
-                let fresh_slice = active_triple_static_slice(triple_fb);
-                let current_fs = runtime.server.control_state.framesize;
-                runtime.server.camera.set_frame(fresh_slice, current_fs);
-            }
+            let fresh_slice = active_triple_static_slice(triple_fb);
+            camera.set_frame(fresh_slice, current_fs);
             return Ok(exact_len);
         }
     }
@@ -2177,7 +2181,7 @@ fn core1_camera_producer_loop() -> ! {
     // 4. Aliasing: Core 0 never accesses `HW_I2S_CAM` while `CORE1_ACTIVE` is true.
     // 5. Synchronization: `CORE1_ACTIVE` Release/Acquire orders handoff.
     // 6. Unwind safety: Diverging loop in `no_std` firmware.
-    let Some(i2s_cam) = (unsafe { HW_I2S_CAM.as_mut() }) else {
+    let Some(i2s_cam) = (unsafe { (*core::ptr::addr_of_mut!(HW_I2S_CAM)).as_mut() }) else {
         loop {
             core::hint::spin_loop();
         }
@@ -2769,9 +2773,15 @@ fn init_psram_and_run_hil(psram_ptr: *mut u8, psram_len: usize, xclk_hw_ok: bool
     };
 
     // JUSTIFICATION: Initialize static PSRAM_BUFFERS singleton.
-    // SAFETY: Single-threaded bare-metal init before server loop starts.
+    // SAFETY:
+    // 1. Alignment & Non-null: addr_of_mut!(PSRAM_BUFFERS) points to static.
+    // 2. Layout: Valid Option<PsramBuffers> slot in BSS.
+    // 3. Provenance: PSRAM_BUFFERS lives for 'static.
+    // 4. Aliasing: Unique single-threaded access during boot initialization.
+    // 5. Synchronization: Called sequentially before WiFi or server starts.
+    // 6. Unwind safety: Bare-metal environment with panic = abort.
     unsafe {
-        PSRAM_BUFFERS = Some(PsramBuffers {
+        *core::ptr::addr_of_mut!(PSRAM_BUFFERS) = Some(PsramBuffers {
             triple_fb,
             p80_rx0,
             p80_rx1,
@@ -2838,9 +2848,15 @@ fn init_psram_and_run_hil(psram_ptr: *mut u8, psram_len: usize, xclk_hw_ok: bool
     let _ = hw_i2s_cam.config();
     let _ = hw_i2s_cam.set_sample_mode(PixelFormat::Jpeg, DEFAULT_XCLK_FREQ_HZ, 0x26);
     // JUSTIFICATION: Initialize static HW_I2S_CAM global singleton.
-    // SAFETY: Single-threaded bare-metal init before server loop starts.
+    // SAFETY:
+    // 1. Alignment & Non-null: addr_of_mut!(HW_I2S_CAM) points to static.
+    // 2. Layout: Valid Option<Esp32I2sCamera> slot in BSS.
+    // 3. Provenance: HW_I2S_CAM lives for 'static.
+    // 4. Aliasing: Unique single-threaded access during boot initialization.
+    // 5. Synchronization: Called sequentially before server loop starts.
+    // 6. Unwind safety: Bare-metal environment with panic = abort.
     unsafe {
-        HW_I2S_CAM = Some(hw_i2s_cam);
+        *core::ptr::addr_of_mut!(HW_I2S_CAM) = Some(hw_i2s_cam);
     }
 }
 
@@ -2856,24 +2872,44 @@ fn capture_boot_dma_and_init_runtime(
 
     let delay = Delay::new();
     // JUSTIFICATION: Access mutable static PSRAM_BUFFERS singleton.
-    // SAFETY: Exclusively accessed from single-threaded initialization.
-    let Some(psram_bufs) = (unsafe { PSRAM_BUFFERS.as_mut() }) else {
+    // SAFETY:
+    // 1. Alignment & Non-null: addr_of_mut!(PSRAM_BUFFERS) points to static.
+    // 2. Layout: Valid Option<PsramBuffers> initialized prior to this call.
+    // 3. Provenance: Lives for 'static.
+    // 4. Aliasing: Exclusively accessed from single-threaded initialization.
+    // 5. Synchronization: Single-threaded sequence on Core 0.
+    // 6. Unwind safety: Bare-metal environment with panic = abort.
+    let Some(psram_bufs) = (unsafe { (*core::ptr::addr_of_mut!(PSRAM_BUFFERS)).as_mut() }) else {
         quiesce_psram_and_software_reset();
     };
     // JUSTIFICATION: Access mutable static HW_I2S_CAM singleton.
-    // SAFETY: Exclusively accessed from single-threaded initialization.
-    let Some(hw_i2s_cam) = (unsafe { HW_I2S_CAM.as_mut() }) else {
+    // SAFETY:
+    // 1. Alignment & Non-null: addr_of_mut!(HW_I2S_CAM) points to static.
+    // 2. Layout: Valid Option<Esp32I2sCamera> initialized prior to this call.
+    // 3. Provenance: Lives for 'static.
+    // 4. Aliasing: Exclusively accessed from single-threaded initialization.
+    // 5. Synchronization: Single-threaded sequence on Core 0.
+    // 6. Unwind safety: Bare-metal environment with panic = abort.
+    let Some(hw_i2s_cam) = (unsafe { (*core::ptr::addr_of_mut!(HW_I2S_CAM)).as_mut() }) else {
         quiesce_psram_and_software_reset();
     };
 
     let ov2640_dma_ok = ov2640_hw_ok;
     let mut boot_dma_ok = false;
 
+    let initial_slice = active_triple_static_slice(&psram_bufs.triple_fb);
+    let mut camera = CameraDriver::new(initial_slice, FrameSize::Hd);
+
     if ov2640_hw_ok {
         for attempt in 1..=3u8 {
             feed_rtc_wdt();
-            match capture_live_hd_jpeg_with_diag(hw_i2s_cam, &mut psram_bufs.triple_fb, &mut || {})
-            {
+            match capture_live_hd_jpeg_with_diag(
+                hw_i2s_cam,
+                &mut psram_bufs.triple_fb,
+                &mut camera,
+                FrameSize::Hd,
+                &mut || {},
+            ) {
                 Ok(captured_len) => {
                     boot_dma_ok = true;
                     println!(
@@ -2926,16 +2962,18 @@ fn capture_boot_dma_and_init_runtime(
         bc_prev.new_boots
     );
 
-    let initial_slice = active_triple_static_slice(&psram_bufs.triple_fb);
-    let mut runtime = FirmwareRuntime::new(
-        KlipperCamConfig::WROVER_KIT_HD,
-        CameraDriver::new(initial_slice, FrameSize::Hd),
-    );
+    let mut runtime = FirmwareRuntime::new(KlipperCamConfig::WROVER_KIT_HD, camera);
     runtime.server.ota_manager = ota_manager;
     // JUSTIFICATION: Initialize static FIRMWARE_RUNTIME global singleton.
-    // SAFETY: Single-threaded bare-metal init before server loop starts.
+    // SAFETY:
+    // 1. Alignment & Non-null: addr_of_mut!(FIRMWARE_RUNTIME) points to static.
+    // 2. Layout: Valid Option<FirmwareRuntime> slot in BSS.
+    // 3. Provenance: FIRMWARE_RUNTIME lives for 'static.
+    // 4. Aliasing: Unique single-threaded access during boot initialization.
+    // 5. Synchronization: Called sequentially before server loop starts.
+    // 6. Unwind safety: Bare-metal environment with panic = abort.
     unsafe {
-        FIRMWARE_RUNTIME = Some(runtime);
+        *core::ptr::addr_of_mut!(FIRMWARE_RUNTIME) = Some(runtime);
     }
     ov2640_dma_ok
 }
@@ -3111,21 +3149,52 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
     use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 
     let delay = Delay::new();
-    // JUSTIFICATION: Access mutable static PSRAM_BUFFERS singleton on Core 0.
-    // SAFETY: Exclusively accessed from Core 0 server execution.
-    let Some(psram_bufs) = (unsafe { PSRAM_BUFFERS.as_mut() }) else {
+    // JUSTIFICATION: Take ownership of static PSRAM_BUFFERS singleton on Core 0.
+    // SAFETY:
+    // 1. Alignment & Non-null: addr_of_mut!(PSRAM_BUFFERS) points to static.
+    // 2. Layout: Valid Option<PsramBuffers> initialized prior to server loop.
+    // 3. Provenance: PSRAM_BUFFERS lives for 'static.
+    // 4. Aliasing: Exclusively taken once on Core 0; never accessed again.
+    // 5. Synchronization: Core 1 is not running yet during this phase.
+    // 6. Unwind safety: Bare-metal environment with panic = abort.
+    let psram_buffers_opt = unsafe { (*core::ptr::addr_of_mut!(PSRAM_BUFFERS)).take() };
+    let Some(PsramBuffers {
+        triple_fb: mut triple_fb_owned,
+        p80_rx0,
+        p80_rx1,
+        p80_rx2,
+        p80_rx3,
+        p80_tx0,
+        p80_tx1,
+        p80_tx2,
+        p80_tx3,
+        p80_hdr_bufs: mut p80_hdr_bufs_owned,
+        p80_resp_bufs: mut p80_resp_bufs_owned,
+        tcp81_rx0,
+        tcp81_tx0,
+        tcp81_rx1,
+        tcp81_tx1,
+        http80_ota_accum,
+        free_psram_bytes,
+    }) = psram_buffers_opt
+    else {
         quiesce_psram_and_software_reset();
     };
+    let triple_fb = &mut triple_fb_owned;
+    let p80_hdr_bufs = &mut p80_hdr_bufs_owned;
+    let p80_resp_bufs = &mut p80_resp_bufs_owned;
+
     // JUSTIFICATION: Access mutable static FIRMWARE_RUNTIME singleton on Core 0.
-    // SAFETY: Exclusively accessed from Core 0 server execution.
-    let Some(runtime) = (unsafe { FIRMWARE_RUNTIME.as_mut() }) else {
+    // SAFETY:
+    // 1. Alignment & Non-null: addr_of_mut!(FIRMWARE_RUNTIME) points to static.
+    // 2. Layout: Valid Option<FirmwareRuntime> initialized during boot.
+    // 3. Provenance: FIRMWARE_RUNTIME lives for 'static.
+    // 4. Aliasing: Exclusively accessed from Core 0 server execution.
+    // 5. Synchronization: Core 1 is not yet active during initialization.
+    // 6. Unwind safety: Bare-metal environment with panic = abort.
+    let Some(runtime) = (unsafe { (*core::ptr::addr_of_mut!(FIRMWARE_RUNTIME)).as_mut() }) else {
         quiesce_psram_and_software_reset();
     };
-    let triple_fb = &mut psram_bufs.triple_fb;
-    let p80_hdr_bufs = &mut psram_bufs.p80_hdr_bufs;
-    let p80_resp_bufs = &mut psram_bufs.p80_resp_bufs;
-    let http80_ota_accum: &mut [u8] = psram_bufs.http80_ota_accum;
-    let free_psram_bytes = psram_bufs.free_psram_bytes;
 
     record_boot_breadcrumb_post_wifi(5, 0, 0);
     let _ = wifi_controller.set_max_tx_power(WIFI_MAX_TX_POWER_QDBM);
@@ -3186,82 +3255,15 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
     let mut iface = NetInterface::new(iface_cfg, &mut net_device, smol_now());
 
     // JUSTIFICATION: Mutable borrow of static SOCKET_STORAGE array.
-    // SAFETY: Single-threaded smoltcp socket set initialization.
+    // SAFETY:
+    // 1. Alignment & Non-null: addr_of_mut!(SOCKET_STORAGE) points to static.
+    // 2. Layout: Valid [Option<SocketStorage>; 7] array in BSS.
+    // 3. Provenance: SOCKET_STORAGE lives for 'static.
+    // 4. Aliasing: Exclusively borrowed once during network init on Core 0.
+    // 5. Synchronization: Executed on Core 0 before network polling starts.
+    // 6. Unwind safety: Bare-metal environment with panic = abort.
     let socket_storage = unsafe { &mut *core::ptr::addr_of_mut!(SOCKET_STORAGE) };
     let mut sockets = SocketSet::new(&mut socket_storage[..]);
-
-    // JUSTIFICATION: Extend lifetime to static for smoltcp socket buffer.
-    // SAFETY: psram_bufs lives for the entire firmware execution lifetime.
-    let p80_rx0: &'static mut [u8] = unsafe {
-        core::slice::from_raw_parts_mut(psram_bufs.p80_rx0.as_mut_ptr(), psram_bufs.p80_rx0.len())
-    };
-    // JUSTIFICATION: Extend lifetime to static for smoltcp socket buffer.
-    // SAFETY: psram_bufs lives for the entire firmware execution lifetime.
-    let p80_tx0: &'static mut [u8] = unsafe {
-        core::slice::from_raw_parts_mut(psram_bufs.p80_tx0.as_mut_ptr(), psram_bufs.p80_tx0.len())
-    };
-    // JUSTIFICATION: Extend lifetime to static for smoltcp socket buffer.
-    // SAFETY: psram_bufs lives for the entire firmware execution lifetime.
-    let p80_rx1: &'static mut [u8] = unsafe {
-        core::slice::from_raw_parts_mut(psram_bufs.p80_rx1.as_mut_ptr(), psram_bufs.p80_rx1.len())
-    };
-    // JUSTIFICATION: Extend lifetime to static for smoltcp socket buffer.
-    // SAFETY: psram_bufs lives for the entire firmware execution lifetime.
-    let p80_tx1: &'static mut [u8] = unsafe {
-        core::slice::from_raw_parts_mut(psram_bufs.p80_tx1.as_mut_ptr(), psram_bufs.p80_tx1.len())
-    };
-    // JUSTIFICATION: Extend lifetime to static for smoltcp socket buffer.
-    // SAFETY: psram_bufs lives for the entire firmware execution lifetime.
-    let p80_rx2: &'static mut [u8] = unsafe {
-        core::slice::from_raw_parts_mut(psram_bufs.p80_rx2.as_mut_ptr(), psram_bufs.p80_rx2.len())
-    };
-    // JUSTIFICATION: Extend lifetime to static for smoltcp socket buffer.
-    // SAFETY: psram_bufs lives for the entire firmware execution lifetime.
-    let p80_tx2: &'static mut [u8] = unsafe {
-        core::slice::from_raw_parts_mut(psram_bufs.p80_tx2.as_mut_ptr(), psram_bufs.p80_tx2.len())
-    };
-    // JUSTIFICATION: Extend lifetime to static for smoltcp socket buffer.
-    // SAFETY: psram_bufs lives for the entire firmware execution lifetime.
-    let p80_rx3: &'static mut [u8] = unsafe {
-        core::slice::from_raw_parts_mut(psram_bufs.p80_rx3.as_mut_ptr(), psram_bufs.p80_rx3.len())
-    };
-    // JUSTIFICATION: Extend lifetime to static for smoltcp socket buffer.
-    // SAFETY: psram_bufs lives for the entire firmware execution lifetime.
-    let p80_tx3: &'static mut [u8] = unsafe {
-        core::slice::from_raw_parts_mut(psram_bufs.p80_tx3.as_mut_ptr(), psram_bufs.p80_tx3.len())
-    };
-    // JUSTIFICATION: Extend lifetime to static for smoltcp socket buffer.
-    // SAFETY: psram_bufs lives for the entire firmware execution lifetime.
-    let tcp81_rx0: &'static mut [u8] = unsafe {
-        core::slice::from_raw_parts_mut(
-            psram_bufs.tcp81_rx0.as_mut_ptr(),
-            psram_bufs.tcp81_rx0.len(),
-        )
-    };
-    // JUSTIFICATION: Extend lifetime to static for smoltcp socket buffer.
-    // SAFETY: psram_bufs lives for the entire firmware execution lifetime.
-    let tcp81_tx0: &'static mut [u8] = unsafe {
-        core::slice::from_raw_parts_mut(
-            psram_bufs.tcp81_tx0.as_mut_ptr(),
-            psram_bufs.tcp81_tx0.len(),
-        )
-    };
-    // JUSTIFICATION: Extend lifetime to static for smoltcp socket buffer.
-    // SAFETY: psram_bufs lives for the entire firmware execution lifetime.
-    let tcp81_rx1: &'static mut [u8] = unsafe {
-        core::slice::from_raw_parts_mut(
-            psram_bufs.tcp81_rx1.as_mut_ptr(),
-            psram_bufs.tcp81_rx1.len(),
-        )
-    };
-    // JUSTIFICATION: Extend lifetime to static for smoltcp socket buffer.
-    // SAFETY: psram_bufs lives for the entire firmware execution lifetime.
-    let tcp81_tx1: &'static mut [u8] = unsafe {
-        core::slice::from_raw_parts_mut(
-            psram_bufs.tcp81_tx1.as_mut_ptr(),
-            psram_bufs.tcp81_tx1.len(),
-        )
-    };
 
     let dhcp_handle = sockets.add(dhcpv4::Socket::new());
     let tcp80_handles: [smoltcp::iface::SocketHandle; PORT80_SOCKET_COUNT] = [
@@ -3697,15 +3699,19 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                 // 4. Aliasing: `CORE1_ACTIVE` is false, so Core 1 is parked.
                 // 5. Synchronization: Checked before borrow.
                 // 6. Unwind safety: Bounded fallback capture.
-                if let Some(hw_i2s_cam) = unsafe { HW_I2S_CAM.as_mut() } {
-                    if capture_live_hd_jpeg_with_diag(hw_i2s_cam, triple_fb, &mut || {
-                        poll_net_burst(&mut iface, &mut net_device, &mut sockets);
-                    })
+                if let Some(hw_i2s_cam) = unsafe { (*core::ptr::addr_of_mut!(HW_I2S_CAM)).as_mut() }
+                {
+                    if capture_live_hd_jpeg_with_diag(
+                        hw_i2s_cam,
+                        triple_fb,
+                        &mut runtime.server.camera,
+                        runtime.server.control_state.framesize,
+                        &mut || {
+                            poll_net_burst(&mut iface, &mut net_device, &mut sockets);
+                        },
+                    )
                     .is_ok()
                     {
-                        let fresh_slice = active_triple_static_slice(triple_fb);
-                        let current_fs = runtime.server.control_state.framesize;
-                        runtime.server.camera.set_frame(fresh_slice, current_fs);
                         last_capture_ms = smol_now().total_millis();
                     }
                 }
@@ -4295,11 +4301,17 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                         // 4. Aliasing: `CORE1_ACTIVE` is false.
                         // 5. Synchronization: Checked before borrow.
                         // 6. Unwind safety: Bounded fallback capture.
-                        if let Some(hw_i2s_cam) = unsafe { HW_I2S_CAM.as_mut() } {
-                            let _ =
-                                capture_live_hd_jpeg_with_diag(hw_i2s_cam, triple_fb, &mut || {
+                        let hw = unsafe { (*core::ptr::addr_of_mut!(HW_I2S_CAM)).as_mut() };
+                        if let Some(hw_i2s_cam) = hw {
+                            let _ = capture_live_hd_jpeg_with_diag(
+                                hw_i2s_cam,
+                                triple_fb,
+                                &mut runtime.server.camera,
+                                runtime.server.control_state.framesize,
+                                &mut || {
                                     poll_net_burst(&mut iface, &mut net_device, &mut sockets);
-                                });
+                                },
+                            );
                         }
                     }
 

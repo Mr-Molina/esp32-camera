@@ -1065,6 +1065,75 @@ impl Esp32I2sCamera {
         self.running = false;
         true
     }
+}
+
+/// Halts hardware I2S0 RX and DMA in-link during emergency panic/reset
+/// teardown without requiring `&mut Esp32I2sCamera`.
+///
+/// # Safety
+///
+/// This function directly accesses hardware MMIO registers without
+/// ownership of the [`Esp32I2sCamera`] instance. The caller must ensure
+/// that no concurrent access to I2S0 registers occurs and that halting RX
+/// and DMA in-link is safe in the current execution state (e.g. panic or
+/// reset teardown).
+// JUSTIFICATION: Emergency stop directly manipulates I2S0 hardware MMIO
+// registers without holding an exclusive `&mut Esp32I2sCamera` handle.
+// SAFETY:
+// 1. Alignment & Non-null: All target register addresses are 4-byte aligned
+//    ESP32 I2S0 MMIO addresses (`0x3FF4_F000..0x3FF4_F0FF`).
+// 2. Memory layout: I2S0 MMIO registers are 32-bit memory-mapped words.
+// 3. Provenance: Fixed peripheral memory map on Xtensa ESP32 architecture.
+// 4. Aliasing: Called during emergency teardown/panic; preempts or replaces
+//    normal driver access to halt in-flight DMA immediately.
+// 5. Volatile semantics: MMIO register writes use volatile store operations
+//    preventing compiler reordering or elision.
+// 6. Panic safety: MMIO register writes on Xtensa do not unwind or panic.
+pub unsafe fn emergency_stop_i2s0_hw() {
+    #[cfg(target_arch = "xtensa")]
+    {
+        let hw_conf = xtensa_mmio_read(I2S0_BASE_ADDR + I2S_CONF_REG_OFFSET) & !I2S_RX_START_BIT;
+        xtensa_mmio_write(I2S0_BASE_ADDR + I2S_CONF_REG_OFFSET, hw_conf);
+
+        let hw_int_ena =
+            xtensa_mmio_read(I2S0_BASE_ADDR + I2S_INT_ENA_REG_OFFSET) & !I2S_IN_SUC_EOF_INT_BIT;
+        xtensa_mmio_write(I2S0_BASE_ADDR + I2S_INT_ENA_REG_OFFSET, hw_int_ena);
+        xtensa_mmio_write(
+            I2S0_BASE_ADDR + I2S_INT_CLR_REG_OFFSET,
+            I2S_IN_SUC_EOF_INT_BIT,
+        );
+
+        let hw_in_link = (xtensa_mmio_read(I2S0_BASE_ADDR + I2S_IN_LINK_REG_OFFSET)
+            & !I2S_INLINK_START_BIT)
+            | I2S_INLINK_STOP_BIT;
+        xtensa_mmio_write(I2S0_BASE_ADDR + I2S_IN_LINK_REG_OFFSET, hw_in_link);
+    }
+}
+
+impl Esp32I2sCamera {
+    /// Halts hardware I2S0 RX and DMA in-link during emergency panic/reset
+    /// teardown without requiring `&mut Esp32I2sCamera`.
+    ///
+    /// # Safety
+    ///
+    /// See module-level [`emergency_stop_i2s0_hw`] for full safety contract.
+    // JUSTIFICATION: Delegates directly to module-level emergency stop function.
+    // SAFETY:
+    // 1. Alignment & Non-null: Forwarded to `emergency_stop_i2s0_hw`.
+    // 2. Memory layout: Forwarded to `emergency_stop_i2s0_hw`.
+    // 3. Provenance: Forwarded to `emergency_stop_i2s0_hw`.
+    // 4. Aliasing: Forwarded to `emergency_stop_i2s0_hw`.
+    // 5. Volatile semantics: Forwarded to `emergency_stop_i2s0_hw`.
+    // 6. Panic safety: Forwarded to `emergency_stop_i2s0_hw`.
+    #[inline]
+    pub unsafe fn emergency_stop_i2s0_hw() {
+        // JUSTIFICATION: Delegates directly to module-level emergency stop function.
+        // SAFETY: Caller satisfies all emergency stop preconditions forwarded
+        // to `emergency_stop_i2s0_hw`.
+        unsafe {
+            emergency_stop_i2s0_hw();
+        }
+    }
 
     /// Deinitializes the I2S0 camera peripheral and gates its DPORT clock
     /// (`ll_cam_deinit`
