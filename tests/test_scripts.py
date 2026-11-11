@@ -3,7 +3,6 @@
 
 import hashlib
 import os
-import struct
 import sys
 import tempfile
 import unittest
@@ -13,9 +12,9 @@ from unittest.mock import MagicMock, patch
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
-import ensure_serial_passive
-import ota_deploy
-import verify_cold_boot_invariants
+import ensure_serial_passive  # noqa: E402
+import ota_deploy  # noqa: E402
+import verify_cold_boot_invariants  # noqa: E402
 
 
 class TestOtaDeploy(unittest.TestCase):
