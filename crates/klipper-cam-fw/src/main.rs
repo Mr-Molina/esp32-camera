@@ -410,22 +410,26 @@ fn pause_core1_camera_producer() -> bool {
 /// Releases Core 1 from its pause loop and waits until it has actually left
 /// it, so a subsequent `pause_core1_camera_producer` can never observe a stale
 /// `CORE1_IS_PAUSED == true` from this pause cycle.
+///
+/// Returns `true` once Core 1 has exited its pause loop (or when Core 1 was
+/// never started). Returns `false` on timeout.
 #[cfg(target_arch = "xtensa")]
 #[esp_hal::ram]
-fn resume_core1_camera_producer() {
+fn resume_core1_camera_producer() -> bool {
     CORE1_PAUSE_REQ.store(false, Ordering::Release);
     if !CORE1_ACTIVE.load(Ordering::Acquire) {
-        return;
+        return true;
     }
     for spin in 0..2_000_000u32 {
         if !CORE1_IS_PAUSED.load(Ordering::Acquire) {
-            break;
+            return true;
         }
         if (spin & 0xFFF) == 0 {
             feed_rtc_wdt();
         }
         core::hint::spin_loop();
     }
+    false
 }
 
 #[cfg(target_arch = "xtensa")]
@@ -2645,7 +2649,7 @@ fn program_ov2640_over_sccb<B: klipper_cam_fw::SccbBus>(hw_sccb: &mut B) -> (boo
             // set_window selects the JPEG CLKRC/PCLK dividers (`div = 12`),
             // then apply OV2640 ISP settings
             let prog_ok = ov.reset(hw_sccb).is_ok()
-                && ov.set_pixformat(hw_sccb, PixelFormat::Jpeg).is_ok()
+                && ov.select_pixformat(PixelFormat::Jpeg).is_ok()
                 && ov.set_framesize(hw_sccb, FrameSize::Hd).is_ok()
                 && ov.set_gainceiling(hw_sccb, GainCeiling::X2).is_ok()
                 && ov.set_bpc(hw_sccb, false).is_ok()
@@ -2664,7 +2668,7 @@ fn program_ov2640_over_sccb<B: klipper_cam_fw::SccbBus>(hw_sccb: &mut B) -> (boo
         }
         Err(_) => {
             println!(concat!(
-                "[KLIPPER-CAM-RS] [HW-2] I2C0 SCCB (GPIO26/GPIO27 @ 100kHz): ",
+                "[KLIPPER-CAM-RS] [HW-2] I2C0 SCCB (GPIO26/GPIO27 @ 200kHz): ",
                 "Bus active (no external OV2640 ribbon sensor ACK at 0x30)"
             ));
             (false, None)
@@ -4072,8 +4076,12 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                                     runtime.server.control_state.framesize,
                                 );
                             }
-                            if is_ota_post && !runtime.server.is_reboot_scheduled() {
-                                resume_core1_camera_producer();
+                            if is_ota_post
+                                && !runtime.server.is_reboot_scheduled()
+                                && !resume_core1_camera_producer()
+                            {
+                                FW_STATS.inc_sccb_errors();
+                                println!("camera: Core 1 resume timed out after aborted OTA");
                             }
 
                             if st.using_ota_accum {
@@ -4134,73 +4142,34 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
         let p80_tx_active = p80_states.iter().any(|s| s.tx_len > 0 && !s.closing);
         if p80_tx_active {
             poll_net_burst(&mut iface, &mut net_device, &mut sockets);
-        } else if let Some(ctrl) = runtime.server.take_pending_control_update() {
-            let _ = pause_core1_camera_producer();
-            if let (Some(ref mut sccb), Some(ref mut ov)) = (&mut kept_sccb, &mut live_ov2640) {
-                let fs_changed = ctrl.framesize != last_applied_ctrl.framesize;
-                if fs_changed && ov.set_framesize(sccb, ctrl.framesize).is_err() {
-                    FW_STATS.inc_sccb_errors();
+        } else if runtime.server.has_pending_control_update() {
+            if !pause_core1_camera_producer() {
+                FW_STATS.inc_sccb_errors();
+                println!("camera: Core 1 pause timed out; deferring /control update");
+            } else if let Some(ctrl) = runtime.server.take_pending_control_update() {
+                if let (Some(ref mut sccb), Some(ref mut ov)) = (&mut kept_sccb, &mut live_ov2640) {
+                    let mut applier = Ov2640ControlApplier(ov, sccb);
+                    let errs = klipper_cam_fw::http::apply_camera_control_diff(
+                        &mut applier,
+                        &ctrl,
+                        &mut last_applied_ctrl,
+                    );
+                    for _ in 0..errs {
+                        FW_STATS.inc_sccb_errors();
+                    }
+                } else {
+                    last_applied_ctrl = ctrl;
                 }
-                if (fs_changed || ctrl.quality != last_applied_ctrl.quality)
-                    && ov.set_quality(sccb, ctrl.quality).is_err()
-                {
+                CORE1_SPSC.reset_consumer();
+                spsc_asm = Core0SpscAssembler::new();
+                if !resume_core1_camera_producer() {
                     FW_STATS.inc_sccb_errors();
+                    println!("camera: Core 1 resume timed out after /control update");
                 }
-                if (fs_changed || ctrl.brightness != last_applied_ctrl.brightness)
-                    && ov.set_brightness(sccb, ctrl.brightness).is_err()
-                {
-                    FW_STATS.inc_sccb_errors();
-                }
-                if (fs_changed || ctrl.contrast != last_applied_ctrl.contrast)
-                    && ov.set_contrast(sccb, ctrl.contrast).is_err()
-                {
-                    FW_STATS.inc_sccb_errors();
-                }
-                if (fs_changed || ctrl.saturation != last_applied_ctrl.saturation)
-                    && ov.set_saturation(sccb, ctrl.saturation).is_err()
-                {
-                    FW_STATS.inc_sccb_errors();
-                }
-                if (fs_changed || ctrl.special_effect != last_applied_ctrl.special_effect)
-                    && ov.set_special_effect(sccb, ctrl.special_effect).is_err()
-                {
-                    FW_STATS.inc_sccb_errors();
-                }
-                if (fs_changed || ctrl.hmirror != last_applied_ctrl.hmirror)
-                    && ov.set_hmirror(sccb, ctrl.hmirror).is_err()
-                {
-                    FW_STATS.inc_sccb_errors();
-                }
-                if (fs_changed || ctrl.vflip != last_applied_ctrl.vflip)
-                    && ov.set_vflip(sccb, ctrl.vflip).is_err()
-                {
-                    FW_STATS.inc_sccb_errors();
-                }
-                if (fs_changed || ctrl.awb != last_applied_ctrl.awb)
-                    && ov.set_whitebal(sccb, ctrl.awb).is_err()
-                {
-                    FW_STATS.inc_sccb_errors();
-                }
-                if (fs_changed || ctrl.agc != last_applied_ctrl.agc)
-                    && ov.set_gain_ctrl(sccb, ctrl.agc).is_err()
-                {
-                    FW_STATS.inc_sccb_errors();
-                }
-                if (fs_changed || ctrl.aec != last_applied_ctrl.aec)
-                    && ov.set_exposure_ctrl(sccb, ctrl.aec).is_err()
-                {
-                    FW_STATS.inc_sccb_errors();
-                }
-                if (fs_changed || ctrl.ae_level != last_applied_ctrl.ae_level)
-                    && ov.set_ae_level(sccb, ctrl.ae_level).is_err()
-                {
-                    FW_STATS.inc_sccb_errors();
-                }
+                post_snapshot_refresh_at_ms = Some(now_ms + 150);
+            } else if !resume_core1_camera_producer() {
+                FW_STATS.inc_sccb_errors();
             }
-            spsc_asm = Core0SpscAssembler::new();
-            resume_core1_camera_producer();
-            last_applied_ctrl = ctrl;
-            post_snapshot_refresh_at_ms = Some(now_ms + 150);
         }
 
         // Reboot if OTA firmware update completed and all Port 80
@@ -4679,6 +4648,62 @@ fn configure_camera_inputs(
         Input::new(p23, InputConfig::default()),
         Input::new(p25, InputConfig::default().with_pull(Pull::Up)),
     ]);
+}
+
+#[cfg(target_arch = "xtensa")]
+struct Ov2640ControlApplier<'a, B>(&'a mut Ov2640, &'a mut B);
+
+#[cfg(target_arch = "xtensa")]
+impl<'a, B: esp32_cam_sccb::SccbBus> klipper_cam_fw::http::CameraControlApplier
+    for Ov2640ControlApplier<'a, B>
+{
+    fn apply_framesize(&mut self, val: FrameSize) -> Result<(), klipper_cam_fw::CameraError> {
+        self.0.set_framesize(self.1, val)
+    }
+
+    fn apply_quality(&mut self, val: i32) -> Result<(), klipper_cam_fw::CameraError> {
+        self.0.set_quality(self.1, val)
+    }
+
+    fn apply_brightness(&mut self, val: i32) -> Result<(), klipper_cam_fw::CameraError> {
+        self.0.set_brightness(self.1, val)
+    }
+
+    fn apply_contrast(&mut self, val: i32) -> Result<(), klipper_cam_fw::CameraError> {
+        self.0.set_contrast(self.1, val)
+    }
+
+    fn apply_saturation(&mut self, val: i32) -> Result<(), klipper_cam_fw::CameraError> {
+        self.0.set_saturation(self.1, val)
+    }
+
+    fn apply_special_effect(&mut self, val: i32) -> Result<(), klipper_cam_fw::CameraError> {
+        self.0.set_special_effect(self.1, val)
+    }
+
+    fn apply_hmirror(&mut self, val: bool) -> Result<(), klipper_cam_fw::CameraError> {
+        self.0.set_hmirror(self.1, val)
+    }
+
+    fn apply_vflip(&mut self, val: bool) -> Result<(), klipper_cam_fw::CameraError> {
+        self.0.set_vflip(self.1, val)
+    }
+
+    fn apply_awb(&mut self, val: bool) -> Result<(), klipper_cam_fw::CameraError> {
+        self.0.set_whitebal(self.1, val)
+    }
+
+    fn apply_agc(&mut self, val: bool) -> Result<(), klipper_cam_fw::CameraError> {
+        self.0.set_gain_ctrl(self.1, val)
+    }
+
+    fn apply_aec(&mut self, val: bool) -> Result<(), klipper_cam_fw::CameraError> {
+        self.0.set_exposure_ctrl(self.1, val)
+    }
+
+    fn apply_ae_level(&mut self, val: i32) -> Result<(), klipper_cam_fw::CameraError> {
+        self.0.set_ae_level(self.1, val)
+    }
 }
 
 /// Bare-metal Xtensa firmware entrypoint for `ESP32-WROVER-DEV`.

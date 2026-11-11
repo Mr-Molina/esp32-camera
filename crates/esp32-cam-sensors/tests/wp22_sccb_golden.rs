@@ -149,22 +149,19 @@ fn test_sccb06_and_sens17_ov2640_banks_and_golden_budgets() {
     assert_eq!(reset_bus.dropped_count(), 0);
 
     // Pin JPEG + HD set_framesize write budget.
-    assert_eq!(
-        sensor.set_pixformat(&mut reset_bus, PixelFormat::Jpeg),
-        Ok(())
-    );
+    assert_eq!(sensor.select_pixformat(PixelFormat::Jpeg), Ok(()));
     reset_bus.clear_transactions();
     let delay_before_fs = reset_bus.total_delay_ms();
     assert_eq!(sensor.set_framesize(&mut reset_bus, FrameSize::Hd), Ok(()));
     let hd_writes = reset_bus.register_write_count();
     let hd_delay = reset_bus.total_delay_ms() - delay_before_fs;
     assert!(
-        (40..=75).contains(&hd_writes),
+        (40..=64).contains(&hd_writes),
         "OV2640 HD set_framesize write budget out of range: {hd_writes}"
     );
-    assert!(
-        hd_delay <= 20,
-        "OV2640 HD set_framesize delay budget exceeded: {hd_delay} ms"
+    assert_eq!(
+        hd_delay, 10,
+        "OV2640 HD set_framesize delay must be 10 ms: {hd_delay} ms"
     );
     assert_eq!(reset_bus.reg8_banked(CameraSccbAddr::OV2640, 1, 0x11), 0x00);
     assert_eq!(reset_bus.reg8_banked(CameraSccbAddr::OV2640, 0, 0xD3), 0x0C);

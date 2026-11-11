@@ -238,7 +238,7 @@ Status values: `TODO` · `IN-PROGRESS` · `READY-FOR-HIL` · `DONE` · `BLOCKED 
   - **[HIL]** Record the baseline numbers (sensor period, per-stage Core 0 ms/frame, FPS) in this file under §8.
 - **Status:** READY-FOR-HIL (2026-11-11, merged `66c7cd1`; 206 host tests + Xtensa build green; hardware baseline pending target camera)
 
-#### - [ ] WP-16: OV2640 driver correctness and SCCB cost (Lane E, plus a small main.rs control-path edit in Lane C) · P1 · S
+#### - [x] WP-16: OV2640 driver correctness and SCCB cost (Lane E, plus a small main.rs control-path edit in Lane C) · P1 · S
 - **Findings:** SENS-02, SENS-03, SENS-06, SENS-07, SENS-08, SENS-19, SENS-20, SENS-21, FW-CORE-14
 - **Steps:**
   1. **SENS-02.** Restore the JPEG PCLK divider to 8 for CIF/SVGA in both places (`ov2640.rs:960-966` and `1091-1099`). Update the test to expect `0x08`. Only reintroduce 4 behind an explicit opt-in after a [HIL] VGA/SVGA soak passes.
@@ -258,7 +258,7 @@ Status values: `TODO` · `IN-PROGRESS` · `READY-FOR-HIL` · `DONE` · `BLOCKED 
   - Mock-bus transaction-count tests pass: HD `set_framesize` at most 64 writes, with exactly one write each to 0x11 and 0xD3.
   - A fault-injection test shows the bank is re-selected after an error.
   - **[HIL]** 200 rapid framesize toggles produce no invalid committed frames.
-- **Status:** TODO
+- **Status:** READY-FOR-HIL
 
 #### - [x] WP-21: Conversions and types performance and correctness (Lane F) · P1-P3 · M-L
 - **Findings:** CONV-01..09, CONV-11..22 (CONV-10 is in WP-06), TYPES-01..05

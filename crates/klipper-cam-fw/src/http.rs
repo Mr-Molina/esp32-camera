@@ -651,6 +651,144 @@ impl Default for CameraControlState {
     }
 }
 
+/// Trait for applying camera sensor control changes to the hardware driver.
+pub trait CameraControlApplier {
+    /// Applies a new frame size / resolution setting.
+    fn apply_framesize(&mut self, val: FrameSize) -> Result<(), CameraError>;
+    /// Applies JPEG compression quality (lower is higher quality).
+    fn apply_quality(&mut self, val: i32) -> Result<(), CameraError>;
+    /// Applies brightness adjustment.
+    fn apply_brightness(&mut self, val: i32) -> Result<(), CameraError>;
+    /// Applies contrast adjustment.
+    fn apply_contrast(&mut self, val: i32) -> Result<(), CameraError>;
+    /// Applies saturation adjustment.
+    fn apply_saturation(&mut self, val: i32) -> Result<(), CameraError>;
+    /// Applies special color effect.
+    fn apply_special_effect(&mut self, val: i32) -> Result<(), CameraError>;
+    /// Applies horizontal mirror.
+    fn apply_hmirror(&mut self, val: bool) -> Result<(), CameraError>;
+    /// Applies vertical flip.
+    fn apply_vflip(&mut self, val: bool) -> Result<(), CameraError>;
+    /// Applies auto white balance enable/disable.
+    fn apply_awb(&mut self, val: bool) -> Result<(), CameraError>;
+    /// Applies auto gain control enable/disable.
+    fn apply_agc(&mut self, val: bool) -> Result<(), CameraError>;
+    /// Applies auto exposure control enable/disable.
+    fn apply_aec(&mut self, val: bool) -> Result<(), CameraError>;
+    /// Applies auto exposure level.
+    fn apply_ae_level(&mut self, val: i32) -> Result<(), CameraError>;
+}
+
+/// Applies differences between `desired` and `last_applied` camera control
+/// states to the underlying sensor hardware via `applier`.
+///
+/// Returns the number of control update errors encountered. Successfully
+/// applied fields are recorded in `last_applied`, while failing fields remain
+/// unchanged so they may be retried on subsequent reconciliation passes.
+pub fn apply_camera_control_diff<A: CameraControlApplier>(
+    applier: &mut A,
+    desired: &CameraControlState,
+    last_applied: &mut CameraControlState,
+) -> u32 {
+    let mut errors = 0u32;
+    let mut force_quality = false;
+
+    if desired.framesize != last_applied.framesize {
+        match applier.apply_framesize(desired.framesize) {
+            Ok(()) => {
+                last_applied.framesize = desired.framesize;
+                force_quality = true;
+            }
+            Err(_) => {
+                errors += 1;
+            }
+        }
+    }
+
+    if force_quality || desired.quality != last_applied.quality {
+        match applier.apply_quality(desired.quality) {
+            Ok(()) => {
+                last_applied.quality = desired.quality;
+            }
+            Err(_) => {
+                errors += 1;
+            }
+        }
+    }
+
+    if desired.brightness != last_applied.brightness {
+        match applier.apply_brightness(desired.brightness) {
+            Ok(()) => last_applied.brightness = desired.brightness,
+            Err(_) => errors += 1,
+        }
+    }
+
+    if desired.contrast != last_applied.contrast {
+        match applier.apply_contrast(desired.contrast) {
+            Ok(()) => last_applied.contrast = desired.contrast,
+            Err(_) => errors += 1,
+        }
+    }
+
+    if desired.saturation != last_applied.saturation {
+        match applier.apply_saturation(desired.saturation) {
+            Ok(()) => last_applied.saturation = desired.saturation,
+            Err(_) => errors += 1,
+        }
+    }
+
+    if desired.special_effect != last_applied.special_effect {
+        match applier.apply_special_effect(desired.special_effect) {
+            Ok(()) => last_applied.special_effect = desired.special_effect,
+            Err(_) => errors += 1,
+        }
+    }
+
+    if desired.hmirror != last_applied.hmirror {
+        match applier.apply_hmirror(desired.hmirror) {
+            Ok(()) => last_applied.hmirror = desired.hmirror,
+            Err(_) => errors += 1,
+        }
+    }
+
+    if desired.vflip != last_applied.vflip {
+        match applier.apply_vflip(desired.vflip) {
+            Ok(()) => last_applied.vflip = desired.vflip,
+            Err(_) => errors += 1,
+        }
+    }
+
+    if desired.awb != last_applied.awb {
+        match applier.apply_awb(desired.awb) {
+            Ok(()) => last_applied.awb = desired.awb,
+            Err(_) => errors += 1,
+        }
+    }
+
+    if desired.agc != last_applied.agc {
+        match applier.apply_agc(desired.agc) {
+            Ok(()) => last_applied.agc = desired.agc,
+            Err(_) => errors += 1,
+        }
+    }
+
+    if desired.aec != last_applied.aec {
+        match applier.apply_aec(desired.aec) {
+            Ok(()) => last_applied.aec = desired.aec,
+            Err(_) => errors += 1,
+        }
+    }
+
+    if desired.ae_level != last_applied.ae_level {
+        match applier.apply_ae_level(desired.ae_level) {
+            Ok(()) => last_applied.ae_level = desired.ae_level,
+            Err(_) => errors += 1,
+        }
+    }
+
+    errors
+}
+
 /// Returns the canonical `"WxH"` resolution label for `fs`.
 #[inline]
 pub const fn framesize_label(fs: FrameSize) -> &'static str {
@@ -1157,6 +1295,14 @@ impl<'a> KlipperCamServer<'a> {
     #[inline]
     pub fn ota_token(&self) -> &[u8] {
         self.config.ota_token.as_bytes()
+    }
+
+    /// Returns whether a camera control setting was modified via `/control`
+    /// and is pending application without clearing the dirty flag.
+    #[must_use]
+    #[inline]
+    pub const fn has_pending_control_update(&self) -> bool {
+        self.control_state.dirty
     }
 
     /// Returns `Some(CameraControlState)` and clears `dirty` if a camera control
@@ -3318,5 +3464,184 @@ Content-Type: image/jpeg\r\nContent-Length: 51200\r\n\r\n";
             write_mjpeg_part_header(51_200, &mut tiny_buf),
             Err(HttpError::BufferTooSmall)
         );
+    }
+
+    struct MockCameraControlApplier {
+        framesize_calls: u32,
+        quality_calls: u32,
+        brightness_calls: u32,
+        contrast_calls: u32,
+        saturation_calls: u32,
+        special_effect_calls: u32,
+        hmirror_calls: u32,
+        vflip_calls: u32,
+        awb_calls: u32,
+        agc_calls: u32,
+        aec_calls: u32,
+        ae_level_calls: u32,
+        fail_contrast: bool,
+    }
+
+    impl MockCameraControlApplier {
+        fn new() -> Self {
+            Self {
+                framesize_calls: 0,
+                quality_calls: 0,
+                brightness_calls: 0,
+                contrast_calls: 0,
+                saturation_calls: 0,
+                special_effect_calls: 0,
+                hmirror_calls: 0,
+                vflip_calls: 0,
+                awb_calls: 0,
+                agc_calls: 0,
+                aec_calls: 0,
+                ae_level_calls: 0,
+                fail_contrast: false,
+            }
+        }
+
+        fn total_calls(&self) -> u32 {
+            self.framesize_calls
+                + self.quality_calls
+                + self.brightness_calls
+                + self.contrast_calls
+                + self.saturation_calls
+                + self.special_effect_calls
+                + self.hmirror_calls
+                + self.vflip_calls
+                + self.awb_calls
+                + self.agc_calls
+                + self.aec_calls
+                + self.ae_level_calls
+        }
+    }
+
+    impl CameraControlApplier for MockCameraControlApplier {
+        fn apply_framesize(&mut self, _val: FrameSize) -> Result<(), CameraError> {
+            self.framesize_calls += 1;
+            Ok(())
+        }
+
+        fn apply_quality(&mut self, _val: i32) -> Result<(), CameraError> {
+            self.quality_calls += 1;
+            Ok(())
+        }
+
+        fn apply_brightness(&mut self, _val: i32) -> Result<(), CameraError> {
+            self.brightness_calls += 1;
+            Ok(())
+        }
+
+        fn apply_contrast(&mut self, _val: i32) -> Result<(), CameraError> {
+            self.contrast_calls += 1;
+            if self.fail_contrast {
+                Err(CameraError::SccbError)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn apply_saturation(&mut self, _val: i32) -> Result<(), CameraError> {
+            self.saturation_calls += 1;
+            Ok(())
+        }
+
+        fn apply_special_effect(&mut self, _val: i32) -> Result<(), CameraError> {
+            self.special_effect_calls += 1;
+            Ok(())
+        }
+
+        fn apply_hmirror(&mut self, _val: bool) -> Result<(), CameraError> {
+            self.hmirror_calls += 1;
+            Ok(())
+        }
+
+        fn apply_vflip(&mut self, _val: bool) -> Result<(), CameraError> {
+            self.vflip_calls += 1;
+            Ok(())
+        }
+
+        fn apply_awb(&mut self, _val: bool) -> Result<(), CameraError> {
+            self.awb_calls += 1;
+            Ok(())
+        }
+
+        fn apply_agc(&mut self, _val: bool) -> Result<(), CameraError> {
+            self.agc_calls += 1;
+            Ok(())
+        }
+
+        fn apply_aec(&mut self, _val: bool) -> Result<(), CameraError> {
+            self.aec_calls += 1;
+            Ok(())
+        }
+
+        fn apply_ae_level(&mut self, _val: i32) -> Result<(), CameraError> {
+            self.ae_level_calls += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_has_pending_control_update_lifecycle() {
+        let mut server = KlipperCamServer::new_default();
+        let mut resp_buf = [0u8; 512];
+
+        assert!(!server.has_pending_control_update());
+        assert_eq!(server.take_pending_control_update(), None);
+
+        let req = b"GET /control?var=brightness&val=2 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n";
+        let resp = server
+            .handle_raw_request(ServerPort::Control, req, &mut resp_buf)
+            .expect("GET /control");
+        let view = HttpResponseView::parse(resp).expect("parse view");
+        assert_eq!(view.status_code, 200);
+
+        assert!(server.has_pending_control_update());
+        assert!(server.has_pending_control_update());
+
+        let pending = server.take_pending_control_update();
+        assert!(pending.is_some());
+        assert_eq!(pending.expect("pending state").brightness, 2);
+        assert!(!server.has_pending_control_update());
+    }
+
+    #[test]
+    fn test_apply_camera_control_diff_framesize_invokes_only_framesize_and_quality() {
+        let mut applier = MockCameraControlApplier::new();
+        let mut last_applied = CameraControlState::new_default();
+        let mut desired = CameraControlState::new_default();
+
+        desired.framesize = FrameSize::Vga;
+
+        let errors = apply_camera_control_diff(&mut applier, &desired, &mut last_applied);
+        assert_eq!(errors, 0);
+        assert_eq!(last_applied.framesize, FrameSize::Vga);
+        assert_eq!(last_applied.quality, desired.quality);
+
+        assert_eq!(applier.framesize_calls, 1);
+        assert_eq!(applier.quality_calls, 1);
+        assert_eq!(applier.total_calls(), 2);
+    }
+
+    #[test]
+    fn test_apply_camera_control_diff_error_preserves_old_value_for_retry() {
+        let mut applier = MockCameraControlApplier::new();
+        applier.fail_contrast = true;
+
+        let mut last_applied = CameraControlState::new_default();
+        let mut desired = CameraControlState::new_default();
+
+        desired.brightness = 2;
+        desired.contrast = 3;
+        desired.saturation = 1;
+
+        let errors = apply_camera_control_diff(&mut applier, &desired, &mut last_applied);
+        assert_eq!(errors, 1);
+
+        assert_eq!(last_applied.brightness, 2);
+        assert_eq!(last_applied.saturation, 1);
+        assert_eq!(last_applied.contrast, 0);
     }
 }

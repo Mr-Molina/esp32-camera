@@ -179,21 +179,9 @@ impl<const SLOTS: usize> Core1JpegSpsc<SLOTS> {
     }
 
     /// Resets the consumer index to match current head, discarding pending items.
-    ///
-    /// # Safety
-    ///
-    /// Must only be called by the designated single consumer thread / core.
     // JUSTIFICATION: Fast drain of obsolete JPEG chunks on stream abort.
-    // SAFETY:
-    // 1. Alignment & Non-null: Only atomic indices are modified.
-    // 2. Memory layout & Bounds: Head value is within `0..SLOTS`.
-    // 3. Provenance & Initialization: Consumer advances `tail` to current `head`.
-    // 4. Disjoint access & Aliasing: Consumer owns `tail` and producer owns
-    //    `head`. Store to `tail` does not alias producer slot writes.
-    // 5. Atomic synchronization: Loads `head` with `Ordering::Acquire` and
-    //    stores `tail` with `Ordering::Release`.
-    // 6. Panic freedom & no_std safety: Pure atomic load/store with no panics.
-    pub unsafe fn reset_consumer(&self) {
+    // SAFETY: Consumer advances `tail` to current `head` via atomic operations.
+    pub fn reset_consumer(&self) {
         let head = self.head.load(Ordering::Acquire);
         self.tail.store(head, Ordering::Release);
     }
@@ -347,8 +335,8 @@ mod tests {
             let _ = unsafe { ring.push_chunk(&[0x11; 16], 0) };
         }
         assert!(!ring.is_empty());
-        // SAFETY: Single consumer in test context.
-        unsafe { ring.reset_consumer() };
+        // Single consumer in test context.
+        ring.reset_consumer();
         assert!(ring.is_empty());
     }
 }
