@@ -290,6 +290,35 @@ impl Lldesc {
         }
     }
 
+    /// Replaces the whole header word (`size`, `length`, `offset`, `sosf`,
+    /// `eof`, `owner`) with one volatile store, e.g. a value from
+    /// [`Self::pack_flags`].
+    ///
+    /// Re-arming a descriptor this way is a single bus write, so the DMA never
+    /// observes a partially updated header (unlike a sequence of `set_*`
+    /// read-modify-writes).
+    #[inline]
+    pub fn store_flags(&mut self, flags: u32) {
+        // JUSTIFICATION: Hardware DMA controller reads descriptor headers
+        // concurrently, so the store must not be elided, split or reordered.
+        // SAFETY:
+        // 1. Alignment & Non-null: `&mut self.size_length_flags` is a valid,
+        //    4-byte aligned `u32` field of a `#[repr(C, align(4))]` struct.
+        // 2. Memory layout: `size_length_flags` is the first 32-bit word of
+        //    `Lldesc`, matching ROM `lldesc_t`.
+        // 3. Provenance & Lifetime: Derived from `&mut self`, valid for the
+        //    duration of the call.
+        // 4. Exclusive aliasing: `&mut self` grants unique CPU-side access.
+        // 5. Volatile semantics: One `write_volatile` of the packed word;
+        //    the fences keep surrounding buffer accesses on their side of it.
+        // 6. Panic safety: A volatile `u32` store cannot unwind.
+        unsafe {
+            compiler_fence(Ordering::SeqCst);
+            ptr::write_volatile(&mut self.size_length_flags, flags);
+            compiler_fence(Ordering::SeqCst);
+        }
+    }
+
     /// Returns the 20-bit physical descriptor address (`addr & 0x000F_FFFF`) used
     /// by ESP32 `I2S0.in_link.addr`.
     ///

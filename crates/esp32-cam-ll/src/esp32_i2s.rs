@@ -11,6 +11,7 @@
 use core::ptr;
 use esp32_cam_types::{CameraError, PixelFormat};
 
+use crate::dma_drain::{CaptureHooks, CaptureStep, DmaStatus, NoCaptureHooks, PolledJpegCapture};
 use crate::dma_filter::{select_sample_mode, DmaFilterKind, I2sSamplingMode, SampleModeConfig};
 use crate::dma_ring::{build_circular_ring, DmaSizeConfig, Lldesc};
 
@@ -146,6 +147,11 @@ pub const I2S_IN_SUC_EOF_INT_BIT: u32 = 1 << 9;
 pub const I2S_IN_DSCR_ERR_INT_RAW: u32 = 1 << 13;
 /// Raw interrupt flag for RX descriptor empty (`BIT(15)` in `I2S_INT_RAW_REG`).
 pub const I2S_IN_DSCR_EMPTY_INT_RAW: u32 = 1 << 15;
+/// Inlink status latches cleared by [`Esp32I2sCamera::start`]: `IN_SUC_EOF`,
+/// `IN_DSCR_ERR` and `IN_DSCR_EMPTY` (`I2S_INT_CLR_REG` uses the raw bit
+/// positions).
+const INLINK_STATUS_LATCHES: u32 =
+    I2S_IN_SUC_EOF_INT_BIT | I2S_IN_DSCR_ERR_INT_RAW | I2S_IN_DSCR_EMPTY_INT_RAW;
 
 /// `I2S0.timing` (`0x1C`), `I2S0.fifo_conf` (`0x20`), `I2S0.rx_eof_num`
 /// (`0x24`), and `I2S0.conf_chan` (`0x2C`).
@@ -272,6 +278,8 @@ pub struct I2s0RegisterBlock {
     pub fifo_conf: u32,
     pub rx_eof_num: u32,
     pub in_link: u32,
+    /// Shadow of `I2S_IN_EOF_DES_ADDR_REG` (address of the last EOF descriptor).
+    pub in_eof_des_addr: u32,
     pub lc_conf: u32,
     pub clkm_conf: u32,
     pub sample_rate_conf: u32,
@@ -442,6 +450,76 @@ fn xtensa_read_gpio_level(gpio_num: u8) -> bool {
     }
 }
 
+/// [`DmaStatus`] over the I2S0 inlink status registers, borrowed from an
+/// [`Esp32I2sCamera`] with [`Esp32I2sCamera::dma_status`].
+///
+/// On Xtensa it reads and clears the hardware `I2S_INT_RAW_REG`,
+/// `I2S_INT_CLR_REG` and `I2S_IN_EOF_DES_ADDR_REG`; on the host it operates
+/// on the shadow [`I2s0RegisterBlock`]. Clears are mirrored into the shadow
+/// block on both targets.
+#[derive(Debug)]
+pub struct I2s0DmaStatus<'a> {
+    regs: &'a mut I2s0RegisterBlock,
+}
+
+impl DmaStatus for I2s0DmaStatus<'_> {
+    #[inline]
+    fn int_raw(&mut self) -> u32 {
+        #[cfg(target_arch = "xtensa")]
+        {
+            xtensa_mmio_read(I2S0_BASE_ADDR + I2S_INT_RAW_REG_OFFSET)
+        }
+        #[cfg(not(target_arch = "xtensa"))]
+        {
+            volatile_read_u32(&self.regs.int_raw)
+        }
+    }
+
+    #[inline]
+    fn clear_int(&mut self, mask: u32) {
+        #[cfg(target_arch = "xtensa")]
+        xtensa_mmio_write(I2S0_BASE_ADDR + I2S_INT_CLR_REG_OFFSET, mask);
+        volatile_write_u32(&mut self.regs.int_clr, mask);
+        let raw = volatile_read_u32(&self.regs.int_raw) & !mask;
+        volatile_write_u32(&mut self.regs.int_raw, raw);
+    }
+
+    #[inline]
+    fn eof_desc_addr(&mut self) -> u32 {
+        #[cfg(target_arch = "xtensa")]
+        {
+            xtensa_mmio_read(I2S0_BASE_ADDR + I2S_IN_EOF_DES_ADDR_REG_OFFSET) & I2S_INLINK_ADDR_MASK
+        }
+        #[cfg(not(target_arch = "xtensa"))]
+        {
+            volatile_read_u32(&self.regs.in_eof_des_addr) & I2S_INLINK_ADDR_MASK
+        }
+    }
+
+    #[inline]
+    fn barrier(&mut self) {
+        #[cfg(target_arch = "xtensa")]
+        {
+            // JUSTIFICATION: Orders I2S0 MMIO status accesses and CPU stores
+            // to the DMA ring against the DMA engine's view of internal SRAM.
+            // SAFETY:
+            // 1. Alignment & Non-null: `memw` takes no memory operand.
+            // 2. Memory layout: Architectural Xtensa memory barrier instruction.
+            // 3. Provenance: Valid instruction on the ESP32 Xtensa LX6 core.
+            // 4. Aliasing: Touches no Rust-visible memory; only drains the
+            //    processor's load/store and write buffers.
+            // 5. Volatile semantics: The `asm!` block is opaque to the
+            //    compiler, which keeps surrounding volatile accesses in
+            //    program order.
+            // 6. Panic safety: `memw` cannot trap or unwind.
+            unsafe {
+                core::arch::asm!("memw");
+            }
+        }
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 #[inline]
 fn find_jpeg_soi(buf: &[u8]) -> Option<usize> {
     if buf.len() < 3 {
@@ -459,7 +537,7 @@ fn find_jpeg_soi(buf: &[u8]) -> Option<usize> {
 }
 
 #[inline]
-fn find_jpeg_eoi(buf: &[u8]) -> Option<usize> {
+pub(crate) fn find_jpeg_eoi(buf: &[u8]) -> Option<usize> {
     if buf.len() < 2 {
         return None;
     }
@@ -479,7 +557,7 @@ fn find_jpeg_eoi(buf: &[u8]) -> Option<usize> {
 /// alignment (including cross-chunk straddling) and returning
 /// `Ok(Some(total_len))` as soon as
 /// `EOI` (`0xFF, 0xD9`) is encountered after `SOI`.
-fn append_unpacked_jpeg_chunk(
+pub(crate) fn append_unpacked_jpeg_chunk(
     chunk: &[u8],
     jpeg_out: &mut [u8],
     written: &mut usize,
@@ -606,6 +684,7 @@ impl Esp32I2sCamera {
                 fifo_conf: 0,
                 rx_eof_num: 0,
                 in_link: 0,
+                in_eof_des_addr: 0,
                 lc_conf: 0,
                 clkm_conf: 0,
                 sample_rate_conf: 0,
@@ -657,6 +736,15 @@ impl Esp32I2sCamera {
 
     pub const fn regs(&self) -> &I2s0RegisterBlock {
         &self.regs
+    }
+
+    /// Borrows the I2S0 inlink status registers as a [`DmaStatus`] for the
+    /// shared half-buffer drain ([`crate::HalfDrain`]).
+    #[inline]
+    pub fn dma_status(&mut self) -> I2s0DmaStatus<'_> {
+        I2s0DmaStatus {
+            regs: &mut self.regs,
+        }
     }
 
     /// Returns the active [`I2sSamplingMode`].
@@ -941,8 +1029,12 @@ impl Esp32I2sCamera {
         let conf_stopped = volatile_read_u32(&self.regs.conf) & !I2S_RX_START_BIT;
         volatile_write_u32(&mut self.regs.conf, conf_stopped);
 
-        // Enable `in_suc_eof` interrupt
-        volatile_write_u32(&mut self.regs.int_clr, I2S_IN_SUC_EOF_INT_BIT);
+        // Clear the inlink status latches of any earlier run (WP-06: a stale
+        // `IN_DSCR_ERR` / `IN_DSCR_EMPTY` would abort every new frame in the
+        // shared drain), then enable the `in_suc_eof` interrupt.
+        volatile_write_u32(&mut self.regs.int_clr, INLINK_STATUS_LATCHES);
+        let int_raw = volatile_read_u32(&self.regs.int_raw) & !INLINK_STATUS_LATCHES;
+        volatile_write_u32(&mut self.regs.int_raw, int_raw);
         let int_ena = volatile_read_u32(&self.regs.int_ena) | I2S_IN_SUC_EOF_INT_BIT;
         volatile_write_u32(&mut self.regs.int_ena, int_ena);
 
@@ -966,7 +1058,7 @@ impl Esp32I2sCamera {
 
             xtensa_mmio_write(
                 I2S0_BASE_ADDR + I2S_INT_CLR_REG_OFFSET,
-                I2S_IN_SUC_EOF_INT_BIT,
+                INLINK_STATUS_LATCHES,
             );
             let hw_int_ena =
                 xtensa_mmio_read(I2S0_BASE_ADDR + I2S_INT_ENA_REG_OFFSET) | I2S_IN_SUC_EOF_INT_BIT;
@@ -1042,6 +1134,14 @@ impl Esp32I2sCamera {
             (volatile_read_u32(&self.regs.in_link) & !I2S_INLINK_START_BIT) | I2S_INLINK_STOP_BIT;
         volatile_write_u32(&mut self.regs.in_link, in_link);
 
+        // LL-21: pulse the inlink and AHB master resets so a write the DMA
+        // already queued cannot land after the caller's buffer borrows end.
+        volatile_write_u32(
+            &mut self.regs.lc_conf,
+            I2S_LC_IN_RST_BIT | I2S_LC_AHBM_RST_BIT,
+        );
+        volatile_write_u32(&mut self.regs.lc_conf, 0);
+
         #[cfg(target_arch = "xtensa")]
         {
             let hw_conf =
@@ -1060,6 +1160,28 @@ impl Esp32I2sCamera {
                 & !I2S_INLINK_START_BIT)
                 | I2S_INLINK_STOP_BIT;
             xtensa_mmio_write(I2S0_BASE_ADDR + I2S_IN_LINK_REG_OFFSET, hw_in_link);
+
+            // LL-21: reset the inlink state machine and the AHB master, then
+            // drain the write buffers.
+            xtensa_mmio_write(
+                I2S0_BASE_ADDR + I2S_LC_CONF_REG_OFFSET,
+                I2S_LC_IN_RST_BIT | I2S_LC_AHBM_RST_BIT,
+            );
+            xtensa_mmio_write(I2S0_BASE_ADDR + I2S_LC_CONF_REG_OFFSET, 0);
+            // JUSTIFICATION: Memory barrier after halting and resetting the
+            // I2S0 inlink DMA.
+            // SAFETY:
+            // 1. Alignment & Non-null: `memw` takes no memory operand.
+            // 2. Memory layout: Architectural Xtensa memory barrier instruction.
+            // 3. Provenance: Valid instruction on the ESP32 Xtensa LX6 core.
+            // 4. Aliasing: Touches no Rust-visible memory; it completes the
+            //    preceding MMIO stores before the caller reuses the DMA ring.
+            // 5. Volatile semantics: The `asm!` block is opaque to the compiler,
+            //    which keeps the preceding volatile MMIO stores before it.
+            // 6. Panic safety: `memw` cannot trap or unwind.
+            unsafe {
+                core::arch::asm!("memw");
+            }
         }
 
         self.running = false;
@@ -1178,20 +1300,44 @@ impl Esp32I2sCamera {
     /// into `1024`-byte
     /// JPEG chunks in `jpeg_out` and returning the exact `SOI..=EOI` byte length.
     ///
-    /// - On `#[cfg(target_arch = "xtensa")]`, synchronizes with `VSYNC`
-    ///   (`GPIO_IN_REG`), starts `I2S0` DMA, polls `I2S_INT_RAW_REG`
-    ///   (`IN_SUC_EOF`), unpacks and re-arms completed half-buffers,
-    ///   and unpacks the final partial half-buffer when `VSYNC` asserts
-    ///   at end of frame.
-    /// - On `#[cfg(not(target_arch = "xtensa"))]`, builds circular ring
-    ///   and unpacks the pre-populated DMA half-buffers in `dma_buf`
-    ///   for deterministic host unit and Miri verification.
+    /// Equivalent to [`Self::capture_jpeg_frame_polled_with_hooks`] with
+    /// [`NoCaptureHooks`].
     pub fn capture_jpeg_frame_polled(
         &mut self,
         descriptors: &mut [Lldesc],
         dma_buf: &mut [u8],
         jpeg_out: &mut [u8],
         max_poll_iters: u32,
+    ) -> Result<usize, CameraError> {
+        self.capture_jpeg_frame_polled_with_hooks(
+            descriptors,
+            dma_buf,
+            jpeg_out,
+            max_poll_iters,
+            &mut NoCaptureHooks,
+        )
+    }
+
+    /// Captures a complete JPEG frame like [`Self::capture_jpeg_frame_polled`],
+    /// calling back into `hooks` while it waits (LL-15).
+    ///
+    /// - On `#[cfg(target_arch = "xtensa")]`, poisons the ring, synchronizes
+    ///   with `VSYNC` (`GPIO_IN_REG`), starts `I2S0` DMA and runs a
+    ///   [`PolledJpegCapture`]: completed half-buffers are consumed through the
+    ///   shared [`crate::HalfDrain`] (EOF position and owner write-back gated,
+    ///   poisoned and re-armed, overrun reported as
+    ///   [`CameraError::Overflow`]), and the final partial half-buffer is
+    ///   processed unconditionally once `VSYNC` ends.
+    /// - On `#[cfg(not(target_arch = "xtensa"))]`, builds circular ring
+    ///   and unpacks the pre-populated DMA half-buffers in `dma_buf`
+    ///   for deterministic host unit and Miri verification.
+    pub fn capture_jpeg_frame_polled_with_hooks<H: CaptureHooks>(
+        &mut self,
+        descriptors: &mut [Lldesc],
+        dma_buf: &mut [u8],
+        jpeg_out: &mut [u8],
+        max_poll_iters: u32,
+        hooks: &mut H,
     ) -> Result<usize, CameraError> {
         let desc_cnt = descriptors.len();
         if desc_cnt < 2
@@ -1244,6 +1390,8 @@ impl Esp32I2sCamera {
                 &dma_buf[..required_dma_bytes],
                 JPEG_DMA_NODE_SIZE,
             )?;
+            // LL-06: no byte of an earlier frame survives anywhere in the ring.
+            dma_buf[..required_dma_bytes].fill(crate::dma_drain::DMA_POISON_BYTE);
             let first_desc_addr =
                 (core::ptr::from_ref(&descriptors[0]) as usize as u32) & I2S_INLINK_ADDR_MASK;
             let vsync_pin = self.vsync_pin.unwrap_or(25);
@@ -1255,204 +1403,38 @@ impl Esp32I2sCamera {
                 && sync_iters < max_poll_iters
             {
                 sync_iters += 1;
+                if sync_iters.is_multiple_of(PolledJpegCapture::IDLE_HOOK_POLLS) {
+                    hooks.idle();
+                }
             }
             if sync_iters >= max_poll_iters {
                 return Err(CameraError::Timeout);
             }
 
+            let mut capture = PolledJpegCapture::new(
+                half_buf_cnt,
+                self.filter,
+                crate::dma_drain::DrainGate::OwnerWriteback,
+            )?;
             if !self.start(&dma_cfg, first_desc_addr) {
                 return Err(CameraError::HardwareError);
             }
 
-            let mut half_buf_idx = 0usize;
-            let mut written = 0usize;
-            let mut soi_found = false;
-            let mut prev_tail = [0u8; 2];
-            let mut prev_tail_len = 0usize;
-            let mut unpacked_chunk = [0u8; JPEG_UNPACKED_HALF_BUFFER_SIZE];
-            let mut seen_active_video = false;
-            let mut idle_since_eof = 0u32;
-            let mut poll_iters = 0u32;
-
-            while poll_iters < max_poll_iters {
-                poll_iters += 1;
-
-                if xtensa_read_gpio_level(vsync_pin) != vsync_sync_level {
-                    seen_active_video = true;
-                }
-
-                let int_raw = xtensa_mmio_read(I2S0_BASE_ADDR + I2S_INT_RAW_REG_OFFSET);
-                if (int_raw & (I2S_IN_DSCR_ERR_INT_RAW | I2S_IN_DSCR_EMPTY_INT_RAW)) != 0 {
-                    xtensa_mmio_write(
-                        I2S0_BASE_ADDR + I2S_INT_CLR_REG_OFFSET,
-                        int_raw & (I2S_IN_DSCR_ERR_INT_RAW | I2S_IN_DSCR_EMPTY_INT_RAW),
-                    );
-                }
-                if (int_raw & I2S_IN_SUC_EOF_INT_BIT) != 0 {
-                    xtensa_mmio_write(
-                        I2S0_BASE_ADDR + I2S_INT_CLR_REG_OFFSET,
-                        I2S_IN_SUC_EOF_INT_BIT,
-                    );
-                    idle_since_eof = 0;
-
-                    #[cfg(target_arch = "xtensa")]
-                    // JUSTIFICATION: Memory synchronization barrier between MMIO and DMA.
-                    // SAFETY: `memw` orders preceding volatile MMIO status reads
-                    // before subsequent SRAM DMA buffer reads on Xtensa.
-                    unsafe {
-                        core::arch::asm!("memw");
-                    }
-                    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
-
-                    let eof_desc_addr =
-                        xtensa_mmio_read(I2S0_BASE_ADDR + I2S_IN_EOF_DES_ADDR_REG_OFFSET)
-                            & I2S_INLINK_ADDR_MASK;
-                    let mut target_half = None;
-                    let mut h = 0usize;
-                    while h < half_buf_cnt {
-                        let desc1_addr = (core::ptr::from_ref(&descriptors[2 * h + 1]) as usize
-                            as u32)
-                            & I2S_INLINK_ADDR_MASK;
-                        let desc0_addr = (core::ptr::from_ref(&descriptors[2 * h]) as usize as u32)
-                            & I2S_INLINK_ADDR_MASK;
-                        if desc1_addr == eof_desc_addr || desc0_addr == eof_desc_addr {
-                            target_half = Some(h);
-                            break;
-                        }
-                        h += 1;
-                    }
-
-                    let mut drained = 0usize;
-                    while drained < half_buf_cnt {
-                        let cur_h = half_buf_idx;
-                        let half_offset = cur_h * JPEG_DMA_HALF_BUFFER_SIZE;
-                        let _ = self.memcpy_filtered(
-                            &mut unpacked_chunk,
-                            &dma_buf[half_offset..half_offset + JPEG_DMA_HALF_BUFFER_SIZE],
-                        );
-                        let flags =
-                            Lldesc::pack_flags(JPEG_DMA_NODE_SIZE as u16, 0, 0, false, false, true);
-                        volatile_write_u32(&mut descriptors[2 * cur_h].size_length_flags, flags);
-                        volatile_write_u32(
-                            &mut descriptors[2 * cur_h + 1].size_length_flags,
-                            flags,
-                        );
-                        half_buf_idx = (cur_h + 1) % half_buf_cnt;
-                        drained += 1;
-
-                        match append_unpacked_jpeg_chunk(
-                            &unpacked_chunk,
-                            jpeg_out,
-                            &mut written,
-                            &mut soi_found,
-                            &mut prev_tail,
-                            &mut prev_tail_len,
-                        ) {
-                            Ok(Some(total_len)) => {
-                                let _ = self.stop();
-                                return Ok(total_len);
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                let _ = self.stop();
-                                return Err(e);
-                            }
-                        }
-
-                        if target_half == Some(cur_h) || target_half.is_none() {
-                            break;
-                        }
-                    }
-                    continue;
-                }
-
-                // If SOI has been found, check if the final partial half-buffer (< 4096 DMA
-                // bytes)
-                // already contains EOI (`0xFF, 0xD9`) on VSYNC end-of-frame or idle window
-                // (`cam_hal.c:408-411`).
-                if soi_found {
-                    idle_since_eof = idle_since_eof.saturating_add(1);
-                    let vsync_eof = seen_active_video
-                        && xtensa_read_gpio_level(vsync_pin) == vsync_sync_level
-                        && xtensa_read_gpio_level(vsync_pin) == vsync_sync_level
-                        && xtensa_read_gpio_level(vsync_pin) == vsync_sync_level
-                        && xtensa_read_gpio_level(vsync_pin) == vsync_sync_level;
-
-                    let has_new_data = !descriptors[2 * half_buf_idx].owner()
-                        || descriptors[2 * half_buf_idx].length() > 0;
-                    if (vsync_eof || idle_since_eof >= 2048) && has_new_data {
-                        let half_offset = half_buf_idx * JPEG_DMA_HALF_BUFFER_SIZE;
-                        let _ = self.memcpy_filtered(
-                            &mut unpacked_chunk,
-                            &dma_buf[half_offset..half_offset + JPEG_DMA_HALF_BUFFER_SIZE],
-                        );
-                        let prev_byte = if written > 0 {
-                            jpeg_out[written - 1]
-                        } else {
-                            0
-                        };
-                        let boundary_eoi = prev_byte == 0xFF && unpacked_chunk[0] == 0xD9;
-                        if boundary_eoi || find_jpeg_eoi(&unpacked_chunk).is_some() {
-                            let _ = self.stop();
-                            if let Some(total_len) = append_unpacked_jpeg_chunk(
-                                &unpacked_chunk,
-                                jpeg_out,
-                                &mut written,
-                                &mut soi_found,
-                                &mut prev_tail,
-                                &mut prev_tail_len,
-                            )? {
-                                return Ok(total_len);
-                            } else {
-                                return Err(CameraError::CorruptedFrame);
-                            }
-                        } else if vsync_eof {
-                            // Also check the next half-buffer in case one full half-buffer was just written
-                            let next_h = (half_buf_idx + 1) % half_buf_cnt;
-                            let next_offset = next_h * JPEG_DMA_HALF_BUFFER_SIZE;
-                            let mut next_chunk = [0u8; JPEG_UNPACKED_HALF_BUFFER_SIZE];
-                            let _ = self.memcpy_filtered(
-                                &mut next_chunk,
-                                &dma_buf[next_offset..next_offset + JPEG_DMA_HALF_BUFFER_SIZE],
-                            );
-                            let cross_chunk_eoi =
-                                unpacked_chunk[JPEG_UNPACKED_HALF_BUFFER_SIZE - 1] == 0xFF
-                                    && next_chunk[0] == 0xD9;
-                            if cross_chunk_eoi || find_jpeg_eoi(&next_chunk).is_some() {
-                                let _ = self.stop();
-                                let _ = append_unpacked_jpeg_chunk(
-                                    &unpacked_chunk,
-                                    jpeg_out,
-                                    &mut written,
-                                    &mut soi_found,
-                                    &mut prev_tail,
-                                    &mut prev_tail_len,
-                                )?;
-                                if let Some(total_len) = append_unpacked_jpeg_chunk(
-                                    &next_chunk,
-                                    jpeg_out,
-                                    &mut written,
-                                    &mut soi_found,
-                                    &mut prev_tail,
-                                    &mut prev_tail_len,
-                                )? {
-                                    return Ok(total_len);
-                                } else {
-                                    return Err(CameraError::CorruptedFrame);
-                                }
-                            }
-                        }
-                        idle_since_eof = 0;
-                    }
-                }
-            }
-
-            let _ = self.stop();
-            Err(CameraError::Timeout)
+            let mut vsync_active = || xtensa_read_gpio_level(vsync_pin) != vsync_sync_level;
+            self.run_polled_capture(
+                &mut capture,
+                descriptors,
+                dma_buf,
+                jpeg_out,
+                max_poll_iters,
+                &mut vsync_active,
+                hooks,
+            )
         }
 
         #[cfg(not(target_arch = "xtensa"))]
         {
+            let _ = hooks;
             build_circular_ring(
                 descriptors,
                 &dma_buf[..required_dma_bytes],
@@ -1510,6 +1492,52 @@ impl Esp32I2sCamera {
                 Err(CameraError::CorruptedFrame)
             }
         }
+    }
+
+    /// Drives a started [`PolledJpegCapture`] for at most `max_poll_iters`
+    /// polls, stopping the DMA on every exit. Target-independent so the host
+    /// build type-checks the loop the Xtensa capture runs.
+    #[cfg_attr(not(target_arch = "xtensa"), allow(dead_code))]
+    #[allow(clippy::too_many_arguments)]
+    fn run_polled_capture<H: CaptureHooks, V: FnMut() -> bool>(
+        &mut self,
+        capture: &mut PolledJpegCapture,
+        descriptors: &mut [Lldesc],
+        dma_buf: &mut [u8],
+        jpeg_out: &mut [u8],
+        max_poll_iters: u32,
+        vsync_active: &mut V,
+        hooks: &mut H,
+    ) -> Result<usize, CameraError> {
+        let mut poll_iters = 0u32;
+        while poll_iters < max_poll_iters {
+            poll_iters += 1;
+            let step = capture.poll(
+                descriptors,
+                dma_buf,
+                &mut self.dma_status(),
+                jpeg_out,
+                vsync_active,
+                hooks,
+            );
+            match step {
+                CaptureStep::Pending => {}
+                CaptureStep::Complete(len) => {
+                    let _ = self.stop();
+                    return Ok(len);
+                }
+                CaptureStep::Failed(e) => {
+                    let _ = self.stop();
+                    return Err(e);
+                }
+                CaptureStep::FrameEnded => {
+                    let _ = self.stop();
+                    return capture.finish(descriptors, dma_buf, &mut self.dma_status(), jpeg_out);
+                }
+            }
+        }
+        let _ = self.stop();
+        Err(CameraError::Timeout)
     }
 }
 
@@ -1853,5 +1881,110 @@ mod tests {
         assert_eq!(result & (0x3F << 18), 0);
         assert_eq!(result & (0x3F << 12), 0x15 << 12);
         assert_eq!(result & 0x3F, 0x3F);
+    }
+
+    #[test]
+    fn test_dma_status_reads_and_clears_the_shadow_registers() {
+        use crate::dma_drain::DmaStatus;
+        let mut cam = Esp32I2sCamera::new();
+        cam.regs.int_raw = I2S_IN_SUC_EOF_INT_BIT | I2S_IN_DSCR_ERR_INT_RAW;
+        cam.regs.in_eof_des_addr = 0x0004_1234;
+        {
+            let mut st = cam.dma_status();
+            assert_eq!(
+                st.int_raw(),
+                I2S_IN_SUC_EOF_INT_BIT | I2S_IN_DSCR_ERR_INT_RAW
+            );
+            assert_eq!(st.eof_desc_addr(), 0x0004_1234);
+            st.clear_int(I2S_IN_DSCR_ERR_INT_RAW);
+            st.barrier();
+        }
+        assert_eq!(cam.regs().int_raw, I2S_IN_SUC_EOF_INT_BIT);
+        assert_eq!(cam.regs().int_clr, I2S_IN_DSCR_ERR_INT_RAW);
+    }
+
+    #[test]
+    fn test_dma_status_feeds_the_shared_half_drain() {
+        use crate::dma_drain::{DrainGate, HalfDrain};
+        use core::ops::ControlFlow;
+
+        let mut cam = Esp32I2sCamera::new();
+        let mut descriptors = [Lldesc::empty(); 4];
+        #[repr(C, align(4))]
+        struct AlignedBuf([u8; 4 * JPEG_DMA_NODE_SIZE]);
+        let mut storage = AlignedBuf([0u8; 4 * JPEG_DMA_NODE_SIZE]);
+        let dma_buf = &mut storage.0;
+        crate::dma_ring::build_circular_ring_mut(&mut descriptors, dma_buf, JPEG_DMA_NODE_SIZE)
+            .expect("ring");
+        dma_buf[..4].copy_from_slice(&DmaElement::new(0xFF, 0).0);
+
+        // The DMA completed half 0.
+        cam.regs.int_raw = I2S_IN_SUC_EOF_INT_BIT;
+        cam.regs.in_eof_des_addr = descriptors[1].link_addr_20bit();
+
+        let mut drain = HalfDrain::new(2, JPEG_DMA_NODE_SIZE, cam.filter(), DrainGate::EofPosition)
+            .expect("drain");
+        let mut scratch = [0u8; JPEG_UNPACKED_HALF_BUFFER_SIZE];
+        let mut first = 0u8;
+        let n = drain
+            .drain_ready_halves(
+                &mut descriptors,
+                dma_buf,
+                &mut cam.dma_status(),
+                &mut scratch,
+                |c| {
+                    first = c[0];
+                    ControlFlow::Continue(())
+                },
+            )
+            .expect("drain");
+        assert_eq!(n, 1);
+        assert_eq!(first, 0xFF);
+        assert_eq!(cam.regs().int_raw & I2S_IN_SUC_EOF_INT_BIT, 0);
+        assert_eq!(drain.half_idx(), 1);
+    }
+
+    #[test]
+    fn test_capture_with_hooks_matches_plain_capture_on_host() {
+        let mut cam = Esp32I2sCamera::new();
+        assert_eq!(cam.config(), Ok(()));
+        let mut descriptors = [Lldesc::empty(); 2];
+        #[repr(C, align(4))]
+        struct AlignedBuf([u8; 2 * JPEG_DMA_NODE_SIZE]);
+        let mut storage = AlignedBuf([0u8; 2 * JPEG_DMA_NODE_SIZE]);
+        let dma_buf = &mut storage.0;
+        for (i, b) in [0xFFu8, 0xD8, 0xFF, 0xD9].into_iter().enumerate() {
+            dma_buf[i * 4..i * 4 + 4].copy_from_slice(&DmaElement::new(b, 0).0);
+        }
+        let mut jpeg_out = [0u8; 1024];
+        let mut hooks = crate::dma_drain::NoCaptureHooks;
+        let r = cam.capture_jpeg_frame_polled_with_hooks(
+            &mut descriptors,
+            dma_buf,
+            &mut jpeg_out,
+            16,
+            &mut hooks,
+        );
+        assert_eq!(r, Ok(4));
+        assert!(!cam.is_running());
+    }
+
+    #[test]
+    fn test_start_clears_stale_inlink_status_latches() {
+        let mut cam = Esp32I2sCamera::new();
+        let stale = I2S_IN_SUC_EOF_INT_BIT | I2S_IN_DSCR_ERR_INT_RAW | I2S_IN_DSCR_EMPTY_INT_RAW;
+        cam.regs.int_raw = stale | 1;
+        let dma_cfg = calc_dma_sizes(
+            true,
+            I2sSamplingMode::Sm0A000B00,
+            1280,
+            720,
+            1,
+            DEFAULT_CAMERA_DMA_BUFFER_SIZE_MAX,
+        )
+        .expect("dma sizes");
+        assert!(cam.start(&dma_cfg, 0x1000));
+        assert_eq!(cam.regs().int_raw, 1, "only the inlink latches are cleared");
+        assert_eq!(cam.regs().int_clr, stale);
     }
 }

@@ -1946,9 +1946,6 @@ fn capture_live_hd_jpeg_with_diag(
     poll_net: &mut dyn FnMut(),
 ) -> Result<usize, (u32, usize, u8, u8, u8, u32)> {
     const GPIO_IN_REG: *const u32 = 0x3FF4_403C as *const u32;
-    const I2S_INT_RAW_REG: *const u32 = 0x3FF4_F00C as *const u32;
-    const I2S_INT_CLR_REG: *mut u32 = 0x3FF4_F018 as *mut u32;
-    const I2S_IN_SUC_EOF_BIT: u32 = 1 << 9;
 
     feed_rtc_wdt();
     // JUSTIFICATION: Static DMA descriptor ring and buffer for I2S0 DMA.
@@ -1978,6 +1975,19 @@ fn capture_live_hd_jpeg_with_diag(
         image_size: slot_cap,
     };
 
+    // WP-06: completed half-buffers are consumed only through the shared ll
+    // drain (EOF position + owner write-back gate, poison, single-store
+    // re-arm, ring-overrun detection).
+    let Ok(mut drain) = esp32_cam_ll::HalfDrain::new(
+        8,
+        2048,
+        i2s_cam.filter(),
+        esp32_cam_ll::DrainGate::OwnerWriteback,
+    ) else {
+        return Err((0, 0, 0, 0, 0, 0xDEAD));
+    };
+    let mut chunk = [0u8; esp32_cam_ll::JPEG_UNPACKED_HALF_BUFFER_SIZE];
+
     let read_vsync = || -> bool {
         // JUSTIFICATION: Direct GPIO register read to sample camera VSYNC pin.
         // SAFETY: GPIO_IN_REG is a valid MMIO register address.
@@ -1992,6 +2002,7 @@ fn capture_live_hd_jpeg_with_diag(
     let mut eof_cnt = 0u32;
     let mut fb_len = 0usize;
     let mut last_int_raw = 0u32;
+    let mut dma_failed = false;
 
     for sync_pass in 0..2u8 {
         feed_rtc_wdt();
@@ -2032,9 +2043,11 @@ fn capture_live_hd_jpeg_with_diag(
         if !i2s_cam.start(&dma_cfg, first_desc_addr) {
             return Err((0, 0, 0, 0, 0, 0xDEAD));
         }
+        drain.reset();
 
         eof_cnt = 0;
         fb_len = 0;
+        dma_failed = false;
         let mut seen_vsync_high = false;
         let mut blank_spin = 0u32;
         let mut missed_soi_on_fast_pass = false;
@@ -2055,67 +2068,60 @@ fn capture_live_hd_jpeg_with_diag(
                     }
                 }
 
-                // JUSTIFICATION: Direct I2S0 interrupt register poll for DMA completion.
-                // SAFETY: I2S_INT_RAW_REG is a valid MMIO register address.
-                let int_raw = unsafe { core::ptr::read_volatile(I2S_INT_RAW_REG) };
-                last_int_raw |= int_raw;
-
-                if (int_raw & I2S_IN_SUC_EOF_BIT) != 0 {
-                    // JUSTIFICATION: Clear I2S0 DMA EOF interrupt status bit in hardware.
-                    // SAFETY: I2S_INT_CLR_REG is a valid MMIO register address.
-                    unsafe {
-                        core::ptr::write_volatile(I2S_INT_CLR_REG, I2S_IN_SUC_EOF_BIT);
-                        core::arch::asm!("memw");
-                    }
-                    core::sync::atomic::compiler_fence(Ordering::Acquire);
-                    feed_rtc_wdt();
-                    last_eof_ms = now_millis();
-
-                    for drained in 0..8u8 {
-                        let half_idx = (eof_cnt as usize) & 7;
-                        if drained > 0 && desc_slice[2 * half_idx + 1].owner() {
-                            break;
+                // FW-CORE-02: consume only halves the DMA has finished.
+                let mut slot_full = false;
+                let mut missed_soi = false;
+                let drained = drain.drain_ready_halves(
+                    desc_slice,
+                    dma_slice,
+                    &mut i2s_cam.dma_status(),
+                    &mut chunk,
+                    |half: &[u8]| {
+                        if fb_len + half.len() > write_slot.len() {
+                            slot_full = true;
+                            return core::ops::ControlFlow::Break(());
                         }
-
-                        let half_offset = half_idx * 4096;
-                        if fb_len + 1024 <= write_slot.len() {
-                            let _ = i2s_cam.memcpy_filtered(
-                                &mut write_slot[fb_len..fb_len + 1024],
-                                &dma_slice[half_offset..half_offset + 4096],
-                            );
-                            let flags = Lldesc::pack_flags(2048, 0, 0, false, false, true);
-                            // JUSTIFICATION: Write DMA descriptor ownership flags in ring.
-                            // SAFETY: half_idx is masked & 7, indexing within desc_slice.
-                            unsafe {
-                                core::ptr::write_volatile(
-                                    &mut desc_slice[2 * half_idx].size_length_flags,
-                                    flags,
-                                );
-                                core::ptr::write_volatile(
-                                    &mut desc_slice[2 * half_idx + 1].size_length_flags,
-                                    flags,
-                                );
-                            }
-                            if eof_cnt == 0
-                                && sync_pass == 0
-                                && verify_jpeg_soi(&write_slot[..256]).is_none()
-                            {
-                                let _ = i2s_cam.stop();
-                                missed_soi_on_fast_pass = true;
-                                break 'dma_loop;
-                            }
-                            fb_len += 1024;
-                            eof_cnt += 1;
-                            if (eof_cnt & 7) == 0 {
-                                feed_rtc_wdt();
-                                poll_net();
-                            }
-                        } else {
-                            let _ = i2s_cam.stop();
-                            break 'dma_loop;
+                        write_slot[fb_len..fb_len + half.len()].copy_from_slice(half);
+                        if eof_cnt == 0
+                            && sync_pass == 0
+                            && verify_jpeg_soi(&write_slot[..256]).is_none()
+                        {
+                            missed_soi = true;
+                            return core::ops::ControlFlow::Break(());
                         }
+                        fb_len += half.len();
+                        eof_cnt += 1;
+                        if (eof_cnt & 7) == 0 {
+                            feed_rtc_wdt();
+                            poll_net();
+                        }
+                        core::ops::ControlFlow::Continue(())
+                    },
+                );
+                match drained {
+                    Err(_) => {
+                        // LL-07: ring overrun or descriptor error; the
+                        // frame is corrupt and must not be committed.
+                        FW_STATS.inc_overflow_aborts();
+                        dma_failed = true;
+                        let _ = i2s_cam.stop();
+                        break 'dma_loop;
                     }
-                    continue;
+                    Ok(_) if missed_soi => {
+                        let _ = i2s_cam.stop();
+                        missed_soi_on_fast_pass = true;
+                        break 'dma_loop;
+                    }
+                    Ok(_) if slot_full => {
+                        let _ = i2s_cam.stop();
+                        break 'dma_loop;
+                    }
+                    Ok(n) if n > 0 => {
+                        feed_rtc_wdt();
+                        last_eof_ms = now_millis();
+                        continue;
+                    }
+                    Ok(_) => {}
                 }
 
                 if eof_cnt > 0 {
@@ -2125,26 +2131,34 @@ fn capture_live_hd_jpeg_with_diag(
                         && !read_vsync()
                         && !read_vsync();
                     if vsync_ended || now_millis().saturating_sub(last_eof_ms) >= 25 {
+                        // `stop()` halts and resets the inlink DMA and
+                        // issues `memw` (LL-21).
                         let _ = i2s_cam.stop();
-                        // JUSTIFICATION: Ensure memory writes complete after stopping camera.
-                        // SAFETY: memw instruction enforces write ordering on Xtensa.
-                        unsafe {
-                            core::arch::asm!("memw");
-                        }
-                        core::sync::atomic::compiler_fence(Ordering::Acquire);
-                        for _ in 0..8u8 {
-                            let half_idx = (eof_cnt as usize) & 7;
-                            if !desc_slice[half_idx * 2].owner()
-                                && fb_len + 1024 <= write_slot.len()
-                            {
-                                let half_offset = half_idx * 4096;
-                                let _ = i2s_cam.memcpy_filtered(
-                                    &mut write_slot[fb_len..fb_len + 1024],
-                                    &dma_slice[half_offset..half_offset + 4096],
-                                );
-                                fb_len += 1024;
+                        // LL-05: take halves the owner gate still held back,
+                        // then the partially written tail half,
+                        // unconditionally. Poisoning (LL-06) makes unwritten
+                        // bytes read as `DMA_POISON_BYTE`, never as stale
+                        // markers.
+                        loop {
+                            let more = drain.pending() > 0;
+                            let Ok(n) = drain.drain_tail_half(
+                                desc_slice,
+                                dma_slice,
+                                &mut i2s_cam.dma_status(),
+                                &mut chunk,
+                            ) else {
+                                break;
+                            };
+                            let tail = &chunk[..n];
+                            if tail.iter().any(|&b| b != esp32_cam_ll::DMA_POISON_BYTE) {
+                                if fb_len + n > write_slot.len() {
+                                    break;
+                                }
+                                write_slot[fb_len..fb_len + n].copy_from_slice(tail);
+                                fb_len += n;
                                 eof_cnt += 1;
-                            } else {
+                            }
+                            if !more {
                                 break;
                             }
                         }
@@ -2153,6 +2167,7 @@ fn capture_live_hd_jpeg_with_diag(
                 }
             }
         }
+        last_int_raw |= drain.int_raw_seen();
 
         if !missed_soi_on_fast_pass {
             break;
@@ -2176,10 +2191,14 @@ fn capture_live_hd_jpeg_with_diag(
         if fb_len > 2 {
             head_bytes[2] = write_slot[2];
         }
-        if fb_len >= 64 {
+        if fb_len >= 64 && !dma_failed {
             if let Some(soi_pos) = verify_jpeg_soi(&write_slot[..fb_len.min(256)]) {
                 let slice_from_soi = &write_slot[soi_pos..fb_len];
-                if let Some(eoi_rel) = verify_jpeg_eoi(slice_from_soi, false) {
+                // CONV-10: probe only the last chunk plus a margin.
+                if let Some(eoi_rel) = esp32_cam_ll::find_jpeg_eoi_tail(
+                    slice_from_soi,
+                    esp32_cam_ll::JPEG_UNPACKED_HALF_BUFFER_SIZE,
+                ) {
                     let exact_len = eoi_rel + 2;
                     if exact_len >= 64 {
                         if soi_pos > 0 {
@@ -2247,13 +2266,81 @@ fn latest_snapshot_static_slice(tfb: &TripleFrameBuffer<'_>) -> &'static [u8] {
     unsafe { core::slice::from_raw_parts(snap.as_ptr(), snap.len()) }
 }
 
+/// Why Core 1 abandoned the frame it was streaming into the SPSC ring.
+#[cfg(target_arch = "xtensa")]
+#[derive(Clone, Copy)]
+enum Core1Abort {
+    /// The first chunk carried no JPEG SOI.
+    SoiMiss,
+    /// The frame exceeded the 128 KiB SPSC frame budget.
+    Overflow,
+    /// The DMA ring lapped or reported a descriptor error (LL-07).
+    DmaFault,
+    /// The SPSC ring stayed full.
+    RingFull,
+    /// Core 0 requested a pause.
+    Paused,
+}
+
+/// Validates one filtered half-buffer chunk and pushes it into the SPSC ring.
+#[cfg(target_arch = "xtensa")]
+#[inline]
+fn core1_accept_chunk(
+    chunk: &[u8],
+    is_first_chunk: &mut bool,
+    total_bytes: &mut usize,
+    push: &impl Fn(&[u8], u8, u32) -> bool,
+) -> Result<(), Core1Abort> {
+    if *is_first_chunk {
+        let scan_end = chunk.len().min(256);
+        if verify_jpeg_soi(&chunk[..scan_end]).is_none() {
+            return Err(Core1Abort::SoiMiss);
+        }
+    }
+    if *total_bytes + chunk.len() > 128 * 1024 {
+        return Err(Core1Abort::Overflow);
+    }
+    let flags = if *is_first_chunk { SPSC_FLAG_SOF } else { 0 };
+    if !push(chunk, flags, 8_000) {
+        return Err(Core1Abort::RingFull);
+    }
+    *is_first_chunk = false;
+    *total_bytes += chunk.len();
+    if CORE1_PAUSE_REQ.load(Ordering::Relaxed) {
+        return Err(Core1Abort::Paused);
+    }
+    Ok(())
+}
+
+/// Records a Core 1 frame abort in `FW_STATS`. Returns whether the frame was
+/// already counted as dropped.
+#[cfg(target_arch = "xtensa")]
+#[inline]
+fn core1_count_abort(reason: Core1Abort) -> bool {
+    match reason {
+        Core1Abort::SoiMiss => {
+            FW_STATS.inc_soi_miss();
+            FW_STATS.inc_c1_dropped();
+            true
+        }
+        Core1Abort::Overflow | Core1Abort::DmaFault => {
+            FW_STATS.inc_overflow_aborts();
+            FW_STATS.inc_c1_dropped();
+            true
+        }
+        Core1Abort::RingFull => {
+            FW_STATS.inc_ring_full_events();
+            FW_STATS.inc_c1_dropped();
+            true
+        }
+        Core1Abort::Paused => false,
+    }
+}
+
 #[cfg(target_arch = "xtensa")]
 #[esp_hal::ram]
 fn core1_camera_producer_loop() -> ! {
     const GPIO_IN_REG: *const u32 = 0x3FF4_403C as *const u32;
-    const I2S_INT_RAW_REG: *const u32 = 0x3FF4_F00C as *const u32;
-    const I2S_INT_CLR_REG: *mut u32 = 0x3FF4_F018 as *mut u32;
-    const I2S_IN_SUC_EOF_BIT: u32 = 1 << 9;
 
     // JUSTIFICATION: Core 1 (`APP_CPU`) takes exclusive ownership of `HW_I2S_CAM`
     // in internal DRAM once started by Core 0.
@@ -2288,7 +2375,7 @@ fn core1_camera_producer_loop() -> ! {
         )
     };
 
-    dma_slice.fill(0);
+    dma_slice.fill(esp32_cam_ll::DMA_POISON_BYTE);
     if build_circular_ring(desc_slice, dma_slice, 2048).is_err() {
         FW_STATS.inc_ring_build_failures();
     }
@@ -2306,6 +2393,20 @@ fn core1_camera_producer_loop() -> ! {
         image_size: 128 * 1024,
     };
     let first_desc_addr = (core::ptr::from_ref(&desc_slice[0]) as usize as u32) & 0x000F_FFFF;
+
+    // WP-06: completed half-buffers are consumed only through the shared ll
+    // drain (EOF position + owner write-back gate, poison, single-store
+    // re-arm, ring-overrun detection).
+    let Ok(mut drain) = esp32_cam_ll::HalfDrain::new(
+        8,
+        2048,
+        i2s_cam.filter(),
+        esp32_cam_ll::DrainGate::OwnerWriteback,
+    ) else {
+        loop {
+            core::hint::spin_loop();
+        }
+    };
 
     let read_vsync = || -> bool {
         // JUSTIFICATION: Poll camera VSYNC level directly from GPIO_IN_REG MMIO.
@@ -2343,7 +2444,6 @@ fn core1_camera_producer_loop() -> ! {
     let mut unpack_buf = [0u8; JPEG_SPSC_CHUNK_BYTES];
     let mut aligned_from_eof = false;
     let mut last_vsync_cycles = 0u32;
-    let rearm_flags = Lldesc::pack_flags(2048, 0, 0, false, false, true);
 
     loop {
         if CORE1_PAUSE_REQ.load(Ordering::Acquire) {
@@ -2400,23 +2500,14 @@ fn core1_camera_producer_loop() -> ! {
         if build_circular_ring(desc_slice, dma_slice, 2048).is_err() {
             FW_STATS.inc_ring_build_failures();
         }
-        // JUSTIFICATION: Clear stale I2S0 EOF interrupt flag before arming DMA.
-        // SAFETY:
-        // 1. Alignment & Non-null: `0x3FF4_F018` is 4-byte aligned I2S0 MMIO.
-        // 2. Layout: 32-bit write-1-to-clear interrupt register.
-        // 3. Provenance: ESP32 I2S0 peripheral register block.
-        // 4. Aliasing: Core 1 exclusively controls I2S0 while unpaused.
-        // 5. Volatile: `write_volatile` commits hardware clear immediately.
-        // 6. Unwind safety: Cannot panic.
-        unsafe {
-            core::ptr::write_volatile(I2S_INT_CLR_REG, I2S_IN_SUC_EOF_BIT);
-        }
+        // `start()` clears the stale `IN_SUC_EOF` / `IN_DSCR_ERR` /
+        // `IN_DSCR_EMPTY` latches before arming the DMA.
         if !i2s_cam.start(&dma_cfg, first_desc_addr) {
             aligned_from_eof = false;
             continue;
         }
+        drain.reset();
 
-        let mut half_idx = 0usize;
         let mut is_first_chunk = true;
         let mut total_bytes = 0usize;
         let mut aborted = false;
@@ -2436,105 +2527,39 @@ fn core1_camera_producer_loop() -> ! {
                 seen_vsync_high = true;
             }
 
-            // JUSTIFICATION: Poll raw I2S0 DMA `IN_SUC_EOF` status bit.
-            // SAFETY:
-            // 1. Alignment & Non-null: `0x3FF4_F00C` is 4-byte aligned MMIO.
-            // 2. Layout: 32-bit status register.
-            // 3. Provenance: ESP32 I2S0 peripheral register block.
-            // 4. Aliasing: Read-only volatile MMIO load.
-            // 5. Volatile: `read_volatile` prevents caching across poll spins.
-            // 6. Unwind safety: Cannot panic.
-            let int_raw = unsafe { core::ptr::read_volatile(I2S_INT_RAW_REG) };
-            if (int_raw & I2S_IN_SUC_EOF_BIT) != 0 {
-                // JUSTIFICATION: Clear I2S0 EOF flag and order SRAM DMA reads.
-                // SAFETY:
-                // 1. Alignment & Non-null: `0x3FF4_F018` is 4-byte aligned MMIO.
-                // 2. Layout: 32-bit interrupt clear register.
-                // 3. Provenance: ESP32 I2S0 peripheral register block.
-                // 4. Aliasing: Core 1 exclusively owns I2S0.
-                // 5. Volatile: `write_volatile` + `memw` orders SRAM reads.
-                // 6. Unwind safety: Inline `memw` cannot fault or unwind.
-                unsafe {
-                    core::ptr::write_volatile(I2S_INT_CLR_REG, I2S_IN_SUC_EOF_BIT);
-                    core::arch::asm!("memw");
-                }
-                core::sync::atomic::compiler_fence(Ordering::Acquire);
+            // FW-CORE-02: consume only halves the DMA has finished; the EOF
+            // bit is only a wake-up hint inside the drain.
+            let mut sink_abort: Option<Core1Abort> = None;
+            let drained = drain.drain_ready_halves(
+                desc_slice,
+                dma_slice,
+                &mut i2s_cam.dma_status(),
+                &mut unpack_buf,
+                |chunk: &[u8]| match core1_accept_chunk(
+                    chunk,
+                    &mut is_first_chunk,
+                    &mut total_bytes,
+                    &push_spsc_bounded,
+                ) {
+                    Ok(()) => core::ops::ControlFlow::Continue(()),
+                    Err(reason) => {
+                        sink_abort = Some(reason);
+                        core::ops::ControlFlow::Break(())
+                    }
+                },
+            );
+            let (drained_halves, abort) = match drained {
+                Ok(n) => (n, sink_abort),
+                Err(_) => (0, Some(Core1Abort::DmaFault)),
+            };
+            if let Some(reason) = abort {
+                c1_drop_counted |= core1_count_abort(reason);
+                aborted = true;
+                aligned_from_eof = false;
+                break 'frame_poll;
+            }
+            if drained_halves > 0 {
                 idle_spins = 0;
-
-                for drained in 0..8u8 {
-                    if drained > 0 && desc_slice[2 * half_idx + 1].owner() {
-                        break;
-                    }
-                    let half_off = half_idx * 4096;
-                    let written = i2s_cam
-                        .memcpy_filtered(&mut unpack_buf, &dma_slice[half_off..half_off + 4096]);
-                    dma_slice[half_off..half_off + 4096].fill(0);
-
-                    // JUSTIFICATION: Re-arm both 2048 B descriptors of the
-                    // drained 4096 B half-buffer back to DMA ownership.
-                    // SAFETY:
-                    // 1. Alignment & Non-null: `desc_slice` is 4-byte aligned.
-                    // 2. Layout: `half_idx < 8`, so `2 * half_idx + 1 < 16`.
-                    // 3. Provenance: Static `I2S_DMA_DESC` array.
-                    // 4. Aliasing: Core 1 exclusively accesses `desc_slice`.
-                    // 5. Volatile: `write_volatile` ensures DMA sees `owner=1`.
-                    // 6. Unwind safety: Bounds proven by `& 7` mask.
-                    unsafe {
-                        core::ptr::write_volatile(
-                            &mut desc_slice[2 * half_idx].size_length_flags,
-                            rearm_flags,
-                        );
-                        core::ptr::write_volatile(
-                            &mut desc_slice[2 * half_idx + 1].size_length_flags,
-                            rearm_flags,
-                        );
-                    }
-                    half_idx = (half_idx + 1) & 7;
-
-                    if is_first_chunk {
-                        let scan_end = written.min(256);
-                        if verify_jpeg_soi(&unpack_buf[..scan_end]).is_none() {
-                            FW_STATS.inc_soi_miss();
-                            FW_STATS.inc_c1_dropped();
-                            c1_drop_counted = true;
-                            aborted = true;
-                            aligned_from_eof = false;
-                            break 'frame_poll;
-                        }
-                    }
-
-                    if total_bytes + written > 128 * 1024 {
-                        FW_STATS.inc_overflow_aborts();
-                        FW_STATS.inc_c1_dropped();
-                        c1_drop_counted = true;
-                        aborted = true;
-                        aligned_from_eof = false;
-                        break 'frame_poll;
-                    }
-
-                    let flags = if is_first_chunk {
-                        is_first_chunk = false;
-                        SPSC_FLAG_SOF
-                    } else {
-                        0
-                    };
-
-                    if !push_spsc_bounded(&unpack_buf[..written], flags, 8_000) {
-                        FW_STATS.inc_ring_full_events();
-                        FW_STATS.inc_c1_dropped();
-                        c1_drop_counted = true;
-                        aborted = true;
-                        aligned_from_eof = false;
-                        break 'frame_poll;
-                    }
-                    total_bytes += written;
-
-                    if CORE1_PAUSE_REQ.load(Ordering::Relaxed) {
-                        aborted = true;
-                        aligned_from_eof = false;
-                        break 'frame_poll;
-                    }
-                }
                 continue 'frame_poll;
             }
 
@@ -2545,69 +2570,46 @@ fn core1_camera_producer_loop() -> ! {
                     && !read_vsync()
                     && !read_vsync();
                 if vsync_ended || idle_spins >= 600_000 {
+                    // `stop()` halts and resets the inlink DMA and issues
+                    // `memw` (LL-21).
                     let _ = i2s_cam.stop();
-                    // JUSTIFICATION: Flush DMA writes to internal SRAM after
-                    // stopping I2S0 at end of frame.
-                    // SAFETY:
-                    // 1. Alignment & Non-null: No memory operand.
-                    // 2. Layout: Architectural memory barrier instruction.
-                    // 3. Provenance: Valid Xtensa ISA instruction.
-                    // 4. Aliasing: Synchronizes hardware DMA with Core 1 reads.
-                    // 5. Volatile: `memw` drains processor/bus write buffers.
-                    // 6. Unwind safety: Cannot trap or unwind.
-                    unsafe {
-                        core::arch::asm!("memw");
-                    }
-                    core::sync::atomic::compiler_fence(Ordering::Acquire);
                     aligned_from_eof = vsync_ended && !read_vsync();
 
-                    for _ in 0..8u8 {
-                        if desc_slice[2 * half_idx + 1].owner() {
-                            break;
-                        }
-                        let half_off = half_idx * 4096;
-                        let written = i2s_cam.memcpy_filtered(
+                    // LL-05: take halves the owner gate still held back, then
+                    // the partially written tail half, unconditionally.
+                    // Poisoning (LL-06) makes unwritten bytes read as
+                    // `DMA_POISON_BYTE`, never as stale markers.
+                    loop {
+                        let more = drain.pending() > 0;
+                        let Ok(n) = drain.drain_tail_half(
+                            desc_slice,
+                            dma_slice,
+                            &mut i2s_cam.dma_status(),
                             &mut unpack_buf,
-                            &dma_slice[half_off..half_off + 4096],
-                        );
-                        dma_slice[half_off..half_off + 4096].fill(0);
-                        half_idx = (half_idx + 1) & 7;
-                        if total_bytes + written > 128 * 1024 {
-                            FW_STATS.inc_overflow_aborts();
-                            FW_STATS.inc_c1_dropped();
-                            c1_drop_counted = true;
+                        ) else {
+                            break;
+                        };
+                        let tail = &unpack_buf[..n];
+                        let has_data = tail.iter().any(|&b| b != esp32_cam_ll::DMA_POISON_BYTE);
+                        let accept = has_data && (more || total_bytes + n <= 128 * 1024);
+                        let accepted = if accept {
+                            core1_accept_chunk(
+                                tail,
+                                &mut is_first_chunk,
+                                &mut total_bytes,
+                                &push_spsc_bounded,
+                            )
+                        } else {
+                            Ok(())
+                        };
+                        if let Err(reason) = accepted {
+                            c1_drop_counted |= core1_count_abort(reason);
                             aborted = true;
                             aligned_from_eof = false;
                             break;
                         }
-                        if !push_spsc_bounded(&unpack_buf[..written], 0, 8_000) {
-                            FW_STATS.inc_ring_full_events();
-                            FW_STATS.inc_c1_dropped();
-                            c1_drop_counted = true;
-                            aborted = true;
-                            aligned_from_eof = false;
+                        if !more {
                             break;
-                        }
-                        total_bytes += written;
-                    }
-
-                    if !aborted && total_bytes + JPEG_SPSC_CHUNK_BYTES <= 128 * 1024 {
-                        let tail_off = half_idx * 4096;
-                        let written = i2s_cam.memcpy_filtered(
-                            &mut unpack_buf,
-                            &dma_slice[tail_off..tail_off + 4096],
-                        );
-                        dma_slice[tail_off..tail_off + 4096].fill(0);
-                        if unpack_buf[..written].iter().any(|&b| b != 0) {
-                            if !push_spsc_bounded(&unpack_buf[..written], 0, 8_000) {
-                                FW_STATS.inc_ring_full_events();
-                                FW_STATS.inc_c1_dropped();
-                                c1_drop_counted = true;
-                                aborted = true;
-                                aligned_from_eof = false;
-                            } else {
-                                total_bytes += written;
-                            }
                         }
                     }
                     break 'frame_poll;
@@ -2633,7 +2635,7 @@ fn core1_camera_producer_loop() -> ! {
             if !c1_drop_counted {
                 FW_STATS.inc_c1_dropped();
             }
-            dma_slice.fill(0);
+            dma_slice.fill(esp32_cam_ll::DMA_POISON_BYTE);
             if !is_first_chunk {
                 let _ = push_spsc_bounded(&[], SPSC_FLAG_ABORT, 8_000);
             }
@@ -3206,7 +3208,11 @@ fn drain_core1_spsc_to_triple(
                     let dst = triple_fb.write_slot_mut();
                     let soi_window = written_len.min(256);
                     if let Some(soi_pos) = verify_jpeg_soi(&dst[..soi_window]) {
-                        if let Some(eoi_rel) = verify_jpeg_eoi(&dst[soi_pos..written_len], false) {
+                        // CONV-10: probe only the last SPSC chunk plus a margin.
+                        if let Some(eoi_rel) = esp32_cam_ll::find_jpeg_eoi_tail(
+                            &dst[soi_pos..written_len],
+                            JPEG_SPSC_CHUNK_BYTES,
+                        ) {
                             valid_bounds = Some((soi_pos, soi_pos + eoi_rel + 2));
                         }
                     }
