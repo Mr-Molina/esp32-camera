@@ -86,7 +86,6 @@ pub const TIMING_TC_REG20_VFLIP: u8 = 0x01;
 pub const TIMING_TC_REG21_HMIRROR: u8 = 0x02;
 
 pub const REG_DLY: u16 = 0xFFFF;
-pub const REGLIST_TAIL: u16 = 0x0000;
 
 pub const RATIO_TABLE: [RatioSettings; 1] = [RatioSettings {
     max_width: 1280,
@@ -547,18 +546,20 @@ pub const SENSOR_FRAMESIZE_VGA_XYSKIP: &[Reg16] = &[
     Reg16::new(0x3060, 0x01),
 ];
 
-/// Writes a slice of [`Reg16`] entries to `slv_addr`, interpreting `REG_DLY`
-/// (`0xFFFF`) as a delay in ms and `REGLIST_TAIL` (`0x0000`) as an early
-/// list terminator.
+/// Writes every entry of `regs` in order, treating an entry whose
+/// register is [`REG_DLY`] as a millisecond delay.
+///
+/// SENS-18: there is no end-of-table marker. The slice carries its own
+/// length, and a marker could collide with a real register — the tail
+/// sentinel used to be 0x0000 or, worse, the same 0xFFFF as `REG_DLY`,
+/// so a delay entry or a write to register 0 ended the table early and
+/// silently dropped everything after it.
 pub fn write_reg_list<B: SccbBus>(
     bus: &mut B,
     slv_addr: u8,
     regs: &[Reg16],
 ) -> Result<(), CameraError> {
     for entry in regs {
-        if entry.reg == REGLIST_TAIL {
-            break;
-        }
         if entry.reg == REG_DLY {
             bus.delay_ms(entry.val as u32);
         } else {

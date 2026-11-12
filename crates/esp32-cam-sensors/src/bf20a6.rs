@@ -13,7 +13,6 @@ pub const SENSOR_ID_LOW: u8 = 0xFD;
 pub const RESET_RELATED: u8 = 0xF2;
 
 pub const REG_DLY: u16 = 0xFFFF;
-pub const REGLIST_TAIL: u16 = 0xFFFF;
 
 pub const BF20A6_DEFAULT_INIT_REGS: &[Reg16] = &[
     Reg16::new(0xF2, 0x01),
@@ -165,16 +164,25 @@ fn set_reg_bits<B: SccbBus>(
     bus.write_reg8(slv_addr, reg, next)
 }
 
-fn write_reg_list<B: SccbBus>(
+/// Writes every entry of `regs` in order, treating an entry whose
+/// register is [`REG_DLY`] as a millisecond delay.
+///
+/// SENS-18: there is no end-of-table marker. The slice carries its own
+/// length, and a marker could collide with a real register — the tail
+/// sentinel used to be 0x0000 or, worse, the same 0xFFFF as `REG_DLY`,
+/// so a delay entry or a write to register 0 ended the table early and
+/// silently dropped everything after it.
+pub fn write_reg_list<B: SccbBus>(
     bus: &mut B,
     slv_addr: u8,
     regs: &[Reg16],
 ) -> Result<(), CameraError> {
     for entry in regs {
-        if entry.reg == REGLIST_TAIL {
-            break;
+        if entry.reg == REG_DLY {
+            bus.delay_ms(entry.val as u32);
+        } else {
+            bus.write_reg8(slv_addr, entry.reg as u8, entry.val)?;
         }
-        bus.write_reg8(slv_addr, entry.reg as u8, entry.val)?;
     }
     Ok(())
 }

@@ -9,7 +9,7 @@ use esp32_cam_sensors::nt99141::Nt99141;
 use esp32_cam_sensors::ov3640::Ov3640;
 use esp32_cam_sensors::ov7725::{self, Ov7725};
 use esp32_cam_sensors::sc101iot::Sc101Iot;
-use esp32_cam_sensors::CameraSensor;
+use esp32_cam_sensors::{CameraSensor, Reg16};
 use esp32_cam_types::{CameraError, CameraSccbAddr, FrameSize, GainCeiling, PixelFormat};
 
 /// NT99141 auto-exposure level register, first of the five written per level.
@@ -413,6 +413,59 @@ fn test_sens14_bf3005_keeps_its_declared_range() {
         sensor.set_contrast(&mut bus, 3),
         Err(CameraError::InvalidArg)
     );
+}
+
+// ---------------------------------------------------------------------------
+// SENS-18: register-table end markers
+// ---------------------------------------------------------------------------
+
+/// Every table writer must apply every entry of the slice it is given.
+///
+/// There used to be an end-of-table sentinel. In Bf20a6 and Hm1055 it was
+/// `0xFFFF`, the *same value* as `REG_DLY`, so the first delay entry in a
+/// table would have ended it. In Gc032a, Gc2145, Hm0360 and Nt99141 it was
+/// `0x0000`, so a legitimate write to register 0 ended it. Either way the
+/// rest of the table was dropped without an error. Slices carry their own
+/// length, so the sentinel is gone.
+macro_rules! table_writer_cases {
+    ($($name:ident => $writer:path;)*) => {
+        $(
+            #[test]
+            fn $name() {
+                let mut bus: MockSccbBus<64> = MockSccbBus::new();
+                let table = [
+                    Reg16::new(0x0012, 0xAA),
+                    // A real write to register 0: the old 0x0000 sentinel.
+                    Reg16::new(0x0000, 0xBB),
+                    // A delay: the old 0xFFFF sentinel in two drivers.
+                    Reg16::new(0xFFFF, 5),
+                    Reg16::new(0x0034, 0xCC),
+                ];
+
+                assert_eq!($writer(&mut bus, 0x30, &table), Ok(()));
+
+                assert_eq!(
+                    bus.transaction_count(),
+                    table.len(),
+                    "every entry of the table must reach the bus"
+                );
+                assert_eq!(
+                    bus.total_delay_ms(),
+                    5,
+                    "the REG_DLY entry must delay, not terminate the table"
+                );
+            }
+        )*
+    };
+}
+
+table_writer_cases! {
+    test_sens18_bf20a6_writes_every_entry  => esp32_cam_sensors::bf20a6::write_reg_list;
+    test_sens18_hm1055_writes_every_entry  => esp32_cam_sensors::hm1055::write_reg_list;
+    test_sens18_gc032a_writes_every_entry  => esp32_cam_sensors::gc032a::write_reg_list;
+    test_sens18_gc2145_writes_every_entry  => esp32_cam_sensors::gc2145::write_reg_list;
+    test_sens18_hm0360_writes_every_entry  => esp32_cam_sensors::hm0360::write_reg_list;
+    test_sens18_nt99141_writes_every_entry => esp32_cam_sensors::nt99141::write_reg_list;
 }
 
 // ---------------------------------------------------------------------------

@@ -53,7 +53,6 @@ pub const P0_SUBSAMPLE: u8 = 0x99;
 pub const P0_SUBSAMPLE_MODE: u8 = 0x9A;
 
 pub const REG_DLY: u16 = 0xFFFF;
-pub const REGLIST_TAIL: u16 = 0x0000;
 
 pub const GC2145_DEFAULT_INIT_REGS: &[Reg16] = &[
     Reg16::new(0xFE, 0xF0),
@@ -775,15 +774,20 @@ fn check_reg_mask<B: SccbBus>(
     Ok((val & mask) == mask)
 }
 
-fn write_reg_list<B: SccbBus>(
+/// Writes every entry of `regs` in order, treating an entry whose
+/// register is [`REG_DLY`] as a millisecond delay.
+///
+/// SENS-18: there is no end-of-table marker. The slice carries its own
+/// length, and a marker could collide with a real register — the tail
+/// sentinel used to be 0x0000 or, worse, the same 0xFFFF as `REG_DLY`,
+/// so a delay entry or a write to register 0 ended the table early and
+/// silently dropped everything after it.
+pub fn write_reg_list<B: SccbBus>(
     bus: &mut B,
     slv_addr: u8,
     regs: &[Reg16],
 ) -> Result<(), CameraError> {
     for entry in regs {
-        if entry.reg == REGLIST_TAIL {
-            break;
-        }
         if entry.reg == REG_DLY {
             bus.delay_ms(entry.val as u32);
         } else {
