@@ -131,6 +131,15 @@ pub struct HttpRequest<'a> {
     pub content_length: Option<isize>,
     /// Value of the `Content-Type` header if present.
     pub content_type: Option<&'a str>,
+    /// Value of the `Host` header if present.
+    pub host: Option<&'a str>,
+    /// Value of the `Origin` header if present (sent by browsers on
+    /// cross-origin and on `POST` requests; `FW-NET-27`).
+    pub origin: Option<&'a str>,
+    /// Whether an `X-Requested-With` header is present. Browsers cannot add
+    /// it cross-origin without a CORS preflight, which this server never
+    /// grants (`FW-NET-27`).
+    pub x_requested_with: bool,
     /// Request body slice following `\r\n\r\n`.
     pub body: &'a [u8],
 }
@@ -323,6 +332,9 @@ pub fn parse_http_request(raw: &[u8]) -> Result<HttpRequest<'_>, HttpError> {
     let mut ota_token: Option<&[u8]> = None;
     let mut content_length: Option<isize> = None;
     let mut content_type: Option<&str> = None;
+    let mut host: Option<&str> = None;
+    let mut origin: Option<&str> = None;
+    let mut x_requested_with = false;
 
     for line in lines {
         if line.is_empty() {
@@ -354,6 +366,18 @@ pub fn parse_http_request(raw: &[u8]) -> Result<HttpRequest<'_>, HttpError> {
             content_length = Some(cl as isize);
         } else if name.eq_ignore_ascii_case("Content-Type") {
             content_type = Some(val);
+        } else if name.eq_ignore_ascii_case("Host") {
+            if host.is_some() {
+                return Err(HttpError::MalformedRequest);
+            }
+            host = Some(val);
+        } else if name.eq_ignore_ascii_case("Origin") {
+            if origin.is_some() {
+                return Err(HttpError::MalformedRequest);
+            }
+            origin = Some(val);
+        } else if name.eq_ignore_ascii_case("X-Requested-With") {
+            x_requested_with = true;
         }
     }
 
@@ -375,8 +399,45 @@ pub fn parse_http_request(raw: &[u8]) -> Result<HttpRequest<'_>, HttpError> {
         ota_token,
         content_length,
         content_type,
+        host,
+        origin,
+        x_requested_with,
         body,
     })
+}
+
+/// Returns `true` if the browser-supplied `origin` (`scheme://host[:port]`)
+/// names the same host and port as the request's `Host` header
+/// (`FW-NET-27`). A missing `Host`, an opaque `null` origin or any mismatch
+/// is cross-origin.
+pub fn is_same_origin(origin: &str, host: Option<&str>) -> bool {
+    let Some(host) = host else {
+        return false;
+    };
+    let (origin_authority, default_port) = if let Some(rest) = origin.strip_prefix("http://") {
+        (rest, ":80")
+    } else if let Some(rest) = origin.strip_prefix("https://") {
+        (rest, ":443")
+    } else {
+        return false;
+    };
+    fn without_port<'s>(authority: &'s str, default_port: &str) -> &'s str {
+        authority.strip_suffix(default_port).unwrap_or(authority)
+    }
+    let o = without_port(origin_authority, default_port);
+    let h = without_port(host, default_port);
+    !o.is_empty() && o.eq_ignore_ascii_case(h)
+}
+
+/// Status line and body for a refused request (no CORS header).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpRejection {
+    /// HTTP status code (`401`, `403`, ...).
+    pub status: u16,
+    /// Reason phrase for the status line.
+    pub reason: &'static str,
+    /// Plain-text response body.
+    pub body: &'static str,
 }
 
 /// Parsed view of an HTTP response written into a byte buffer.
@@ -939,7 +1000,8 @@ function u(c){if(c.framesize)$('framesize').value=c.framesize;\
 S.forEach(function(x){if(c[x[0]]!==undefined)$(x[0]).value=c[x[0]];});\
 B.forEach(function(x){if(c[x[0]]!==undefined)$(x[0]).checked=!!c[x[0]];});}\
 function sc(){fetch('/control').then(rj).then(u).catch(function(){});}\
-function setCtrl(k,v){fetch('/control?var='+k+'&val='+v).then(rj).then(function(c){\
+function setCtrl(k,v){fetch('/control?var='+k+'&val='+v,{method:'POST',\
+headers:{'X-Requested-With':'fetch'}}).then(rj).then(function(c){\
 u(c);if(m==='snap')setTimeout(snap,250);}).catch(function(){ne=1;});}\
 function poll(){if(pb)return;pb=1;var bt=setTimeout(function(){pb=0;},2500);\
 fetch('/status').then(rj).then(function(s){clearTimeout(bt);pb=0;\
@@ -1297,6 +1359,33 @@ impl<'a> KlipperCamServer<'a> {
         self.config.ota_token.as_bytes()
     }
 
+    /// Authorizes an OTA upload (`X-OTA-Token`, `FW-NET-04` / `FW-NET-08`).
+    ///
+    /// A firmware still configured with the public [`DEFAULT_OTA_TOKEN`]
+    /// refuses every upload with `403 Forbidden`, whatever token is sent.
+    /// Otherwise the token is compared in constant time; a mismatch is
+    /// `401 Unauthorized`.
+    ///
+    /// [`DEFAULT_OTA_TOKEN`]: crate::config::DEFAULT_OTA_TOKEN
+    pub fn check_ota_auth(&self, provided: &[u8]) -> Result<(), HttpRejection> {
+        if self.config.is_default_ota_token() {
+            return Err(HttpRejection {
+                status: 403,
+                reason: "Forbidden",
+                body: "Forbidden: OTA disabled; firmware was built with the default token. \
+                       Rebuild with WIFI_OTA_TOKEN set.\n",
+            });
+        }
+        if !constant_time_eq(provided, self.config.ota_token.as_bytes()) {
+            return Err(HttpRejection {
+                status: 401,
+                reason: "Unauthorized",
+                body: "Unauthorized: Invalid or missing X-OTA-Token\n",
+            });
+        }
+        Ok(())
+    }
+
     /// Returns whether a camera control setting was modified via `/control`
     /// and is pending application without clearing the dirty flag.
     #[must_use]
@@ -1492,7 +1581,7 @@ impl<'a> KlipperCamServer<'a> {
             (HttpMethod::Get, "/") => self.handle_root_p80(req, out_buf),
             (HttpMethod::Get, "/snapshot") => self.handle_snapshot(out_buf),
             (HttpMethod::Get, "/status") => self.handle_status(out_buf),
-            (HttpMethod::Get, "/control") => self.handle_control(req, out_buf),
+            (HttpMethod::Get | HttpMethod::Post, "/control") => self.handle_control(req, out_buf),
             (HttpMethod::Get, "/panel") => self.handle_panel_get(out_buf),
             (HttpMethod::Get, "/update") => self.handle_ota_get(out_buf),
             (HttpMethod::Post, "/update") => self.handle_ota_post(req, out_buf, flash),
@@ -1620,243 +1709,276 @@ impl<'a> KlipperCamServer<'a> {
         Ok(writer.into_bytes())
     }
 
-    /// Handles `GET /control` and `GET /control?var=<param>&val=<int>` on Port 80.
+    /// Handles `/control` on Port 80 (`FW-NET-27`).
+    ///
+    /// - `GET /control` is read-only and returns the current JSON with
+    ///   `Access-Control-Allow-Origin: *`.
+    /// - A mutation (`var=<param>&val=<int>` in the query, or in a
+    ///   form-encoded body on `POST`) requires `POST`, or a `GET` carrying
+    ///   `X-Requested-With`; a plain `GET` mutation is `405 Method Not
+    ///   Allowed`. A browser `Origin` that does not match `Host` is `403`.
+    ///   Mutating responses never carry a CORS header.
     fn handle_control<'b>(
         &mut self,
         req: &HttpRequest<'_>,
         out_buf: &'b mut [u8],
     ) -> Result<&'b [u8], HttpError> {
-        if let Some(q) = req.query {
-            if !q.is_empty() {
-                if q.len() > MAX_URL_QUERY_LEN {
+        let is_post = req.method == HttpMethod::Post;
+        let params = match req.query {
+            Some(q) if !q.is_empty() => Some(q),
+            _ if is_post => core::str::from_utf8(req.body)
+                .ok()
+                .map(str::trim)
+                .filter(|b| !b.is_empty()),
+            _ => None,
+        };
+        if params.is_some() {
+            if !is_post && !req.x_requested_with {
+                return write_control_method_not_allowed(out_buf);
+            }
+            if let Some(origin) = req.origin {
+                if !is_same_origin(origin, req.host) {
+                    return write_http_error(
+                        out_buf,
+                        403,
+                        "Forbidden",
+                        "Cross-origin /control request refused\n",
+                        false,
+                    );
+                }
+            }
+        }
+        let cors = params.is_none() && !is_post;
+
+        if let Some(q) = params {
+            if q.len() > MAX_URL_QUERY_LEN {
+                return write_http_error(
+                    out_buf,
+                    400,
+                    "Bad Request",
+                    "Query string exceeds maximum length\n",
+                    false,
+                );
+            }
+
+            let mut var_opt: Option<&str> = None;
+            let mut val_str_opt: Option<&str> = None;
+            for pair in q.split('&') {
+                if let Some(eq_idx) = pair.find('=') {
+                    let k = &pair[..eq_idx];
+                    let v = &pair[eq_idx + 1..];
+                    if k == "var" {
+                        if var_opt.is_some() {
+                            return write_http_error(
+                                out_buf,
+                                400,
+                                "Bad Request",
+                                "Duplicate 'var' parameter\n",
+                                false,
+                            );
+                        }
+                        var_opt = Some(v);
+                    } else if k == "val" {
+                        if val_str_opt.is_some() {
+                            return write_http_error(
+                                out_buf,
+                                400,
+                                "Bad Request",
+                                "Duplicate 'val' parameter\n",
+                                false,
+                            );
+                        }
+                        val_str_opt = Some(v);
+                    }
+                }
+            }
+
+            let var_name = match var_opt {
+                Some(v) if !v.is_empty() => v,
+                _ => {
                     return write_http_error(
                         out_buf,
                         400,
                         "Bad Request",
-                        "Query string exceeds maximum length\n",
-                        true,
+                        "Missing 'var' parameter\n",
+                        false,
                     );
                 }
+            };
 
-                let mut var_opt: Option<&str> = None;
-                let mut val_str_opt: Option<&str> = None;
-                for pair in q.split('&') {
-                    if let Some(eq_idx) = pair.find('=') {
-                        let k = &pair[..eq_idx];
-                        let v = &pair[eq_idx + 1..];
-                        if k == "var" {
-                            if var_opt.is_some() {
-                                return write_http_error(
-                                    out_buf,
-                                    400,
-                                    "Bad Request",
-                                    "Duplicate 'var' parameter\n",
-                                    true,
-                                );
-                            }
-                            var_opt = Some(v);
-                        } else if k == "val" {
-                            if val_str_opt.is_some() {
-                                return write_http_error(
-                                    out_buf,
-                                    400,
-                                    "Bad Request",
-                                    "Duplicate 'val' parameter\n",
-                                    true,
-                                );
-                            }
-                            val_str_opt = Some(v);
-                        }
-                    }
+            let val = match val_str_opt.and_then(parse_isize_ascii) {
+                Some(v) => v,
+                None => {
+                    return write_http_error(
+                        out_buf,
+                        400,
+                        "Bad Request",
+                        "Missing or invalid integer 'val' parameter\n",
+                        false,
+                    );
                 }
+            };
 
-                let var_name = match var_opt {
-                    Some(v) if !v.is_empty() => v,
-                    _ => {
-                        return write_http_error(
-                            out_buf,
-                            400,
-                            "Bad Request",
-                            "Missing 'var' parameter\n",
-                            true,
-                        );
+            match var_name {
+                "framesize" => match parse_framesize_val(val) {
+                    Some(fs) => {
+                        self.control_state.framesize = fs;
+                        self.camera.set_frame_size(fs);
                     }
-                };
-
-                let val = match val_str_opt.and_then(parse_isize_ascii) {
-                    Some(v) => v,
                     None => {
                         return write_http_error(
                             out_buf,
                             400,
                             "Bad Request",
-                            "Missing or invalid integer 'val' parameter\n",
-                            true,
+                            "Invalid framesize value\n",
+                            false,
                         );
                     }
-                };
-
-                match var_name {
-                    "framesize" => match parse_framesize_val(val) {
-                        Some(fs) => {
-                            self.control_state.framesize = fs;
-                            self.camera.set_frame_size(fs);
-                        }
-                        None => {
-                            return write_http_error(
-                                out_buf,
-                                400,
-                                "Bad Request",
-                                "Invalid framesize value\n",
-                                true,
-                            );
-                        }
-                    },
-                    "quality" => {
-                        if !(4..=63).contains(&val) {
-                            return write_http_error(
-                                out_buf,
-                                400,
-                                "Bad Request",
-                                "Quality must be in 4..=63\n",
-                                true,
-                            );
-                        }
-                        self.control_state.quality = val as i32;
-                    }
-                    "brightness" => {
-                        if !(-2..=2).contains(&val) {
-                            return write_http_error(
-                                out_buf,
-                                400,
-                                "Bad Request",
-                                "Brightness must be in -2..=2\n",
-                                true,
-                            );
-                        }
-                        self.control_state.brightness = val as i32;
-                    }
-                    "contrast" => {
-                        if !(-2..=2).contains(&val) {
-                            return write_http_error(
-                                out_buf,
-                                400,
-                                "Bad Request",
-                                "Contrast must be in -2..=2\n",
-                                true,
-                            );
-                        }
-                        self.control_state.contrast = val as i32;
-                    }
-                    "saturation" => {
-                        if !(-2..=2).contains(&val) {
-                            return write_http_error(
-                                out_buf,
-                                400,
-                                "Bad Request",
-                                "Saturation must be in -2..=2\n",
-                                true,
-                            );
-                        }
-                        self.control_state.saturation = val as i32;
-                    }
-                    "special_effect" => {
-                        if !(0..=6).contains(&val) {
-                            return write_http_error(
-                                out_buf,
-                                400,
-                                "Bad Request",
-                                "Special effect must be in 0..=6\n",
-                                true,
-                            );
-                        }
-                        self.control_state.special_effect = val as i32;
-                    }
-                    "hmirror" => {
-                        if val != 0 && val != 1 {
-                            return write_http_error(
-                                out_buf,
-                                400,
-                                "Bad Request",
-                                "Boolean parameter must be 0 or 1\n",
-                                true,
-                            );
-                        }
-                        self.control_state.hmirror = val != 0;
-                    }
-                    "vflip" => {
-                        if val != 0 && val != 1 {
-                            return write_http_error(
-                                out_buf,
-                                400,
-                                "Bad Request",
-                                "Boolean parameter must be 0 or 1\n",
-                                true,
-                            );
-                        }
-                        self.control_state.vflip = val != 0;
-                    }
-                    "awb" => {
-                        if val != 0 && val != 1 {
-                            return write_http_error(
-                                out_buf,
-                                400,
-                                "Bad Request",
-                                "Boolean parameter must be 0 or 1\n",
-                                true,
-                            );
-                        }
-                        self.control_state.awb = val != 0;
-                    }
-                    "agc" => {
-                        if val != 0 && val != 1 {
-                            return write_http_error(
-                                out_buf,
-                                400,
-                                "Bad Request",
-                                "Boolean parameter must be 0 or 1\n",
-                                true,
-                            );
-                        }
-                        self.control_state.agc = val != 0;
-                    }
-                    "aec" => {
-                        if val != 0 && val != 1 {
-                            return write_http_error(
-                                out_buf,
-                                400,
-                                "Bad Request",
-                                "Boolean parameter must be 0 or 1\n",
-                                true,
-                            );
-                        }
-                        self.control_state.aec = val != 0;
-                    }
-                    "ae_level" => {
-                        if !(-2..=2).contains(&val) {
-                            return write_http_error(
-                                out_buf,
-                                400,
-                                "Bad Request",
-                                "AE level must be in -2..=2\n",
-                                true,
-                            );
-                        }
-                        self.control_state.ae_level = val as i32;
-                    }
-                    _ => {
+                },
+                "quality" => {
+                    if !(4..=63).contains(&val) {
                         return write_http_error(
                             out_buf,
                             400,
                             "Bad Request",
-                            "Unknown camera control variable\n",
-                            true,
+                            "Quality must be in 4..=63\n",
+                            false,
                         );
                     }
+                    self.control_state.quality = val as i32;
                 }
-
-                self.control_state.dirty = true;
+                "brightness" => {
+                    if !(-2..=2).contains(&val) {
+                        return write_http_error(
+                            out_buf,
+                            400,
+                            "Bad Request",
+                            "Brightness must be in -2..=2\n",
+                            false,
+                        );
+                    }
+                    self.control_state.brightness = val as i32;
+                }
+                "contrast" => {
+                    if !(-2..=2).contains(&val) {
+                        return write_http_error(
+                            out_buf,
+                            400,
+                            "Bad Request",
+                            "Contrast must be in -2..=2\n",
+                            false,
+                        );
+                    }
+                    self.control_state.contrast = val as i32;
+                }
+                "saturation" => {
+                    if !(-2..=2).contains(&val) {
+                        return write_http_error(
+                            out_buf,
+                            400,
+                            "Bad Request",
+                            "Saturation must be in -2..=2\n",
+                            false,
+                        );
+                    }
+                    self.control_state.saturation = val as i32;
+                }
+                "special_effect" => {
+                    if !(0..=6).contains(&val) {
+                        return write_http_error(
+                            out_buf,
+                            400,
+                            "Bad Request",
+                            "Special effect must be in 0..=6\n",
+                            false,
+                        );
+                    }
+                    self.control_state.special_effect = val as i32;
+                }
+                "hmirror" => {
+                    if val != 0 && val != 1 {
+                        return write_http_error(
+                            out_buf,
+                            400,
+                            "Bad Request",
+                            "Boolean parameter must be 0 or 1\n",
+                            false,
+                        );
+                    }
+                    self.control_state.hmirror = val != 0;
+                }
+                "vflip" => {
+                    if val != 0 && val != 1 {
+                        return write_http_error(
+                            out_buf,
+                            400,
+                            "Bad Request",
+                            "Boolean parameter must be 0 or 1\n",
+                            false,
+                        );
+                    }
+                    self.control_state.vflip = val != 0;
+                }
+                "awb" => {
+                    if val != 0 && val != 1 {
+                        return write_http_error(
+                            out_buf,
+                            400,
+                            "Bad Request",
+                            "Boolean parameter must be 0 or 1\n",
+                            false,
+                        );
+                    }
+                    self.control_state.awb = val != 0;
+                }
+                "agc" => {
+                    if val != 0 && val != 1 {
+                        return write_http_error(
+                            out_buf,
+                            400,
+                            "Bad Request",
+                            "Boolean parameter must be 0 or 1\n",
+                            false,
+                        );
+                    }
+                    self.control_state.agc = val != 0;
+                }
+                "aec" => {
+                    if val != 0 && val != 1 {
+                        return write_http_error(
+                            out_buf,
+                            400,
+                            "Bad Request",
+                            "Boolean parameter must be 0 or 1\n",
+                            false,
+                        );
+                    }
+                    self.control_state.aec = val != 0;
+                }
+                "ae_level" => {
+                    if !(-2..=2).contains(&val) {
+                        return write_http_error(
+                            out_buf,
+                            400,
+                            "Bad Request",
+                            "AE level must be in -2..=2\n",
+                            false,
+                        );
+                    }
+                    self.control_state.ae_level = val as i32;
+                }
+                _ => {
+                    return write_http_error(
+                        out_buf,
+                        400,
+                        "Bad Request",
+                        "Unknown camera control variable\n",
+                        false,
+                    );
+                }
             }
+
+            self.control_state.dirty = true;
         }
 
         let mut json_stack = [0u8; CONTROL_JSON_BUF_LEN];
@@ -1865,9 +1987,13 @@ impl<'a> KlipperCamServer<'a> {
         let mut writer = SliceWriter::new(out_buf);
         write!(
             writer,
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-            Access-Control-Allow-Origin: *\r\nConnection: close\r\n\
-            Content-Length: {}\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{}\
+            Connection: close\r\nContent-Length: {}\r\n\r\n{}",
+            if cors {
+                "Access-Control-Allow-Origin: *\r\n"
+            } else {
+                ""
+            },
             json_str.len(),
             json_str
         )
@@ -1963,8 +2089,9 @@ xhr.send(file);}</script></body></html>";
     }
 
     /// Handles `POST /update` on Port 80 (`klipper_cam.c` lines 350-466):
-    /// 1. Constant-time `X-OTA-Token` authentication (`401 Unauthorized` without
-    ///    CORS on failure, `FW-NET-08`).
+    /// 1. [`Self::check_ota_auth`]: `403 Forbidden` while the public default
+    ///    token is configured (`FW-NET-04`), else constant-time `X-OTA-Token`
+    ///    authentication (`401 Unauthorized` without CORS, `FW-NET-08`).
     /// 2. `Content-Length` validation (`> 0` and `<= 0x1B0000`, `FW-NET-09`).
     /// 3. ESP32 `0xE9` image magic and segment count validation (`1..=16`).
     /// 4. 1024-byte chunked write loop to passive OTA slot + `otadata` CRC32
@@ -1975,21 +2102,8 @@ xhr.send(file);}</script></body></html>";
         out_buf: &'b mut [u8],
         flash: &mut F,
     ) -> Result<&'b [u8], HttpError> {
-        let expected_token = self.config.ota_token.as_bytes();
-        let provided_token = req.ota_token.unwrap_or(b"");
-
-        if !constant_time_eq(provided_token, expected_token) {
-            let unauthorized_body = "Unauthorized: Invalid or missing X-OTA-Token\n";
-            let mut writer = SliceWriter::new(out_buf);
-            write!(
-                writer,
-                "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\n\
-                Connection: close\r\nContent-Length: {}\r\n\r\n{}",
-                unauthorized_body.len(),
-                unauthorized_body
-            )
-            .map_err(|_| HttpError::BufferTooSmall)?;
-            return Ok(writer.into_bytes());
+        if let Err(rej) = self.check_ota_auth(req.ota_token.unwrap_or(b"")) {
+            return write_http_error(out_buf, rej.status, rej.reason, rej.body, false);
         }
 
         let content_len = match req.content_length {
@@ -2046,6 +2160,15 @@ xhr.send(file);}</script></body></html>";
 
         let written_slot = match self.ota_manager.write_ota_image_to_flash(flash, payload) {
             Ok(slot) => slot,
+            Err(OtaError::ReadbackMismatch) => {
+                return write_http_error(
+                    out_buf,
+                    500,
+                    "Internal Server Error",
+                    "Flash read-back verification failed",
+                    false,
+                );
+            }
             Err(
                 OtaError::InvalidOtaDataCrc
                 | OtaError::RollbackStateInvalid
@@ -2184,6 +2307,22 @@ Upload Main Firmware:\n\
     Ok(writer.into_bytes())
 }
 
+/// Writes `405 Method Not Allowed` with `Allow: POST` (no CORS header) for a
+/// state-changing `GET /control` (`FW-NET-27`).
+fn write_control_method_not_allowed(out_buf: &mut [u8]) -> Result<&[u8], HttpError> {
+    let body = "Use POST (or send X-Requested-With) to change camera settings\n";
+    let mut writer = SliceWriter::new(out_buf);
+    write!(
+        writer,
+        "HTTP/1.1 405 Method Not Allowed\r\nAllow: POST\r\nContent-Type: text/plain\r\n\
+        Connection: close\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    )
+    .map_err(|_| HttpError::BufferTooSmall)?;
+    Ok(writer.into_bytes())
+}
+
 /// Helper to write an HTTP error response into `out_buf`.
 pub fn write_http_error<'a>(
     out_buf: &'a mut [u8],
@@ -2223,7 +2362,19 @@ pub fn write_http_error<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DEFAULT_OTA_TOKEN;
     use crate::ota::OtaImgState;
+
+    /// Non-default OTA token used by every test server.
+    const TEST_OTA_TOKEN: &str = "wp09-test-ota-token";
+
+    /// Test server with a private OTA token (the public default is refused
+    /// with `403`, `FW-NET-04`).
+    fn test_server() -> KlipperCamServer<'static> {
+        let mut cfg = KlipperCamConfig::WROVER_KIT_HD;
+        cfg.ota_token = TEST_OTA_TOKEN;
+        KlipperCamServer::new(cfg, CameraDriver::new_hd_default())
+    }
 
     #[test]
     fn test_constant_time_eq() {
@@ -2241,7 +2392,7 @@ mod tests {
     /// with all 7 original JSON telemetry keys first, followed by diagnostics.
     #[test]
     fn test_challenger_1_port80_status_7_key_json() {
-        let mut server = KlipperCamServer::new_default();
+        let mut server = test_server();
         server.set_telemetry(42_500, 192_000, 4_100_000, -51);
 
         let mut resp_buf = [0u8; 1536];
@@ -2394,7 +2545,7 @@ mod tests {
     /// `Access-Control-Allow-Origin: *`, and a valid 1280x720 JFIF JPEG payload.
     #[test]
     fn test_challenger_2_port80_snapshot_and_query_delegation() {
-        let mut server = KlipperCamServer::new_default();
+        let mut server = test_server();
         let mut resp_buf = [0u8; 1024];
 
         for uri in ["/snapshot", "/?action=snapshot"] {
@@ -2434,7 +2585,7 @@ mod tests {
     /// `APP-005`).
     #[test]
     fn test_challenger_3_port80_root_and_stream_isolation() {
-        let mut server = KlipperCamServer::new_default();
+        let mut server = test_server();
         let mut resp_buf = [0u8; 1024];
 
         // 1. GET / -> 200 OK text/plain
@@ -2481,7 +2632,7 @@ mod tests {
     /// and valid MJPEG boundary framing.
     #[test]
     fn test_challenger_4_port81_mjpeg_stream_framing() {
-        let mut server = KlipperCamServer::new_default();
+        let mut server = test_server();
         let mut resp_buf = [0u8; 1024];
 
         for path in ["/stream", "/"] {
@@ -2519,7 +2670,7 @@ Content-Type: image/jpeg\r\nContent-Length: 43\r\n\r\n";
     /// (`"stream_active":true`) succeed!
     #[test]
     fn test_challenger_5_concurrent_stream_busy_guard_and_port80_snapshot() {
-        let server = KlipperCamServer::new_default();
+        let server = test_server();
 
         // Client 1 starts streaming on Port 81
         let mut client1_stream = server
@@ -2582,7 +2733,7 @@ Content-Type: image/jpeg\r\nContent-Length: 43\r\n\r\n";
     /// and next target partitions (`ota_0` and `ota_1`).
     #[test]
     fn test_challenger_6_port80_update_get_html() {
-        let mut server = KlipperCamServer::new_default();
+        let mut server = test_server();
         let mut resp_buf = [0u8; 4096];
         let resp = server
             .handle_raw_request(
@@ -2610,7 +2761,7 @@ Content-Type: image/jpeg\r\nContent-Length: 43\r\n\r\n";
     /// acquisition.
     #[test]
     fn test_challenger_7_port80_ota_post_auth_validation_and_rollback() {
-        let mut server = KlipperCamServer::new_default();
+        let mut server = test_server();
         let mut resp_buf = [0u8; 1024];
 
         // 1. Missing X-OTA-Token -> 401 Unauthorized, NO Access-Control-Allow-Origin
@@ -2733,10 +2884,10 @@ X-OTA-Token: wrong-token\r\nContent-Length: 24\r\n\r\n\
         let initial_frame: [u8; 6] = [0xFF, 0xD8, 0x11, 0x22, 0xFF, 0xD9];
         let updated_frame: [u8; 8] = [0xFF, 0xD8, 0xAA, 0xBB, 0xCC, 0xDD, 0xFF, 0xD9];
 
-        let mut server = KlipperCamServer::new(
-            KlipperCamConfig::WROVER_KIT_HD,
-            CameraDriver::new(&initial_frame, FrameSize::Vga),
-        );
+        let mut cfg = KlipperCamConfig::WROVER_KIT_HD;
+        cfg.ota_token = TEST_OTA_TOKEN;
+        let mut server =
+            KlipperCamServer::new(cfg, CameraDriver::new(&initial_frame, FrameSize::Vga));
         assert_eq!(server.camera.frame_data(), &initial_frame);
 
         // Update live frame via set_frame and verify GET /snapshot returns updated
@@ -2800,7 +2951,7 @@ X-OTA-Token: wrong-token\r\nContent-Length: 24\r\n\r\n\
 
     #[test]
     fn test_port80_control_get_and_parameter_updates() {
-        let mut server = KlipperCamServer::new_default();
+        let mut server = test_server();
         let mut resp_buf = [0u8; 2048];
 
         // 1. Initially no pending control update; GET /control returns default HD JSON
@@ -2830,7 +2981,7 @@ X-OTA-Token: wrong-token\r\nContent-Length: 24\r\n\r\n\
         let r_hm = server
             .handle_raw_request(
                 ServerPort::Control,
-                b"GET /control?var=hmirror&val=1 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n",
+                b"POST /control?var=hmirror&val=1 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n",
                 &mut resp_buf,
             )
             .expect("GET /control?var=hmirror&val=1");
@@ -2849,7 +3000,7 @@ X-OTA-Token: wrong-token\r\nContent-Length: 24\r\n\r\n\
         let r_q = server
             .handle_raw_request(
                 ServerPort::Control,
-                b"GET /control?var=quality&val=10 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n",
+                b"POST /control?var=quality&val=10 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n",
                 &mut resp_buf,
             )
             .expect("GET /control?var=quality&val=10");
@@ -2862,7 +3013,7 @@ X-OTA-Token: wrong-token\r\nContent-Length: 24\r\n\r\n\
         let r_b = server
             .handle_raw_request(
                 ServerPort::Control,
-                b"GET /control?var=brightness&val=-1 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n",
+                b"POST /control?var=brightness&val=-1 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n",
                 &mut resp_buf,
             )
             .expect("GET /control?var=brightness&val=-1");
@@ -2875,41 +3026,43 @@ X-OTA-Token: wrong-token\r\nContent-Length: 24\r\n\r\n\
         // awb, agc, aec, ae_level, framesize
         for (req_raw, expected_substr) in [
             (
-                b"GET /control?var=contrast&val=2 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+                b"POST /control?var=contrast&val=2 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n"
+                    .as_slice(),
                 "\"contrast\":2",
             ),
             (
-                b"GET /control?var=saturation&val=-2 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n"
+                b"POST /control?var=saturation&val=-2 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n"
                     .as_slice(),
                 "\"saturation\":-2",
             ),
             (
-                b"GET /control?var=special_effect&val=3 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n"
+                b"POST /control?var=special_effect&val=3 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n"
                     .as_slice(),
                 "\"special_effect\":3",
             ),
             (
-                b"GET /control?var=vflip&val=1 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+                b"POST /control?var=vflip&val=1 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
                 "\"vflip\":1",
             ),
             (
-                b"GET /control?var=awb&val=0 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+                b"POST /control?var=awb&val=0 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
                 "\"awb\":0",
             ),
             (
-                b"GET /control?var=agc&val=0 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+                b"POST /control?var=agc&val=0 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
                 "\"agc\":0",
             ),
             (
-                b"GET /control?var=aec&val=0 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+                b"POST /control?var=aec&val=0 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
                 "\"aec\":0",
             ),
             (
-                b"GET /control?var=ae_level&val=1 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+                b"POST /control?var=ae_level&val=1 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n"
+                    .as_slice(),
                 "\"ae_level\":1",
             ),
             (
-                b"GET /control?var=framesize&val=800 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n"
+                b"POST /control?var=framesize&val=800 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n"
                     .as_slice(),
                 "\"framesize\":9,\"framesize_label\":\"800x600\"",
             ),
@@ -2959,32 +3112,33 @@ X-OTA-Token: wrong-token\r\nContent-Length: 24\r\n\r\n\
 
     #[test]
     fn test_port80_control_invalid_parameters_return_400_bad_request() {
-        let mut server = KlipperCamServer::new_default();
+        let mut server = test_server();
         let mut resp_buf = [0u8; 1024];
 
         for bad_req in [
-            b"GET /control?var=unknown&val=1 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
-            b"GET /control?var=quality&val=3 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
-            b"GET /control?var=quality&val=64 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
-            b"GET /control?var=brightness&val=3 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
-            b"GET /control?var=contrast&val=-3 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
-            b"GET /control?var=saturation&val=9 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
-            b"GET /control?var=special_effect&val=7 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n"
+            b"POST /control?var=unknown&val=1 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+            b"POST /control?var=quality&val=3 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+            b"POST /control?var=quality&val=64 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+            b"POST /control?var=brightness&val=3 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+            b"POST /control?var=contrast&val=-3 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+            b"POST /control?var=saturation&val=9 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+            b"POST /control?var=special_effect&val=7 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n"
                 .as_slice(),
-            b"GET /control?var=hmirror&val=2 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
-            b"GET /control?var=vflip&val=-1 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
-            b"GET /control?var=ae_level&val=-5 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
-            b"GET /control?var=framesize&val=999 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
-            b"GET /control?var=quality HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
-            b"GET /control?val=10 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
-            b"GET /control?var=quality&val=abc HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+            b"POST /control?var=hmirror&val=2 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+            b"POST /control?var=vflip&val=-1 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+            b"POST /control?var=ae_level&val=-5 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+            b"POST /control?var=framesize&val=999 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+            b"POST /control?var=quality HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+            b"POST /control?val=10 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+            b"POST /control?var=quality&val=abc HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
         ] {
             let resp = server
                 .handle_raw_request(ServerPort::Control, bad_req, &mut resp_buf)
                 .expect("400 response written");
             let view = HttpResponseView::parse(resp).expect("parse 400 response");
             assert_eq!(view.status_code, 400);
-            assert_eq!(view.access_control_allow_origin, Some("*"));
+            // FW-NET-27: mutating responses carry no CORS header.
+            assert_eq!(view.access_control_allow_origin, None);
         }
 
         // State must remain clean and unmodified after rejected requests
@@ -2994,7 +3148,7 @@ X-OTA-Token: wrong-token\r\nContent-Length: 24\r\n\r\n\
 
     #[test]
     fn test_port80_panel_get_html_dashboard() {
-        let mut server = KlipperCamServer::new_default();
+        let mut server = test_server();
         let mut resp_buf = [0u8; 4096];
 
         let resp = server
@@ -3012,7 +3166,7 @@ X-OTA-Token: wrong-token\r\nContent-Length: 24\r\n\r\n\
         assert!(html.contains("Klipper Cam Control Panel"));
         assert!(html.contains(":81/stream"));
         assert!(html.contains("/snapshot"));
-        assert!(html.contains("fetch('/control?var='+k+'&val='+v)"));
+        assert!(html.contains("fetch('/control?var='+k+'&val='+v,{method:'POST'"));
         assert!(html.contains("fetch('/status')"));
         assert!(html.contains("onerror="));
         assert!(html.contains("recover()"));
@@ -3146,7 +3300,7 @@ Content-Length: 9223372036854775808\r\n\r\n";
 
     #[test]
     fn test_qa201_oversized_query_and_exact_match() {
-        let mut server = KlipperCamServer::new_default();
+        let mut server = test_server();
         let mut resp_buf = [0u8; 1024];
 
         // Query string > 256 bytes on GET / -> 400 Bad Request
@@ -3191,7 +3345,7 @@ Content-Length: 9223372036854775808\r\n\r\n";
     fn test_qa201_ota_post_failures_and_flash_error() {
         use crate::ota::MockNorFlash;
 
-        let mut server = KlipperCamServer::new_default();
+        let mut server = test_server();
         let mut resp_buf = [0u8; 1024];
 
         // Missing Content-Length on POST /update -> 400 Bad Request
@@ -3267,7 +3421,7 @@ Content-Length: 9223372036854775808\r\n\r\n";
 
     #[test]
     fn test_qa201_port81_404_and_format_ota_minimal_root() {
-        let mut server = KlipperCamServer::new_default();
+        let mut server = test_server();
         let mut resp_buf = [0u8; 1024];
 
         // Port 81 GET /snapshot -> 404 Not Found
@@ -3316,11 +3470,11 @@ Content-Length: 9223372036854775808\r\n\r\n";
 
     #[test]
     fn test_qa201_control_edge_cases_and_dirty_flag_transitions() {
-        let mut server = KlipperCamServer::new_default();
+        let mut server = test_server();
         let mut resp_buf = [0u8; 1024];
 
         // isize::MIN and isize::MAX on /control -> 400 Bad Request
-        let min_req = b"GET /control?var=quality&val=-9223372036854775808 HTTP/1.1\r\n\
+        let min_req = b"POST /control?var=quality&val=-9223372036854775808 HTTP/1.1\r\n\
 Host: 172.22.1.52\r\n\r\n";
         let r_min = server
             .handle_raw_request(ServerPort::Control, min_req, &mut resp_buf)
@@ -3328,7 +3482,7 @@ Host: 172.22.1.52\r\n\r\n";
         let v_min = HttpResponseView::parse(r_min).expect("parse 400");
         assert_eq!(v_min.status_code, 400);
 
-        let max_req = b"GET /control?var=quality&val=9223372036854775807 HTTP/1.1\r\n\
+        let max_req = b"POST /control?var=quality&val=9223372036854775807 HTTP/1.1\r\n\
 Host: 172.22.1.52\r\n\r\n";
         let r_max = server
             .handle_raw_request(ServerPort::Control, max_req, &mut resp_buf)
@@ -3338,7 +3492,7 @@ Host: 172.22.1.52\r\n\r\n";
 
         // Duplicate var parameter -> 400 Bad Request
         let dup_var =
-            b"GET /control?var=quality&val=10&var=brightness HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n";
+            b"POST /control?var=quality&val=10&var=brightness HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n";
         let r_dup_var = server
             .handle_raw_request(ServerPort::Control, dup_var, &mut resp_buf)
             .expect("handled");
@@ -3350,7 +3504,7 @@ Host: 172.22.1.52\r\n\r\n";
 
         // Duplicate val parameter -> 400 Bad Request
         let dup_val =
-            b"GET /control?var=quality&val=10&val=20 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n";
+            b"POST /control?var=quality&val=10&val=20 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n";
         let r_dup_val = server
             .handle_raw_request(ServerPort::Control, dup_val, &mut resp_buf)
             .expect("handled");
@@ -3364,7 +3518,7 @@ Host: 172.22.1.52\r\n\r\n";
         assert_eq!(server.camera.frame_size(), FrameSize::Hd);
         assert_eq!(server.take_pending_control_update(), None);
 
-        let fs_req = b"GET /control?var=framesize&val=8 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n";
+        let fs_req = b"POST /control?var=framesize&val=8 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n";
         let r_fs = server
             .handle_raw_request(ServerPort::Control, fs_req, &mut resp_buf)
             .expect("handled");
@@ -3382,7 +3536,7 @@ Host: 172.22.1.52\r\n\r\n";
 
     #[test]
     fn test_port80_responses_emit_connection_close_header() {
-        let mut server = KlipperCamServer::new_default();
+        let mut server = test_server();
         let mut resp_buf = [0u8; 4096];
 
         for raw_req in [
@@ -3600,13 +3754,13 @@ Content-Type: image/jpeg\r\nContent-Length: 51200\r\n\r\n";
 
     #[test]
     fn test_has_pending_control_update_lifecycle() {
-        let mut server = KlipperCamServer::new_default();
+        let mut server = test_server();
         let mut resp_buf = [0u8; 512];
 
         assert!(!server.has_pending_control_update());
         assert_eq!(server.take_pending_control_update(), None);
 
-        let req = b"GET /control?var=brightness&val=2 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n";
+        let req = b"POST /control?var=brightness&val=2 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n";
         let resp = server
             .handle_raw_request(ServerPort::Control, req, &mut resp_buf)
             .expect("GET /control");
@@ -3658,5 +3812,320 @@ Content-Type: image/jpeg\r\nContent-Length: 51200\r\n\r\n";
         assert_eq!(last_applied.brightness, 2);
         assert_eq!(last_applied.saturation, 1);
         assert_eq!(last_applied.contrast, 0);
+    }
+
+    // ---- WP-09 / FW-NET-04: default OTA token is refused ----
+
+    fn ota_post_request(token: &str, image: &[u8]) -> alloc::vec::Vec<u8> {
+        let mut req = alloc::format!(
+            "POST /update HTTP/1.1\r\nHost: 172.22.1.52\r\nX-OTA-Token: {}\r\n\
+             Content-Length: {}\r\n\r\n",
+            token,
+            image.len()
+        )
+        .into_bytes();
+        req.extend_from_slice(image);
+        req
+    }
+
+    #[test]
+    fn test_wp09_default_ota_token_returns_403() {
+        let mut cfg = KlipperCamConfig::WROVER_KIT_HD;
+        cfg.ota_token = DEFAULT_OTA_TOKEN;
+        let mut server = KlipperCamServer::new(cfg, CameraDriver::new_hd_default());
+        assert!(server.config.is_default_ota_token());
+        let image = crate::ota::make_valid_esp_image(false);
+        let mut resp_buf = [0u8; 1024];
+
+        // Even the matching (public) token is forbidden.
+        for token in [DEFAULT_OTA_TOKEN, "anything-else", ""] {
+            let req = ota_post_request(token, &image);
+            let resp = server
+                .handle_raw_request(ServerPort::Control, &req, &mut resp_buf)
+                .expect("403 written");
+            let view = HttpResponseView::parse(resp).expect("parse 403");
+            assert_eq!(view.status_code, 403, "token {token:?}");
+            assert_eq!(view.access_control_allow_origin, None);
+        }
+        assert!(!server.is_reboot_scheduled());
+        assert_eq!(server.last_ota_target_slot(), None);
+        assert_eq!(server.ota_manager.active_slot(), OtaSlot::Ota0);
+
+        let rejection = server
+            .check_ota_auth(DEFAULT_OTA_TOKEN.as_bytes())
+            .expect_err("default token rejected");
+        assert_eq!(rejection.status, 403);
+    }
+
+    #[test]
+    fn test_wp09_check_ota_auth_private_token() {
+        let server = test_server();
+        assert_eq!(server.check_ota_auth(TEST_OTA_TOKEN.as_bytes()), Ok(()));
+        let wrong = server.check_ota_auth(b"wrong").expect_err("wrong token");
+        assert_eq!(wrong.status, 401);
+        let missing = server.check_ota_auth(b"").expect_err("missing token");
+        assert_eq!(missing.status, 401);
+
+        let mut server = test_server();
+        let image = crate::ota::make_valid_esp_image(true);
+        let req = ota_post_request(TEST_OTA_TOKEN, &image);
+        let mut resp_buf = [0u8; 1024];
+        let resp = server
+            .handle_raw_request(ServerPort::Control, &req, &mut resp_buf)
+            .expect("200 written");
+        assert_eq!(
+            HttpResponseView::parse(resp).expect("parse").status_code,
+            200
+        );
+    }
+
+    #[test]
+    fn test_wp09_ota_post_rejects_s3_image_and_misplaced_digest() {
+        let mut resp_buf = [0u8; 1024];
+
+        let mut s3 = crate::ota::make_valid_esp_image(false);
+        s3[12..14].copy_from_slice(&0x0009u16.to_le_bytes());
+        let mut misplaced = crate::ota::make_valid_esp_image(true);
+        misplaced.extend_from_slice(&[0xFF; 16]);
+
+        for image in [s3, misplaced] {
+            let mut server = test_server();
+            let req = ota_post_request(TEST_OTA_TOKEN, &image);
+            let resp = server
+                .handle_raw_request(ServerPort::Control, &req, &mut resp_buf)
+                .expect("400 written");
+            let view = HttpResponseView::parse(resp).expect("parse 400");
+            assert_eq!(view.status_code, 400);
+            assert!(!server.is_reboot_scheduled());
+            assert_eq!(server.ota_manager.active_slot(), OtaSlot::Ota0);
+        }
+    }
+
+    #[test]
+    fn test_wp09_ota_post_readback_mismatch_returns_500() {
+        struct FlakyFlash(crate::ota::MockNorFlash<8192>);
+        impl OtaFlashStorage for FlakyFlash {
+            fn read_aligned(&mut self, offset: u32, buf: &mut [u8]) -> Result<(), OtaError> {
+                self.0.read_aligned(offset, buf)?;
+                if offset >= crate::ota::OTA_1_OFFSET {
+                    buf[0] ^= 0x80;
+                }
+                Ok(())
+            }
+            fn erase_range(&mut self, from: u32, to: u32) -> Result<(), OtaError> {
+                self.0.erase_range(from, to)
+            }
+            fn write_aligned(&mut self, offset: u32, data: &[u8]) -> Result<(), OtaError> {
+                self.0.write_aligned(offset, data)
+            }
+        }
+
+        let mut flash = FlakyFlash(crate::ota::MockNorFlash::new_booted_ota0());
+        let otadata_before = (flash.0.otadata_s0, flash.0.otadata_s1);
+        let mut server = test_server();
+        let image = crate::ota::make_valid_esp_image(false);
+        let req = ota_post_request(TEST_OTA_TOKEN, &image);
+        let mut resp_buf = [0u8; 1024];
+        let resp = server
+            .handle_raw_request_with_flash(ServerPort::Control, &req, &mut resp_buf, &mut flash)
+            .expect("500 written");
+        let view = HttpResponseView::parse(resp).expect("parse 500");
+        assert_eq!(view.status_code, 500);
+        assert!(!server.is_reboot_scheduled());
+        assert_eq!((flash.0.otadata_s0, flash.0.otadata_s1), otadata_before);
+    }
+
+    // ---- WP-09 / FW-NET-27: /control mutations are POST-only, no CORS ----
+
+    #[test]
+    fn test_wp09_control_get_with_var_returns_405() {
+        let mut server = test_server();
+        let mut resp_buf = [0u8; 1024];
+        for req in [
+            b"GET /control?var= HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+            b"GET /control?var=hmirror&val=1 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+            b"GET /control?var=quality&val=99 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+        ] {
+            let resp = server
+                .handle_raw_request(ServerPort::Control, req, &mut resp_buf)
+                .expect("405 written");
+            let view = HttpResponseView::parse(resp).expect("parse 405");
+            assert_eq!(view.status_code, 405);
+            assert!(
+                view.headers_raw.contains("Allow: POST"),
+                "{}",
+                view.headers_raw
+            );
+            assert_eq!(view.access_control_allow_origin, None);
+        }
+        assert_eq!(server.take_pending_control_update(), None);
+        assert_eq!(server.control_state, CameraControlState::new_default());
+    }
+
+    #[test]
+    fn test_wp09_control_read_only_get_keeps_cors() {
+        let mut server = test_server();
+        let mut resp_buf = [0u8; 1024];
+        for req in [
+            b"GET /control HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+            b"GET /control? HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
+        ] {
+            let resp = server
+                .handle_raw_request(ServerPort::Control, req, &mut resp_buf)
+                .expect("200 written");
+            let view = HttpResponseView::parse(resp).expect("parse 200");
+            assert_eq!(view.status_code, 200);
+            assert_eq!(view.access_control_allow_origin, Some("*"));
+        }
+        assert_eq!(server.take_pending_control_update(), None);
+    }
+
+    #[test]
+    fn test_wp09_control_post_accepted_without_cors() {
+        let mut server = test_server();
+        let mut resp_buf = [0u8; 1024];
+
+        // Query-string parameters on POST.
+        let resp = server
+            .handle_raw_request(
+                ServerPort::Control,
+                b"POST /control?var=hmirror&val=1 HTTP/1.1\r\nHost: 172.22.1.52\r\n\
+                  Content-Length: 0\r\n\r\n",
+                &mut resp_buf,
+            )
+            .expect("200 written");
+        let view = HttpResponseView::parse(resp).expect("parse 200");
+        assert_eq!(view.status_code, 200);
+        assert_eq!(view.access_control_allow_origin, None);
+        assert!(
+            server
+                .take_pending_control_update()
+                .expect("pending")
+                .hmirror
+        );
+
+        // Form-encoded body parameters on POST (`curl -d var=..&val=..`).
+        let resp = server
+            .handle_raw_request(
+                ServerPort::Control,
+                b"POST /control HTTP/1.1\r\nHost: 172.22.1.52\r\n\
+                  Content-Type: application/x-www-form-urlencoded\r\n\
+                  Content-Length: 18\r\n\r\nvar=quality&val=10",
+                &mut resp_buf,
+            )
+            .expect("200 written");
+        let view = HttpResponseView::parse(resp).expect("parse 200");
+        assert_eq!(
+            view.status_code,
+            200,
+            "{:?}",
+            core::str::from_utf8(view.body)
+        );
+        assert_eq!(view.access_control_allow_origin, None);
+        assert_eq!(
+            server
+                .take_pending_control_update()
+                .expect("pending")
+                .quality,
+            10
+        );
+
+        // Invalid value on POST: 400 without CORS, state unchanged.
+        let resp = server
+            .handle_raw_request(
+                ServerPort::Control,
+                b"POST /control?var=quality&val=99 HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n",
+                &mut resp_buf,
+            )
+            .expect("400 written");
+        let view = HttpResponseView::parse(resp).expect("parse 400");
+        assert_eq!(view.status_code, 400);
+        assert_eq!(view.access_control_allow_origin, None);
+        assert_eq!(server.take_pending_control_update(), None);
+    }
+
+    #[test]
+    fn test_wp09_control_get_with_x_requested_with_accepted() {
+        let mut server = test_server();
+        let mut resp_buf = [0u8; 1024];
+        let resp = server
+            .handle_raw_request(
+                ServerPort::Control,
+                b"GET /control?var=vflip&val=1 HTTP/1.1\r\nHost: 172.22.1.52\r\n\
+                  X-Requested-With: XMLHttpRequest\r\n\r\n",
+                &mut resp_buf,
+            )
+            .expect("200 written");
+        let view = HttpResponseView::parse(resp).expect("parse 200");
+        assert_eq!(view.status_code, 200);
+        assert_eq!(view.access_control_allow_origin, None);
+        assert!(server.take_pending_control_update().expect("pending").vflip);
+    }
+
+    #[test]
+    fn test_wp09_control_cross_origin_mutation_forbidden() {
+        let mut server = test_server();
+        let mut resp_buf = [0u8; 1024];
+        for req in [
+            b"POST /control?var=hmirror&val=1 HTTP/1.1\r\nHost: 172.22.1.52\r\n\
+              Origin: http://evil.example\r\n\r\n"
+                .as_slice(),
+            b"POST /control?var=hmirror&val=1 HTTP/1.1\r\nHost: 172.22.1.52\r\n\
+              Origin: null\r\n\r\n"
+                .as_slice(),
+            b"GET /control?var=hmirror&val=1 HTTP/1.1\r\nHost: 172.22.1.52\r\n\
+              X-Requested-With: XMLHttpRequest\r\nOrigin: http://172.22.1.53\r\n\r\n"
+                .as_slice(),
+        ] {
+            let resp = server
+                .handle_raw_request(ServerPort::Control, req, &mut resp_buf)
+                .expect("403 written");
+            let view = HttpResponseView::parse(resp).expect("parse 403");
+            assert_eq!(view.status_code, 403);
+            assert_eq!(view.access_control_allow_origin, None);
+        }
+        assert_eq!(server.take_pending_control_update(), None);
+
+        // Same-origin browser POST (the panel) is accepted.
+        for req in [
+            b"POST /control?var=hmirror&val=1 HTTP/1.1\r\nHost: 172.22.1.52\r\n\
+              Origin: http://172.22.1.52\r\n\r\n"
+                .as_slice(),
+            b"POST /control?var=hmirror&val=1 HTTP/1.1\r\nHost: 172.22.1.52:80\r\n\
+              Origin: http://172.22.1.52\r\n\r\n"
+                .as_slice(),
+            b"POST /control?var=hmirror&val=1 HTTP/1.1\r\nHost: camera.local:8080\r\n\
+              Origin: http://camera.local:8080\r\n\r\n"
+                .as_slice(),
+        ] {
+            let resp = server
+                .handle_raw_request(ServerPort::Control, req, &mut resp_buf)
+                .expect("200 written");
+            let view = HttpResponseView::parse(resp).expect("parse 200");
+            assert_eq!(view.status_code, 200);
+        }
+    }
+
+    #[test]
+    fn test_wp09_panel_uses_post_for_control() {
+        let html = KLIPPER_CONTROL_PANEL_HTML;
+        assert!(html.contains("method:'POST'"));
+        assert!(!html.contains("fetch('/control?var='+k+'&val='+v)"));
+    }
+
+    #[test]
+    fn test_wp09_parse_request_captures_csrf_headers() {
+        let req = parse_http_request(
+            b"POST /control HTTP/1.1\r\nHost: cam:80\r\nOrigin: http://cam\r\n\
+              X-Requested-With: fetch\r\n\r\n",
+        )
+        .expect("parse");
+        assert_eq!(req.host, Some("cam:80"));
+        assert_eq!(req.origin, Some("http://cam"));
+        assert!(req.x_requested_with);
+        let plain = parse_http_request(b"GET / HTTP/1.1\r\n\r\n").expect("parse");
+        assert_eq!(plain.host, None);
+        assert_eq!(plain.origin, None);
+        assert!(!plain.x_requested_with);
     }
 }

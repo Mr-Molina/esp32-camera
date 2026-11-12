@@ -41,8 +41,7 @@ use klipper_cam_fw::{
     CameraSensor, DmaElement, Esp32I2sCamera, EspImageHeader, FirmwareRuntime, FramePool,
     FrameSize, GrabMode, HttpResponseView, Ipv4Addr, KlipperCamConfig, MockSccbBus, OtaSlot,
     Ov2640, PingPongFrameBuffer, PixelFormat, ServerPort, SliceWriter, WroverKitPins, XclkConfig,
-    XclkController, DEFAULT_JPEG_QUALITY, DEFAULT_OTA_TOKEN, DEFAULT_XCLK_FREQ_HZ,
-    MJPEG_CONTENT_TYPE,
+    XclkController, DEFAULT_JPEG_QUALITY, DEFAULT_XCLK_FREQ_HZ, MJPEG_CONTENT_TYPE,
 };
 
 #[cfg(target_arch = "xtensa")]
@@ -179,6 +178,9 @@ fn hil_check_ll_dma_and_i2s0() -> bool {
     started && stopped && deinit_ok
 }
 
+/// Private token for the in-memory HTTP/OTA self-test (never a device secret).
+const HIL_SELF_TEST_OTA_TOKEN: &str = "hil-self-test-ota-token";
+
 #[inline(never)]
 fn hil_check_jpeg_pool_and_http_ota() -> bool {
     if !verify_partition_table_integrity() {
@@ -264,7 +266,11 @@ fn hil_check_jpeg_pool_and_http_ota() -> bool {
     }
 
     let fw_cam = CameraDriver::new(&jpeg_encoded[..jpeg_len], FrameSize::Hd);
-    let mut runtime = FirmwareRuntime::new(KlipperCamConfig::WROVER_KIT_HD, fw_cam);
+    // The public default OTA token is refused with 403 (FW-NET-04), so the
+    // in-memory OTA self-test uses its own private token.
+    let mut self_test_cfg = KlipperCamConfig::WROVER_KIT_HD;
+    self_test_cfg.ota_token = HIL_SELF_TEST_OTA_TOKEN;
+    let mut runtime = FirmwareRuntime::new(self_test_cfg, fw_cam);
     runtime.on_wifi_sta_start();
     if runtime
         .on_wifi_got_ip(Ipv4Addr::new(172, 22, 1, 52))
@@ -318,7 +324,7 @@ fn hil_check_jpeg_pool_and_http_ota() -> bool {
     let req_len = {
         let mut w = SliceWriter::new(&mut ota_req);
         let _ = w.write_str_checked("POST /update HTTP/1.1\r\nHost: 172.22.1.52\r\nX-OTA-Token: ");
-        let _ = w.write_str_checked(DEFAULT_OTA_TOKEN);
+        let _ = w.write_str_checked(HIL_SELF_TEST_OTA_TOKEN);
         let _ = w.write_str_checked("\r\nContent-Length: 64\r\n\r\n");
         let _ = w.write_bytes(&ota_payload);
         w.written_len()
@@ -3081,17 +3087,36 @@ fn build_wifi_station_configs() -> (
 ) {
     use esp_radio::wifi::sta::{ScanMethod, StationConfig};
     use esp_radio::wifi::{AuthenticationMethodConfig, Config as WifiConfig, ControllerConfig};
-    use klipper_cam_fw::{active_wifi_pass, active_wifi_ssid};
+    use klipper_cam_fw::config::{WifiAuthMode, ALLOW_OPEN_WIFI};
 
-    let ssid = active_wifi_ssid();
-    let pass = active_wifi_pass();
-    let auth = if pass.is_empty() {
-        AuthenticationMethodConfig::Open
-    } else {
-        match pass.try_into() {
-            Ok(pw) => AuthenticationMethodConfig::WpaWpa2Personal(pw),
-            Err(_) => AuthenticationMethodConfig::Open,
+    // FW-NET-03: validate the boot configuration and fail closed. A bad
+    // configuration or passphrase stops boot; it never falls back to Open.
+    let boot_cfg = KlipperCamConfig::from_build_env();
+    let auth_mode = match boot_cfg.boot_wifi_auth(ALLOW_OPEN_WIFI) {
+        Ok(mode) => mode,
+        Err(e) => panic!("[KLIPPER-CAM-RS] [CONFIG] refusing to start Wi-Fi: {e}"),
+    };
+    // FW-NET-04: the public default token disables OTA (POST /update -> 403).
+    if boot_cfg.is_default_ota_token() {
+        println!(
+            "[KLIPPER-CAM-RS] [SECURITY] WARNING: default OTA token in use; \
+             POST /update is disabled (403). Rebuild with WIFI_OTA_TOKEN set."
+        );
+    }
+
+    let ssid = boot_cfg.network.wifi_ssid;
+    let pass = boot_cfg.network.wifi_password;
+    let auth = match auth_mode {
+        WifiAuthMode::Open => {
+            println!("[KLIPPER-CAM-RS] [SECURITY] WARNING: joining an Open Wi-Fi network (allow-open-wifi)");
+            AuthenticationMethodConfig::Open
         }
+        WifiAuthMode::WpaWpa2Personal => match pass.try_into() {
+            Ok(pw) => AuthenticationMethodConfig::WpaWpa2Personal(pw),
+            Err(_) => panic!(
+                "[KLIPPER-CAM-RS] [CONFIG] WIFI_PASS rejected by the Wi-Fi driver; refusing to start Wi-Fi"
+            ),
+        },
     };
     let mut sta_cfg = StationConfig::default()
         .with_authentication(auth)
@@ -3954,15 +3979,17 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                                         );
                                         st.last_send_queue = sock80.send_queue();
                                     }
-                                } else if !klipper_cam_fw::http::constant_time_eq(
-                                    parsed.ota_token.unwrap_or(b""),
-                                    runtime.server.ota_token(),
-                                ) {
+                                } else if let Err(rej) = runtime
+                                    .server
+                                    .check_ota_auth(parsed.ota_token.unwrap_or(b""))
+                                {
+                                    // FW-NET-04: 403 while the default token is
+                                    // configured, else 401 on a token mismatch.
                                     if let Ok(err) = write_http_error(
                                         p80_resp_bufs[idx],
-                                        401,
-                                        "Unauthorized",
-                                        "Unauthorized: Invalid or missing X-OTA-Token\n",
+                                        rej.status,
+                                        rej.reason,
+                                        rej.body,
                                         false,
                                     ) {
                                         st.req_len = 0;

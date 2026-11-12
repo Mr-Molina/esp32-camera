@@ -61,6 +61,23 @@ pub const ESP_IMAGE_MAX_SEGMENTS: u8 = 16;
 /// Size in bytes of the fixed `esp_image_header_t` prefix (`24` bytes).
 pub const ESP_IMAGE_HEADER_LEN: usize = 24;
 
+/// `esp_image_header_t::chip_id` value for the original ESP32
+/// (`ESP_CHIP_ID_ESP32`). Any other value (e.g. `0x0009` for ESP32-S3) is
+/// rejected by [`validate_ota_image_header`] (`FW-NET-18`).
+pub const ESP_IMAGE_CHIP_ID_ESP32: u16 = 0x0000;
+
+/// ESP32 internal instruction RAM (`SOC_IRAM_LOW..SOC_IRAM_HIGH`), a valid
+/// application entry-point region.
+pub const ESP32_IRAM_ENTRY_RANGE: core::ops::Range<u32> = 0x4007_0000..0x400A_0000;
+
+/// ESP32 flash-mapped instruction region (`SOC_IROM_LOW..SOC_IROM_HIGH`), a
+/// valid application entry-point region.
+pub const ESP32_IROM_ENTRY_RANGE: core::ops::Range<u32> = 0x400D_0000..0x4040_0000;
+
+/// Length of the SHA-256 digest ESP-IDF appends after the checksum block when
+/// `esp_image_header_t::hash_appended == 1`.
+pub const ESP_IMAGE_DIGEST_LEN: usize = 32;
+
 /// Maximum chunk size read per socket receive step during OTA
 /// (`1024` bytes, `klipper_cam.c`).
 pub const OTA_CHUNK_SIZE: usize = 1024;
@@ -648,6 +665,10 @@ impl<F: OtaFlashStorage, P: Core1ParkControl> OtaFlashStorage for GuardedFlashSt
     fn has_persistent_otadata(&self) -> bool {
         self.flash.has_persistent_otadata()
     }
+
+    fn supports_readback(&self) -> bool {
+        self.flash.supports_readback()
+    }
 }
 
 /// Hardware abstraction trait for SPI NOR flash `otadata` and OTA
@@ -672,6 +693,13 @@ pub trait OtaFlashStorage {
     /// Returns `true` if this storage backend persists real `otadata` across
     /// reboots.
     fn has_persistent_otadata(&self) -> bool {
+        true
+    }
+
+    /// Returns `true` if [`OtaFlashStorage::read_aligned`] returns the bytes
+    /// actually programmed, so the OTA write path can read the image back and
+    /// re-hash it before committing `otadata` (`FW-NET-18`).
+    fn supports_readback(&self) -> bool {
         true
     }
 }
@@ -699,6 +727,11 @@ impl OtaFlashStorage for NoOpFlashStorage {
 
     #[inline]
     fn has_persistent_otadata(&self) -> bool {
+        false
+    }
+
+    #[inline]
+    fn supports_readback(&self) -> bool {
         false
     }
 }
@@ -1165,6 +1198,7 @@ impl OtaDataManager {
         let erase_len = ((payload.len() as u32) + 0xFFF) & !0xFFF;
         flash.erase_range(partition.offset, partition.offset.saturating_add(erase_len))?;
 
+        let mut written_hash = Sha256::new();
         let mut chunk = AlignedFlashChunk::default();
         let mut received = 0usize;
         while received < payload.len() {
@@ -1181,6 +1215,7 @@ impl OtaDataManager {
                 chunk.0[pad] = 0xFF;
                 pad += 1;
             }
+            written_hash.update(&chunk.0[..step]);
             flash.write_aligned(
                 partition.offset.saturating_add(received as u32),
                 &chunk.0[..aligned_step],
@@ -1188,8 +1223,40 @@ impl OtaDataManager {
             received += step;
         }
 
+        if flash.supports_readback() {
+            let expected = written_hash.finalize();
+            let actual = Self::readback_digest(flash, partition.offset, payload.len(), &mut chunk)?;
+            if actual != expected {
+                return Err(OtaError::ReadbackMismatch);
+            }
+        }
+
         self.commit_update(flash, target_slot)?;
         Ok(target_slot)
+    }
+
+    /// Reads `len` bytes back from `base` in [`OTA_CHUNK_SIZE`] 4-byte-aligned
+    /// chunks and returns their SHA-256 (`FW-NET-18` read-back before
+    /// `commit_update`).
+    fn readback_digest<F: OtaFlashStorage>(
+        flash: &mut F,
+        base: u32,
+        len: usize,
+        chunk: &mut AlignedFlashChunk,
+    ) -> Result<[u8; 32], OtaError> {
+        let mut hasher = Sha256::new();
+        let mut off = 0usize;
+        while off < len {
+            let step = (len - off).min(OTA_CHUNK_SIZE);
+            let aligned_step = (step + 3) & !3;
+            flash.read_aligned(
+                base.saturating_add(off as u32),
+                &mut chunk.0[..aligned_step],
+            )?;
+            hasher.update(&chunk.0[..step]);
+            off += step;
+        }
+        Ok(hasher.finalize())
     }
 
     /// Returns `true` when at least one sector is bootable and the winning
@@ -1400,8 +1467,10 @@ impl EspImageHeader {
 /// 3. `image_prefix[0] == ESP_IMAGE_HEADER_MAGIC` (`0xE9`)
 /// 4. `segment_count` in `1..=16`
 ///    (`ESP_IMAGE_MIN_SEGMENTS..=ESP_IMAGE_MAX_SEGMENTS`)
-/// 5. `entry_addr` in ESP32 executable memory regions
-///    (`0x4008_0000..0x4080_0000` or `0x3F40_0000..0x3F80_0000`)
+/// 5. `chip_id` (bytes `12..14`) equals [`ESP_IMAGE_CHIP_ID_ESP32`]
+/// 6. `entry_addr` in ESP32 IRAM ([`ESP32_IRAM_ENTRY_RANGE`]) or IROM
+///    ([`ESP32_IROM_ENTRY_RANGE`]); DROM/DRAM entry points are rejected
+///    (`FW-NET-18`)
 pub fn validate_ota_image_header(
     image_prefix: &[u8],
     total_image_len: usize,
@@ -1439,8 +1508,13 @@ pub fn validate_ota_image_header(
         image_prefix[7],
     ]);
 
-    let is_valid_entry = (0x4008_0000..0x4080_0000).contains(&entry_addr)
-        || (0x3F40_0000..0x3F80_0000).contains(&entry_addr);
+    let chip_id = u16::from_le_bytes([image_prefix[12], image_prefix[13]]);
+    if chip_id != ESP_IMAGE_CHIP_ID_ESP32 {
+        return Err(OtaError::InvalidChipId(chip_id));
+    }
+
+    let is_valid_entry = ESP32_IRAM_ENTRY_RANGE.contains(&entry_addr)
+        || ESP32_IROM_ENTRY_RANGE.contains(&entry_addr);
     if !is_valid_entry {
         return Err(OtaError::InvalidEntryAddr(entry_addr));
     }
@@ -1711,8 +1785,9 @@ pub fn sha256_digest(data: &[u8]) -> [u8; 32] {
 ///    `image`.
 /// 3. Computes the ESP-IDF 8-bit XOR checksum (seeded with `0xEF`) over all
 ///    segment payloads and verifies the byte at boundary `aligned_end - 1`.
-/// 4. If `image[23] == 1` (`hash_appended`), validates the trailing
-///    32-byte SHA-256 digest.
+/// 4. If `image[23] == 1` (`hash_appended`), requires the 32-byte SHA-256
+///    digest at exactly `aligned_end..aligned_end + 32 == image.len()` and
+///    validates it.
 pub fn validate_ota_image_integrity(image: &[u8]) -> Result<EspImageHeaderSummary, OtaError> {
     let header = validate_ota_image_header(image, image.len(), OTA_PARTITION_MAX_SIZE)?;
 
@@ -1769,18 +1844,13 @@ pub fn validate_ota_image_integrity(image: &[u8]) -> Result<EspImageHeaderSummar
 
     let hash_appended = image[23] == 1;
     if hash_appended {
-        let (hash_start, hash_end) = if aligned_end
-            .checked_add(32)
-            .is_some_and(|end| end <= image.len())
-        {
-            (aligned_end, aligned_end + 32)
-        } else if image.len() >= 32 && image.len() > checksum_offset {
-            (image.len() - 32, image.len())
-        } else {
-            return Err(OtaError::ImageTooSmall);
-        };
-        let expected_hash = &image[hash_start..hash_end];
-        let computed_hash = sha256_digest(&image[..hash_start]);
+        // The digest must sit immediately after the checksum block and end
+        // the image exactly (`FW-NET-18`); no fallback placement.
+        if aligned_end.checked_add(ESP_IMAGE_DIGEST_LEN) != Some(image.len()) {
+            return Err(OtaError::InvalidDigestPlacement);
+        }
+        let expected_hash = &image[aligned_end..];
+        let computed_hash = sha256_digest(&image[..aligned_end]);
         if computed_hash != expected_hash {
             return Err(OtaError::InvalidSha256);
         }
@@ -1825,6 +1895,12 @@ pub enum OtaError {
     InvalidSegmentCount(u8),
     /// Entry address outside ESP32 executable memory regions (`400 Bad Request`).
     InvalidEntryAddr(u32),
+    /// Image `chip_id` is not ESP32 (`0x0000`), e.g. an ESP32-S3 build
+    /// (`400 Bad Request`, `FW-NET-18`).
+    InvalidChipId(u16),
+    /// `hash_appended` is set but the digest does not end the image exactly at
+    /// `aligned_end + 32` (`400 Bad Request`, `FW-NET-18`).
+    InvalidDigestPlacement,
     /// ESP-IDF 8-bit XOR checksum mismatch (`400 Bad Request`).
     InvalidChecksum,
     /// Appended SHA-256 digest mismatch (`400 Bad Request`).
@@ -1836,6 +1912,10 @@ pub enum OtaError {
     SocketReadTimeout,
     /// Underlying flash erase/write failure (`500 Internal Server Error`).
     FlashWriteError,
+    /// The image read back from flash after writing does not hash to the
+    /// received payload; `otadata` is left unchanged
+    /// (`500 Internal Server Error`, `FW-NET-18`).
+    ReadbackMismatch,
     /// `otadata` CRC-32 validation failed (`500 Internal Server Error`).
     InvalidOtaDataCrc,
     /// Current slot is in `Invalid` or `Aborted` state and cannot cancel rollback.
@@ -1881,6 +1961,19 @@ impl fmt::Display for OtaError {
                     addr
                 )
             }
+            Self::InvalidChipId(id) => {
+                write!(
+                    f,
+                    "Firmware image validation failed: chip_id 0x{:04X} is not ESP32",
+                    id
+                )
+            }
+            Self::InvalidDigestPlacement => {
+                write!(
+                    f,
+                    "Firmware image validation failed: misplaced SHA-256 digest"
+                )
+            }
             Self::InvalidChecksum => {
                 write!(f, "Firmware image validation failed: checksum mismatch")
             }
@@ -1892,6 +1985,7 @@ impl fmt::Display for OtaError {
             ),
             Self::SocketReadTimeout => write!(f, "OTA socket read error or timeout"),
             Self::FlashWriteError => write!(f, "esp_ota_write failed"),
+            Self::ReadbackMismatch => write!(f, "OTA flash read-back verification failed"),
             Self::InvalidOtaDataCrc => write!(f, "Invalid otadata CRC32"),
             Self::RollbackStateInvalid => write!(f, "Cannot mark invalid/aborted slot valid"),
             Self::SequenceOverflow => write!(f, "OTA sequence counter overflow"),
@@ -2312,5 +2406,179 @@ mod tests {
         let reloaded = OtaDataManager::load_from_flash(&mut flash).expect("reload after Valid");
         assert_eq!(reloaded.active_slot(), OtaSlot::Ota1);
         assert_eq!(reloaded.sector_1.state(), OtaImgState::Valid);
+    }
+
+    // ---- WP-09 / FW-NET-18: OTA image header and write-path hardening ----
+
+    #[test]
+    fn test_wp09_rejects_non_esp32_chip_id() {
+        // ESP32-S3 images carry `chip_id = 0x0009` at header bytes 12..14.
+        let mut s3 = make_valid_esp_image(false);
+        s3[12..14].copy_from_slice(&0x0009u16.to_le_bytes());
+        assert_eq!(
+            validate_ota_image_header(&s3, s3.len(), OTA_PARTITION_MAX_SIZE),
+            Err(OtaError::InvalidChipId(0x0009))
+        );
+        assert_eq!(
+            validate_ota_image_integrity(&s3),
+            Err(OtaError::InvalidChipId(0x0009))
+        );
+
+        let mut flash: MockNorFlash<8192> = MockNorFlash::new_booted_ota0();
+        let before = flash.clone();
+        let mut mgr = OtaDataManager::load_from_flash(&mut flash).expect("load");
+        assert_eq!(
+            mgr.write_ota_image_to_flash(&mut flash, &s3),
+            Err(OtaError::InvalidChipId(0x0009))
+        );
+        assert_eq!(flash, before, "rejected image must not touch flash");
+
+        // chip_id == 0 (ESP32) is accepted.
+        let esp32 = make_valid_esp_image(false);
+        assert!(validate_ota_image_integrity(&esp32).is_ok());
+    }
+
+    #[test]
+    fn test_wp09_entry_point_must_be_iram_or_irom() {
+        let accepted = [
+            0x4007_0000u32, // IRAM start
+            0x4008_0400,    // typical call_start_cpu0 in IRAM
+            0x4009_FFFC,    // IRAM end - 4
+            0x400D_0000,    // IROM start
+            0x400D_1234,    // typical IROM entry
+            0x403F_FFFC,    // IROM end - 4
+        ];
+        for addr in accepted {
+            let hdr = EspImageHeader::minimal_valid_header_bytes(1, addr);
+            assert!(
+                validate_ota_image_header(&hdr, 1024, OTA_PARTITION_MAX_SIZE).is_ok(),
+                "entry 0x{addr:08X} must be accepted"
+            );
+        }
+        let rejected = [
+            0x3F40_0020u32, // DROM (data, not executable)
+            0x3FFB_0000,    // DRAM
+            0x4006_FFFC,    // below IRAM
+            0x400A_0000,    // IRAM end (exclusive)
+            0x400C_0000,    // RTC fast / between IRAM and IROM
+            0x4040_0000,    // IROM end (exclusive)
+            0x4080_0000,    // outside the ESP32 map
+        ];
+        for addr in rejected {
+            let hdr = EspImageHeader::minimal_valid_header_bytes(1, addr);
+            assert_eq!(
+                validate_ota_image_header(&hdr, 1024, OTA_PARTITION_MAX_SIZE),
+                Err(OtaError::InvalidEntryAddr(addr)),
+                "entry 0x{addr:08X} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_wp09_misplaced_digest_rejected() {
+        let good = make_valid_esp_image(true);
+        let aligned_end = good.len() - 32;
+        assert!(validate_ota_image_integrity(&good).is_ok());
+
+        // Trailing bytes after a correctly placed digest.
+        let mut trailing = good.clone();
+        trailing.extend_from_slice(&[0xFF; 16]);
+        assert_eq!(
+            validate_ota_image_integrity(&trailing),
+            Err(OtaError::InvalidDigestPlacement)
+        );
+
+        // Padding between checksum and digest, with the digest re-computed
+        // over everything before it and placed at the very end.
+        let mut padded = good[..aligned_end].to_vec();
+        padded.extend_from_slice(&[0xFF; 16]);
+        let digest = sha256_digest(&padded);
+        padded.extend_from_slice(&digest);
+        assert_eq!(
+            validate_ota_image_integrity(&padded),
+            Err(OtaError::InvalidDigestPlacement)
+        );
+
+        // `hash_appended` set but no digest present at all.
+        let missing = good[..aligned_end].to_vec();
+        assert_eq!(
+            validate_ota_image_integrity(&missing),
+            Err(OtaError::InvalidDigestPlacement)
+        );
+    }
+
+    /// Flash wrapper that flips one bit in the target app partition after
+    /// the write that covers `flip_offset`, simulating a marginal NOR cell.
+    struct BitFlipFlash {
+        inner: MockNorFlash<8192>,
+        flip_offset: u32,
+        flipped: bool,
+    }
+
+    impl OtaFlashStorage for BitFlipFlash {
+        fn read_aligned(&mut self, offset: u32, buf: &mut [u8]) -> Result<(), OtaError> {
+            self.inner.read_aligned(offset, buf)
+        }
+
+        fn erase_range(&mut self, from: u32, to: u32) -> Result<(), OtaError> {
+            self.inner.erase_range(from, to)
+        }
+
+        fn write_aligned(&mut self, offset: u32, data: &[u8]) -> Result<(), OtaError> {
+            self.inner.write_aligned(offset, data)?;
+            let end = offset + data.len() as u32;
+            if !self.flipped && (offset..end).contains(&self.flip_offset) {
+                let idx = (self.flip_offset - OTA_1_OFFSET) as usize;
+                self.inner.ota_1[idx] ^= 0x04;
+                self.flipped = true;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_wp09_readback_bitflip_leaves_otadata_unchanged() {
+        let mut flash = BitFlipFlash {
+            inner: MockNorFlash::new_booted_ota0(),
+            flip_offset: OTA_1_OFFSET + 1500,
+            flipped: false,
+        };
+        let mut mgr = OtaDataManager::load_from_flash(&mut flash).expect("load");
+        let otadata_s0 = flash.inner.otadata_s0;
+        let otadata_s1 = flash.inner.otadata_s1;
+        let mgr_before = mgr;
+
+        let image = make_valid_esp_image_with_len(2000, true);
+        assert!(validate_ota_image_integrity(&image).is_ok());
+        assert_eq!(
+            mgr.write_ota_image_to_flash(&mut flash, &image),
+            Err(OtaError::ReadbackMismatch)
+        );
+        assert!(flash.flipped, "fault must have been injected");
+        assert_eq!(flash.inner.otadata_s0, otadata_s0);
+        assert_eq!(flash.inner.otadata_s1, otadata_s1);
+        assert_eq!(mgr, mgr_before, "in-memory otadata must stay unchanged");
+        assert_eq!(mgr.active_slot(), OtaSlot::Ota0);
+
+        // Without the fault the same image commits.
+        let mut clean: MockNorFlash<8192> = MockNorFlash::new_booted_ota0();
+        let mut mgr2 = OtaDataManager::load_from_flash(&mut clean).expect("load");
+        assert_eq!(
+            mgr2.write_ota_image_to_flash(&mut clean, &image),
+            Ok(OtaSlot::Ota1)
+        );
+        assert_eq!(&clean.ota_1[..image.len()], &image[..]);
+    }
+
+    #[test]
+    fn test_wp09_noop_flash_skips_readback() {
+        assert!(!NoOpFlashStorage.supports_readback());
+        assert!(MockNorFlash::<8192>::new().supports_readback());
+        let mut mgr = OtaDataManager::new_booted_ota0();
+        let image = make_valid_esp_image(true);
+        assert_eq!(
+            mgr.write_ota_image_to_flash(&mut NoOpFlashStorage, &image),
+            Ok(OtaSlot::Ota1)
+        );
     }
 }

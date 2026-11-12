@@ -85,11 +85,11 @@ Zero C/C++ files or `esp-idf` C runtime dependencies remain in the workspace. Si
 | **`GET /`** | `text/html` | Landing page linking to `/status`, `/snapshot`, `:81/stream`, `/panel`, and `/update`. |
 | **`GET /status`** | `application/json` | 7-key JSON health & memory telemetry: `{"uptime_ms":...,"free_heap":...,"free_psram":...,"wifi_rssi":...,"active_partition":"ota_0","framesize":"1280x720","stream_active":false}`. |
 | **`GET /snapshot`** | `image/jpeg` | Latest validated `1280x720` JFIF frame from the active `PingPongFrameBuffer` slot (`Cache-Control: no-store`). |
-| **`GET /control`** | `application/json` | Current `OV2640` camera parameters: `framesize`, `framesize_label`, `quality`, `brightness`, `contrast`, `saturation`, `special_effect`, `hmirror`, `vflip`, `awb`, `agc`, `aec`, `ae_level`. |
-| **`GET /control?var=<k>&val=<v>`** | `application/json` | Live `OV2640` `I2C0` SCCB register update (`quality` `4..=63`, `brightness`/`contrast`/`saturation`/`ae_level` `-2..=2`, `special_effect` `0..=6`, `hmirror`/`vflip`/`awb`/`agc`/`aec` `0..=1`, `framesize` `5..=13` or width `320..=1600`). Returns `400 Bad Request` on invalid input. |
+| **`GET /control`** | `application/json` | Read-only. Current `OV2640` camera parameters: `framesize`, `framesize_label`, `quality`, `brightness`, `contrast`, `saturation`, `special_effect`, `hmirror`, `vflip`, `awb`, `agc`, `aec`, `ae_level` (`Access-Control-Allow-Origin: *`). |
+| **`POST /control?var=<k>&val=<v>`** | `application/json` | Live `OV2640` `I2C0` SCCB register update (`quality` `4..=63`, `brightness`/`contrast`/`saturation`/`ae_level` `-2..=2`, `special_effect` `0..=6`, `hmirror`/`vflip`/`awb`/`agc`/`aec` `0..=1`, `framesize` `5..=13` or width `320..=1600`). `var`/`val` may also be sent as a form-encoded body. A `GET` with `var=` is accepted only with an `X-Requested-With` header and otherwise returns `405 Method Not Allowed` (`Allow: POST`). A browser `Origin` that does not match `Host` returns `403 Forbidden`. Returns `400 Bad Request` on invalid input. Responses to setting changes carry no `Access-Control-Allow-Origin` header. |
 | **`GET /panel`** | `text/html` | Self-contained dark-mode interactive Camera Control & Live Preview dashboard. |
 | **`GET /update`** | `text/html` | Interactive Wireless OTA firmware upload UI. |
-| **`POST /update`** | `text/plain` | Authenticated wireless OTA firmware upload (`X-OTA-Token: <token>` header required; returns `401 Unauthorized` without wildcard CORS on mismatch). Stops `I2S0` DMA, validates the ESP-IDF `0xE9` image header, writes to the passive OTA slot (`ota_0` or `ota_1`), updates `otadata` (`0x17000`) with ESP-IDF CRC32, and triggers `software_reset()`. |
+| **`POST /update`** | `text/plain` | Authenticated wireless OTA firmware upload (`X-OTA-Token: <token>` header required; returns `401 Unauthorized` without wildcard CORS on mismatch, and `403 Forbidden` for every upload while the firmware was built with the public default token). Stops `I2S0` DMA, validates the ESP-IDF `0xE9` image header (ESP32 `chip_id` 0, entry point in IRAM or IROM, SHA-256 digest exactly at the end when appended), writes to the passive OTA slot (`ota_0` or `ota_1`), reads the image back and re-hashes it, updates `otadata` (`0x17000`) with ESP-IDF CRC32, and triggers `software_reset()`. |
 
 ### Port 81 — Dedicated MJPEG Stream
 
@@ -118,15 +118,17 @@ cargo +nightly miri test -p esp32-cam-ll -p esp32-cam-conversions -p esp32-cam-t
 
 ### 2. Configuring Local Wi-Fi Credentials (`.env.local`)
 
-Secrets are never hardcoded or tracked in Git. Store your compile-time `WIFI_PASS` (and optional `WIFI_SSID` / `WIFI_OTA_TOKEN`) in an untracked `.env.local` file with `0600` permissions:
+Secrets are never hardcoded or tracked in Git. Store your compile-time `WIFI_PASS` and `WIFI_OTA_TOKEN` (and optional `WIFI_SSID`) in an untracked `.env.local` file with `0600` permissions:
 
 ```bash
 install -m 600 /dev/null /home/console-admin/Github/esp32-camera/.env.local
 # Edit /home/console-admin/Github/esp32-camera/.env.local and add:
 # WIFI_SSID=iot
 # WIFI_PASS=<your-wpa2-passphrase>
-# WIFI_OTA_TOKEN=klipper-cam-ota-2026
+# WIFI_OTA_TOKEN=<your-private-ota-token>
 ```
+
+An Xtensa release build fails when `WIFI_PASS` or `WIFI_OTA_TOKEN` is unset or empty, or when the token is the public default. A firmware built with the default token refuses every OTA upload with `403 Forbidden`. An empty `WIFI_PASS` (an Open network) is accepted only with `--features allow-open-wifi`; otherwise the firmware refuses to start Wi-Fi.
 
 ### 3. Building the Bare-Metal Xtensa Firmware (`+esp`)
 
@@ -197,7 +199,7 @@ flip_horizontal: False
 flip_vertical: False
 ```
 
-Live image orientation (`hmirror`, `vflip`), JPEG compression quality (`quality`), exposure (`ae_level`), and resolution (`framesize`) can be tuned on the fly from a browser at `http://172.22.1.52/panel` or via `curl "http://172.22.1.52/control?var=hmirror&val=1"`.
+Live image orientation (`hmirror`, `vflip`), JPEG compression quality (`quality`), exposure (`ae_level`), and resolution (`framesize`) can be tuned on the fly from a browser at `http://172.22.1.52/panel` or via `curl -X POST "http://<camera-ip>/control?var=hmirror&val=1"`.
 
 ---
 

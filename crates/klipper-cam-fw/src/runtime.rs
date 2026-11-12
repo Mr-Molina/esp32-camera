@@ -315,9 +315,7 @@ mod tests {
     use super::*;
     use core::fmt::Write;
 
-    use crate::config::{
-        DEFAULT_FB_COUNT, DEFAULT_JPEG_QUALITY, DEFAULT_OTA_TOKEN, DEFAULT_XCLK_FREQ_HZ,
-    };
+    use crate::config::{DEFAULT_FB_COUNT, DEFAULT_JPEG_QUALITY, DEFAULT_XCLK_FREQ_HZ};
     use crate::http::{
         format_ota_minimal_root, HttpResponseView, ServerPort, SliceWriter, MJPEG_CONTENT_TYPE,
         SYNTHETIC_HD_JFIF_FRAME,
@@ -514,7 +512,11 @@ mod tests {
         // 5. Wire captured JPEG into KlipperCamServer & FirmwareRuntime (Port 80 +
         // Port 81).
         let fw_cam = CameraDriver::new(&captured_jpeg[..captured_len], FrameSize::Hd);
-        let mut runtime = FirmwareRuntime::new(KlipperCamConfig::WROVER_KIT_HD, fw_cam);
+        // WP-09: the public default OTA token is refused with 403, so the
+        // end-to-end OTA step runs with a private token.
+        let mut fw_cfg = KlipperCamConfig::WROVER_KIT_HD;
+        fw_cfg.ota_token = "runtime-e2e-ota-token";
+        let mut runtime = FirmwareRuntime::new(fw_cfg, fw_cam);
         runtime.on_wifi_sta_start();
         runtime
             .on_wifi_got_ip(Ipv4Addr::new(172, 22, 1, 52))
@@ -593,7 +595,7 @@ mod tests {
             let mut w = SliceWriter::new(&mut ota_req);
             let _ =
                 w.write_str_checked("POST /update HTTP/1.1\r\nHost: 172.22.1.52\r\nX-OTA-Token: ");
-            let _ = w.write_str_checked(DEFAULT_OTA_TOKEN);
+            let _ = w.write_str_checked(runtime.server.config.ota_token);
             let _ = write!(w, "\r\nContent-Length: {}\r\n\r\n", ota_payload.len());
             let _ = w.write_bytes(&ota_payload);
             w.written_len()

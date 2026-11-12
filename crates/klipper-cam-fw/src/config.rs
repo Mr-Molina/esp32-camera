@@ -12,6 +12,10 @@ use esp32_cam_types::{CameraFbLocation, CameraGrabMode, FrameSize, PixelFormat};
 
 /// Default OTA authentication token when `WIFI_OTA_TOKEN` is unset at
 /// compile time.
+///
+/// This value is public. A firmware still running with it refuses every
+/// `POST /update` with `403 Forbidden` (`FW-NET-04`), and Xtensa release
+/// builds without a real token fail in `build.rs` (`BUILD-07`).
 pub const DEFAULT_OTA_TOKEN: &str = "klipper-cam-ota-2026";
 
 /// Default Wi-Fi SSID when `WIFI_SSID` is not set at compile time.
@@ -123,7 +127,82 @@ pub const fn is_using_default_ota_token() -> bool {
     true
 }
 
+/// `true` when the crate is built with the `allow-open-wifi` feature, the
+/// only way an empty `WIFI_PASS` may join an Open (unencrypted) network
+/// (`FW-NET-03`).
+pub const ALLOW_OPEN_WIFI: bool = cfg!(feature = "allow-open-wifi");
+
+/// Returns `true` if `len` is a usable WPA2-PSK passphrase length: `0`
+/// (Open network, subject to [`ALLOW_OPEN_WIFI`]) or `8..=63` bytes.
+#[inline]
+pub const fn is_valid_wifi_passphrase_len(len: usize) -> bool {
+    len == 0 || (len >= 8 && len <= 63)
+}
+
+/// Wi-Fi station authentication selected at boot by [`wifi_auth_mode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WifiAuthMode {
+    /// Unencrypted network; only reachable with the `allow-open-wifi` feature.
+    Open,
+    /// WPA/WPA2-Personal with the configured passphrase.
+    WpaWpa2Personal,
+}
+
+/// Fatal boot-time configuration errors (`FW-NET-03`). The firmware refuses
+/// to start Wi-Fi rather than fall back to an Open network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConfigError {
+    /// [`KlipperCamConfig::is_valid`] returned `false`.
+    InvalidConfig,
+    /// Empty `WIFI_PASS` without the `allow-open-wifi` feature.
+    OpenWifiNotAllowed,
+    /// `WIFI_PASS` length (bytes) is outside `8..=63`.
+    InvalidPassphraseLength(usize),
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidConfig => f.write_str(
+                "invalid configuration (SSID 1..=32 bytes, WIFI_PASS empty or 8..=63 bytes, \
+                 non-empty OTA token, distinct non-zero ports)",
+            ),
+            Self::OpenWifiNotAllowed => f.write_str(
+                "WIFI_PASS is empty; build with the `allow-open-wifi` feature to join an Open network",
+            ),
+            Self::InvalidPassphraseLength(len) => {
+                write!(f, "WIFI_PASS is {} bytes; WPA2-PSK needs 8..=63", len)
+            }
+        }
+    }
+}
+
+/// Selects the station authentication for `pass`, failing closed
+/// (`FW-NET-03`): an empty passphrase is Open only when `allow_open` is set,
+/// and a passphrase outside `8..=63` bytes is an error, never Open.
+#[inline]
+pub const fn wifi_auth_mode(pass: &str, allow_open: bool) -> Result<WifiAuthMode, ConfigError> {
+    let len = pass.len();
+    if len == 0 {
+        if allow_open {
+            Ok(WifiAuthMode::Open)
+        } else {
+            Err(ConfigError::OpenWifiNotAllowed)
+        }
+    } else if is_valid_wifi_passphrase_len(len) {
+        Ok(WifiAuthMode::WpaWpa2Personal)
+    } else {
+        Err(ConfigError::InvalidPassphraseLength(len))
+    }
+}
+
 const _: () = assert!(HTTP_PORT != STREAM_PORT);
+// FW-NET-03: a compile-time `WIFI_PASS` must be empty or a valid WPA2-PSK
+// passphrase (8..=63 bytes); a 70-byte passphrase fails the build here.
+const _: () = assert!(
+    is_valid_wifi_passphrase_len(active_wifi_pass().len()),
+    "WIFI_PASS must be empty or 8..=63 bytes"
+);
 const _: () = assert!(JPEG_QUALITY >= 1 && JPEG_QUALITY <= 63);
 const _: () = assert!(!OTA_TOKEN.is_empty());
 
@@ -672,6 +751,16 @@ impl KlipperCamConfig {
         true
     }
 
+    /// Boot-time configuration gate (`FW-NET-03`): runs [`Self::is_valid`]
+    /// and then selects the Wi-Fi authentication via [`wifi_auth_mode`].
+    /// Any error must stop Wi-Fi bring-up.
+    pub const fn boot_wifi_auth(&self, allow_open: bool) -> Result<WifiAuthMode, ConfigError> {
+        if !self.is_valid() {
+            return Err(ConfigError::InvalidConfig);
+        }
+        wifi_auth_mode(self.network.wifi_password, allow_open)
+    }
+
     /// Resolves `KlipperCamConfig` from compile-time build environment variables.
     pub const fn from_build_env() -> Self {
         let mut cfg = Self::WROVER_KIT_HD;
@@ -894,5 +983,110 @@ mod tests {
         assert_ne!(HTTP_PORT, STREAM_PORT);
         assert!((1..=63).contains(&JPEG_QUALITY));
         assert!(!OTA_TOKEN.is_empty());
+    }
+
+    // ---- WP-09 / FW-NET-03 + FW-NET-04: fail-closed boot configuration ----
+
+    #[test]
+    fn test_wp09_wifi_auth_mode_fails_closed() {
+        // Empty passphrase is an Open network: only with the explicit opt-in.
+        assert_eq!(
+            wifi_auth_mode("", false),
+            Err(ConfigError::OpenWifiNotAllowed)
+        );
+        assert_eq!(wifi_auth_mode("", true), Ok(WifiAuthMode::Open));
+
+        // WPA2-PSK passphrases must be 8..=63 bytes; anything else is fatal,
+        // never a silent fallback to Open.
+        assert_eq!(
+            wifi_auth_mode("short", false),
+            Err(ConfigError::InvalidPassphraseLength(5))
+        );
+        assert_eq!(
+            wifi_auth_mode("short", true),
+            Err(ConfigError::InvalidPassphraseLength(5))
+        );
+        let seventy = "x".repeat(70);
+        assert_eq!(
+            wifi_auth_mode(&seventy, true),
+            Err(ConfigError::InvalidPassphraseLength(70))
+        );
+        assert_eq!(
+            wifi_auth_mode("12345678", false),
+            Ok(WifiAuthMode::WpaWpa2Personal)
+        );
+        let max = "y".repeat(63);
+        assert_eq!(
+            wifi_auth_mode(&max, false),
+            Ok(WifiAuthMode::WpaWpa2Personal)
+        );
+        assert!(is_valid_wifi_passphrase_len(0));
+        assert!(!is_valid_wifi_passphrase_len(7));
+        assert!(is_valid_wifi_passphrase_len(8));
+        assert!(is_valid_wifi_passphrase_len(63));
+        assert!(!is_valid_wifi_passphrase_len(64));
+    }
+
+    #[test]
+    fn test_wp09_boot_wifi_auth_checks_is_valid_first() {
+        let mut cfg = KlipperCamConfig::WROVER_KIT_HD;
+        cfg.network.wifi_password = "correct-horse";
+        assert_eq!(cfg.boot_wifi_auth(false), Ok(WifiAuthMode::WpaWpa2Personal));
+
+        let mut bad_ssid = cfg;
+        bad_ssid.network.wifi_ssid = "";
+        assert_eq!(
+            bad_ssid.boot_wifi_auth(true),
+            Err(ConfigError::InvalidConfig)
+        );
+
+        let mut bad_ports = cfg;
+        bad_ports.stream_port = bad_ports.control_port;
+        assert_eq!(
+            bad_ports.boot_wifi_auth(true),
+            Err(ConfigError::InvalidConfig)
+        );
+
+        let mut open = cfg;
+        open.network.wifi_password = "";
+        assert_eq!(
+            open.boot_wifi_auth(false),
+            Err(ConfigError::OpenWifiNotAllowed)
+        );
+        assert_eq!(open.boot_wifi_auth(true), Ok(WifiAuthMode::Open));
+
+        let mut bad_pass = cfg;
+        bad_pass.network.wifi_password = "1234567";
+        assert_eq!(
+            bad_pass.boot_wifi_auth(true),
+            Err(ConfigError::InvalidConfig)
+        );
+    }
+
+    #[test]
+    fn test_wp09_config_error_display_is_actionable() {
+        extern crate alloc;
+        use alloc::string::ToString;
+        assert!(ConfigError::OpenWifiNotAllowed
+            .to_string()
+            .contains("allow-open-wifi"));
+        assert!(ConfigError::InvalidPassphraseLength(70)
+            .to_string()
+            .contains("70"));
+        assert!(!ConfigError::InvalidConfig.to_string().is_empty());
+    }
+
+    #[test]
+    fn test_wp09_allow_open_wifi_tracks_feature() {
+        assert_eq!(ALLOW_OPEN_WIFI, cfg!(feature = "allow-open-wifi"));
+    }
+
+    #[test]
+    fn test_wp09_default_token_detection() {
+        let mut cfg = KlipperCamConfig::WROVER_KIT_HD;
+        cfg.ota_token = DEFAULT_OTA_TOKEN;
+        assert!(cfg.is_default_ota_token());
+        cfg.ota_token = "a-real-secret";
+        assert!(!cfg.is_default_ota_token());
     }
 }

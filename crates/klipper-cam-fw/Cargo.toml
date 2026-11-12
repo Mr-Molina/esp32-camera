@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Bare-metal no_std Klipper camera HTTP/MJPEG streaming and constant-time OTA firmware"
+build = "build.rs"
+
+[features]
+# Allow an empty WIFI_PASS to join an Open (unencrypted) network. Without this
+# feature the firmware refuses to start Wi-Fi on an empty passphrase, and an
+# Xtensa release build fails in build.rs (FW-NET-03, BUILD-07).
+allow-open-wifi = []
 
 [dependencies]
 esp32-cam-types.workspace = true

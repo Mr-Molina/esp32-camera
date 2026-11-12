@@ -18,11 +18,13 @@ use alloc::vec::Vec;
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
+use klipper_cam_fw::CameraDriver;
 use klipper_cam_fw::Core1ParkControl;
 use klipper_cam_fw::EspImageHeader;
 use klipper_cam_fw::FirmwareRuntime;
 use klipper_cam_fw::GuardedFlashStorage;
 use klipper_cam_fw::Ipv4Addr;
+use klipper_cam_fw::KlipperCamConfig;
 use klipper_cam_fw::KlipperCamServer;
 use klipper_cam_fw::MockNorFlash;
 use klipper_cam_fw::OtaDataManager;
@@ -32,7 +34,17 @@ use klipper_cam_fw::OtaFlashStorage;
 use klipper_cam_fw::OtaImgState;
 use klipper_cam_fw::OtaSlot;
 use klipper_cam_fw::ServerPort;
-use klipper_cam_fw::DEFAULT_OTA_TOKEN;
+
+/// Private OTA token for these tests; the public default token is refused
+/// with `403` (WP-09, `FW-NET-04`).
+const TEST_OTA_TOKEN: &str = "wp05-test-ota-token";
+
+/// Server with a private OTA token.
+fn test_server() -> KlipperCamServer<'static> {
+    let mut cfg = KlipperCamConfig::WROVER_KIT_HD;
+    cfg.ota_token = TEST_OTA_TOKEN;
+    KlipperCamServer::new(cfg, CameraDriver::new_hd_default())
+}
 
 /// Mock multicore parking controller tracking pause invocations and state.
 struct MockPark {
@@ -148,13 +160,10 @@ fn paused_flag_set_during_every_erase_and_write() {
     };
     let mut guarded = GuardedFlashStorage::new(asserting_flash, &park);
 
-    let mut server = KlipperCamServer::new_default();
+    let mut server = test_server();
     let valid_image = EspImageHeader::minimal_valid_image_64();
-    let req_bytes = make_update_request(
-        Some(DEFAULT_OTA_TOKEN),
-        &valid_image,
-        Some(valid_image.len()),
-    );
+    let req_bytes =
+        make_update_request(Some(TEST_OTA_TOKEN), &valid_image, Some(valid_image.len()));
 
     let mut out_buf = [0u8; 1024];
     let resp = server
@@ -291,15 +300,12 @@ fn seq_7_8_commits_to_seq_9_in_sector_0_and_inconsistent_otadata_returns_500() {
     assert_eq!(mgr.active_slot(), OtaSlot::Ota1);
     assert_eq!(mgr.next_update_slot(), OtaSlot::Ota0);
 
-    let mut server = KlipperCamServer::new_default();
+    let mut server = test_server();
     server.ota_manager = mgr;
 
     let valid_image = EspImageHeader::minimal_valid_image_64();
-    let req_bytes = make_update_request(
-        Some(DEFAULT_OTA_TOKEN),
-        &valid_image,
-        Some(valid_image.len()),
-    );
+    let req_bytes =
+        make_update_request(Some(TEST_OTA_TOKEN), &valid_image, Some(valid_image.len()));
 
     let mut out_buf = [0u8; 1024];
     let resp = server
@@ -330,7 +336,7 @@ fn seq_7_8_commits_to_seq_9_in_sector_0_and_inconsistent_otadata_returns_500() {
     flash_corrupt.otadata_s1[..32].copy_from_slice(&s1_init);
     flash_corrupt.otadata_s0[0] ^= 0x55; // Corrupt CRC in sector 0
 
-    let mut server_corrupt = KlipperCamServer::new_default();
+    let mut server_corrupt = test_server();
     server_corrupt.ota_manager = mgr;
 
     let erases_before = flash_corrupt.erase_count;
@@ -359,7 +365,7 @@ fn bare_or_unauthed_or_incomplete_post_does_not_pause_core1() {
     let park = MockPark::new();
     let flash = MockNorFlash::<8192>::new_booted_ota0();
     let mut guarded = GuardedFlashStorage::new(flash, &park);
-    let mut server = KlipperCamServer::new_default();
+    let mut server = test_server();
     let valid_image = EspImageHeader::minimal_valid_image_64();
 
     // 1. Bare POST /update with no headers or token
@@ -404,7 +410,7 @@ fn bare_or_unauthed_or_incomplete_post_does_not_pause_core1() {
     );
 
     // 3. Truncated body (Content-Length declares 4096 bytes but only 64 provided)
-    let truncated_req = make_update_request(Some(DEFAULT_OTA_TOKEN), &valid_image, Some(4096));
+    let truncated_req = make_update_request(Some(TEST_OTA_TOKEN), &valid_image, Some(4096));
     let mut out_buf3 = [0u8; 1024];
     let resp3 = server
         .handle_raw_request_with_flash(
