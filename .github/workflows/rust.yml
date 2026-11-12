@@ -58,7 +58,6 @@ jobs:
     name: Xtensa ESP32 Build & Size Gate
     runs-on: ubuntu-latest
     env:
-      CARGO_TARGET_XTENSA_ESP32_NONE_ELF_LINKER: xtensa-esp32-elf-gcc
       RUSTUP_TOOLCHAIN: esp
     steps:
       - name: Checkout repository

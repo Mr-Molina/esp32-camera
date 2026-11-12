@@ -32,3 +32,25 @@ esp32-cam-ll = { path = "crates/esp32-cam-ll" }
 esp32-cam-hal = { path = "crates/esp32-cam-hal" }
 embedded-hal = { version = "1.0.0", default-features = false }
 
+
+# BUILD-04: cross-crate inlining of the ll, conversions and SPSC hot paths into
+# the firmware. `opt-level = 3` is pending a hardware A/B against "s" (WP-02).
+# `debug = 2` only adds DWARF to the ELF for esp-backtrace symbolization; it is
+# not flashed.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = 2
+overflow-checks = false
+debug-assertions = false
+incremental = false
+
+[profile.dev]
+opt-level = "s"
+
+# BUILD-14: opt-in size profile, built with `cargo +esp fw-tiny`
+# (see `.cargo/config.toml`), which adds panic=immediate-abort.
+[profile.release-tiny]
+inherits = "release"
+opt-level = "s"

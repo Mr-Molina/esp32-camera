@@ -1175,7 +1175,6 @@ dependencies = [
 name = "klipper-cam-fw"
 version = "0.1.0"
 dependencies = [
- "embassy-futures",
  "esp-alloc",
  "esp-backtrace",
  "esp-bootloader-esp-idf",

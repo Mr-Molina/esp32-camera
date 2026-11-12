@@ -1,6 +1,25 @@
+# Xtensa firmware build settings. No absolute paths: the linker is
+# `xtensa-esp32-elf-gcc` from PATH (the target spec's default), which
+# `espup`'s `export-esp.sh` provides. Do not set `[build] target` here; host
+# tests (`cargo test --workspace`) must keep building for the host.
 [target.xtensa-esp32-none-elf]
-linker = "/home/console-admin/.rustup/toolchains/esp/xtensa-esp-elf/esp-16.2.0_20260914/xtensa-esp-elf/bin/xtensa-esp32-elf-gcc"
+runner = "espflash flash --monitor --chip esp32 --partition-table partitions_rust_ota.csv --target-app-partition ota_0"
 rustflags = [
     "-C", "link-arg=-nostartfiles",
     "-C", "link-arg=-Tlinkall.x",
+]
+
+[alias]
+# `cargo +esp fw` builds the release firmware; `cargo +esp fw-check` runs the
+# Xtensa clippy gate.
+fw = "build --target xtensa-esp32-none-elf -Zbuild-std=core,alloc -p klipper-cam-fw --release"
+fw-check = "clippy --target xtensa-esp32-none-elf -Zbuild-std=core,alloc --workspace --release -- -D warnings"
+# Opt-in size build (BUILD-14): `opt-level = "s"` and panic=immediate-abort.
+# Saves roughly 30 KB more than `fw`, but a panic prints nothing: the device
+# only resets through the watchdog. Rustflags arrays from `--config` are
+# appended to the ones above.
+fw-tiny = [
+    "build", "--target", "xtensa-esp32-none-elf", "-Zbuild-std=core,alloc",
+    "-p", "klipper-cam-fw", "--profile", "release-tiny",
+    "--config", "target.xtensa-esp32-none-elf.rustflags=[\"-Zunstable-options\", \"-Cpanic=immediate-abort\"]",
 ]

@@ -412,7 +412,7 @@ Status values: `TODO` · `IN-PROGRESS` · `READY-FOR-HIL` · `DONE` · `BLOCKED 
   - On a fresh clone with `export-esp` sourced, `cargo +esp fw` links.
   - Image and `.rwtext` sizes are reported before and after; expect about −25 KB image and −5.7 KB IRAM.
   - **[HIL]** A/B FPS for `opt-level` 3 vs `"s"`. Keep the faster one and record both.
-- **Status:** TODO
+- **Status:** IN-PROGRESS (2026-11-12; steps 1-5 done, host gates green, 314 tests. Not verified: `cargo +esp fw` linking, image/`.rwtext` sizes and the `fw-tiny` alias (no esp toolchain in that session). Step 4 keeps `iface-max-addr-count-2`, because the interface holds the 172.22.1.52 fallback and the DHCP lease at once (main.rs `update_ip_addrs`). Step 6 (BUILD-13, matched esp-hal/esp-radio pair) not attempted: it needs an Xtensa build. CI's `CARGO_TARGET_XTENSA_ESP32_NONE_ELF_LINKER` override was dropped as no longer needed. Open [HIL]: A/B FPS for `opt-level` 3 vs "s".)
 
 ### Wave 2: structure
 
