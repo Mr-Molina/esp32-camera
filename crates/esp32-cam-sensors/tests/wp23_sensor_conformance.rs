@@ -2,6 +2,7 @@
 //! for `WP-23` (non-Ov2640 sensor driver correctness).
 
 use esp32_cam_sccb::MockSccbBus;
+use esp32_cam_sensors::hm0360::Hm0360;
 use esp32_cam_sensors::hm1055::{Hm1055, CKCFG2};
 use esp32_cam_sensors::nt99141::Nt99141;
 use esp32_cam_sensors::ov3640::Ov3640;
@@ -165,6 +166,78 @@ fn test_sens04_ov3640_window_format_setters_refuse() {
         0,
         "a refusing setter must not touch the bus"
     );
+}
+
+// ---------------------------------------------------------------------------
+// SENS-10: HM0360 240x240 and unsupported framesizes
+// ---------------------------------------------------------------------------
+
+/// A distinctive register from `SENSOR_FRAMESIZE_240X240`.
+const HM0360_240_WINDOW_REG: u16 = 0x05E0;
+
+/// `SENSOR_FRAMESIZE_240X240` was defined but never written: a catch-all arm
+/// swallowed every size below VGA that had no table of its own and returned
+/// `Ok`, leaving the sensor at whatever the default table had set.
+#[test]
+fn test_sens10_hm0360_240x240_writes_its_table() {
+    let mut bus: MockSccbBus<1024> = MockSccbBus::new();
+    let mut sensor = Hm0360::new();
+
+    assert_eq!(
+        sensor.set_framesize(&mut bus, FrameSize::Size240x240),
+        Ok(())
+    );
+    assert_eq!(
+        bus.reg16(CameraSccbAddr::HM0360, HM0360_240_WINDOW_REG),
+        0xBE,
+        "the 240x240 window table must reach the bus"
+    );
+    assert_eq!(sensor.status().framesize, FrameSize::Size240x240);
+}
+
+#[test]
+fn test_sens10_hm0360_rejects_framesizes_with_no_table() {
+    for framesize in [
+        FrameSize::Size96x96,
+        FrameSize::Size128x128,
+        FrameSize::Qcif,
+        FrameSize::Hqvga,
+        FrameSize::Size320x320,
+        FrameSize::Cif,
+        FrameSize::Hvga,
+        FrameSize::Svga,
+        FrameSize::Uxga,
+    ] {
+        let mut bus: MockSccbBus<1024> = MockSccbBus::new();
+        let mut sensor = Hm0360::new();
+        let before = sensor.status().framesize;
+
+        assert_eq!(
+            sensor.set_framesize(&mut bus, framesize),
+            Err(CameraError::FailedToSetFrameSize),
+            "{framesize:?} has no register table and must be rejected"
+        );
+        assert_eq!(
+            sensor.status().framesize,
+            before,
+            "a rejected framesize must not be recorded in status"
+        );
+    }
+}
+
+#[test]
+fn test_sens10_hm0360_supported_framesizes_still_apply() {
+    for framesize in [
+        FrameSize::Qqvga,
+        FrameSize::Size240x240,
+        FrameSize::Qvga,
+        FrameSize::Vga,
+    ] {
+        let mut bus: MockSccbBus<1024> = MockSccbBus::new();
+        let mut sensor = Hm0360::new();
+        assert_eq!(sensor.set_framesize(&mut bus, framesize), Ok(()));
+        assert_eq!(sensor.status().framesize, framesize);
+    }
 }
 
 // ---------------------------------------------------------------------------

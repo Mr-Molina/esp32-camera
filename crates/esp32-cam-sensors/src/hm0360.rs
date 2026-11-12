@@ -815,10 +815,11 @@ impl<B: SccbBus> CameraSensor<B> for Hm0360 {
     }
 
     fn set_framesize(&mut self, bus: &mut B, framesize: FrameSize) -> Result<(), CameraError> {
-        if framesize > FrameSize::Vga {
-            return Err(CameraError::FailedToSetFrameSize);
-        }
-        self.status.framesize = framesize;
+        // SENS-10: only these four sizes have register tables. A catch-all
+        // arm used to accept every other size below VGA, return `Ok` and
+        // leave the sensor wherever `SENSOR_DEFAULT_REGS` had put it.
+        //
+        // SENS-24: `status` is updated only after the writes succeed.
         write_reg_list(bus, self.slv_addr, SENSOR_DEFAULT_REGS)?;
         match framesize {
             FrameSize::Qqvga => {
@@ -829,15 +830,24 @@ impl<B: SccbBus> CameraSensor<B> for Hm0360 {
                 write_reg_list(bus, self.slv_addr, SENSOR_FRAMESIZE_QVGA)?;
                 set_reg_bits(bus, self.slv_addr, PMU_CFG_3, 0, 0x01, 1)?;
             }
+            FrameSize::Size240x240 => {
+                write_reg_list(bus, self.slv_addr, SENSOR_FRAMESIZE_240X240)?;
+                // Unverified: QQVGA and QVGA are sub-sampled readouts and set
+                // this bit, VGA is full readout and clears it. 240x240 is a
+                // window crop (it programs the 0x05Ex crop block, not the
+                // 0x355x sub-sample block), so it is grouped with VGA here.
+                // Confirm against an HM0360 on hardware.
+                set_reg_bits(bus, self.slv_addr, PMU_CFG_3, 0, 0x01, 0)?;
+            }
             FrameSize::Vga => {
                 set_reg_bits(bus, self.slv_addr, PMU_CFG_3, 0, 0x01, 0)?;
             }
-            _ => {
-                set_reg_bits(bus, self.slv_addr, PMU_CFG_3, 0, 0x01, 0)?;
-            }
+            _ => return Err(CameraError::FailedToSetFrameSize),
         }
         self.set_pll(bus, 0, 0, 0, 0, 0, 0, 0, 0)?;
-        bus.write_reg16(self.slv_addr, COMMAND_UPDATE, 0x01)
+        bus.write_reg16(self.slv_addr, COMMAND_UPDATE, 0x01)?;
+        self.status.framesize = framesize;
+        Ok(())
     }
 
     fn set_brightness(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
