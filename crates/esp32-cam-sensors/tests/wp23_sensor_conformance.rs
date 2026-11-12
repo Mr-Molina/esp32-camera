@@ -7,7 +7,7 @@ use esp32_cam_sensors::hm1055::{Hm1055, CKCFG2};
 use esp32_cam_sensors::nt99141::Nt99141;
 use esp32_cam_sensors::ov3640::Ov3640;
 use esp32_cam_sensors::CameraSensor;
-use esp32_cam_types::{CameraError, CameraSccbAddr, FrameSize, PixelFormat};
+use esp32_cam_types::{CameraError, CameraSccbAddr, FrameSize, GainCeiling, PixelFormat};
 
 /// NT99141 auto-exposure level register, first of the five written per level.
 const NT99141_AE_REG: u16 = 0x32B8;
@@ -238,6 +238,89 @@ fn test_sens10_hm0360_supported_framesizes_still_apply() {
         assert_eq!(sensor.set_framesize(&mut bus, framesize), Ok(()));
         assert_eq!(sensor.status().framesize, framesize);
     }
+}
+
+// ---------------------------------------------------------------------------
+// SENS-13: setters that returned Ok without touching hardware
+// ---------------------------------------------------------------------------
+
+/// The trait's contract is that a control the sensor cannot do returns
+/// [`CameraError::NotSupported`]. A pile of overrides instead recorded the
+/// requested value in `status` and returned `Ok`, so callers — and
+/// `/control`, which reads the status back — were told a setting had been
+/// applied when nothing had reached the sensor.
+#[test]
+fn test_sens13_nt99141_unsupported_controls_say_so() {
+    let mut bus: MockSccbBus<256> = MockSccbBus::new();
+    let mut sensor = Nt99141::new();
+
+    assert_eq!(
+        sensor.set_denoise(&mut bus, 4),
+        Err(CameraError::NotSupported)
+    );
+    assert_eq!(
+        sensor.set_gainceiling(&mut bus, GainCeiling::X16),
+        Err(CameraError::NotSupported)
+    );
+    assert_eq!(
+        sensor.set_whitebal(&mut bus, true),
+        Err(CameraError::NotSupported)
+    );
+    assert_eq!(
+        sensor.set_aec2(&mut bus, true),
+        Err(CameraError::NotSupported)
+    );
+    assert_eq!(
+        sensor.set_dcw(&mut bus, true),
+        Err(CameraError::NotSupported)
+    );
+    assert_eq!(
+        sensor.set_bpc(&mut bus, true),
+        Err(CameraError::NotSupported)
+    );
+    assert_eq!(
+        sensor.set_wpc(&mut bus, true),
+        Err(CameraError::NotSupported)
+    );
+    assert_eq!(
+        sensor.set_raw_gma(&mut bus, true),
+        Err(CameraError::NotSupported)
+    );
+    assert_eq!(
+        sensor.set_lenc(&mut bus, true),
+        Err(CameraError::NotSupported)
+    );
+    assert_eq!(
+        sensor.set_res_raw(&mut bus, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false, false),
+        Err(CameraError::NotSupported)
+    );
+    assert_eq!(
+        sensor.set_pll(&mut bus, 0, 0, 0, 0, 0, 0, 0, 0),
+        Err(CameraError::NotSupported)
+    );
+
+    assert_eq!(
+        bus.transaction_count(),
+        0,
+        "an unsupported control must not touch the bus"
+    );
+}
+
+#[test]
+fn test_sens13_hm1055_unsupported_controls_say_so() {
+    let mut bus: MockSccbBus<256> = MockSccbBus::new();
+    let mut sensor = Hm1055::new();
+
+    assert_eq!(
+        sensor.set_quality(&mut bus, 10),
+        Err(CameraError::NotSupported)
+    );
+    assert_eq!(
+        sensor.set_res_raw(&mut bus, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false, false),
+        Err(CameraError::NotSupported)
+    );
+
+    assert_eq!(bus.transaction_count(), 0);
 }
 
 // ---------------------------------------------------------------------------

@@ -1137,11 +1137,6 @@ impl<B: SccbBus> CameraSensor<B> for Hm1055 {
         Ok(())
     }
 
-    fn set_quality(&mut self, _bus: &mut B, quality: i32) -> Result<(), CameraError> {
-        self.status.quality = (quality & 0xFF) as u8;
-        Ok(())
-    }
-
     fn set_colorbar(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         write_reg_bits(bus, self.slv_addr, TESTIMG, 0x01, enable)?;
         bus.write_reg16(self.slv_addr, CMU, 0x01)?;
@@ -1272,25 +1267,6 @@ impl<B: SccbBus> CameraSensor<B> for Hm1055 {
         } else {
             bus.write_reg16(self.slv_addr, reg16, (next & 0xFF) as u8)
         }
-    }
-
-    fn set_res_raw(
-        &mut self,
-        _bus: &mut B,
-        _start_x: i32,
-        _start_y: i32,
-        _end_x: i32,
-        _end_y: i32,
-        _offset_x: i32,
-        _offset_y: i32,
-        _total_x: i32,
-        _total_y: i32,
-        _output_x: i32,
-        _output_y: i32,
-        _scale: bool,
-        _binning: bool,
-    ) -> Result<(), CameraError> {
-        Ok(())
     }
 
     fn set_pll(

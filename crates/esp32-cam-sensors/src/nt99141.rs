@@ -6,7 +6,7 @@
 
 use crate::{
     CameraError, CameraModel, CameraPid, CameraSccbAddr, CameraSensor, CameraStatus, FrameSize,
-    GainCeiling, PixelFormat, RatioSettings, Reg16, SccbBus, SensorId,
+    PixelFormat, RatioSettings, Reg16, SccbBus, SensorId,
 };
 
 pub const SYSTEM_CTROL0: u16 = 0x3021;
@@ -605,18 +605,6 @@ fn check_reg_mask<B: SccbBus>(
     Ok((val & mask) == mask)
 }
 
-#[inline]
-fn write_addr_reg<B: SccbBus>(
-    bus: &mut B,
-    slv_addr: u8,
-    reg: u16,
-    x_value: u16,
-    y_value: u16,
-) -> Result<(), CameraError> {
-    bus.write_reg16_val16(slv_addr, reg, x_value)?;
-    bus.write_reg16_val16(slv_addr, reg.wrapping_add(2), y_value)
-}
-
 /// Detects an NT99141 sensor at `slv_addr` (`0x2A`).
 pub fn detect<B: SccbBus>(bus: &mut B, slv_addr: u8) -> Result<SensorId, CameraError> {
     Nt99141::detect(bus, slv_addr)
@@ -933,18 +921,6 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
         Ok(())
     }
 
-    fn set_denoise(&mut self, _bus: &mut B, _level: i32) -> Result<(), CameraError> {
-        Ok(())
-    }
-
-    fn set_gainceiling(
-        &mut self,
-        _bus: &mut B,
-        _gainceiling: GainCeiling,
-    ) -> Result<(), CameraError> {
-        Ok(())
-    }
-
     fn set_quality(&mut self, bus: &mut B, quality: i32) -> Result<(), CameraError> {
         let qs = (quality as u8) & 0x3F;
         bus.write_reg16(self.slv_addr, COMPRESSION_CTRL07, qs)?;
@@ -961,11 +937,6 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
             enable,
         )?;
         self.status.colorbar = enable;
-        Ok(())
-    }
-
-    fn set_whitebal(&mut self, _bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.awb = enable;
         Ok(())
     }
 
@@ -995,11 +966,6 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
     fn set_vflip(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         self.status.vflip = enable;
         self.set_image_options(bus)
-    }
-
-    fn set_aec2(&mut self, _bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.aec2 = enable;
-        Ok(())
     }
 
     fn set_awb_gain(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
@@ -1085,31 +1051,6 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
         Ok(())
     }
 
-    fn set_dcw(&mut self, _bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.dcw = enable;
-        Ok(())
-    }
-
-    fn set_bpc(&mut self, _bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.bpc = enable;
-        Ok(())
-    }
-
-    fn set_wpc(&mut self, _bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.wpc = enable;
-        Ok(())
-    }
-
-    fn set_raw_gma(&mut self, _bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.raw_gma = enable;
-        Ok(())
-    }
-
-    fn set_lenc(&mut self, _bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.lenc = enable;
-        Ok(())
-    }
-
     fn get_reg(&mut self, bus: &mut B, reg: i32, mask: i32) -> Result<i32, CameraError> {
         if !(0..=0xFFFF).contains(&reg) || mask < 0 {
             return Err(CameraError::InvalidArg);
@@ -1155,71 +1096,6 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
         } else {
             bus.write_reg16(self.slv_addr, reg16, (next & 0xFF) as u8)
         }
-    }
-
-    fn set_res_raw(
-        &mut self,
-        bus: &mut B,
-        start_x: i32,
-        start_y: i32,
-        end_x: i32,
-        end_y: i32,
-        offset_x: i32,
-        offset_y: i32,
-        total_x: i32,
-        total_y: i32,
-        output_x: i32,
-        output_y: i32,
-        scale: bool,
-        binning: bool,
-    ) -> Result<(), CameraError> {
-        write_addr_reg(
-            bus,
-            self.slv_addr,
-            X_ADDR_ST_H,
-            start_x as u16,
-            start_y as u16,
-        )?;
-        write_addr_reg(bus, self.slv_addr, X_ADDR_END_H, end_x as u16, end_y as u16)?;
-        write_addr_reg(
-            bus,
-            self.slv_addr,
-            X_OFFSET_H,
-            offset_x as u16,
-            offset_y as u16,
-        )?;
-        write_addr_reg(
-            bus,
-            self.slv_addr,
-            X_TOTAL_SIZE_H,
-            total_x as u16,
-            total_y as u16,
-        )?;
-        write_addr_reg(
-            bus,
-            self.slv_addr,
-            X_OUTPUT_SIZE_H,
-            output_x as u16,
-            output_y as u16,
-        )?;
-        self.status.scale = scale;
-        self.status.binning = binning;
-        self.set_image_options(bus)
-    }
-
-    fn set_pll(
-        &mut self,
-        _bus: &mut B,
-        _bypass: i32,
-        _mul: i32,
-        _sys: i32,
-        _root: i32,
-        _pre: i32,
-        _seld5: i32,
-        _pclken: i32,
-        _pclk: i32,
-    ) -> Result<(), CameraError> {
-        Err(CameraError::NotSupported)
     }
 
     fn set_xclk(&mut self, _bus: &mut B, _timer: i32, xclk: i32) -> Result<(), CameraError> {
