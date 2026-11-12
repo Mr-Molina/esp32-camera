@@ -647,7 +647,7 @@ Status values: `TODO` · `IN-PROGRESS` · `READY-FOR-HIL` · `DONE` · `BLOCKED 
   - Optional: replace the firmware's `TripleFrameBuffer` with the HAL pool and compare FPS.
 - **Status:** TODO
 
-#### - [ ] WP-23: Non-OV2640 sensor driver correctness (Lane E) · P1-P3 · M-L
+#### - [ ] WP-23: Non-OV2640 sensor driver correctness (Lane E) · P1-P3 · M-L (steps 1-7 and 9 done)
 - **Findings:** SENS-04, SENS-05, SENS-09, SENS-10, SENS-11, SENS-12, SENS-13, SENS-14, SENS-15, SENS-18, SENS-22, SENS-23, SENS-24, SENS-25
 - **Steps:** in priority order.
   1. **SENS-09.** Probe 8-bit sensors before 16-bit ones at each shared address.
@@ -665,7 +665,13 @@ Status values: `TODO` · `IN-PROGRESS` · `READY-FOR-HIL` · `DONE` · `BLOCKED 
   - A shared conformance test runs across all 18 drivers.
   - Per-driver tests for each fix.
   - `cargo bloat` shows klipper-cam-fw links only the OV2640 driver.
-- **Status:** TODO
+- **Status:** IN-PROGRESS (2026-11-12, `085d043`..`60926e2`; host gates green, 377 workspace tests. Xtensa gates NOT run — no esp toolchain in this session — but this crate is target-independent and `forbid(unsafe_code)`, so the risk is low.)
+  - **Done:** steps 1-7 and 9. SENS-09 (probe order: all 8-bit sensors before any 16-bit one, since a 16-bit probe writes stray data into an 8-bit part sharing the address — 0x30 and 0x3C were both affected); SENS-05, SENS-11, SENS-12; SENS-04 (OV3640 window/format/PLL/quality setters now refuse rather than write OV3660 registers into real hardware); SENS-10 (+ the `status`-after-write half of SENS-24 in the same function); SENS-13 (13 no-op setters removed, `set_xclk` documented); SENS-18 (end markers dropped from six table writers); SENS-24 (one framesize policy, with the shared 18-driver conformance sweep from the acceptance list).
+  - The conformance sweep found **two drivers the finding did not list**: `Ov7670` refused sub-VGA sizes with `InvalidArg` from an inner match arm, and `Ov7725` used `InvalidArg` at its top guard. Both are fixed.
+  - **Partial — SENS-14.** The missing range checks are in, behind a shared `level_in(level, lo, hi)` helper: `Ov7725` and `Sc101Iot` had none at all, so `(level & 0xFF) as u8` silently truncated an out-of-range level into an unrelated register value. The per-sensor lookup tables the finding also asks for are **not** done: whether a given part reads the register as two's complement or as a magnitude differs per sensor and cannot be settled without the upstream C driver or the datasheets, neither of which is in this repo. The on-wire encoding is unchanged and the helper documents the open question.
+  - **Not started:** SENS-15 (step 8, delta tables), SENS-22 (step 10, per-sensor cargo features), SENS-23 (step 11, `omnivision_common`), SENS-25 (part of step 9, the minor C deviations). SENS-15 and SENS-25 both turn on matching the upstream C driver's register sequences, which this repo does not contain; SENS-15 in particular would drop a default-table rewrite on sensors that cannot be tested here. SENS-22 and SENS-23 are mechanical but large.
+  - **Open:** §7 question 6 (is any OV3640 in use?) now decides whether the OV3640 driver should be repaired or marked unsupported outright — `reset()` still writes its unverified default table. The HM0360 `PMU_CFG_3` value for 240x240 is a judgement call flagged in the code and needs an HM0360 to confirm.
+  - `cargo bloat` acceptance not checked: it needs an Xtensa build.
 
 #### - [ ] WP-25: Low-level DMA engine performance (Lane D) · P2-P3 · M · after WP-06 and WP-08
 - **Findings:** LL-09, LL-10, LL-11, LL-12, LL-18, LL-19
