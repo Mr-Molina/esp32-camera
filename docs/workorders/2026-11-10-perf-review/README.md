@@ -373,7 +373,7 @@ Status values: `TODO` · `IN-PROGRESS` · `READY-FOR-HIL` · `DONE` · `BLOCKED 
   - **[HIL]** Disassembly shows `memw` before the store to `0x3FF4_F034`. A 10k-frame colour-bar CRC soak passes.
 - **Status:** TODO
 
-#### - [x] WP-09: Security hardening (Lane G, plus a small main.rs edit) · P1 · S-M
+#### - [ ] WP-09: Security hardening (Lane G, plus a small main.rs edit) · P1 · S-M
 - **Findings:** FW-NET-04, BUILD-07, FW-NET-03, FW-NET-18, FW-NET-27
 - **Steps:**
   1. **BUILD-07.** Add `crates/klipper-cam-fw/build.rs` (coordinate with Lane B) that panics for Xtensa release builds when `WIFI_PASS` or `WIFI_OTA_TOKEN` is unset or empty, and emits `rerun-if-env-changed` for both.
