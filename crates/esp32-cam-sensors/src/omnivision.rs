@@ -208,7 +208,7 @@ mod tests {
 
         assert_eq!(
             sensor.set_framesize(&mut bus, FrameSize::Qhd),
-            Err(CameraError::InvalidArg)
+            Err(CameraError::FailedToSetFrameSize)
         );
 
         // Enforce 16-bit register upper bounds on `set_aec_value` and `set_agc_gain`
@@ -520,7 +520,7 @@ mod tests {
         assert_eq!(bus.reg8(CameraSccbAddr::OV7725, ov7725::DSPAUTO), 0xF3);
         assert_eq!(
             sensor.set_framesize(&mut bus, FrameSize::Svga),
-            Err(CameraError::InvalidArg)
+            Err(CameraError::FailedToSetFrameSize)
         );
 
         // Gain ceiling: Gain64x and Gain128x unsupported on OV7725
@@ -583,7 +583,7 @@ mod tests {
         assert_eq!(sensor.set_framesize(&mut bus, FrameSize::Qqvga), Ok(()));
         assert_eq!(
             sensor.set_framesize(&mut bus, FrameSize::Cif),
-            Err(CameraError::InvalidArg)
+            Err(CameraError::FailedToSetFrameSize)
         );
         assert_eq!(
             sensor.set_framesize(&mut bus, FrameSize::Uxga),

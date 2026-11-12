@@ -463,7 +463,7 @@ impl<B: SccbBus> CameraSensor<B> for Ov7725 {
 
     fn set_framesize(&mut self, bus: &mut B, framesize: FrameSize) -> Result<(), CameraError> {
         if (framesize as u8) > (FrameSize::Vga as u8) {
-            return Err(CameraError::InvalidArg);
+            return Err(CameraError::FailedToSetFrameSize);
         }
         let res = framesize.resolution();
         let w = res.width;

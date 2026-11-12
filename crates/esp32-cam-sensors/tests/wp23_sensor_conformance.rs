@@ -2,12 +2,23 @@
 //! for `WP-23` (non-Ov2640 sensor driver correctness).
 
 use esp32_cam_sccb::MockSccbBus;
+use esp32_cam_sensors::bf20a6::Bf20a6;
 use esp32_cam_sensors::bf3005::Bf3005;
+use esp32_cam_sensors::gc0308::Gc0308;
+use esp32_cam_sensors::gc032a::Gc032a;
+use esp32_cam_sensors::gc2145::Gc2145;
 use esp32_cam_sensors::hm0360::Hm0360;
 use esp32_cam_sensors::hm1055::{Hm1055, CKCFG2};
+use esp32_cam_sensors::mega_ccm::MegaCcm;
 use esp32_cam_sensors::nt99141::Nt99141;
+use esp32_cam_sensors::ov2640::Ov2640;
 use esp32_cam_sensors::ov3640::Ov3640;
+use esp32_cam_sensors::ov3660::Ov3660;
+use esp32_cam_sensors::ov5640::Ov5640;
+use esp32_cam_sensors::ov7670::Ov7670;
 use esp32_cam_sensors::ov7725::{self, Ov7725};
+use esp32_cam_sensors::sc030iot::Sc030Iot;
+use esp32_cam_sensors::sc031gs::Sc031Gs;
 use esp32_cam_sensors::sc101iot::Sc101Iot;
 use esp32_cam_sensors::{CameraSensor, Reg16};
 use esp32_cam_types::{CameraError, CameraSccbAddr, FrameSize, GainCeiling, PixelFormat};
@@ -466,6 +477,122 @@ table_writer_cases! {
     test_sens18_gc2145_writes_every_entry  => esp32_cam_sensors::gc2145::write_reg_list;
     test_sens18_hm0360_writes_every_entry  => esp32_cam_sensors::hm0360::write_reg_list;
     test_sens18_nt99141_writes_every_entry => esp32_cam_sensors::nt99141::write_reg_list;
+}
+
+// ---------------------------------------------------------------------------
+// SENS-24: one framesize policy, checked across all 18 drivers
+// ---------------------------------------------------------------------------
+
+/// Every [`FrameSize`] variant, so the conformance sweep covers the sizes a
+/// driver supports and the ones it does not.
+const ALL_FRAMESIZES: [FrameSize; FrameSize::COUNT] = [
+    FrameSize::Size96x96,
+    FrameSize::Qqvga,
+    FrameSize::Size128x128,
+    FrameSize::Qcif,
+    FrameSize::Hqvga,
+    FrameSize::Size240x240,
+    FrameSize::Qvga,
+    FrameSize::Size320x320,
+    FrameSize::Cif,
+    FrameSize::Hvga,
+    FrameSize::Vga,
+    FrameSize::Svga,
+    FrameSize::Xga,
+    FrameSize::Hd,
+    FrameSize::Sxga,
+    FrameSize::Uxga,
+    FrameSize::Fhd,
+    FrameSize::PHd,
+    FrameSize::P3Mp,
+    FrameSize::Qxga,
+    FrameSize::Qhd,
+    FrameSize::Wqxga,
+    FrameSize::PFhd,
+    FrameSize::Qsxga,
+    FrameSize::Size5Mp,
+];
+
+/// The shared 18-driver conformance sweep (WP-23 acceptance).
+///
+/// `set_framesize` must obey one policy everywhere:
+///
+///   * it either applies the size the caller asked for, or refuses;
+///   * refusing means `FailedToSetFrameSize` — not `InvalidArg`, and not
+///     silently substituting a size the caller did not ask for;
+///   * `status().framesize` reports what the sensor was actually set to, so
+///     it changes on success and stays put on refusal.
+///
+/// Gc032a, Gc0308 and MegaCcm used to clamp an oversized request down to
+/// their maximum, write that, record it and return `Ok`, so a caller asking
+/// for UXGA got VGA and was told it had succeeded. Ov3660 refused with
+/// `InvalidArg`, which the firmware reports differently.
+///
+/// `NotSupported` is allowed as a refusal for a driver that cannot do
+/// framesizes at all — Ov3640, whose register map is another part's
+/// (SENS-04).
+macro_rules! framesize_conformance {
+    ($($name:ident => $driver:ty;)*) => {
+        $(
+            #[test]
+            fn $name() {
+                for framesize in ALL_FRAMESIZES {
+                    let mut bus: MockSccbBus<4096> = MockSccbBus::new();
+                    let mut sensor = <$driver>::new();
+                    let before = sensor.status().framesize;
+
+                    match sensor.set_framesize(&mut bus, framesize) {
+                        Ok(()) => assert_eq!(
+                            sensor.status().framesize,
+                            framesize,
+                            "{} accepted {framesize:?} but recorded a different size: \
+                             a size it cannot do must be refused, not quietly swapped",
+                            stringify!($driver),
+                        ),
+                        Err(err) => {
+                            assert!(
+                                matches!(
+                                    err,
+                                    CameraError::FailedToSetFrameSize
+                                        | CameraError::NotSupported
+                                ),
+                                "{} refused {framesize:?} with {err:?}; the policy is \
+                                 FailedToSetFrameSize",
+                                stringify!($driver),
+                            );
+                            assert_eq!(
+                                sensor.status().framesize,
+                                before,
+                                "{} refused {framesize:?} but still recorded it",
+                                stringify!($driver),
+                            );
+                        }
+                    }
+                }
+            }
+        )*
+    };
+}
+
+framesize_conformance! {
+    test_sens24_conformance_ov2640   => Ov2640;
+    test_sens24_conformance_ov3660   => Ov3660;
+    test_sens24_conformance_ov3640   => Ov3640;
+    test_sens24_conformance_ov5640   => Ov5640;
+    test_sens24_conformance_ov7670   => Ov7670;
+    test_sens24_conformance_ov7725   => Ov7725;
+    test_sens24_conformance_nt99141  => Nt99141;
+    test_sens24_conformance_gc2145   => Gc2145;
+    test_sens24_conformance_gc0308   => Gc0308;
+    test_sens24_conformance_gc032a   => Gc032a;
+    test_sens24_conformance_bf3005   => Bf3005;
+    test_sens24_conformance_bf20a6   => Bf20a6;
+    test_sens24_conformance_sc101iot => Sc101Iot;
+    test_sens24_conformance_sc030iot => Sc030Iot;
+    test_sens24_conformance_sc031gs  => Sc031Gs;
+    test_sens24_conformance_mega_ccm => MegaCcm;
+    test_sens24_conformance_hm1055   => Hm1055;
+    test_sens24_conformance_hm0360   => Hm0360;
 }
 
 // ---------------------------------------------------------------------------

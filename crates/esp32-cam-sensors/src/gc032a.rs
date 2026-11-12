@@ -672,12 +672,14 @@ impl<B: SccbBus> CameraSensor<B> for Gc032a {
     }
 
     fn set_framesize(&mut self, bus: &mut B, framesize: FrameSize) -> Result<(), CameraError> {
-        let fs = if framesize > FrameSize::Vga {
-            FrameSize::Vga
-        } else {
-            framesize
-        };
-        self.status.framesize = fs;
+        // SENS-24: a size above VGA used to be clamped to VGA, written,
+        // recorded and reported as success, so a caller asking for SVGA got
+        // VGA and was told it had worked. Refuse instead, and record the
+        // size only once the writes have gone through.
+        if framesize > FrameSize::Vga {
+            return Err(CameraError::FailedToSetFrameSize);
+        }
+        let fs = framesize;
         let w = fs.width();
         let h = fs.height();
         let row_s = (FrameSize::Vga.height() - h) / 2;
@@ -704,7 +706,9 @@ impl<B: SccbBus> CameraSensor<B> for Gc032a {
         bus.write_reg8(self.slv_addr, P3_IMAGE_WIDTH_HIGH, h8(w))?;
         bus.write_reg8(self.slv_addr, P3_IMAGE_HEIGHT_LOW, l8(h))?;
         bus.write_reg8(self.slv_addr, P3_IMAGE_HEIGHT_HIGH, h8(h))?;
-        bus.write_reg8(self.slv_addr, 0xFE, 0x00)
+        bus.write_reg8(self.slv_addr, 0xFE, 0x00)?;
+        self.status.framesize = fs;
+        Ok(())
     }
 
     fn set_colorbar(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {

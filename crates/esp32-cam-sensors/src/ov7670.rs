@@ -491,7 +491,7 @@ impl<B: SccbBus> CameraSensor<B> for Ov7670 {
                 write_regs8(bus, self.slv_addr, OV7670_QQVGA)?;
                 self.frame_control(bus, 158, 14, 12, 490)?;
             }
-            _ => return Err(CameraError::InvalidArg),
+            _ => return Err(CameraError::FailedToSetFrameSize),
         }
 
         bus.delay_ms(30);

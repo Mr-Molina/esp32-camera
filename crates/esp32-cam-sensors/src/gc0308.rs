@@ -695,12 +695,13 @@ impl<B: SccbBus> CameraSensor<B> for Gc0308 {
     }
 
     fn set_framesize(&mut self, bus: &mut B, framesize: FrameSize) -> Result<(), CameraError> {
-        let fs = if framesize > FrameSize::Vga {
-            FrameSize::Vga
-        } else {
-            framesize
-        };
-        self.status.framesize = fs;
+        // SENS-24: see Gc032a. An oversized request was clamped to VGA and
+        // reported as success; it is refused now, and the size is recorded
+        // only after the writes succeed.
+        if framesize > FrameSize::Vga {
+            return Err(CameraError::FailedToSetFrameSize);
+        }
+        let fs = framesize;
         let w = fs.width();
         let h = fs.height();
         let vga_w = FrameSize::Vga.width();
@@ -750,7 +751,9 @@ impl<B: SccbBus> CameraSensor<B> for Gc0308 {
         bus.write_reg8(self.slv_addr, SUBSAMPLE_UV0, chosen.reg0x58)?;
         bus.write_reg8(self.slv_addr, SUBSAMPLE_UV1, chosen.reg0x59)?;
 
-        bus.write_reg8(self.slv_addr, 0xFE, 0x00)
+        bus.write_reg8(self.slv_addr, 0xFE, 0x00)?;
+        self.status.framesize = fs;
+        Ok(())
     }
 
     fn set_contrast(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {

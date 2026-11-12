@@ -824,7 +824,7 @@ impl<B: SccbBus> CameraSensor<B> for Ov3660 {
 
     fn set_framesize(&mut self, bus: &mut B, framesize: FrameSize) -> Result<(), CameraError> {
         if (framesize as u8) > (FrameSize::Qxga as u8) {
-            return Err(CameraError::InvalidArg);
+            return Err(CameraError::FailedToSetFrameSize);
         }
         let old_framesize = self.status.framesize;
         let old_binning = self.status.binning;
