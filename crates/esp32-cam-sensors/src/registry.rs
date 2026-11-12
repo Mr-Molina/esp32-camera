@@ -244,9 +244,7 @@ mod tests {
                 SccbTransaction::Read8 { slv_addr, .. }
                 | SccbTransaction::Write8 { slv_addr, .. }
                 | SccbTransaction::Read16 { slv_addr, .. }
-                | SccbTransaction::Write16 { slv_addr, .. } => {
-                    *slv_addr == CameraSccbAddr::OV2640
-                }
+                | SccbTransaction::Write16 { slv_addr, .. } => *slv_addr == CameraSccbAddr::OV2640,
                 _ => false,
             })
             .copied();

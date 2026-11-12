@@ -884,14 +884,18 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
     }
 
     fn set_brightness(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
-        let value = match level {
+        // SENS-11: 0x32F2 is shared with contrast, where 0x80 is the neutral
+        // midpoint. Level 0 used to fall through to the catch-all and write
+        // 0x00, the darkest value.
+        let value: u8 = match level {
             3 => 0xA0,
             2 => 0x90,
             1 => 0x88,
+            0 => 0x80,
             -1 => 0x78,
             -2 => 0x70,
             -3 => 0x60,
-            _ => 0x00,
+            _ => return Err(CameraError::InvalidArg),
         };
         bus.write_reg16(self.slv_addr, 0x32F2, value)?;
         bus.write_reg16(self.slv_addr, 0x3060, 0x01)?;
@@ -1068,8 +1072,10 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
     }
 
     fn set_ae_level(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
-        let clamped = level.clamp(0, 8) as usize;
-        let base = clamped * 5;
+        // SENS-05: `SENSOR_AE_LEVEL` holds nine five-register groups for
+        // levels -4..=4, so the neutral level 0 is group 4, not group 0.
+        let clamped = level.clamp(-4, 4);
+        let base = ((clamped + 4) as usize) * 5;
         for i in 0..5 {
             let entry = SENSOR_AE_LEVEL[base + i];
             bus.write_reg16(self.slv_addr, entry.reg, entry.val)?;

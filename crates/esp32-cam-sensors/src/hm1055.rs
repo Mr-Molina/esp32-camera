@@ -1325,20 +1325,17 @@ impl<B: SccbBus> CameraSensor<B> for Hm1055 {
         };
 
         if bypass == 0 {
-            ckcfg2 |= match mul {
-                204 => 10,
-                216 => 11,
-                228 => 0x12,
-                240 => 0x13,
-                288 => 0x17,
-                300 => 0x18,
-                312 => 0x19,
-                324 => 0x1A,
-                336 => 0x1B,
-                348 => 0x1C,
-                360 => 0x1D,
-                _ => 0x17,
-            };
+            // SENS-12: the multiplier codes run consecutively from 0x10 at
+            // mul 204, one code per step of 12. Two arms of the old lookup
+            // were written in decimal (`10`, `11`), so multipliers 204 and
+            // 216 programmed 0x0A and 0x0B — a different PLL setting — and
+            // every unlisted multiplier silently fell back to 0x17.
+            if !(204..=360).contains(&mul) || (mul - 204) % 12 != 0 {
+                return Err(CameraError::InvalidArg);
+            }
+            let code =
+                0x10 + u8::try_from((mul - 204) / 12).map_err(|_| CameraError::InvalidArg)?;
+            ckcfg2 |= code;
         }
 
         if pclken > 0 {
