@@ -3085,6 +3085,7 @@ fn build_wifi_station_configs() -> (
     esp_radio::wifi::ControllerConfig,
     &'static str,
 ) {
+    use esp_println::println;
     use esp_radio::wifi::sta::{ScanMethod, StationConfig};
     use esp_radio::wifi::{AuthenticationMethodConfig, Config as WifiConfig, ControllerConfig};
     use klipper_cam_fw::config::{WifiAuthMode, ALLOW_OPEN_WIFI};
