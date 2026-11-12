@@ -28,9 +28,21 @@ pub fn detect_sensor<B: SccbBus>(bus: &mut B) -> Result<(CameraModel, u8, Sensor
     // (Ov2640 / Sc031Gs) and 0x3C (Gc2145 / Ov3660 / Ov3640 / Ov5640). A
     // 16-bit read puts two address bytes on the wire, and an 8-bit sensor
     // sitting at that address latches them as a register index and a value,
-    // so merely probing for the 16-bit part *writes* into the 8-bit one. The
-    // opposite order is safe: a 16-bit sensor that receives a single address
-    // byte sees a truncated read and writes nothing.
+    // so merely probing for the 16-bit part *writes* into the 8-bit one.
+    //
+    // The reverse order is believed safer, not proven safe. Most of the
+    // 8-bit probes are reads, and a 16-bit sensor that receives a single
+    // address byte sees a truncated read and writes nothing. But two of the
+    // now-earlier probes are not pure reads: `Ov2640::detect` opens with a
+    // BANK_SEL *write*, which is two bytes an Sc031Gs at 0x30 could parse as
+    // a complete 16-bit address with the data byte missing, and
+    // `Gc2145::detect` leaves an Ov5640/Ov3660/Ov3640 at 0x3C holding half
+    // an address. Both should be harmless, because an I2C slave resynchronises
+    // on the next START, but that is a part-specific claim this repo cannot
+    // settle. The old order was a deliberate choice about the same hazard in
+    // the other direction; this swaps a write-corruption hazard for a
+    // resynchronisation one. SENS-09 asks for a hardware A/B, which has not
+    // been run.
     //
     // Within each group the order is the historical preference order.
     // `registry::tests::test_probe_order_8bit_before_16bit_at_each_address`

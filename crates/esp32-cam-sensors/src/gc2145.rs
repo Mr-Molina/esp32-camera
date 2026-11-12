@@ -777,11 +777,10 @@ fn check_reg_mask<B: SccbBus>(
 /// Writes every entry of `regs` in order, treating an entry whose
 /// register is [`REG_DLY`] as a millisecond delay.
 ///
-/// SENS-18: there is no end-of-table marker. The slice carries its own
-/// length, and a marker could collide with a real register — the tail
-/// sentinel used to be 0x0000 or, worse, the same 0xFFFF as `REG_DLY`,
-/// so a delay entry or a write to register 0 ended the table early and
-/// silently dropped everything after it.
+/// SENS-18: there is no end-of-table marker. The sentinel here used to be
+/// 0x0000, so a legitimate write to register 0 ended the table early and
+/// silently dropped the rest. The slice carries its own length, so no
+/// sentinel is needed.
 pub fn write_reg_list<B: SccbBus>(
     bus: &mut B,
     slv_addr: u8,

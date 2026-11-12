@@ -448,9 +448,12 @@ impl<B: SccbBus> CameraSensor<B> for Sc101Iot {
 
     fn set_contrast(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
         // SENS-14: this driver had no range check at all, so a level outside
-        // a byte was truncated into an unrelated register value. The bounds
-        // mirror the sibling Sc030Iot, which shares this register layout:
-        // one byte for contrast, a 16-bit pair for saturation and sharpness.
+        // a byte was truncated into an unrelated register value. The
+        // saturation and sharpness bounds below mirror the sibling Sc030Iot,
+        // which shares this register layout. Contrast does not: Sc030Iot
+        // bounds it -4..=4, and narrowing to that here would reject levels
+        // this driver has always written through, so it takes the signed
+        // range that survives the cast instead.
         let level = crate::level_in(level, i8::MIN as i32, i8::MAX as i32)?;
         self.set_reg_bits(bus, 0x00F5, 6, 1, 0)?;
         self.set_reg(bus, 0x014B, 0xFF, level & 0xFF)?;

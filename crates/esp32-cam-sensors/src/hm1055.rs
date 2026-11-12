@@ -833,11 +833,10 @@ fn check_reg_mask<B: SccbBus>(
 /// Writes every entry of `regs` in order, treating an entry whose
 /// register is [`REG_DLY`] as a millisecond delay.
 ///
-/// SENS-18: there is no end-of-table marker. The slice carries its own
-/// length, and a marker could collide with a real register — the tail
-/// sentinel used to be 0x0000 or, worse, the same 0xFFFF as `REG_DLY`,
-/// so a delay entry or a write to register 0 ended the table early and
-/// silently dropped everything after it.
+/// SENS-18: there is no end-of-table marker. The sentinel here used to be
+/// 0xFFFF — the same value as `REG_DLY` — so the first delay entry in a
+/// table would have ended it and silently dropped the rest. The slice
+/// carries its own length, so no sentinel is needed.
 pub fn write_reg_list<B: SccbBus>(
     bus: &mut B,
     slv_addr: u8,
@@ -1314,7 +1313,16 @@ impl<B: SccbBus> CameraSensor<B> for Hm1055 {
             // were written in decimal (`10`, `11`), so multipliers 204 and
             // 216 programmed 0x0A and 0x0B — a different PLL setting — and
             // every unlisted multiplier silently fell back to 0x17.
-            if !(204..=360).contains(&mul) || (mul - 204) % 12 != 0 {
+            // The codes run consecutively from 0x10 at mul 204, one per step
+            // of 12, and that formula reproduces every multiplier the
+            // original lookup attested. It deliberately does NOT extend to
+            // 252, 264 and 276: the old table jumped from 240 straight to
+            // 288, and three consecutive omissions are evidence the real
+            // encoding is not uniform there. Those three are refused rather
+            // than given invented codes, which on this part would mean an
+            // unverified PLL divider driving PCLK.
+            const SKIPPED: [i32; 3] = [252, 264, 276];
+            if !(204..=360).contains(&mul) || (mul - 204) % 12 != 0 || SKIPPED.contains(&mul) {
                 return Err(CameraError::InvalidArg);
             }
             let code =

@@ -167,11 +167,10 @@ fn set_reg_bits<B: SccbBus>(
 /// Writes every entry of `regs` in order, treating an entry whose
 /// register is [`REG_DLY`] as a millisecond delay.
 ///
-/// SENS-18: there is no end-of-table marker. The slice carries its own
-/// length, and a marker could collide with a real register — the tail
-/// sentinel used to be 0x0000 or, worse, the same 0xFFFF as `REG_DLY`,
-/// so a delay entry or a write to register 0 ended the table early and
-/// silently dropped everything after it.
+/// SENS-18: there is no end-of-table marker. The sentinel here used to be
+/// 0xFFFF — the same value as `REG_DLY` — so the first delay entry in a
+/// table would have ended it and silently dropped the rest. The slice
+/// carries its own length, so no sentinel is needed.
 pub fn write_reg_list<B: SccbBus>(
     bus: &mut B,
     slv_addr: u8,
@@ -399,7 +398,7 @@ impl<B: SccbBus> CameraSensor<B> for Bf20a6 {
         }
         let w = framesize.width();
         let h = framesize.height();
-        self.status.framesize = framesize;
+        // SENS-24: recorded after the writes land, not before.
 
         bus.write_reg8(self.slv_addr, 0x1B, 0)?;
 
@@ -418,6 +417,7 @@ impl<B: SccbBus> CameraSensor<B> for Bf20a6 {
         }
 
         bus.delay_ms(30);
+        self.status.framesize = framesize;
         Ok(())
     }
 

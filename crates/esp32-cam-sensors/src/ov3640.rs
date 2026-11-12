@@ -543,7 +543,12 @@ impl Ov3640 {
         self.slv_addr
     }
 
-    /// Returns the currently configured [`PixelFormat`].
+    /// Returns the [`PixelFormat`] this driver was constructed with.
+    ///
+    /// SENS-04: while [`CameraSensor::set_pixformat`] refuses, nothing ever
+    /// changes this field, so it reports the constructor default rather than
+    /// anything the sensor is in. It becomes meaningful again when a verified
+    /// OV3640 register map is ported and `set_pixformat` starts recording.
     #[inline]
     pub const fn pixformat(&self) -> PixelFormat {
         self.pixformat

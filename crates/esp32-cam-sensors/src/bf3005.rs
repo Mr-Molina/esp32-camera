@@ -371,7 +371,7 @@ impl<B: SccbBus> CameraSensor<B> for Bf3005 {
         }
         let w = framesize.width();
         let h = framesize.height();
-        self.status.framesize = framesize;
+        // SENS-24: recorded after the writes land, not before.
 
         if w <= 320 && h <= 240 {
             set_reg_bits(bus, self.slv_addr, 0x12, 4, 1, 1)?;
@@ -390,6 +390,7 @@ impl<B: SccbBus> CameraSensor<B> for Bf3005 {
         }
 
         bus.delay_ms(30);
+        self.status.framesize = framesize;
         Ok(())
     }
 

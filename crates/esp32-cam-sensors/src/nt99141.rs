@@ -3,6 +3,23 @@
 //! Ported from `sensors/nt99141.c`,
 //! `sensors/private_include/nt99141_regs.h`, and
 //! `sensors/private_include/nt99141_settings.h`.
+//!
+//! # Suspected foreign registers (unresolved)
+//!
+//! Part of this module addresses registers that look like OmniVision's, not
+//! Novatek's: the window block declared below at 0x3800..0x3810, and the
+//! 0x5000/0x5183/0x5306 reads in `init_status`. Those are OV5640-generation
+//! signatures. `set_res_raw` wrote the 0x38xx block and was removed under
+//! SENS-13; the constants and the `init_status` reads remain, so
+//! `init_status` may report AWB, BPC, WPC and denoise state read from
+//! registers this part does not implement.
+//!
+//! This is the same class of defect SENS-04 records against
+//! [`crate::ov3640`], but it was found while reviewing WP-23 rather than in
+//! the work order, so no behaviour was changed on the strength of it. It
+//! needs the same decision from the repository owner: port a verified
+//! NT99141 map, or mark the affected calls unsupported. Until then, treat
+//! `init_status` output from this driver as unverified.
 
 use crate::{
     CameraError, CameraModel, CameraPid, CameraSccbAddr, CameraSensor, CameraStatus, FrameSize,
@@ -549,11 +566,10 @@ pub const SENSOR_FRAMESIZE_VGA_XYSKIP: &[Reg16] = &[
 /// Writes every entry of `regs` in order, treating an entry whose
 /// register is [`REG_DLY`] as a millisecond delay.
 ///
-/// SENS-18: there is no end-of-table marker. The slice carries its own
-/// length, and a marker could collide with a real register — the tail
-/// sentinel used to be 0x0000 or, worse, the same 0xFFFF as `REG_DLY`,
-/// so a delay entry or a write to register 0 ended the table early and
-/// silently dropped everything after it.
+/// SENS-18: there is no end-of-table marker. The sentinel here used to be
+/// 0x0000, so a legitimate write to register 0 ended the table early and
+/// silently dropped the rest. The slice carries its own length, so no
+/// sentinel is needed.
 pub fn write_reg_list<B: SccbBus>(
     bus: &mut B,
     slv_addr: u8,
@@ -839,7 +855,8 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
         if framesize > FrameSize::Hd {
             return Err(CameraError::FailedToSetFrameSize);
         }
-        self.status.framesize = framesize;
+        // SENS-24: recorded after the writes land, so a bus fault partway
+        // through does not leave status claiming a size the sensor never took.
         write_reg_list(bus, self.slv_addr, SENSOR_DEFAULT_REGS)?;
         if framesize == FrameSize::Qvga {
             write_reg_list(bus, self.slv_addr, SENSOR_FRAMESIZE_QVGA)?;
@@ -851,11 +868,17 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
             write_reg_list(bus, self.slv_addr, SENSOR_FRAMESIZE_VGA)?;
         }
         let pixformat = self.pixformat;
-        self.set_pixformat(bus, pixformat)
+        self.set_pixformat(bus, pixformat)?;
+        self.status.framesize = framesize;
+        Ok(())
     }
 
     fn set_contrast(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
-        let (value1, value2) = match level {
+        // SENS-11: 0x32F2 below is the register `set_brightness` also writes,
+        // where 0x80 is the neutral midpoint. The catch-all arm used to write
+        // 0x00 — the darkest value — for any level outside -3..=3 and report
+        // success, so `set_contrast(4)` blacked the image out.
+        let (value1, value2): (u8, u8) = match level {
             3 => (0xD0, 0xB0),
             2 => (0xE0, 0xA0),
             1 => (0xF0, 0x90),
@@ -863,7 +886,7 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
             -1 => (0x10, 0x70),
             -2 => (0x20, 0x60),
             -3 => (0x30, 0x50),
-            _ => (0x00, 0x00),
+            _ => return Err(CameraError::InvalidArg),
         };
         bus.write_reg16(self.slv_addr, 0x32FC, value1)?;
         bus.write_reg16(self.slv_addr, 0x32F2, value2)?;

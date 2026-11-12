@@ -1331,8 +1331,12 @@ impl<B: SccbBus> CameraSensor<B> for Ov5640 {
     }
 
     fn set_framesize(&mut self, bus: &mut B, framesize: FrameSize) -> Result<(), CameraError> {
+        // SENS-24: unified on `FailedToSetFrameSize`. `Size5Mp` is the last
+        // discriminant, so this guard is unreachable today and the
+        // conformance sweep cannot exercise it; it is corrected so the
+        // policy still holds if a larger variant is ever added.
         if (framesize as u8) > (FrameSize::Size5Mp as u8) {
-            return Err(CameraError::InvalidArg);
+            return Err(CameraError::FailedToSetFrameSize);
         }
         let old_framesize = self.status.framesize;
         let old_binning = self.status.binning;

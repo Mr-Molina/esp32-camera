@@ -21,7 +21,9 @@ use esp32_cam_sensors::sc030iot::Sc030Iot;
 use esp32_cam_sensors::sc031gs::Sc031Gs;
 use esp32_cam_sensors::sc101iot::Sc101Iot;
 use esp32_cam_sensors::{CameraSensor, Reg16};
-use esp32_cam_types::{CameraError, CameraSccbAddr, FrameSize, GainCeiling, PixelFormat};
+use esp32_cam_types::{
+    CameraError, CameraSccbAddr, FrameSize, GainCeiling, PixelFormat, ALL_FRAMESIZES,
+};
 
 /// NT99141 auto-exposure level register, first of the five written per level.
 const NT99141_AE_REG: u16 = 0x32B8;
@@ -67,18 +69,6 @@ fn test_sens05_set_ae_level_spans_the_signed_range() {
             "status must record the requested level, not the table index"
         );
     }
-}
-
-#[test]
-fn test_sens05_set_ae_level_clamps_out_of_range() {
-    let mut bus: MockSccbBus<256> = MockSccbBus::new();
-    let mut sensor = Nt99141::new();
-
-    assert_eq!(sensor.set_ae_level(&mut bus, 99), Ok(()));
-    assert_eq!(bus.reg16(CameraSccbAddr::NT99141, NT99141_AE_REG), 0x4D);
-
-    assert_eq!(sensor.set_ae_level(&mut bus, -99), Ok(()));
-    assert_eq!(bus.reg16(CameraSccbAddr::NT99141, NT99141_AE_REG), 0x29);
 }
 
 // ---------------------------------------------------------------------------
@@ -483,36 +473,6 @@ table_writer_cases! {
 // SENS-24: one framesize policy, checked across all 18 drivers
 // ---------------------------------------------------------------------------
 
-/// Every [`FrameSize`] variant, so the conformance sweep covers the sizes a
-/// driver supports and the ones it does not.
-const ALL_FRAMESIZES: [FrameSize; FrameSize::COUNT] = [
-    FrameSize::Size96x96,
-    FrameSize::Qqvga,
-    FrameSize::Size128x128,
-    FrameSize::Qcif,
-    FrameSize::Hqvga,
-    FrameSize::Size240x240,
-    FrameSize::Qvga,
-    FrameSize::Size320x320,
-    FrameSize::Cif,
-    FrameSize::Hvga,
-    FrameSize::Vga,
-    FrameSize::Svga,
-    FrameSize::Xga,
-    FrameSize::Hd,
-    FrameSize::Sxga,
-    FrameSize::Uxga,
-    FrameSize::Fhd,
-    FrameSize::PHd,
-    FrameSize::P3Mp,
-    FrameSize::Qxga,
-    FrameSize::Qhd,
-    FrameSize::Wqxga,
-    FrameSize::PFhd,
-    FrameSize::Qsxga,
-    FrameSize::Size5Mp,
-];
-
 /// The shared 18-driver conformance sweep (WP-23 acceptance).
 ///
 /// `set_framesize` must obey one policy everywhere:
@@ -523,10 +483,14 @@ const ALL_FRAMESIZES: [FrameSize; FrameSize::COUNT] = [
 ///   * `status().framesize` reports what the sensor was actually set to, so
 ///     it changes on success and stays put on refusal.
 ///
-/// Gc032a, Gc0308 and MegaCcm used to clamp an oversized request down to
-/// their maximum, write that, record it and return `Ok`, so a caller asking
-/// for UXGA got VGA and was told it had succeeded. Ov3660 refused with
+/// Gc032a and Gc0308 used to clamp an oversized request down to VGA, write
+/// that, record it and return `Ok`, so a caller asking for SVGA got VGA and
+/// was told it had succeeded. Ov3660, Ov7725 and Ov7670 refused with
 /// `InvalidArg`, which the firmware reports differently.
+///
+/// Ov5640 and MegaCcm also had non-conforming guards, but on the largest
+/// FrameSize discriminant, so they are unreachable and this sweep cannot
+/// exercise them. They were corrected by inspection, not by this test.
 ///
 /// `NotSupported` is allowed as a refusal for a driver that cannot do
 /// framesizes at all — Ov3640, whose register map is another part's
@@ -596,6 +560,110 @@ framesize_conformance! {
 }
 
 // ---------------------------------------------------------------------------
+// Review follow-ups
+// ---------------------------------------------------------------------------
+
+/// SENS-11, second half: `set_contrast` writes the same 0x32F2 register as
+/// `set_brightness`, and kept the catch-all arm that writes 0x00 — the
+/// darkest value — for any level outside -3..=3. `set_contrast(4)` returned
+/// `Ok`, blacked the image out and recorded 4 as the applied contrast.
+#[test]
+fn test_nt99141_contrast_rejects_out_of_range_instead_of_blacking_out() {
+    for level in [4i32, -4, 99, -99] {
+        let mut bus: MockSccbBus<256> = MockSccbBus::new();
+        let mut sensor = Nt99141::new();
+        assert_eq!(
+            sensor.set_contrast(&mut bus, level),
+            Err(CameraError::InvalidArg),
+            "contrast {level} is outside -3..=3"
+        );
+    }
+}
+
+#[test]
+fn test_nt99141_contrast_in_range_levels_are_monotonic() {
+    for (level, want) in [
+        (-3i32, 0x50u8),
+        (-2, 0x60),
+        (-1, 0x70),
+        (0, 0x80),
+        (1, 0x90),
+        (2, 0xA0),
+        (3, 0xB0),
+    ] {
+        let mut bus: MockSccbBus<256> = MockSccbBus::new();
+        let mut sensor = Nt99141::new();
+        assert_eq!(sensor.set_contrast(&mut bus, level), Ok(()));
+        assert_eq!(
+            bus.reg16(CameraSccbAddr::NT99141, NT99141_BRIGHTNESS_REG),
+            want,
+            "contrast {level}"
+        );
+    }
+}
+
+/// SENS-12, narrowed: the original lookup jumped from 240 straight to 288,
+/// skipping 252, 264 and 276 — three consecutive steps of 12. That gap is
+/// evidence the real encoding is not a uniform sequence, so the computed
+/// formula is used only for the multipliers the table actually attested and
+/// the three it skipped are refused rather than given invented codes.
+#[test]
+fn test_hm1055_pll_refuses_the_multipliers_the_table_skipped() {
+    for mul in [252i32, 264, 276] {
+        let mut bus: MockSccbBus<256> = MockSccbBus::new();
+        let mut sensor = Hm1055::new();
+        assert_eq!(
+            sensor.set_pll(&mut bus, 0, mul, 1, 0, 0, 0, 1, 16),
+            Err(CameraError::InvalidArg),
+            "multiplier {mul} has no attested encoding"
+        );
+    }
+}
+
+/// SENS-24, second half, applied to the drivers it was missed in: a framesize
+/// write that fails partway must not leave `status` claiming a size the
+/// sensor never reached.
+#[test]
+fn test_framesize_status_not_recorded_when_a_write_fails() {
+    macro_rules! case {
+        ($driver:ty, $size:expr) => {{
+            // Find a failure point inside the register sequence.
+            let mut probe: MockSccbBus<4096> = MockSccbBus::new();
+            let mut sensor = <$driver>::new();
+            if sensor.set_framesize(&mut probe, $size).is_ok() {
+                let ops = probe.transaction_count();
+                assert!(ops > 1, "{} wrote too little to probe", stringify!($driver));
+
+                let mut bus: MockSccbBus<4096> = MockSccbBus::new();
+                let mut sensor = <$driver>::new();
+                let before = sensor.status().framesize;
+                bus.fail_at(ops / 2);
+
+                assert!(
+                    sensor.set_framesize(&mut bus, $size).is_err(),
+                    "{} should surface the injected bus failure",
+                    stringify!($driver),
+                );
+                assert_eq!(
+                    sensor.status().framesize,
+                    before,
+                    "{} recorded {:?} although the writes failed",
+                    stringify!($driver),
+                    $size,
+                );
+            }
+        }};
+    }
+
+    case!(Nt99141, FrameSize::Qvga);
+    case!(Bf3005, FrameSize::Vga);
+    case!(Bf20a6, FrameSize::Vga);
+    case!(Gc032a, FrameSize::Qvga);
+    case!(Gc0308, FrameSize::Qvga);
+    case!(Hm0360, FrameSize::Qvga);
+}
+
+// ---------------------------------------------------------------------------
 // SENS-12: HM1055 PLL multiplier encoding
 // ---------------------------------------------------------------------------
 
@@ -605,7 +673,22 @@ framesize_conformance! {
 /// different PLL setting entirely.
 #[test]
 fn test_sens12_pll_multiplier_codes_are_consecutive_from_0x10() {
-    for (step, mul) in (204..=360).step_by(12).enumerate() {
+    // The multipliers the original lookup attested, with the codes the
+    // formula derives. 252, 264 and 276 are deliberately absent: the old
+    // table skipped them, so no encoding for them is attested.
+    for (mul, want) in [
+        (204i32, 0x10u8),
+        (216, 0x11),
+        (228, 0x12),
+        (240, 0x13),
+        (288, 0x17),
+        (300, 0x18),
+        (312, 0x19),
+        (324, 0x1A),
+        (336, 0x1B),
+        (348, 0x1C),
+        (360, 0x1D),
+    ] {
         let mut bus: MockSccbBus<256> = MockSccbBus::new();
         let mut sensor = Hm1055::new();
 
@@ -616,7 +699,6 @@ fn test_sens12_pll_multiplier_codes_are_consecutive_from_0x10() {
         );
 
         let code = bus.reg16(CameraSccbAddr::HM1055, CKCFG2) & 0x1F;
-        let want = 0x10 + u8::try_from(step).expect("step fits in u8");
         assert_eq!(code, want, "multiplier {mul} encoded as {code:#04x}");
     }
 }
