@@ -59,7 +59,7 @@ cargo build --target xtensa-esp32-none-elf -Zbuild-std=core,alloc -p klipper-cam
 
 ## Working with Claude (Superpowers and token economy)
 
-- Plugins are declared in `.claude/settings.json` (`extraKnownMarketplaces` + `enabledPlugins`) so local and cloud sessions both load them: Superpowers (`Mr-Molina/superpowers`) and Microsoft TokenEconomizer (`microsoft/TokenEconomizer`).
+- Plugins: Superpowers (`Mr-Molina/superpowers`) and Microsoft TokenEconomizer (`microsoft/TokenEconomizer`). Local sessions load them from `.claude/settings.json`. Cloud sessions ignore those keys, so the cloud environment's setup script installs them instead (see `scripts/cloud-setup.sh`).
 - Use the Superpowers workflow: brainstorm before building features, write a plan for multi-step changes, use test-driven development for bug fixes and new behaviour, debug with systematic root-cause analysis, and check verification output before claiming success.
 - For broad searches across crates, delegate to an Explore subagent and ask for the conclusion, not file dumps.
 - Read large files in ranges (`offset`/`limit`) and search before reading. The biggest sources are `klipper-cam-fw/src/main.rs`, `http.rs`, `jpeg_codec.rs` and `esp32_i2s.rs`.
