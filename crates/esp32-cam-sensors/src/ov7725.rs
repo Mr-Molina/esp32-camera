@@ -504,12 +504,19 @@ impl<B: SccbBus> CameraSensor<B> for Ov7725 {
     }
 
     fn set_contrast(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
+        // SENS-14: bounded to what the single-byte register can hold, so an
+        // out-of-range level is refused rather than truncated into an
+        // unrelated setting. The sensor's own accepted range is narrower but
+        // has not been confirmed against the upstream C driver.
+        let level = crate::level_in(level, i8::MIN as i32, i8::MAX as i32)?;
         bus.write_reg8(self.slv_addr, CONTRAST, (level & 0xFF) as u8)?;
         self.status.contrast = level as i8;
         Ok(())
     }
 
     fn set_brightness(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
+        // SENS-14: see `set_contrast`.
+        let level = crate::level_in(level, i8::MIN as i32, i8::MAX as i32)?;
         bus.write_reg8(self.slv_addr, BRIGHTNESS, (level & 0xFF) as u8)?;
         self.status.brightness = level as i8;
         Ok(())

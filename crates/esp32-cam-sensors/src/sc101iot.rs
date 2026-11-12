@@ -447,6 +447,11 @@ impl<B: SccbBus> CameraSensor<B> for Sc101Iot {
     }
 
     fn set_contrast(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
+        // SENS-14: this driver had no range check at all, so a level outside
+        // a byte was truncated into an unrelated register value. The bounds
+        // mirror the sibling Sc030Iot, which shares this register layout:
+        // one byte for contrast, a 16-bit pair for saturation and sharpness.
+        let level = crate::level_in(level, i8::MIN as i32, i8::MAX as i32)?;
         self.set_reg_bits(bus, 0x00F5, 6, 1, 0)?;
         self.set_reg(bus, 0x014B, 0xFF, level & 0xFF)?;
         self.status.contrast = level as i8;
@@ -454,17 +459,23 @@ impl<B: SccbBus> CameraSensor<B> for Sc101Iot {
     }
 
     fn set_saturation(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
+        let level = crate::level_in(level, 0, 0xFFFF)?;
         self.set_reg_bits(bus, 0x00F5, 5, 1, 0)?;
         self.set_reg(bus, 0x0149, 0xFF, level & 0xFF)?;
         self.set_reg(bus, 0x014A, 0xFF, (level >> 8) & 0xFF)?;
+        // NOTE: `CameraStatus::saturation` is an i8, so a 16-bit level is
+        // reported back truncated. Widening the field is a shared-types
+        // change (WP-21 territory), not a sensor-driver one.
         self.status.saturation = level as i8;
         Ok(())
     }
 
     fn set_sharpness(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
+        let level = crate::level_in(level, 0, 0xFFFF)?;
         self.set_reg_bits(bus, 0x00E0, 1, 1, 1)?;
         self.set_reg(bus, 0x00D0, 0xFF, level & 0xFF)?;
         self.set_reg(bus, 0x00D2, 0xFF, (level >> 8) & 0xFF)?;
+        // NOTE: see `set_saturation` on the i8 status field.
         self.status.sharpness = level as i8;
         Ok(())
     }

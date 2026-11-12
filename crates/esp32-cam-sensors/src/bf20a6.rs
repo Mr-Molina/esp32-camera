@@ -414,9 +414,7 @@ impl<B: SccbBus> CameraSensor<B> for Bf20a6 {
     }
 
     fn set_sharpness(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
-        if !(-2..=2).contains(&level) {
-            return Err(CameraError::InvalidArg);
-        }
+        let level = crate::level_in(level, -2, 2)?;
         bus.write_reg8(self.slv_addr, 0x70, (level & 0xFF) as u8)?;
         self.status.sharpness = level as i8;
         Ok(())

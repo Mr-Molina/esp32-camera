@@ -116,6 +116,29 @@ pub fn write_regs16<B: SccbBus>(
     Ok(())
 }
 
+/// Checks that a signed control level lies in `lo..=hi`, returning it
+/// unchanged, or [`CameraError::InvalidArg`] if it does not (SENS-14).
+///
+/// Drivers write these levels into a register with `(level & 0xFF) as u8`.
+/// Without a bound, that silently truncates: a level of 300 reaches the
+/// sensor as 0x2C, an arbitrary setting the caller never asked for and is
+/// never told about, because the firmware discards errors from `/control`
+/// setters. Rejecting the value is the honest answer.
+///
+/// # Note on encoding
+///
+/// This validates the *range* only. Whether a given sensor reads that
+/// register as two's complement (so -2 is 0xFE) or as an index into a
+/// vendor lookup table has not been checked against the upstream C driver
+/// for every part, and differs between them. Where a driver already
+/// declares a narrower range, that range is kept.
+pub fn level_in(level: i32, lo: i32, hi: i32) -> Result<i32, CameraError> {
+    if level < lo || level > hi {
+        return Err(CameraError::InvalidArg);
+    }
+    Ok(level)
+}
+
 /// Modifies selected bits in an 8-bit register using bit offset and bitmask.
 pub fn set_reg_bits8<B: SccbBus>(
     bus: &mut B,

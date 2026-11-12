@@ -2,10 +2,13 @@
 //! for `WP-23` (non-Ov2640 sensor driver correctness).
 
 use esp32_cam_sccb::MockSccbBus;
+use esp32_cam_sensors::bf3005::Bf3005;
 use esp32_cam_sensors::hm0360::Hm0360;
 use esp32_cam_sensors::hm1055::{Hm1055, CKCFG2};
 use esp32_cam_sensors::nt99141::Nt99141;
 use esp32_cam_sensors::ov3640::Ov3640;
+use esp32_cam_sensors::ov7725::{self, Ov7725};
+use esp32_cam_sensors::sc101iot::Sc101Iot;
 use esp32_cam_sensors::CameraSensor;
 use esp32_cam_types::{CameraError, CameraSccbAddr, FrameSize, GainCeiling, PixelFormat};
 
@@ -321,6 +324,95 @@ fn test_sens13_hm1055_unsupported_controls_say_so() {
     );
 
     assert_eq!(bus.transaction_count(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// SENS-14: signed levels written without a range check
+// ---------------------------------------------------------------------------
+
+/// `(level & 0xFF) as u8` silently truncates anything outside a byte, so a
+/// level of 300 reached the sensor as 0x2C — an arbitrary setting nobody
+/// asked for, and the caller was never told, because the firmware discards
+/// errors from `/control` setters.
+#[test]
+fn test_sens14_ov7725_rejects_levels_that_would_truncate() {
+    for level in [300i32, -300, 1000, i32::MIN, i32::MAX] {
+        let mut bus: MockSccbBus<256> = MockSccbBus::new();
+        let mut sensor = Ov7725::new();
+
+        assert_eq!(
+            sensor.set_contrast(&mut bus, level),
+            Err(CameraError::InvalidArg),
+            "contrast {level} would truncate"
+        );
+        assert_eq!(
+            sensor.set_brightness(&mut bus, level),
+            Err(CameraError::InvalidArg),
+            "brightness {level} would truncate"
+        );
+        assert_eq!(bus.transaction_count(), 0);
+    }
+}
+
+#[test]
+fn test_sens14_ov7725_keeps_accepting_representable_levels() {
+    let mut bus: MockSccbBus<256> = MockSccbBus::new();
+    let mut sensor = Ov7725::new();
+
+    assert_eq!(sensor.set_contrast(&mut bus, -2), Ok(()));
+    assert_eq!(bus.reg8(CameraSccbAddr::OV7725, ov7725::CONTRAST), 0xFE);
+    assert_eq!(sensor.set_brightness(&mut bus, 2), Ok(()));
+    assert_eq!(bus.reg8(CameraSccbAddr::OV7725, ov7725::BRIGHTNESS), 0x02);
+}
+
+#[test]
+fn test_sens14_sc101iot_rejects_out_of_range_levels() {
+    let mut bus: MockSccbBus<256> = MockSccbBus::new();
+    let mut sensor = Sc101Iot::new();
+
+    assert_eq!(
+        sensor.set_contrast(&mut bus, 300),
+        Err(CameraError::InvalidArg)
+    );
+    // Saturation and sharpness span two registers, so they take the same
+    // 0..=0xFFFF range its sibling Sc030Iot already declares.
+    assert_eq!(
+        sensor.set_saturation(&mut bus, -1),
+        Err(CameraError::InvalidArg)
+    );
+    assert_eq!(
+        sensor.set_saturation(&mut bus, 0x1_0000),
+        Err(CameraError::InvalidArg)
+    );
+    assert_eq!(
+        sensor.set_sharpness(&mut bus, -1),
+        Err(CameraError::InvalidArg)
+    );
+}
+
+#[test]
+fn test_sens14_sc101iot_keeps_accepting_in_range_levels() {
+    let mut bus: MockSccbBus<256> = MockSccbBus::new();
+    let mut sensor = Sc101Iot::new();
+
+    // Registers are addressed as 0xPPRR: page PP via the page-select
+    // register, then an 8-bit write to RR.
+    assert_eq!(sensor.set_saturation(&mut bus, 0x1234), Ok(()));
+    assert_eq!(bus.reg8(CameraSccbAddr::SC101IOT, 0x49), 0x34);
+    assert_eq!(bus.reg8(CameraSccbAddr::SC101IOT, 0x4A), 0x12);
+}
+
+/// Drivers that already declared a narrower range keep it.
+#[test]
+fn test_sens14_bf3005_keeps_its_declared_range() {
+    let mut bus: MockSccbBus<256> = MockSccbBus::new();
+    let mut sensor = Bf3005::new();
+
+    assert_eq!(sensor.set_contrast(&mut bus, 2), Ok(()));
+    assert_eq!(
+        sensor.set_contrast(&mut bus, 3),
+        Err(CameraError::InvalidArg)
+    );
 }
 
 // ---------------------------------------------------------------------------
