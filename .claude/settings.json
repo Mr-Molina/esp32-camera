@@ -1,1 +1,28 @@
-
+mkdir -p .claude
+cat > .claude/settings.json <<'EOF'
+{
+  "permissions": {
+    "allow": [
+      "Bash(git status:*)",
+      "Bash(git log:*)",
+      "Bash(git diff:*)",
+      "Bash(git show:*)",
+      "Bash(git branch:*)",
+      "Bash(git fetch:*)",
+      "Bash(cargo fmt:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(cargo test:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo check:*)",
+      "Bash(ruff check:*)",
+      "Bash(ruff format:*)",
+      "Bash(pytest:*)"
+    ],
+    "deny": [
+      "Read(./target/**)",
+      "Read(./.env.local)",
+      "Read(./.env*.local)"
+    ]
+  }
+}
+EOF
