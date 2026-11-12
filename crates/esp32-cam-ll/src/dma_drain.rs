@@ -383,6 +383,8 @@ impl HalfDrain {
     ) -> Result<usize, CameraError> {
         let half_bytes = self.half_bytes();
         let off = self.half_idx * half_bytes;
+        // LL-03: read only what the DMA wrote before this point.
+        crate::esp32_i2s::dma_fence(core::sync::atomic::Ordering::Acquire);
         let half = dma_buf
             .get(off..off + half_bytes)
             .ok_or(CameraError::InvalidArg)?;
@@ -682,7 +684,7 @@ impl PolledJpegCapture {
 mod tests {
     use super::*;
     use crate::dma_filter::DmaElement;
-    use crate::dma_ring::build_circular_ring_mut;
+    use crate::dma_ring::build_circular_ring;
 
     const HALVES: usize = 8;
     const NODE: usize = JPEG_DMA_NODE_SIZE;
@@ -722,7 +724,7 @@ mod tests {
     impl<const N: usize, const B: usize> Ring<N, B> {
         fn new() -> Self {
             let mut r = Self {
-                desc: [Lldesc::empty(); N],
+                desc: [Lldesc::EMPTY; N],
                 buf: [DMA_POISON_BYTE; B],
             };
             r.build();
@@ -732,7 +734,7 @@ mod tests {
         /// Re-initializes the descriptors (as every capture start does) but
         /// keeps the buffer contents, like the real static ring.
         fn build(&mut self) {
-            build_circular_ring_mut(&mut self.desc, &mut self.buf, NODE).expect("ring builds");
+            build_circular_ring(&mut self.desc, &mut self.buf, NODE).expect("ring builds");
         }
 
         /// The DMA writes unpacked JPEG `bytes` into half `h` at unpacked
@@ -861,7 +863,7 @@ mod tests {
         assert!(ring.half(0).iter().all(|&b| b == DMA_POISON_BYTE));
         assert!(ring.half(1).iter().all(|&b| b == DMA_POISON_BYTE));
         for d in 0..4 {
-            assert_eq!(ring.desc[d].size_length_flags, rearmed_flags());
+            assert_eq!(ring.desc[d].flags(), rearmed_flags());
         }
         // Half 2 is untouched.
         assert_eq!(ring.half(2)[2], 0xA2);
@@ -1057,7 +1059,7 @@ mod tests {
         assert_eq!(drain.half_idx(), 1);
         assert_eq!(drain.pending(), 2);
         // The consumed half was re-armed before the sink ran; the others not.
-        assert_eq!(ring.desc[1].size_length_flags, rearmed_flags());
+        assert_eq!(ring.desc[1].flags(), rearmed_flags());
         assert!(!ring.desc[3].owner());
     }
 
@@ -1079,7 +1081,7 @@ mod tests {
         assert_eq!(&scratch[..4], &[0xFF, 0xD8, 0xFF, 0xD9]);
         assert!(scratch[4..].iter().all(|&b| b == DMA_POISON_BYTE));
         assert!(ring.half(0).iter().all(|&b| b == DMA_POISON_BYTE));
-        assert_eq!(ring.desc[0].size_length_flags, rearmed_flags());
+        assert_eq!(ring.desc[0].flags(), rearmed_flags());
         assert_eq!(drain.half_idx(), 1);
         assert_eq!(drain.halves_drained(), 1);
         assert!(dma.barriers >= 1, "poison ordered before re-arm");

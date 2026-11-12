@@ -1,0 +1,12 @@
+error[E0505]: cannot move out of `cam` because it is borrowed
+  --> tests/ui/camera_dropped_while_running.rs:22:10
+   |
+ 7 |     let mut cam = Esp32I2sCamera::take().expect("I2S0 is free");
+   |         ------- binding `cam` declared here
+...
+21 |     let running = cam.start(&cfg, &mut ring).expect("start");
+   |                   --- borrow of `cam` occurs here
+22 |     drop(cam);
+   |          ^^^ move out of `cam` occurs here
+23 |     running.stop();
+   |     ------- borrow later used here

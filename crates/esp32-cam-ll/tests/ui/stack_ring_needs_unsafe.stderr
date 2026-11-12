@@ -1,0 +1,28 @@
+error[E0597]: `desc` does not live long enough
+  --> tests/ui/stack_ring_needs_unsafe.rs:13:33
+   |
+11 |     let mut desc = [Lldesc::EMPTY; 4];
+   |         -------- binding `desc` declared here
+12 |     let mut buf = Buf([0; 8192]);
+13 |     let mut ring = DmaRing::new(&mut desc, &mut buf.0, 2048).expect("ring");
+   |                                 ^^^^^^^^^ borrowed value does not live long enough
+...
+26 |     let running = cam.start(&cfg, &mut ring).expect("start");
+   |                   -------------------------- argument requires that `desc` is borrowed for `'static`
+27 |     core::mem::forget(running);
+28 | }
+   | - `desc` dropped here while still borrowed
+
+error[E0597]: `buf.0` does not live long enough
+  --> tests/ui/stack_ring_needs_unsafe.rs:13:44
+   |
+12 |     let mut buf = Buf([0; 8192]);
+   |         ------- binding `buf` declared here
+13 |     let mut ring = DmaRing::new(&mut desc, &mut buf.0, 2048).expect("ring");
+   |                                            ^^^^^^^^^^ borrowed value does not live long enough
+...
+26 |     let running = cam.start(&cfg, &mut ring).expect("start");
+   |                   -------------------------- argument requires that `buf.0` is borrowed for `'static`
+27 |     core::mem::forget(running);
+28 | }
+   | - `buf.0` dropped here while still borrowed

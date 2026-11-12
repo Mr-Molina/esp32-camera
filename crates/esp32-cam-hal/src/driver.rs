@@ -639,7 +639,9 @@ pub struct CameraDriver<
     sensor: Sensor,
     config: CameraConfig,
     xclk: XclkController,
-    i2s: Esp32I2sCamera,
+    /// The I2S0 controller: `None` when another owner holds I2S0 (LL-13,
+    /// Xtensa only), in which case `init` fails with `InvalidState`.
+    i2s: Option<Esp32I2sCamera>,
     dma_cfg: Option<DmaSizeConfig>,
     pool: FramePool<COUNT, BUF_CAP>,
     timestamp_counter_us: u64,
@@ -666,7 +668,7 @@ impl<
             sensor,
             config,
             xclk: XclkController::new(),
-            i2s: Esp32I2sCamera::new(),
+            i2s: new_i2s(),
             dma_cfg: None,
             pool: FramePool::new(grab_mode),
             timestamp_counter_us: 0,
@@ -708,8 +710,9 @@ impl<
         let setup_res = (|| -> Result<DmaSizeConfig, CameraError> {
             // 3. Configure low-level I2S0 pins unconditionally (HAL-003)
             let ll_pins = pins.to_ll_pin_config(true);
-            self.i2s.set_pin(&ll_pins)?;
-            self.i2s.config()?;
+            let i2s = self.i2s.as_mut().ok_or(CameraError::InvalidState)?;
+            i2s.set_pin(&ll_pins)?;
+            i2s.config()?;
 
             // 4. Check sensor capabilities against requested format and
             // resolution (`esp_camera.c:337-346`)
@@ -728,11 +731,15 @@ impl<
             // 5. Configure sampling mode and DMA sizes (`cam_config` in
             // `driver/cam_hal.c:595-666`)
             let sensor_pid = self.sensor.id().pid;
-            let sample_cfg = self.i2s.set_sample_mode(
-                self.config.pixel_format,
-                self.config.xclk_freq_hz,
-                sensor_pid,
-            )?;
+            let sample_cfg = self
+                .i2s
+                .as_mut()
+                .ok_or(CameraError::InvalidState)?
+                .set_sample_mode(
+                    self.config.pixel_format,
+                    self.config.xclk_freq_hz,
+                    sensor_pid,
+                )?;
             let res = frame_size.resolution();
             let dma_cfg = calc_dma_sizes(
                 self.config.pixel_format == PixelFormat::Jpeg,
@@ -885,6 +892,11 @@ impl<
     pub const fn max_frame_size(&self) -> FrameSize {
         self.max_frame_size
     }
+
+    #[cfg(test)]
+    fn i2s_running(&self) -> bool {
+        self.i2s.as_ref().is_some_and(Esp32I2sCamera::is_running)
+    }
 }
 
 impl<
@@ -901,11 +913,12 @@ impl<
         mut self,
     ) -> Result<CameraDriver<Board, Sccb, Streaming, Sensor, COUNT, BUF_CAP>, CameraError> {
         let dma_cfg = self.dma_cfg.ok_or(CameraError::InvalidState)?;
-        self.i2s.vsync_intr_enable(true);
-        if !self.i2s.start(&dma_cfg, 0) {
-            self.i2s.vsync_intr_enable(false);
+        let i2s = self.i2s.as_mut().ok_or(CameraError::InvalidState)?;
+        i2s.vsync_intr_enable(true);
+        if let Err(e) = start_dma(i2s, &dma_cfg) {
+            i2s.vsync_intr_enable(false);
             self.xclk.disable_out_clock();
-            return Err(CameraError::HardwareError);
+            return Err(e);
         }
         Ok(CameraDriver {
             board: self.board,
@@ -932,7 +945,7 @@ impl<
         dma_half_buffers: &[&[u8]],
     ) -> Result<FrameGuard<'_>, CameraError> {
         assemble_and_lease_frame(
-            &mut self.i2s,
+            self.i2s.as_mut().ok_or(CameraError::InvalidState)?,
             &self.dma_cfg,
             &self.config,
             &self.sensor,
@@ -984,13 +997,15 @@ impl<
         mut self,
     ) -> Result<CameraDriver<Board, Sccb, Uninitialized, Sensor, COUNT, BUF_CAP>, CameraError> {
         let mut first_err = None;
-        if !self.i2s.stop() && first_err.is_none() {
-            first_err = Some(CameraError::HardwareError);
-        }
-        self.i2s.vsync_intr_enable(false);
-        if let Err(e) = self.i2s.deinit() {
-            if first_err.is_none() {
-                first_err = Some(e);
+        if let Some(i2s) = self.i2s.as_mut() {
+            if !i2s.stop() {
+                first_err = Some(CameraError::HardwareError);
+            }
+            i2s.vsync_intr_enable(false);
+            if let Err(e) = i2s.deinit() {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
             }
         }
         self.xclk.disable_out_clock();
@@ -1033,7 +1048,7 @@ impl<
         dma_half_buffers: &[&[u8]],
     ) -> Result<FrameGuard<'_>, CameraError> {
         assemble_and_lease_frame(
-            &mut self.i2s,
+            self.i2s.as_mut().ok_or(CameraError::InvalidState)?,
             &self.dma_cfg,
             &self.config,
             &self.sensor,
@@ -1048,8 +1063,10 @@ impl<
     pub fn stop_streaming(
         mut self,
     ) -> CameraDriver<Board, Sccb, Initialized, Sensor, COUNT, BUF_CAP> {
-        self.i2s.vsync_intr_enable(false);
-        let _ = self.i2s.stop();
+        if let Some(i2s) = self.i2s.as_mut() {
+            i2s.vsync_intr_enable(false);
+            let _ = i2s.stop();
+        }
         CameraDriver {
             board: self.board,
             bus: self.bus,
@@ -1076,6 +1093,43 @@ impl<
     }
 }
 
+/// The I2S0 controller for a new driver: on Xtensa the single instance from
+/// [`Esp32I2sCamera::take`] (LL-13), on the host an independent
+/// shadow-register simulator.
+fn new_i2s() -> Option<Esp32I2sCamera> {
+    #[cfg(target_arch = "xtensa")]
+    {
+        Esp32I2sCamera::take()
+    }
+    #[cfg(not(target_arch = "xtensa"))]
+    {
+        Some(Esp32I2sCamera::new())
+    }
+}
+
+/// Starts the DMA for the HAL's capture pipeline.
+///
+/// HAL-01 (WP-08): the HAL owns no DMA ring yet (WP-20 gives it a
+/// `DmaRing<'static>`), and the low-level API no longer starts DMA at an
+/// unchecked address, so on Xtensa streaming and one-shot capture return
+/// [`CameraError::NotSupported`]. On the host the start is simulated on the
+/// shadow registers; frames come from the caller's half-buffers.
+fn start_dma(i2s: &mut Esp32I2sCamera, dma_cfg: &DmaSizeConfig) -> Result<(), CameraError> {
+    #[cfg(target_arch = "xtensa")]
+    {
+        let _ = (i2s, dma_cfg);
+        Err(CameraError::NotSupported)
+    }
+    #[cfg(not(target_arch = "xtensa"))]
+    {
+        if i2s.simulate_start(dma_cfg) {
+            Ok(())
+        } else {
+            Err(CameraError::HardwareError)
+        }
+    }
+}
+
 fn assemble_and_lease_frame<
     'a,
     Sccb: SccbBus,
@@ -1099,8 +1153,8 @@ fn assemble_and_lease_frame<
     // HAL-004: only start if !i2s.is_running(), and only stop if it was not
     // running before
     let was_running = i2s.is_running();
-    if !was_running && !i2s.start(&dma_cfg, 0) {
-        return Err(CameraError::HardwareError);
+    if !was_running {
+        start_dma(i2s, &dma_cfg)?;
     }
 
     let fs = sensor.status().framesize;
@@ -1354,7 +1408,7 @@ mod tests {
         let mut init_driver = driver.init().expect("driver init");
 
         // 1. In Initialized state, i2s is not yet running (HAL-003)
-        assert!(!init_driver.i2s.is_running());
+        assert!(!init_driver.i2s_running());
 
         // 2. One-shot capture from Initialized state starts and then stops i2s
         // (HAL-004)
@@ -1366,11 +1420,11 @@ mod tests {
             assert_eq!(frame.len(), 8);
         }
         // After one-shot capture, i2s is stopped
-        assert!(!init_driver.i2s.is_running());
+        assert!(!init_driver.i2s_running());
 
         // 3. Start streaming: i2s becomes active
         let mut streaming = init_driver.start_streaming().expect("start streaming");
-        assert!(streaming.i2s.is_running());
+        assert!(streaming.i2s_running());
 
         // 4. Capture while streaming: i2s remains active throughout! (HAL-004)
         {
@@ -1379,11 +1433,11 @@ mod tests {
                 .expect("streaming capture");
             assert_eq!(frame.len(), 8);
         }
-        assert!(streaming.i2s.is_running());
+        assert!(streaming.i2s_running());
 
         // 5. Deinit stops and tears down
         let stopped = streaming.stop_streaming();
-        assert!(!stopped.i2s.is_running());
+        assert!(!stopped.i2s_running());
         let _uninit = stopped.deinit().expect("deinit succeeds");
     }
 

@@ -24,15 +24,16 @@ pub use dma_filter::{
     select_sample_mode, DmaElement, DmaFilterFn, DmaFilterKind, I2sSamplingMode, SampleModeConfig,
 };
 pub use dma_ring::{
-    build_circular_ring, calc_dma_sizes, calc_rgb_dma_sizes, verify_circular_ring, DmaSizeConfig,
-    Lldesc, DEFAULT_CAMERA_DMA_BUFFER_SIZE_MAX, LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE,
-    MAX_DMA_IMAGE_SIZE,
+    build_circular_ring, calc_dma_sizes, calc_rgb_dma_sizes, is_dma_capable, validate_dma_ring,
+    verify_circular_ring, DmaRing, DmaRingLayout, DmaRingStorage, DmaSizeConfig, Lldesc,
+    DEFAULT_CAMERA_DMA_BUFFER_SIZE_MAX, DESC_BYTES, DMA_CAPABLE_END, DMA_CAPABLE_START,
+    LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE, MAX_DMA_IMAGE_SIZE,
 };
 pub use esp32_i2s::{
     emergency_stop_i2s0_hw, io_mux_reg_addr, CamPinConfig, Esp32I2sCamera, GpioMatrixBinding,
-    I2s0DmaStatus, I2s0RegisterBlock, DPORT_BASE_ADDR, DPORT_I2S0_CLK_EN, DPORT_I2S0_RST,
-    DPORT_PERIP_CLK_EN_REG, DPORT_PERIP_RST_EN_REG, ESP32_GPIO_NUM_MAX, GPIO_BASE_ADDR,
-    GPIO_ENABLE1_W1TC_REG, GPIO_ENABLE_W1TC_REG, GPIO_FUNC0_IN_SEL_CFG_REG,
+    I2s0DmaStatus, I2s0RegisterBlock, RunningCapture, DPORT_BASE_ADDR, DPORT_I2S0_CLK_EN,
+    DPORT_I2S0_RST, DPORT_PERIP_CLK_EN_REG, DPORT_PERIP_RST_EN_REG, ESP32_GPIO_NUM_MAX,
+    GPIO_BASE_ADDR, GPIO_ENABLE1_W1TC_REG, GPIO_ENABLE_W1TC_REG, GPIO_FUNC0_IN_SEL_CFG_REG,
     GPIO_FUNC0_OUT_SEL_CFG_REG, GPIO_IN1_REG, GPIO_IN_REG, GPIO_MATRIX_CONST_ONE_INPUT,
     GPIO_PIN0_REG, I2S0I_DATA_IN0_IDX, I2S0I_H_ENABLE_IDX, I2S0I_H_SYNC_IDX, I2S0I_V_SYNC_IDX,
     I2S0I_WS_IN_IDX, I2S0_BASE_ADDR, I2S_CLKM_CONF_REG_OFFSET, I2S_CONF2_REG_OFFSET,

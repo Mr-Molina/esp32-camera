@@ -8,5 +8,16 @@ description = "Low-level DMA descriptor ring, I2S0/LCD_CAM peripheral interface,
 [dependencies]
 esp32-cam-types.workspace = true
 
-[lints]
-workspace = true
+[dev-dependencies]
+trybuild = "1.0.122"
+
+# LL-20: this is the one crate with `unsafe` MMIO and DMA code, so its lints
+# are `deny` (the workspace defaults are `warn`). Keep the list a superset of
+# `[workspace.lints]`.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+static_mut_refs = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+undocumented_unsafe_blocks = "deny"

@@ -1,11 +1,11 @@
-//! ESP32 ROM `lldesc_t` DMA descriptor layout, circular ring initialization,
-//! and RGB/JPEG
-//! DMA buffer sizing algorithms (`target/esp32/ll_cam.c:470-559`,
-//! `driver/cam_hal.c:465-482`).
+//! ESP32 ROM `lldesc_t` DMA descriptor layout, the checked [`DmaRing`]
+//! (LL-01), circular ring initialization, and RGB/JPEG DMA buffer sizing
+//! algorithms (`target/esp32/ll_cam.c:470-559`, `driver/cam_hal.c:465-482`).
 
+use core::cell::UnsafeCell;
+use core::fmt;
 use core::ptr;
-use core::sync::atomic::compiler_fence;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use esp32_cam_types::CameraError;
 
 use crate::dma_filter::I2sSamplingMode;
@@ -22,6 +22,18 @@ pub const DEFAULT_CAMERA_DMA_BUFFER_SIZE_MAX: usize = 32768;
 /// `ll_cam.c:481`).
 pub const MAX_DMA_IMAGE_SIZE: usize = 4 * 1024 * 1024;
 
+/// First byte of the ESP32 internal SRAM the I2S DMA can reach
+/// (`0x3FFA_E000`, DRAM; ESP32 TRM "Embedded Memory").
+pub const DMA_CAPABLE_START: usize = 0x3FFA_E000;
+
+/// Last byte (inclusive) of the DMA-capable internal SRAM window
+/// (`0x3FFF_FFFF`). External PSRAM (`0x3F80_0000..`) is not DMA-capable.
+pub const DMA_CAPABLE_END: usize = 0x3FFF_FFFF;
+
+/// Size of one [`Lldesc`] in bytes (`lldesc_t` is three 32-bit words on the
+/// target).
+pub const DESC_BYTES: usize = core::mem::size_of::<Lldesc>();
+
 /// Hardware DMA linked-list descriptor matching ESP32/ESP32-S2/ESP32-S3 ROM
 /// `lldesc_t`.
 ///
@@ -32,17 +44,43 @@ pub const MAX_DMA_IMAGE_SIZE: usize = 4 * 1024 * 1024;
 /// - bit `29` (`1` bit): `sosf` (start of sub-frame)
 /// - bit `30` (`1` bit): `eof` (end of frame)
 /// - bit `31` (`1` bit): `owner` (`1` = DMA controller, `0` = CPU software)
+///
+/// The header word is written back by the DMA engine (owner, length, eof)
+/// while the CPU holds references to the descriptor, so it is an
+/// [`AtomicU32`] (LL-03): every accessor is a single load or store, and the
+/// setters take `&self`. Loads are `Acquire` and stores `Release`, which on
+/// Xtensa adds a `memw` on the DMA side of each access.
+///
+/// `buf` is `*mut u8`: the DMA writes through it (LL-02).
 #[repr(C, align(4))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Lldesc {
-    pub size_length_flags: u32,
-    pub buf: *const u8,
+    pub size_length_flags: AtomicU32,
+    pub buf: *mut u8,
     pub qe_stqe_next: *const Lldesc,
 }
+
+// `lldesc_t` layout: the header word first, then the two pointers.
+const _: () = assert!(core::mem::offset_of!(Lldesc, size_length_flags) == 0);
+#[cfg(target_pointer_width = "32")]
+const _: () = assert!(
+    core::mem::size_of::<Lldesc>() == 12
+        && core::mem::align_of::<Lldesc>() == 4
+        && core::mem::offset_of!(Lldesc, buf) == 4
+);
 
 impl Default for Lldesc {
     fn default() -> Self {
         Self::empty()
+    }
+}
+
+impl fmt::Debug for Lldesc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Lldesc")
+            .field("size_length_flags", &format_args!("{:#010x}", self.flags()))
+            .field("buf", &self.buf)
+            .field("qe_stqe_next", &self.qe_stqe_next)
+            .finish()
     }
 }
 
@@ -63,6 +101,15 @@ impl Lldesc {
     pub const EOF_BIT: u32 = 1 << 30;
     /// Bit flag for `owner` (`bit 31`, `1` = DMA hardware).
     pub const OWNER_BIT: u32 = 1 << 31;
+
+    /// A zeroed descriptor with null `buf` and `qe_stqe_next`, usable in
+    /// array repeat expressions (`[Lldesc::EMPTY; 16]`). Every use is a
+    /// fresh descriptor, which is the point.
+    #[allow(
+        clippy::declare_interior_mutable_const,
+        reason = "array-repeat initializer; each use must be a new descriptor"
+    )]
+    pub const EMPTY: Self = Self::empty();
 
     /// Packs `size`, `length`, `offset`, `sosf`, `eof`, and `owner` into the 32-bit
     /// header word.
@@ -92,231 +139,122 @@ impl Lldesc {
     #[inline]
     pub const fn empty() -> Self {
         Self {
-            size_length_flags: 0,
-            buf: ptr::null(),
+            size_length_flags: AtomicU32::new(0),
+            buf: ptr::null_mut(),
             qe_stqe_next: ptr::null(),
         }
+    }
+
+    /// Reads the whole header word with one `Acquire` load.
+    #[inline]
+    pub fn flags(&self) -> u32 {
+        self.size_length_flags.load(Ordering::Acquire)
+    }
+
+    /// Replaces the whole header word (`size`, `length`, `offset`, `sosf`,
+    /// `eof`, `owner`) with one `Release` store, e.g. a value from
+    /// [`Self::pack_flags`].
+    ///
+    /// Re-arming a descriptor this way is a single bus write, so the DMA never
+    /// observes a partially updated header, and the `Release` ordering keeps
+    /// earlier buffer writes (poisoning) before it (LL-03).
+    #[inline]
+    pub fn store_flags(&self, flags: u32) {
+        self.size_length_flags.store(flags, Ordering::Release);
+    }
+
+    /// Replaces the bits of `mask` with `bits`: one load and one packed
+    /// store. Only for a CPU-owned descriptor (the DMA is stopped or does not
+    /// own it); use [`Self::store_flags`] to re-arm a descriptor the DMA may
+    /// write back concurrently.
+    #[inline]
+    fn update_flags(&self, mask: u32, bits: u32) {
+        let cur = self.flags();
+        self.store_flags((cur & !mask) | (bits & mask));
     }
 
     /// Returns the 12-bit `size` field (`0..=4095`).
     #[inline]
     pub fn size(&self) -> u16 {
-        // JUSTIFICATION: Hardware DMA controller accesses descriptor fields
-        // concurrently.
-        // SAFETY: `self.size_length_flags` is an aligned, valid u32 reference.
-        let flags = unsafe {
-            compiler_fence(Ordering::SeqCst);
-            let val = ptr::read_volatile(&self.size_length_flags);
-            compiler_fence(Ordering::SeqCst);
-            val
-        };
-        (flags & Self::SIZE_MASK) as u16
+        (self.flags() & Self::SIZE_MASK) as u16
     }
 
     /// Sets the 12-bit `size` field (`0..=4095`), saturating at `4095`.
+    /// CPU-owned descriptors only (see [`Self::store_flags`]).
     #[inline]
-    pub fn set_size(&mut self, size: u16) {
-        let s = size.min(0x0FFF) as u32;
-        // JUSTIFICATION: Hardware DMA controller accesses descriptor fields
-        // concurrently.
-        // SAFETY: `self.size_length_flags` is an aligned, valid u32 reference.
-        unsafe {
-            compiler_fence(Ordering::SeqCst);
-            let cur = ptr::read_volatile(&self.size_length_flags);
-            ptr::write_volatile(&mut self.size_length_flags, (cur & !Self::SIZE_MASK) | s);
-            compiler_fence(Ordering::SeqCst);
-        }
+    pub fn set_size(&self, size: u16) {
+        self.update_flags(Self::SIZE_MASK, size.min(0x0FFF) as u32);
     }
 
     /// Returns the 12-bit `length` field (`0..=4095`).
     #[inline]
     pub fn length(&self) -> u16 {
-        // JUSTIFICATION: Hardware DMA controller accesses descriptor fields
-        // concurrently.
-        // SAFETY: `self.size_length_flags` is an aligned, valid u32 reference.
-        let flags = unsafe {
-            compiler_fence(Ordering::SeqCst);
-            let val = ptr::read_volatile(&self.size_length_flags);
-            compiler_fence(Ordering::SeqCst);
-            val
-        };
-        ((flags & Self::LENGTH_MASK) >> Self::LENGTH_SHIFT) as u16
+        ((self.flags() & Self::LENGTH_MASK) >> Self::LENGTH_SHIFT) as u16
     }
 
     /// Sets the 12-bit `length` field (`0..=4095`), saturating at `4095`.
+    /// CPU-owned descriptors only (see [`Self::store_flags`]).
     #[inline]
-    pub fn set_length(&mut self, length: u16) {
-        let l = (length.min(0x0FFF) as u32) << Self::LENGTH_SHIFT;
-        // JUSTIFICATION: Hardware DMA controller accesses descriptor fields
-        // concurrently.
-        // SAFETY: `self.size_length_flags` is an aligned, valid u32 reference.
-        unsafe {
-            compiler_fence(Ordering::SeqCst);
-            let cur = ptr::read_volatile(&self.size_length_flags);
-            ptr::write_volatile(&mut self.size_length_flags, (cur & !Self::LENGTH_MASK) | l);
-            compiler_fence(Ordering::SeqCst);
-        }
+    pub fn set_length(&self, length: u16) {
+        self.update_flags(
+            Self::LENGTH_MASK,
+            (length.min(0x0FFF) as u32) << Self::LENGTH_SHIFT,
+        );
     }
 
     /// Returns the 5-bit `offset` field (`0..=31`).
     #[inline]
     pub fn offset(&self) -> u8 {
-        // JUSTIFICATION: Hardware DMA controller accesses descriptor fields
-        // concurrently.
-        // SAFETY: `self.size_length_flags` is an aligned, valid u32 reference.
-        let flags = unsafe {
-            compiler_fence(Ordering::SeqCst);
-            let val = ptr::read_volatile(&self.size_length_flags);
-            compiler_fence(Ordering::SeqCst);
-            val
-        };
-        ((flags & Self::OFFSET_MASK) >> Self::OFFSET_SHIFT) as u8
+        ((self.flags() & Self::OFFSET_MASK) >> Self::OFFSET_SHIFT) as u8
     }
 
     /// Sets the 5-bit `offset` field (`0..=31`), saturating at `31`.
+    /// CPU-owned descriptors only (see [`Self::store_flags`]).
     #[inline]
-    pub fn set_offset(&mut self, offset: u8) {
-        let o = (offset.min(0x1F) as u32) << Self::OFFSET_SHIFT;
-        // JUSTIFICATION: Hardware DMA controller accesses descriptor fields
-        // concurrently.
-        // SAFETY: `self.size_length_flags` is an aligned, valid u32 reference.
-        unsafe {
-            compiler_fence(Ordering::SeqCst);
-            let cur = ptr::read_volatile(&self.size_length_flags);
-            ptr::write_volatile(&mut self.size_length_flags, (cur & !Self::OFFSET_MASK) | o);
-            compiler_fence(Ordering::SeqCst);
-        }
+    pub fn set_offset(&self, offset: u8) {
+        self.update_flags(
+            Self::OFFSET_MASK,
+            (offset.min(0x1F) as u32) << Self::OFFSET_SHIFT,
+        );
     }
 
     /// Returns the `sosf` (start of sub-frame) flag (`bit 29`).
     #[inline]
     pub fn sosf(&self) -> bool {
-        // JUSTIFICATION: Hardware DMA controller accesses descriptor fields
-        // concurrently.
-        // SAFETY: `self.size_length_flags` is an aligned, valid u32 reference.
-        let flags = unsafe {
-            compiler_fence(Ordering::SeqCst);
-            let val = ptr::read_volatile(&self.size_length_flags);
-            compiler_fence(Ordering::SeqCst);
-            val
-        };
-        (flags & Self::SOSF_BIT) != 0
+        (self.flags() & Self::SOSF_BIT) != 0
     }
 
     /// Sets the `sosf` (start of sub-frame) flag (`bit 29`).
+    /// CPU-owned descriptors only (see [`Self::store_flags`]).
     #[inline]
-    pub fn set_sosf(&mut self, sosf: bool) {
-        // JUSTIFICATION: Hardware DMA controller accesses descriptor fields
-        // concurrently.
-        // SAFETY: `self.size_length_flags` is an aligned, valid u32 reference.
-        unsafe {
-            compiler_fence(Ordering::SeqCst);
-            let cur = ptr::read_volatile(&self.size_length_flags);
-            let next = if sosf {
-                cur | Self::SOSF_BIT
-            } else {
-                cur & !Self::SOSF_BIT
-            };
-            ptr::write_volatile(&mut self.size_length_flags, next);
-            compiler_fence(Ordering::SeqCst);
-        }
+    pub fn set_sosf(&self, sosf: bool) {
+        self.update_flags(Self::SOSF_BIT, if sosf { Self::SOSF_BIT } else { 0 });
     }
 
     /// Returns the `eof` (end of frame) flag (`bit 30`).
     #[inline]
     pub fn eof(&self) -> bool {
-        // JUSTIFICATION: Hardware DMA controller accesses descriptor fields
-        // concurrently.
-        // SAFETY: `self.size_length_flags` is an aligned, valid u32 reference.
-        let flags = unsafe {
-            compiler_fence(Ordering::SeqCst);
-            let val = ptr::read_volatile(&self.size_length_flags);
-            compiler_fence(Ordering::SeqCst);
-            val
-        };
-        (flags & Self::EOF_BIT) != 0
+        (self.flags() & Self::EOF_BIT) != 0
     }
 
     /// Sets the `eof` (end of frame) flag (`bit 30`).
+    /// CPU-owned descriptors only (see [`Self::store_flags`]).
     #[inline]
-    pub fn set_eof(&mut self, eof: bool) {
-        // JUSTIFICATION: Hardware DMA controller accesses descriptor fields
-        // concurrently.
-        // SAFETY: `self.size_length_flags` is an aligned, valid u32 reference.
-        unsafe {
-            compiler_fence(Ordering::SeqCst);
-            let cur = ptr::read_volatile(&self.size_length_flags);
-            let next = if eof {
-                cur | Self::EOF_BIT
-            } else {
-                cur & !Self::EOF_BIT
-            };
-            ptr::write_volatile(&mut self.size_length_flags, next);
-            compiler_fence(Ordering::SeqCst);
-        }
+    pub fn set_eof(&self, eof: bool) {
+        self.update_flags(Self::EOF_BIT, if eof { Self::EOF_BIT } else { 0 });
     }
 
     /// Returns the `owner` flag (`bit 31`, `true` = owned by DMA hardware).
     #[inline]
     pub fn owner(&self) -> bool {
-        // JUSTIFICATION: Hardware DMA controller accesses descriptor fields
-        // concurrently.
-        // SAFETY: `self.size_length_flags` is an aligned, valid u32 reference.
-        let flags = unsafe {
-            compiler_fence(Ordering::SeqCst);
-            let val = ptr::read_volatile(&self.size_length_flags);
-            compiler_fence(Ordering::SeqCst);
-            val
-        };
-        (flags & Self::OWNER_BIT) != 0
+        (self.flags() & Self::OWNER_BIT) != 0
     }
 
     /// Sets the `owner` flag (`bit 31`, `true` = owned by DMA hardware).
+    /// CPU-owned descriptors only (see [`Self::store_flags`]).
     #[inline]
-    pub fn set_owner(&mut self, owner: bool) {
-        // JUSTIFICATION: Hardware DMA controller accesses descriptor fields
-        // concurrently.
-        // SAFETY: `self.size_length_flags` is an aligned, valid u32 reference.
-        unsafe {
-            compiler_fence(Ordering::SeqCst);
-            let cur = ptr::read_volatile(&self.size_length_flags);
-            let next = if owner {
-                cur | Self::OWNER_BIT
-            } else {
-                cur & !Self::OWNER_BIT
-            };
-            ptr::write_volatile(&mut self.size_length_flags, next);
-            compiler_fence(Ordering::SeqCst);
-        }
-    }
-
-    /// Replaces the whole header word (`size`, `length`, `offset`, `sosf`,
-    /// `eof`, `owner`) with one volatile store, e.g. a value from
-    /// [`Self::pack_flags`].
-    ///
-    /// Re-arming a descriptor this way is a single bus write, so the DMA never
-    /// observes a partially updated header (unlike a sequence of `set_*`
-    /// read-modify-writes).
-    #[inline]
-    pub fn store_flags(&mut self, flags: u32) {
-        // JUSTIFICATION: Hardware DMA controller reads descriptor headers
-        // concurrently, so the store must not be elided, split or reordered.
-        // SAFETY:
-        // 1. Alignment & Non-null: `&mut self.size_length_flags` is a valid,
-        //    4-byte aligned `u32` field of a `#[repr(C, align(4))]` struct.
-        // 2. Memory layout: `size_length_flags` is the first 32-bit word of
-        //    `Lldesc`, matching ROM `lldesc_t`.
-        // 3. Provenance & Lifetime: Derived from `&mut self`, valid for the
-        //    duration of the call.
-        // 4. Exclusive aliasing: `&mut self` grants unique CPU-side access.
-        // 5. Volatile semantics: One `write_volatile` of the packed word;
-        //    the fences keep surrounding buffer accesses on their side of it.
-        // 6. Panic safety: A volatile `u32` store cannot unwind.
-        unsafe {
-            compiler_fence(Ordering::SeqCst);
-            ptr::write_volatile(&mut self.size_length_flags, flags);
-            compiler_fence(Ordering::SeqCst);
-        }
+    pub fn set_owner(&self, owner: bool) {
+        self.update_flags(Self::OWNER_BIT, if owner { Self::OWNER_BIT } else { 0 });
     }
 
     /// Returns the 20-bit physical descriptor address (`addr & 0x000F_FFFF`) used
@@ -330,6 +268,312 @@ impl Lldesc {
     #[inline]
     pub fn link_addr_20bit(&self) -> u32 {
         (ptr::from_ref(self) as usize as u32) & 0x000F_FFFF
+    }
+}
+
+/// Returns `true` if `len > 0` bytes at `addr` lie entirely inside the ESP32
+/// DMA-capable internal SRAM window
+/// ([`DMA_CAPABLE_START`]`..=`[`DMA_CAPABLE_END`]).
+#[inline]
+#[must_use]
+pub const fn is_dma_capable(addr: usize, len: usize) -> bool {
+    if len == 0 || addr < DMA_CAPABLE_START {
+        return false;
+    }
+    match addr.checked_add(len - 1) {
+        Some(last) => last <= DMA_CAPABLE_END,
+        None => false,
+    }
+}
+
+/// Addresses and geometry of a descriptor ring, as checked by
+/// [`validate_dma_ring`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DmaRingLayout {
+    /// Address of the first [`Lldesc`].
+    pub desc_addr: usize,
+    /// Number of descriptors (one per node).
+    pub desc_count: usize,
+    /// Address of the DMA buffer.
+    pub buf_addr: usize,
+    /// Length of the DMA buffer in bytes (at least `desc_count * node_size`).
+    pub buf_len: usize,
+    /// Bytes per descriptor node.
+    pub node_size: usize,
+}
+
+/// Validates a descriptor ring layout (LL-01). A pure function on addresses,
+/// so it is unit-tested on the host with target addresses.
+///
+/// - [`CameraError::InvalidArg`] unless `desc_count >= 2`, `node_size` is
+///   non-zero, a multiple of 4 and at most [`LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE`]
+///   (`4092`), and both the descriptors and the buffer are 4-byte aligned.
+/// - [`CameraError::BufferTooSmall`] when `buf_len < desc_count * node_size`.
+/// - With `require_dma_window`, [`CameraError::InvalidArg`] unless the
+///   descriptors and the `desc_count * node_size` bytes of buffer the ring
+///   uses all lie in the DMA-capable window (no PSRAM, no peripheral space).
+///   [`DmaRing::new`] sets it on Xtensa.
+/// - Address arithmetic that would overflow is [`CameraError::InvalidArg`].
+pub const fn validate_dma_ring(
+    layout: &DmaRingLayout,
+    require_dma_window: bool,
+) -> Result<(), CameraError> {
+    let l = layout;
+    if l.desc_count < 2
+        || l.node_size == 0
+        || l.node_size > LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE
+        || !l.node_size.is_multiple_of(4)
+        || !l.desc_addr.is_multiple_of(4)
+        || !l.buf_addr.is_multiple_of(4)
+    {
+        return Err(CameraError::InvalidArg);
+    }
+    let Some(ring_bytes) = l.desc_count.checked_mul(l.node_size) else {
+        return Err(CameraError::Overflow);
+    };
+    let Some(desc_bytes) = l.desc_count.checked_mul(DESC_BYTES) else {
+        return Err(CameraError::Overflow);
+    };
+    if l.buf_len < ring_bytes {
+        return Err(CameraError::BufferTooSmall);
+    }
+    if l.buf_addr.checked_add(ring_bytes).is_none() || l.desc_addr.checked_add(desc_bytes).is_none()
+    {
+        return Err(CameraError::InvalidArg);
+    }
+    if require_dma_window
+        && !(is_dma_capable(l.desc_addr, desc_bytes) && is_dma_capable(l.buf_addr, ring_bytes))
+    {
+        return Err(CameraError::InvalidArg);
+    }
+    Ok(())
+}
+
+/// A circular descriptor ring over a DMA buffer, built by a checked
+/// constructor (LL-01).
+///
+/// [`DmaRing::new`] validates alignment, node size and (on Xtensa) that the
+/// descriptors and the buffer lie in DMA-capable internal SRAM, then links
+/// the ring. [`crate::Esp32I2sCamera::start`] borrows a `DmaRing<'static>`
+/// mutably for the lifetime of the returned [`crate::RunningCapture`], so
+/// the CPU cannot touch, move or drop the ring while the DMA writes into it.
+///
+/// If a `RunningCapture` is leaked (`mem::forget`), the ring stays *armed*:
+/// every accessor and every later start fail with
+/// [`CameraError::InvalidState`], because the DMA may still be writing.
+#[derive(Debug)]
+pub struct DmaRing<'a> {
+    descriptors: &'a mut [Lldesc],
+    buffer: &'a mut [u8],
+    node_size: usize,
+    armed: bool,
+}
+
+impl<'a> DmaRing<'a> {
+    /// Validates the layout ([`validate_dma_ring`], with the DMA window check
+    /// on Xtensa only, so host tests can build rings over host memory) and
+    /// links a circular ring of `descriptors.len()` nodes of `node_size`
+    /// bytes over the start of `buffer`. Every descriptor is DMA-owned with
+    /// `length == 0`. The ring covers exactly `descriptors.len() * node_size`
+    /// bytes; any rest of `buffer` is not part of it.
+    pub fn new(
+        descriptors: &'a mut [Lldesc],
+        buffer: &'a mut [u8],
+        node_size: usize,
+    ) -> Result<Self, CameraError> {
+        let layout = DmaRingLayout {
+            desc_addr: descriptors.as_ptr() as usize,
+            desc_count: descriptors.len(),
+            buf_addr: buffer.as_ptr() as usize,
+            buf_len: buffer.len(),
+            node_size,
+        };
+        validate_dma_ring(&layout, cfg!(target_arch = "xtensa"))?;
+        let ring_bytes = layout.desc_count * node_size;
+        let buffer = &mut buffer[..ring_bytes];
+        build_circular_ring(descriptors, buffer, node_size)?;
+        Ok(Self {
+            descriptors,
+            buffer,
+            node_size,
+            armed: false,
+        })
+    }
+
+    /// Number of descriptors (nodes).
+    #[inline]
+    pub fn desc_count(&self) -> usize {
+        self.descriptors.len()
+    }
+
+    /// Bytes per node.
+    #[inline]
+    pub const fn node_size(&self) -> usize {
+        self.node_size
+    }
+
+    /// Bytes of DMA buffer in the ring (`desc_count * node_size`).
+    #[inline]
+    pub fn len_bytes(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// 20-bit `in_link` address of the first descriptor.
+    #[inline]
+    pub fn first_desc_addr(&self) -> u32 {
+        self.descriptors[0].link_addr_20bit()
+    }
+
+    /// `true` while a [`crate::RunningCapture`] over this ring is live, or
+    /// after one was leaked.
+    #[inline]
+    pub const fn is_armed(&self) -> bool {
+        self.armed
+    }
+
+    /// The descriptors, for inspection. [`CameraError::InvalidState`] while
+    /// the ring is armed.
+    pub fn descriptors(&self) -> Result<&[Lldesc], CameraError> {
+        if self.armed {
+            return Err(CameraError::InvalidState);
+        }
+        Ok(self.descriptors)
+    }
+
+    /// The descriptors and the buffer, e.g. for
+    /// [`crate::HalfDrain::drain_tail_half`] after the DMA was stopped.
+    /// [`CameraError::InvalidState`] while the ring is armed.
+    pub fn parts_mut(&mut self) -> Result<(&mut [Lldesc], &mut [u8]), CameraError> {
+        if self.armed {
+            return Err(CameraError::InvalidState);
+        }
+        Ok((self.descriptors, self.buffer))
+    }
+
+    /// Fills the whole ring buffer with [`crate::DMA_POISON_BYTE`] (LL-06).
+    pub fn poison(&mut self) -> Result<(), CameraError> {
+        let (_, buf) = self.parts_mut()?;
+        buf.fill(crate::dma_drain::DMA_POISON_BYTE);
+        Ok(())
+    }
+
+    /// Re-links the ring and hands every descriptor back to the DMA
+    /// (`owner = 1`, `length = 0`, no `eof`), as before each start.
+    pub fn rearm(&mut self) -> Result<(), CameraError> {
+        let node_size = self.node_size;
+        let (desc, buf) = self.parts_mut()?;
+        build_circular_ring(desc, buf, node_size).map(|_| ())
+    }
+
+    /// Splits the ring for a [`crate::RunningCapture`]: arms it and returns
+    /// raw pointers to the descriptors and the buffer plus the armed flag.
+    pub(crate) fn arm(&mut self) -> Result<RingParts<'_>, CameraError> {
+        if self.armed {
+            return Err(CameraError::InvalidState);
+        }
+        self.armed = true;
+        Ok(RingParts {
+            descriptors: ptr::NonNull::from(&mut *self.descriptors),
+            buffer: ptr::NonNull::from(&mut *self.buffer),
+            node_size: self.node_size,
+            armed: &mut self.armed,
+        })
+    }
+}
+
+/// Raw view of an armed [`DmaRing`], held by [`crate::RunningCapture`].
+#[derive(Debug)]
+pub(crate) struct RingParts<'r> {
+    pub(crate) descriptors: ptr::NonNull<[Lldesc]>,
+    pub(crate) buffer: ptr::NonNull<[u8]>,
+    pub(crate) node_size: usize,
+    pub(crate) armed: &'r mut bool,
+}
+
+#[repr(C, align(4))]
+struct AlignedBytes<const N: usize>([u8; N]);
+
+/// `'static` storage for one [`DmaRing`] of `NODES` descriptors over a
+/// 4-byte-aligned `BYTES`-byte buffer, handed out at most once.
+///
+/// Declare it as a `static` so it lands in internal SRAM (`.bss`), which is
+/// DMA-capable, and take the ring with [`Self::take_ring`]:
+///
+/// ```
+/// use esp32_cam_ll::DmaRingStorage;
+/// static RING: DmaRingStorage<4, 512> = DmaRingStorage::new();
+/// let ring = RING.take_ring(128).expect("first take");
+/// assert_eq!(ring.len_bytes(), 512);
+/// assert!(RING.take_ring(128).is_err());
+/// ```
+pub struct DmaRingStorage<const NODES: usize, const BYTES: usize> {
+    taken: AtomicBool,
+    descriptors: UnsafeCell<[Lldesc; NODES]>,
+    buffer: UnsafeCell<AlignedBytes<BYTES>>,
+}
+
+// JUSTIFICATION: The cells are only reached through `take_ring`, which hands
+// out the single `&'static mut` view after winning the `taken` flag.
+// SAFETY:
+// 1. Alignment & Non-null: Not applicable; no pointer is created here.
+// 2. Memory layout: `UnsafeCell<T>` has the layout of `T`.
+// 3. Provenance & Lifetime: The storage is used as a `static`.
+// 4. Exclusive aliasing: `take_ring` swaps `taken` to `true` with `AcqRel`
+//    before creating the only mutable references, so at most one thread (or
+//    core) ever obtains them; no shared reference to the cells exists.
+// 5. Volatile semantics: Not applicable.
+// 6. Panic safety: Not applicable.
+unsafe impl<const NODES: usize, const BYTES: usize> Sync for DmaRingStorage<NODES, BYTES> {}
+
+impl<const NODES: usize, const BYTES: usize> Default for DmaRingStorage<NODES, BYTES> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const NODES: usize, const BYTES: usize> fmt::Debug for DmaRingStorage<NODES, BYTES> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DmaRingStorage")
+            .field("nodes", &NODES)
+            .field("bytes", &BYTES)
+            .field("taken", &self.taken.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+impl<const NODES: usize, const BYTES: usize> DmaRingStorage<NODES, BYTES> {
+    /// Creates zeroed, untaken storage.
+    pub const fn new() -> Self {
+        Self {
+            taken: AtomicBool::new(false),
+            descriptors: UnsafeCell::new([Lldesc::EMPTY; NODES]),
+            buffer: UnsafeCell::new(AlignedBytes([0; BYTES])),
+        }
+    }
+
+    /// Builds the [`DmaRing`] over this storage with `node_size`-byte nodes.
+    ///
+    /// The first call claims the storage for good, even when the ring
+    /// geometry is then rejected; later calls fail with
+    /// [`CameraError::InvalidState`].
+    pub fn take_ring(&'static self, node_size: usize) -> Result<DmaRing<'static>, CameraError> {
+        if self.taken.swap(true, Ordering::AcqRel) {
+            return Err(CameraError::InvalidState);
+        }
+        // JUSTIFICATION: Hands out the one mutable view of the storage.
+        // SAFETY:
+        // 1. Alignment & Non-null: `UnsafeCell::get` of a `static` is non-null
+        //    and aligned for `[Lldesc; NODES]` and `AlignedBytes<BYTES>`.
+        // 2. Memory layout: The cells hold initialized arrays.
+        // 3. Provenance & Lifetime: `self` is `&'static`, so the references
+        //    are valid for `'static`.
+        // 4. Exclusive aliasing: This call won the `taken` swap above, so no
+        //    other reference to either cell exists or will ever be created.
+        // 5. Volatile semantics: Not applicable.
+        // 6. Panic safety: Creating references cannot unwind.
+        let (descriptors, buffer) =
+            unsafe { (&mut *self.descriptors.get(), &mut (*self.buffer.get()).0) };
+        DmaRing::new(descriptors, buffer, node_size)
     }
 }
 
@@ -558,141 +802,63 @@ pub fn calc_dma_sizes(
 }
 
 /// Initializes a circular linked-list ring of [`Lldesc`] descriptors over
-/// `buffer`, matching
-/// `allocate_dma_descriptors` in `driver/cam_hal.c:465-482`.
+/// the mutable `buffer` the DMA writes into (`allocate_dma_descriptors` in
+/// `driver/cam_hal.c:465-482`), returning the descriptor count.
+///
+/// LL-02: this is the only builder; it takes `&mut [u8]`, so the `buf`
+/// pointers it stores carry write provenance. Prefer [`DmaRing::new`], which
+/// also checks the DMA window on Xtensa.
 ///
 /// Validates that:
 /// - `descriptors.len() >= 2`,
 /// - `node_size` is non-zero, `<= LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE` (`4092`),
-///   and 4-byte aligned,
+///   and a multiple of 4,
+/// - `descriptors` and `buffer` are 4-byte aligned,
 /// - `buffer.len() >= descriptors.len() * node_size`.
 pub fn build_circular_ring(
-    descriptors: &mut [Lldesc],
-    buffer: &[u8],
-    node_size: usize,
-) -> Result<(), CameraError> {
-    let count = descriptors.len();
-    if count < 2
-        || node_size == 0
-        || node_size > LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE
-        || !node_size.is_multiple_of(4)
-    {
-        return Err(CameraError::InvalidArg);
-    }
-
-    let buf_base = buffer.as_ptr();
-    let desc_base = descriptors.as_ptr();
-
-    if ((buf_base as usize) & 0x3 != 0) || ((desc_base as usize) & 0x3 != 0) {
-        return Err(CameraError::InvalidArg);
-    }
-
-    let required_bytes = count.checked_mul(node_size).ok_or(CameraError::Overflow)?;
-    if buffer.len() < required_bytes {
-        return Err(CameraError::BufferTooSmall);
-    }
-
-    let mut x = 0;
-    while x < count {
-        let next_idx = (x + 1) % count;
-        let byte_offset = x * node_size;
-
-        let chunk_ptr: *mut u8;
-        let next_desc_ptr: *mut Lldesc;
-
-        // JUSTIFICATION: Initializing descriptor linked list and slice offsets.
-        // SAFETY:
-        // 1. Alignment & Non-null: `buf_base` is derived from a valid slice `buffer:
-        //    &[u8]` (1-byte aligned)
-        // and `desc_base` is derived from `descriptors: &mut [Lldesc]` (4-byte aligned
-        // via `#[repr(C, align(4))]`).
-        // 2. Memory layout: `Lldesc` is `#[repr(C, align(4))]` matching hardware
-        //    `lldesc_t`.
-        // 3. Provenance & Bounds: `byte_offset = x * node_size < count * node_size <=
-        //    buffer.len()`, and
-        // `next_idx < count == descriptors.len()`, so both `.add(...)` operations stay
-        // strictly within
-        //    their respective allocated objects.
-        // 4. Aliasing: Raw pointers `chunk_ptr` and `next_desc_ptr` are stored
-        //    passively in `Lldesc` fields
-        // for hardware DMA consumption and are not dereferenced while `descriptors` is
-        // mutably borrowed.
-        unsafe {
-            chunk_ptr = buf_base.add(byte_offset) as *mut u8;
-            next_desc_ptr = desc_base.add(next_idx) as *mut Lldesc;
-        }
-
-        descriptors[x] = Lldesc {
-            size_length_flags: Lldesc::pack_flags(node_size as u16, 0, 0, false, false, true),
-            buf: chunk_ptr,
-            qe_stqe_next: next_desc_ptr,
-        };
-        x += 1;
-    }
-
-    Ok(())
-}
-
-/// Initializes a circular linked-list ring of [`Lldesc`] descriptors over
-/// a mutable `buffer` (SEC-011), returning the initialized descriptor count.
-///
-/// Validates that:
-/// - `descriptors.len() >= 2`,
-/// - `node_size` is non-zero, `<= LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE` (`4092`),
-///   and 4-byte aligned,
-/// - `buffer.len() >= descriptors.len() * node_size`.
-pub fn build_circular_ring_mut(
     descriptors: &mut [Lldesc],
     buffer: &mut [u8],
     node_size: usize,
 ) -> Result<usize, CameraError> {
     let count = descriptors.len();
-    if count < 2
-        || node_size == 0
-        || node_size > LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE
-        || !node_size.is_multiple_of(4)
-    {
-        return Err(CameraError::InvalidArg);
-    }
+    validate_dma_ring(
+        &DmaRingLayout {
+            desc_addr: descriptors.as_ptr() as usize,
+            desc_count: count,
+            buf_addr: buffer.as_ptr() as usize,
+            buf_len: buffer.len(),
+            node_size,
+        },
+        false,
+    )?;
 
     let buf_base = buffer.as_mut_ptr();
     let desc_base = descriptors.as_mut_ptr();
-
-    if ((buf_base as usize) & 0x3 != 0) || ((desc_base as usize) & 0x3 != 0) {
-        return Err(CameraError::InvalidArg);
-    }
-
-    let required_bytes = count.checked_mul(node_size).ok_or(CameraError::Overflow)?;
-    if buffer.len() < required_bytes {
-        return Err(CameraError::BufferTooSmall);
-    }
+    let flags = Lldesc::pack_flags(node_size as u16, 0, 0, false, false, true);
 
     let mut x = 0;
     while x < count {
         let next_idx = (x + 1) % count;
         let byte_offset = x * node_size;
 
-        let chunk_ptr: *mut u8;
-        let next_desc_ptr: *mut Lldesc;
-
         // JUSTIFICATION: Initializing descriptor linked list and slice offsets.
         // SAFETY:
-        // 1. Alignment & Non-null: `buf_base` is derived from a live valid
-        //    `&mut [u8]` slice and `desc_base` is derived from
-        //    `descriptors: &mut [Lldesc]`.
+        // 1. Alignment & Non-null: `buf_base` is derived from a live
+        //    `&mut [u8]` and `desc_base` from `descriptors: &mut [Lldesc]`;
+        //    both were checked 4-byte aligned above.
         // 2. Memory layout: `Lldesc` is `#[repr(C, align(4))]`.
-        // 3. Provenance & Bounds: `byte_offset = x * node_size < count *`
-        //    `node_size <= buffer.len()`, and `next_idx < count ==`
-        //    `descriptors.len()`, staying within allocations.
-        // 4. Aliasing: `chunk_ptr` and `next_desc_ptr` pointers are stored in
-        //    descriptor fields.
-        unsafe {
-            chunk_ptr = buf_base.add(byte_offset);
-            next_desc_ptr = desc_base.add(next_idx);
-        }
+        // 3. Provenance & Bounds: `byte_offset = x * node_size < count *
+        //    node_size <= buffer.len()`, and `next_idx < count ==
+        //    descriptors.len()`, staying within the allocations.
+        // 4. Aliasing: The pointers are only stored in descriptor fields for
+        //    the DMA engine; nothing is dereferenced here.
+        // 5. Volatile semantics: Not applicable (address arithmetic only).
+        // 6. Panic safety: Pointer arithmetic cannot unwind.
+        let (chunk_ptr, next_desc_ptr) =
+            unsafe { (buf_base.add(byte_offset), desc_base.add(next_idx)) };
 
         descriptors[x] = Lldesc {
-            size_length_flags: Lldesc::pack_flags(node_size as u16, 0, 0, false, false, true),
+            size_length_flags: AtomicU32::new(flags),
             buf: chunk_ptr,
             qe_stqe_next: next_desc_ptr,
         };
@@ -782,7 +948,7 @@ mod tests {
     fn test_lldesc_bitfield_packing_and_alignment() {
         assert!(align_of::<Lldesc>() >= 4);
 
-        let mut desc = Lldesc::empty();
+        let desc = Lldesc::empty();
         desc.set_size(2048);
         desc.set_length(1024);
         desc.set_offset(17);
@@ -827,42 +993,31 @@ mod tests {
 
     #[test]
     fn test_circular_ring_builder_and_verifier() {
-        let buf = AlignedBuffer([0u8; 4096]);
-        let mut ring = [Lldesc::empty(); 4];
+        let mut buf = AlignedBuffer([0u8; 4096]);
+        let mut ring = [Lldesc::EMPTY; 4];
 
-        assert_eq!(build_circular_ring(&mut ring, &buf.0, 1024), Ok(()));
+        // LL-02: the only builder takes `&mut [u8]` (SEC-011).
+        assert_eq!(build_circular_ring(&mut ring, &mut buf.0, 1024), Ok(4));
         assert_eq!(verify_circular_ring(&ring, &buf.0, 1024), Ok(()));
-
-        // Test build_circular_ring_mut (SEC-011)
-        let mut mut_buf = AlignedBuffer([0u8; 4096]);
-        let mut mut_ring = [Lldesc::empty(); 4];
-        assert_eq!(
-            build_circular_ring_mut(&mut mut_ring, &mut mut_buf.0, 1024),
-            Ok(4)
-        );
 
         // Verify circular wrap-around from last descriptor back to index 0
         assert!(ptr::eq(ring[3].qe_stqe_next, &ring[0]));
         assert!(ptr::eq(ring[0].buf, buf.0.as_ptr()));
 
         // Reject count < 2 (LOGIC-013)
-        let mut single_desc = [Lldesc::empty(); 1];
+        let mut single_desc = [Lldesc::EMPTY; 1];
         assert_eq!(
-            build_circular_ring(&mut single_desc, &buf.0, 1024),
+            build_circular_ring(&mut single_desc, &mut buf.0, 1024),
             Err(CameraError::InvalidArg)
         );
         assert_eq!(
             verify_circular_ring(&single_desc, &buf.0, 1024),
             Err(CameraError::InvalidArg)
         );
-        assert_eq!(
-            build_circular_ring_mut(&mut single_desc, &mut mut_buf.0, 1024),
-            Err(CameraError::InvalidArg)
-        );
 
         // Misaligned buffer tests
         assert_eq!(
-            build_circular_ring(&mut ring, &buf.0[1..], 1024),
+            build_circular_ring(&mut ring, &mut buf.0[1..], 1024),
             Err(CameraError::InvalidArg)
         );
         assert_eq!(
@@ -872,16 +1027,16 @@ mod tests {
 
         // Reject invalid parameters (LL-007)
         assert_eq!(
-            build_circular_ring(&mut ring, &buf.0, 0),
+            build_circular_ring(&mut ring, &mut buf.0, 0),
             Err(CameraError::InvalidArg)
         );
         assert_eq!(
-            build_circular_ring(&mut ring, &buf.0, 4093),
+            build_circular_ring(&mut ring, &mut buf.0, 4093),
             Err(CameraError::InvalidArg)
         );
         // Reject non-multiple of 4
         assert_eq!(
-            build_circular_ring(&mut ring, &buf.0, 1023),
+            build_circular_ring(&mut ring, &mut buf.0, 1023),
             Err(CameraError::InvalidArg)
         );
         assert_eq!(
@@ -889,9 +1044,11 @@ mod tests {
             Err(CameraError::InvalidArg)
         );
         assert_eq!(
-            build_circular_ring(&mut ring, &buf.0[..2048], 1024),
+            build_circular_ring(&mut ring, &mut buf.0[..2048], 1024),
             Err(CameraError::BufferTooSmall)
         );
+        // Restore a valid ring for the verifier checks below.
+        assert_eq!(build_circular_ring(&mut ring, &mut buf.0, 1024), Ok(4));
 
         // Reject corrupt descriptor flags in verifier
         ring[1].set_eof(true);
@@ -911,6 +1068,241 @@ mod tests {
             verify_circular_ring(&ring, &buf.0, 1024),
             Err(CameraError::InvalidState)
         );
+    }
+
+    /// A valid internal-SRAM layout: 16 descriptors at `0x3FFB_0000` and a
+    /// 32 KiB buffer at `0x3FFC_0000` with 2048-byte nodes.
+    const fn sram_layout() -> DmaRingLayout {
+        DmaRingLayout {
+            desc_addr: 0x3FFB_0000,
+            desc_count: 16,
+            buf_addr: 0x3FFC_0000,
+            buf_len: 32768,
+            node_size: 2048,
+        }
+    }
+
+    #[test]
+    fn validator_accepts_an_internal_sram_ring() {
+        assert_eq!(validate_dma_ring(&sram_layout(), true), Ok(()));
+        // The window bounds themselves are inclusive.
+        let edge = DmaRingLayout {
+            desc_addr: DMA_CAPABLE_START,
+            desc_count: 2,
+            buf_addr: DMA_CAPABLE_END + 1 - 2 * 4092,
+            buf_len: 2 * 4092,
+            node_size: 4092,
+        };
+        assert_eq!(validate_dma_ring(&edge, true), Ok(()));
+    }
+
+    #[test]
+    fn validator_rejects_a_psram_buffer() {
+        let psram = DmaRingLayout {
+            buf_addr: 0x3F80_0000,
+            ..sram_layout()
+        };
+        assert_eq!(
+            validate_dma_ring(&psram, true),
+            Err(CameraError::InvalidArg)
+        );
+        // Without the window check (host rings) the same layout passes.
+        assert_eq!(validate_dma_ring(&psram, false), Ok(()));
+    }
+
+    #[test]
+    fn validator_rejects_psram_descriptors() {
+        let psram = DmaRingLayout {
+            desc_addr: 0x3F80_1000,
+            ..sram_layout()
+        };
+        assert_eq!(
+            validate_dma_ring(&psram, true),
+            Err(CameraError::InvalidArg)
+        );
+    }
+
+    #[test]
+    fn validator_rejects_rings_leaving_the_dma_window() {
+        // Starts one word below the window.
+        let below = DmaRingLayout {
+            buf_addr: DMA_CAPABLE_START - 4,
+            ..sram_layout()
+        };
+        assert_eq!(
+            validate_dma_ring(&below, true),
+            Err(CameraError::InvalidArg)
+        );
+        // Starts inside the window but runs past its end.
+        let straddle = DmaRingLayout {
+            buf_addr: 0x3FFF_C000,
+            ..sram_layout()
+        };
+        assert_eq!(
+            validate_dma_ring(&straddle, true),
+            Err(CameraError::InvalidArg)
+        );
+        // Descriptors straddling the end of the window.
+        let desc_straddle = DmaRingLayout {
+            desc_addr: DMA_CAPABLE_END + 1 - 8 * DESC_BYTES,
+            ..sram_layout()
+        };
+        assert_eq!(
+            validate_dma_ring(&desc_straddle, true),
+            Err(CameraError::InvalidArg)
+        );
+        // Peripheral space (I2S0 itself) is not DMA-capable memory.
+        let mmio = DmaRingLayout {
+            desc_addr: 0x3FF4_F000,
+            ..sram_layout()
+        };
+        assert_eq!(validate_dma_ring(&mmio, true), Err(CameraError::InvalidArg));
+        // Address arithmetic that would wrap is rejected, not wrapped.
+        let wrap = DmaRingLayout {
+            buf_addr: usize::MAX - 3,
+            ..sram_layout()
+        };
+        assert_eq!(
+            validate_dma_ring(&wrap, false),
+            Err(CameraError::InvalidArg)
+        );
+    }
+
+    #[test]
+    fn validator_rejects_misaligned_rings() {
+        for (desc_addr, buf_addr) in [(0x3FFB_0002, 0x3FFC_0000), (0x3FFB_0000, 0x3FFC_0001)] {
+            let l = DmaRingLayout {
+                desc_addr,
+                buf_addr,
+                ..sram_layout()
+            };
+            assert_eq!(validate_dma_ring(&l, true), Err(CameraError::InvalidArg));
+            assert_eq!(validate_dma_ring(&l, false), Err(CameraError::InvalidArg));
+        }
+    }
+
+    #[test]
+    fn validator_rejects_bad_node_sizes_and_counts() {
+        for node_size in [0, 2, 1022, 4093, 4094, 4096] {
+            let l = DmaRingLayout {
+                node_size,
+                buf_len: 16 * 4096,
+                ..sram_layout()
+            };
+            assert_eq!(
+                validate_dma_ring(&l, false),
+                Err(CameraError::InvalidArg),
+                "node_size {node_size}"
+            );
+        }
+        let single = DmaRingLayout {
+            desc_count: 1,
+            ..sram_layout()
+        };
+        assert_eq!(
+            validate_dma_ring(&single, false),
+            Err(CameraError::InvalidArg)
+        );
+        let short = DmaRingLayout {
+            buf_len: 32764,
+            ..sram_layout()
+        };
+        assert_eq!(
+            validate_dma_ring(&short, false),
+            Err(CameraError::BufferTooSmall)
+        );
+    }
+
+    #[test]
+    fn is_dma_capable_checks_the_whole_range() {
+        assert!(is_dma_capable(0x3FFA_E000, 4));
+        assert!(is_dma_capable(0x3FFF_FFFC, 4));
+        assert!(!is_dma_capable(0x3FFF_FFFC, 8));
+        assert!(!is_dma_capable(0x3FFA_DFFC, 4));
+        assert!(!is_dma_capable(0x3F80_0000, 4));
+        assert!(!is_dma_capable(0x3FFB_0000, 0));
+    }
+
+    #[test]
+    fn dma_ring_rejects_a_misaligned_host_buffer() {
+        let mut desc = [Lldesc::EMPTY; 4];
+        let mut buf = AlignedBuffer([0u8; 4100]);
+        assert!(matches!(
+            DmaRing::new(&mut desc, &mut buf.0[1..], 1024),
+            Err(CameraError::InvalidArg)
+        ));
+        assert!(matches!(
+            DmaRing::new(&mut desc, &mut buf.0[..4096], 1023),
+            Err(CameraError::InvalidArg)
+        ));
+        assert!(matches!(
+            DmaRing::new(&mut desc, &mut buf.0[..2048], 1024),
+            Err(CameraError::BufferTooSmall)
+        ));
+    }
+
+    #[test]
+    fn dma_ring_builds_a_writable_circular_ring() {
+        let mut desc = [Lldesc::EMPTY; 4];
+        let mut buf = AlignedBuffer([0u8; 4100]);
+        let mut ring = DmaRing::new(&mut desc, &mut buf.0, 1024).expect("ring");
+        assert_eq!(ring.desc_count(), 4);
+        assert_eq!(ring.node_size(), 1024);
+        assert_eq!(ring.len_bytes(), 4096);
+        {
+            let (d, b) = ring.parts_mut().expect("idle ring");
+            assert_eq!(b.len(), 4096, "the ring covers exactly count * node_size");
+            assert_eq!(verify_circular_ring(d, b, 1024), Ok(()));
+            assert_eq!(d[0].link_addr_20bit(), ring_first_addr(d));
+        }
+        // LL-02: the DMA writes through `desc.buf`. Do the same from the CPU:
+        // the pointer must carry write provenance for the buffer.
+        {
+            let (d, _) = ring.parts_mut().expect("idle ring");
+            let p = d[1].buf;
+            // JUSTIFICATION: Simulates the DMA engine writing into node 1.
+            // SAFETY:
+            // 1. Alignment & Non-null: `p` is node 1's start inside `buf`.
+            // 2. Memory layout: `u8` has no alignment requirement.
+            // 3. Provenance & Lifetime: `p` was derived from the `&mut [u8]`
+            //    the ring borrows, which is live.
+            // 4. Aliasing: No reference to the buffer is live here; `d`
+            //    borrows only the descriptors.
+            // 5. Volatile semantics: A plain write, as the test reads it back.
+            // 6. Panic safety: A byte store cannot unwind.
+            unsafe { p.add(3).write(0xAB) };
+        }
+        let (_, b) = ring.parts_mut().expect("idle ring");
+        assert_eq!(b[1024 + 3], 0xAB);
+
+        ring.poison().expect("idle ring");
+        let (d, b) = ring.parts_mut().expect("idle ring");
+        assert!(b.iter().all(|&x| x == crate::dma_drain::DMA_POISON_BYTE));
+        d[2].store_flags(0);
+        ring.rearm().expect("idle ring");
+        let (d, b) = ring.parts_mut().expect("idle ring");
+        assert_eq!(verify_circular_ring(d, b, 1024), Ok(()));
+    }
+
+    fn ring_first_addr(d: &[Lldesc]) -> u32 {
+        (ptr::from_ref(&d[0]) as usize as u32) & 0x000F_FFFF
+    }
+
+    #[test]
+    fn lldesc_header_is_one_shared_word() {
+        assert_eq!(core::mem::size_of::<AtomicU32>(), 4);
+        assert_eq!(core::mem::offset_of!(Lldesc, size_length_flags), 0);
+        let d = Lldesc::EMPTY;
+        // Setters take `&self`: the header is shared with the DMA engine.
+        d.store_flags(Lldesc::pack_flags(2048, 7, 0, false, true, false));
+        assert_eq!(
+            d.flags(),
+            Lldesc::pack_flags(2048, 7, 0, false, true, false)
+        );
+        d.set_owner(true);
+        assert!(d.owner());
+        assert_eq!(d.length(), 7);
+        assert!(d.eof());
     }
 
     #[test]
@@ -1019,15 +1411,15 @@ mod tests {
         let cfg = calc_rgb_dma_sizes(4, 1, 1, 1, 8192).expect("valid aligned rgb dma config");
         assert_eq!(cfg.dma_node_buffer_size % 4, 0);
 
-        let mut ring = [Lldesc::empty(); 2];
-        let buf = AlignedBuffer([0u8; 8192]);
+        let mut ring = [Lldesc::EMPTY; 2];
+        let mut buf = AlignedBuffer([0u8; 8192]);
         assert_eq!(
             build_circular_ring(
                 &mut ring,
-                &buf.0[..2 * cfg.dma_node_buffer_size],
+                &mut buf.0[..2 * cfg.dma_node_buffer_size],
                 cfg.dma_node_buffer_size
             ),
-            Ok(())
+            Ok(2)
         );
     }
 }

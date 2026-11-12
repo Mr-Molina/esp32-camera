@@ -1,0 +1,12 @@
+error[E0505]: cannot move out of `ring` because it is borrowed
+  --> tests/ui/ring_dropped_while_running.rs:22:10
+   |
+ 8 |     let mut ring = RING.take_ring(2048).expect("ring");
+   |         -------- binding `ring` declared here
+...
+21 |     let running = cam.start(&cfg, &mut ring).expect("start");
+   |                                   --------- borrow of `ring` occurs here
+22 |     drop(ring);
+   |          ^^^^ move out of `ring` occurs here
+23 |     running.stop();
+   |     ------- borrow later used here

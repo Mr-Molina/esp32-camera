@@ -1,0 +1,5 @@
+error[E0599]: no method named `clone` found for struct `Esp32I2sCamera` in the current scope
+ --> tests/ui/camera_clone.rs:6:28
+  |
+6 |     let second_owner = cam.clone();
+  |                            ^^^^^ method not found in `Esp32I2sCamera`

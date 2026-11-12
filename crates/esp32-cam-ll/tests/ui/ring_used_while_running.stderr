@@ -1,0 +1,9 @@
+error[E0499]: cannot borrow `ring` as mutable more than once at a time
+  --> tests/ui/ring_used_while_running.rs:22:13
+   |
+21 |     let running = cam.start(&cfg, &mut ring).expect("start");
+   |                                   --------- first mutable borrow occurs here
+22 |     let _ = ring.parts_mut();
+   |             ^^^^ second mutable borrow occurs here
+23 |     running.stop();
+   |     ------- first borrow later used here

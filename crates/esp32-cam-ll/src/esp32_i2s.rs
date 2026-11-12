@@ -8,12 +8,17 @@
 //! `deinit`, `vsync_intr_enable`, `set_sample_mode`, and
 //! `capture_jpeg_frame_polled`.
 
+use core::marker::PhantomData;
+use core::ops::ControlFlow;
 use core::ptr;
+use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 use esp32_cam_types::{CameraError, PixelFormat};
 
-use crate::dma_drain::{CaptureHooks, CaptureStep, DmaStatus, NoCaptureHooks, PolledJpegCapture};
+use crate::dma_drain::{
+    CaptureHooks, CaptureStep, DmaStatus, HalfDrain, NoCaptureHooks, PolledJpegCapture,
+};
 use crate::dma_filter::{select_sample_mode, DmaFilterKind, I2sSamplingMode, SampleModeConfig};
-use crate::dma_ring::{build_circular_ring, DmaSizeConfig, Lldesc};
+use crate::dma_ring::{DmaRing, DmaSizeConfig, Lldesc, RingParts};
 
 /// Physical base address of the `DPORT` peripheral on ESP32 (`0x3FF0_0000`).
 pub const DPORT_BASE_ADDR: usize = 0x3FF0_0000;
@@ -328,36 +333,50 @@ fn volatile_read_u32(reg: &u32) -> u32 {
     unsafe { ptr::read_volatile(ptr) }
 }
 
+/// Writes `val` to the 32-bit MMIO register at `addr` (LL-20: `unsafe`).
+///
+/// # Safety
+///
+/// `addr` must be a 4-byte aligned ESP32 peripheral register in
+/// `0x3FF0_0000..0x3FF8_0000`, the caller must own that peripheral (or be in
+/// an emergency teardown that preempts its owner), and the write must not
+/// make the hardware access memory the caller does not own (for example a
+/// DMA start at an unchecked descriptor address).
 #[cfg(target_arch = "xtensa")]
 #[inline]
-fn xtensa_mmio_write(addr: usize, val: u32) {
-    let ptr = addr as *mut u32;
+unsafe fn xtensa_mmio_write(addr: usize, val: u32) {
     // JUSTIFICATION: ESP32 MMIO register write requires unsafe raw pointer
     // dereference.
     // SAFETY:
-    // 1. Alignment & Non-null: Caller passes 4-byte aligned ESP32 MMIO register
-    //    addresses in `0x3FF0_0000..0x3FF7_FFFF`.
+    // 1. Alignment & Non-null: The caller passes a 4-byte aligned ESP32 MMIO
+    //    register address in `0x3FF0_0000..0x3FF8_0000`.
     // 2. Memory layout: ESP32 DPORT, GPIO, RTC_IO, IO_MUX, and I2S0 peripheral
     //    registers are 32-bit memory-mapped words.
     // 3. Provenance: Hardware peripheral address space on Xtensa ESP32 target.
-    // 4. Aliasing: Executed under peripheral ownership of `Esp32I2sCamera`.
+    // 4. Aliasing: The caller owns the peripheral (function contract).
     // 5. Volatile semantics: `write_volatile` is required for hardware MMIO side
     //    effects.
     // 6. Panic safety: Hardware MMIO store does not unwind.
     unsafe {
-        ptr::write_volatile(ptr, val);
+        ptr::write_volatile(addr as *mut u32, val);
     }
 }
 
+/// Reads the 32-bit MMIO register at `addr` (LL-20: `unsafe`).
+///
+/// # Safety
+///
+/// `addr` must be a 4-byte aligned ESP32 peripheral register in
+/// `0x3FF0_0000..0x3FF8_0000` whose read has no side effect the caller does
+/// not own.
 #[cfg(target_arch = "xtensa")]
 #[inline]
-fn xtensa_mmio_read(addr: usize) -> u32 {
-    let ptr = addr as *const u32;
+unsafe fn xtensa_mmio_read(addr: usize) -> u32 {
     // JUSTIFICATION: ESP32 MMIO register read requires unsafe raw pointer
     // dereference.
     // SAFETY:
-    // 1. Alignment & Non-null: Caller passes 4-byte aligned ESP32 MMIO register
-    //    addresses in `0x3FF0_0000..0x3FF7_FFFF`.
+    // 1. Alignment & Non-null: The caller passes a 4-byte aligned ESP32 MMIO
+    //    register address in `0x3FF0_0000..0x3FF8_0000`.
     // 2. Memory layout: ESP32 DPORT, GPIO, RTC_IO, IO_MUX, and I2S0 peripheral
     //    registers are 32-bit memory-mapped words.
     // 3. Provenance: Hardware peripheral address space on Xtensa ESP32 target.
@@ -366,87 +385,151 @@ fn xtensa_mmio_read(addr: usize) -> u32 {
     // 5. Volatile semantics: `read_volatile` prevents compiler elision or
     //    reordering of hardware status reads.
     // 6. Panic safety: Hardware MMIO load does not unwind.
-    unsafe { ptr::read_volatile(ptr) }
+    unsafe { ptr::read_volatile(addr as *const u32) }
 }
 
+/// Orders CPU memory accesses against the DMA engine (LL-03): a compiler
+/// fence with `ordering` plus, on Xtensa, a `memw` that drains the
+/// load/store and write buffers to internal SRAM.
+///
+/// Use `Release` before handing memory to the DMA (descriptor writes before
+/// the `in_link` start store) and `Acquire` before reading what the DMA
+/// wrote.
+#[inline(always)]
+pub(crate) fn dma_fence(ordering: Ordering) {
+    compiler_fence(ordering);
+    #[cfg(target_arch = "xtensa")]
+    {
+        // JUSTIFICATION: Xtensa memory barrier between CPU and DMA accesses.
+        // SAFETY:
+        // 1. Alignment & Non-null: `memw` takes no memory operand.
+        // 2. Memory layout: Architectural Xtensa memory barrier instruction.
+        // 3. Provenance: Valid instruction on the ESP32 Xtensa LX6 core.
+        // 4. Aliasing: Touches no Rust-visible memory; only drains the
+        //    processor's load/store and write buffers.
+        // 5. Volatile semantics: The `asm!` block is opaque to the compiler
+        //    (no `nomem`), so it is also a full compiler barrier.
+        // 6. Panic safety: `memw` cannot trap or unwind.
+        unsafe {
+            core::arch::asm!("memw", options(nostack, preserves_flags));
+        }
+    }
+}
+
+/// Routes `gpio_num` to the digital `IO_MUX` as a GPIO-matrix input.
+///
+/// # Safety
+///
+/// `gpio_num` must be a bonded ESP32 GPIO (`io_mux_reg_addr(gpio_num)` is
+/// `Some`, so `gpio_num < 40`) that the caller owns for the camera.
 #[cfg(target_arch = "xtensa")]
 #[inline]
-fn xtensa_configure_input_pad(gpio_num: u8, enable_pullup: bool) {
-    // Route RTC_IO-capable pads to the digital IO_MUX before configuring IO_MUX and
-    // GPIO matrix
-    match gpio_num {
-        36..=39 => {
-            let bit = 27 - (gpio_num - 36);
-            let v = xtensa_mmio_read(RTC_IO_SENSOR_PADS_REG) & !(1u32 << bit);
-            xtensa_mmio_write(RTC_IO_SENSOR_PADS_REG, v);
-        }
-        34 | 35 => {
-            let bit = if gpio_num == 34 { 29 } else { 28 };
-            let v = xtensa_mmio_read(RTC_IO_ADC_PAD_REG) & !(1u32 << bit);
-            xtensa_mmio_write(RTC_IO_ADC_PAD_REG, v);
-        }
-        25 => {
-            let mut v = xtensa_mmio_read(RTC_IO_PAD_DAC1_REG)
-                & !((1 << 17) | (1 << 28) | (1 << 18) | (1 << 10));
-            if enable_pullup {
-                v |= 1 << 27;
-            } else {
-                v &= !(1 << 27);
+unsafe fn xtensa_configure_input_pad(gpio_num: u8, enable_pullup: bool) {
+    // JUSTIFICATION: IO_MUX, RTC_IO and GPIO matrix MMIO for one camera pad.
+    // SAFETY:
+    // 1. Alignment & Non-null: Every address is a fixed, 4-byte aligned
+    //    RTC_IO / IO_MUX / GPIO register; the per-pin offsets are bounded by
+    //    `gpio_num < 40` (function contract).
+    // 2. Memory layout: 32-bit peripheral registers.
+    // 3. Provenance: ESP32 peripheral address space.
+    // 4. Aliasing: The caller owns the pad (function contract) and these are
+    //    read-modify-writes of that pad's bits only.
+    // 5. Volatile semantics: All accesses are volatile MMIO.
+    // 6. Panic safety: MMIO accesses cannot unwind.
+    unsafe {
+        // Route RTC_IO-capable pads to the digital IO_MUX before configuring
+        // IO_MUX and the GPIO matrix.
+        match gpio_num {
+            36..=39 => {
+                let bit = 27 - (gpio_num - 36);
+                let v = xtensa_mmio_read(RTC_IO_SENSOR_PADS_REG) & !(1u32 << bit);
+                xtensa_mmio_write(RTC_IO_SENSOR_PADS_REG, v);
             }
-            xtensa_mmio_write(RTC_IO_PAD_DAC1_REG, v);
+            34 | 35 => {
+                let bit = if gpio_num == 34 { 29 } else { 28 };
+                let v = xtensa_mmio_read(RTC_IO_ADC_PAD_REG) & !(1u32 << bit);
+                xtensa_mmio_write(RTC_IO_ADC_PAD_REG, v);
+            }
+            25 => {
+                let mut v = xtensa_mmio_read(RTC_IO_PAD_DAC1_REG)
+                    & !((1 << 17) | (1 << 28) | (1 << 18) | (1 << 10));
+                if enable_pullup {
+                    v |= 1 << 27;
+                } else {
+                    v &= !(1 << 27);
+                }
+                xtensa_mmio_write(RTC_IO_PAD_DAC1_REG, v);
+            }
+            26 => {
+                let v = xtensa_mmio_read(RTC_IO_PAD_DAC2_REG)
+                    & !((1 << 17) | (1 << 28) | (1 << 18) | (1 << 10));
+                xtensa_mmio_write(RTC_IO_PAD_DAC2_REG, v);
+            }
+            4 => {
+                let v = xtensa_mmio_read(RTC_IO_TOUCH_PAD0_REG) & !(1 << 19);
+                xtensa_mmio_write(RTC_IO_TOUCH_PAD0_REG, v);
+            }
+            _ => {}
         }
-        26 => {
-            let v = xtensa_mmio_read(RTC_IO_PAD_DAC2_REG)
-                & !((1 << 17) | (1 << 28) | (1 << 18) | (1 << 10));
-            xtensa_mmio_write(RTC_IO_PAD_DAC2_REG, v);
+
+        // Configure IO_MUX: MCU_SEL (bits 12..=14), FUN_DRV (bits 10..=11),
+        // FUN_IE (bit 9), FUN_WPU (bit 8), FUN_WPD (bit 7).
+        // - Input-only pads (GPIO >= 34): 0x0200 = MCU_SEL 0 (function 1),
+        //   FUN_IE 1, no pulls (these pads have none).
+        // - Other pads: 0x2A00 = MCU_SEL 2 (GPIO), FUN_DRV 2, FUN_IE 1, no
+        //   pull; 0x2B00 additionally sets FUN_WPU (pull-up). FUN_WPD is
+        //   never set.
+        if let Some(mux_addr) = io_mux_reg_addr(gpio_num) {
+            let mux_val = if gpio_num >= 34 {
+                0x0200
+            } else if enable_pullup {
+                0x2B00
+            } else {
+                0x2A00
+            };
+            xtensa_mmio_write(mux_addr, mux_val);
         }
-        4 => {
-            let v = xtensa_mmio_read(RTC_IO_TOUCH_PAD0_REG) & !(1 << 19);
-            xtensa_mmio_write(RTC_IO_TOUCH_PAD0_REG, v);
+
+        // Disable GPIO output driver
+        if gpio_num < 32 {
+            xtensa_mmio_write(GPIO_ENABLE_W1TC_REG, 1u32 << gpio_num);
+        } else if gpio_num < ESP32_GPIO_NUM_MAX {
+            xtensa_mmio_write(GPIO_ENABLE1_W1TC_REG, 1u32 << (gpio_num - 32));
         }
-        _ => {}
-    }
 
-    // Configure IO_MUX: MCU_SEL = 2 (GPIO function, bits 12..14), FUN_DRV = 2
-    // (bits 10..11), FUN_IE = 1 (bit 9), and optional FUN_WPU = 1 (bit 8).
-    // For ESP32 input-only GPI pads (pin >= 34), write 0x0200 (MCU_SEL = 0
-    // Function 1, FUN_IE = 1, no pull-down). For pin < 34, keep 0x2A00
-    // (MCU_SEL = 2, FUN_IE = 1, FUN_WPD = 1) or 0x2B00 if pullup is enabled.
-    if let Some(mux_addr) = io_mux_reg_addr(gpio_num) {
-        let mux_val = if gpio_num >= 34 {
-            0x0200
-        } else if enable_pullup {
-            0x2B00
-        } else {
-            0x2A00
-        };
-        xtensa_mmio_write(mux_addr, mux_val);
-    }
+        // Clear open-drain / interrupt bits in GPIO_PINn_REG
+        xtensa_mmio_write(GPIO_PIN0_REG + 4 * (gpio_num as usize), 0);
 
-    // Disable GPIO output driver
-    if gpio_num < 32 {
-        xtensa_mmio_write(GPIO_ENABLE_W1TC_REG, 1u32 << gpio_num);
-    } else if gpio_num < ESP32_GPIO_NUM_MAX {
-        xtensa_mmio_write(GPIO_ENABLE1_W1TC_REG, 1u32 << (gpio_num - 32));
-    }
-
-    // Clear open-drain / interrupt bits in GPIO_PINn_REG
-    xtensa_mmio_write(GPIO_PIN0_REG + 4 * (gpio_num as usize), 0);
-
-    // Disconnect output matrix for output-capable pads (0..=33) using
-    // SIG_GPIO_OUT_IDX (0x100)
-    if gpio_num < 34 {
-        xtensa_mmio_write(GPIO_FUNC0_OUT_SEL_CFG_REG + 4 * (gpio_num as usize), 0x100);
+        // Disconnect output matrix for output-capable pads (0..=33) using
+        // SIG_GPIO_OUT_IDX (0x100)
+        if gpio_num < 34 {
+            xtensa_mmio_write(GPIO_FUNC0_OUT_SEL_CFG_REG + 4 * (gpio_num as usize), 0x100);
+        }
     }
 }
 
+/// Reads the input level of `gpio_num` (`0..=39`) from `GPIO_IN_REG` /
+/// `GPIO_IN1_REG`.
 #[cfg(target_arch = "xtensa")]
 #[inline]
 fn xtensa_read_gpio_level(gpio_num: u8) -> bool {
-    if gpio_num < 32 {
-        ((xtensa_mmio_read(GPIO_IN_REG) >> gpio_num) & 1) != 0
-    } else {
-        ((xtensa_mmio_read(GPIO_IN1_REG) >> (gpio_num - 32)) & 1) != 0
+    // JUSTIFICATION: Read-only sample of the GPIO input level registers.
+    // SAFETY:
+    // 1. Alignment & Non-null: `GPIO_IN_REG` / `GPIO_IN1_REG` are fixed,
+    //    4-byte aligned GPIO registers.
+    // 2. Memory layout: 32-bit peripheral registers.
+    // 3. Provenance: ESP32 GPIO peripheral address space.
+    // 4. Aliasing: A read of the input latches has no side effect and does
+    //    not conflict with any owner of the GPIO block.
+    // 5. Volatile semantics: Volatile MMIO read, re-sampled on every call.
+    // 6. Panic safety: MMIO reads cannot unwind; shifts are bounded by
+    //    `gpio_num & 31`.
+    unsafe {
+        if gpio_num < 32 {
+            ((xtensa_mmio_read(GPIO_IN_REG) >> gpio_num) & 1) != 0
+        } else {
+            ((xtensa_mmio_read(GPIO_IN1_REG) >> ((gpio_num - 32) & 31)) & 1) != 0
+        }
     }
 }
 
@@ -462,12 +545,30 @@ pub struct I2s0DmaStatus<'a> {
     regs: &'a mut I2s0RegisterBlock,
 }
 
+/// SAFETY comment shared by the read-only I2S0 status register reads below.
+#[cfg(target_arch = "xtensa")]
+macro_rules! i2s0_status_read {
+    ($off:expr) => {{
+        // JUSTIFICATION: Read of an I2S0 status register.
+        // SAFETY:
+        // 1. Alignment & Non-null: `I2S0_BASE_ADDR + off` is a fixed, 4-byte
+        //    aligned I2S0 register.
+        // 2. Memory layout: 32-bit peripheral register.
+        // 3. Provenance: ESP32 I2S0 peripheral address space.
+        // 4. Aliasing: `I2s0DmaStatus` mutably borrows the owning
+        //    `Esp32I2sCamera`, so it is the only I2S0 accessor.
+        // 5. Volatile semantics: Volatile MMIO read.
+        // 6. Panic safety: MMIO reads cannot unwind.
+        unsafe { xtensa_mmio_read(I2S0_BASE_ADDR + $off) }
+    }};
+}
+
 impl DmaStatus for I2s0DmaStatus<'_> {
     #[inline]
     fn int_raw(&mut self) -> u32 {
         #[cfg(target_arch = "xtensa")]
         {
-            xtensa_mmio_read(I2S0_BASE_ADDR + I2S_INT_RAW_REG_OFFSET)
+            i2s0_status_read!(I2S_INT_RAW_REG_OFFSET)
         }
         #[cfg(not(target_arch = "xtensa"))]
         {
@@ -478,7 +579,19 @@ impl DmaStatus for I2s0DmaStatus<'_> {
     #[inline]
     fn clear_int(&mut self, mask: u32) {
         #[cfg(target_arch = "xtensa")]
-        xtensa_mmio_write(I2S0_BASE_ADDR + I2S_INT_CLR_REG_OFFSET, mask);
+        // JUSTIFICATION: Write-1-to-clear of I2S0 inlink status latches.
+        // SAFETY:
+        // 1. Alignment & Non-null: `I2S_INT_CLR_REG` is a fixed, 4-byte
+        //    aligned I2S0 register.
+        // 2. Memory layout: 32-bit peripheral register.
+        // 3. Provenance: ESP32 I2S0 peripheral address space.
+        // 4. Aliasing: `I2s0DmaStatus` mutably borrows the owning
+        //    `Esp32I2sCamera`; clearing status latches starts no DMA.
+        // 5. Volatile semantics: Volatile MMIO write.
+        // 6. Panic safety: MMIO writes cannot unwind.
+        unsafe {
+            xtensa_mmio_write(I2S0_BASE_ADDR + I2S_INT_CLR_REG_OFFSET, mask);
+        }
         volatile_write_u32(&mut self.regs.int_clr, mask);
         let raw = volatile_read_u32(&self.regs.int_raw) & !mask;
         volatile_write_u32(&mut self.regs.int_raw, raw);
@@ -488,7 +601,7 @@ impl DmaStatus for I2s0DmaStatus<'_> {
     fn eof_desc_addr(&mut self) -> u32 {
         #[cfg(target_arch = "xtensa")]
         {
-            xtensa_mmio_read(I2S0_BASE_ADDR + I2S_IN_EOF_DES_ADDR_REG_OFFSET) & I2S_INLINK_ADDR_MASK
+            i2s0_status_read!(I2S_IN_EOF_DES_ADDR_REG_OFFSET) & I2S_INLINK_ADDR_MASK
         }
         #[cfg(not(target_arch = "xtensa"))]
         {
@@ -496,27 +609,12 @@ impl DmaStatus for I2s0DmaStatus<'_> {
         }
     }
 
+    /// `memw` plus a `SeqCst` compiler fence (LL-03): orders the status
+    /// reads before the SRAM reads of a half (Acquire side) and the
+    /// poisoning before the descriptor re-arm (Release side).
     #[inline]
     fn barrier(&mut self) {
-        #[cfg(target_arch = "xtensa")]
-        {
-            // JUSTIFICATION: Orders I2S0 MMIO status accesses and CPU stores
-            // to the DMA ring against the DMA engine's view of internal SRAM.
-            // SAFETY:
-            // 1. Alignment & Non-null: `memw` takes no memory operand.
-            // 2. Memory layout: Architectural Xtensa memory barrier instruction.
-            // 3. Provenance: Valid instruction on the ESP32 Xtensa LX6 core.
-            // 4. Aliasing: Touches no Rust-visible memory; only drains the
-            //    processor's load/store and write buffers.
-            // 5. Volatile semantics: The `asm!` block is opaque to the
-            //    compiler, which keeps surrounding volatile accesses in
-            //    program order.
-            // 6. Panic safety: `memw` cannot trap or unwind.
-            unsafe {
-                core::arch::asm!("memw");
-            }
-        }
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        dma_fence(Ordering::SeqCst);
     }
 }
 
@@ -637,8 +735,18 @@ pub(crate) fn append_unpacked_jpeg_chunk(
     Ok(None)
 }
 
+/// Claim flag for the I2S0 peripheral (LL-13): set by
+/// [`Esp32I2sCamera::take`], cleared when that owner drops.
+static I2S0_TAKEN: AtomicBool = AtomicBool::new(false);
+
 /// Low-level ESP32 I2S0 camera peripheral controller (`target/esp32/ll_cam.c`).
-#[derive(Debug, Clone)]
+///
+/// LL-13: I2S0 has exactly one owner. The type is neither `Clone` nor (on
+/// Xtensa) `Default`; [`Self::take`] hands out the single instance and its
+/// `Drop` stops the DMA and releases the claim. On the host, where every
+/// register access goes to a private shadow block and no DMA engine exists,
+/// [`Self::new`] creates independent simulators for tests.
+#[derive(Debug)]
 pub struct Esp32I2sCamera {
     regs: I2s0RegisterBlock,
     sampling_mode: I2sSamplingMode,
@@ -651,8 +759,14 @@ pub struct Esp32I2sCamera {
     gpio_bindings: [GpioMatrixBinding; 12],
     gpio_binding_count: usize,
     running: bool,
+    /// `true` for the instance from [`Self::take`], which owns `I2S0_TAKEN`.
+    claimed: bool,
+    /// Inlink/AHB DMA reset pulses issued by [`Self::stop`] (host tests).
+    #[cfg(test)]
+    dma_resets: u32,
 }
 
+#[cfg(not(target_arch = "xtensa"))]
 impl Default for Esp32I2sCamera {
     fn default() -> Self {
         Self::new()
@@ -664,13 +778,36 @@ impl Drop for Esp32I2sCamera {
         if self.running {
             let _ = self.stop();
         }
+        if self.claimed {
+            I2S0_TAKEN.store(false, Ordering::Release);
+        }
     }
 }
 
 impl Esp32I2sCamera {
-    /// Creates an uninitialized [`Esp32I2sCamera`] controller.
+    /// Claims the I2S0 peripheral and returns its single controller, or
+    /// `None` while another [`Esp32I2sCamera`] from `take` is alive (LL-13).
+    /// Dropping the controller stops the DMA and releases the claim.
+    pub fn take() -> Option<Self> {
+        if I2S0_TAKEN.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        let mut cam = Self::unclaimed();
+        cam.claimed = true;
+        Some(cam)
+    }
+
+    /// Creates an independent host simulator of the controller. Every
+    /// register access goes to its private shadow block; no hardware is
+    /// touched. Not available on Xtensa, where [`Self::take`] is the only
+    /// constructor.
+    #[cfg(not(target_arch = "xtensa"))]
     #[inline]
     pub const fn new() -> Self {
+        Self::unclaimed()
+    }
+
+    const fn unclaimed() -> Self {
         Self {
             regs: I2s0RegisterBlock {
                 dport_clk_en: 0,
@@ -706,11 +843,12 @@ impl Esp32I2sCamera {
             }; 12],
             gpio_binding_count: 0,
             running: false,
+            claimed: false,
+            #[cfg(test)]
+            dma_resets: 0,
         }
     }
 
-    /// Returns a shared reference to the underlying register block for inspection.
-    #[inline]
     /// Checks for DMA descriptor errors (`IN_DSCR_ERR` or `IN_DSCR_EMPTY`),
     /// clears the interrupt flags in `int_clr`, and returns `true` if an error
     /// was detected.
@@ -718,9 +856,9 @@ impl Esp32I2sCamera {
         let err_mask = I2S_IN_DSCR_ERR_INT_RAW | I2S_IN_DSCR_EMPTY_INT_RAW;
         #[cfg(target_arch = "xtensa")]
         {
-            let raw = xtensa_mmio_read(I2S0_BASE_ADDR + I2S_INT_RAW_REG_OFFSET);
+            let raw = i2s0_status_read!(I2S_INT_RAW_REG_OFFSET);
             if (raw & err_mask) != 0 {
-                xtensa_mmio_write(I2S0_BASE_ADDR + I2S_INT_CLR_REG_OFFSET, raw & err_mask);
+                self.dma_status().clear_int(raw & err_mask);
                 return true;
             }
         }
@@ -734,6 +872,14 @@ impl Esp32I2sCamera {
         }
     }
 
+    /// Inlink/AHB DMA reset pulses issued by [`Self::stop`] so far.
+    #[cfg(test)]
+    pub(crate) const fn dma_resets(&self) -> u32 {
+        self.dma_resets
+    }
+
+    /// Returns a shared reference to the shadow register block for inspection.
+    #[inline]
     pub const fn regs(&self) -> &I2s0RegisterBlock {
         &self.regs
     }
@@ -857,7 +1003,19 @@ impl Esp32I2sCamera {
         self.gpio_binding_count = 12;
 
         #[cfg(target_arch = "xtensa")]
-        {
+        // JUSTIFICATION: Pad and GPIO-matrix routing for the camera inputs.
+        // SAFETY:
+        // 1. Alignment & Non-null: Every pin was validated above as a bonded
+        //    GPIO (`io_mux_reg_addr` is `Some`, `< 40`), and every signal
+        //    index is `<= 192`, so `GPIO_FUNC0_IN_SEL_CFG_REG + 4 * idx` is a
+        //    4-byte aligned GPIO-matrix register.
+        // 2. Memory layout: 32-bit peripheral registers.
+        // 3. Provenance: ESP32 GPIO / IO_MUX / RTC_IO address space.
+        // 4. Aliasing: `&mut self` is the single I2S0 owner (LL-13), which
+        //    owns the camera pins it was configured with.
+        // 5. Volatile semantics: Volatile MMIO accesses.
+        // 6. Panic safety: MMIO accesses cannot unwind.
+        unsafe {
             xtensa_configure_input_pad(cfg.pin_pclk as u8, false);
             xtensa_configure_input_pad(cfg.pin_vsync as u8, true);
             xtensa_configure_input_pad(cfg.pin_href as u8, false);
@@ -868,24 +1026,47 @@ impl Esp32I2sCamera {
                 idx += 1;
             }
 
-            let mut b_idx = 0;
-            while b_idx < 12 {
-                let b = self.gpio_bindings[b_idx];
-                let inv = if b.signal_idx == I2S0I_V_SYNC_IDX {
-                    self.vsync_invert
-                } else {
-                    b.inverted
-                };
-                let sel_val = (1u32 << 7) | ((inv as u32) << 6) | ((b.gpio_num as u32) & 0x3F);
+            self.write_gpio_matrix_bindings();
+        }
+
+        Ok(())
+    }
+
+    /// Writes the recorded bindings into the GPIO input matrix.
+    ///
+    /// # Safety
+    ///
+    /// The bindings must come from a successful [`Self::set_pin`] (validated
+    /// pins and I2S0 signal indices).
+    #[cfg(target_arch = "xtensa")]
+    unsafe fn write_gpio_matrix_bindings(&self) {
+        let mut b_idx = 0;
+        while b_idx < self.gpio_binding_count {
+            let b = self.gpio_bindings[b_idx];
+            let inv = if b.signal_idx == I2S0I_V_SYNC_IDX {
+                self.vsync_invert
+            } else {
+                b.inverted
+            };
+            let sel_val = (1u32 << 7) | ((inv as u32) << 6) | ((b.gpio_num as u32) & 0x3F);
+            // JUSTIFICATION: GPIO-matrix input selection for one I2S0 signal.
+            // SAFETY:
+            // 1. Alignment & Non-null: `signal_idx <= 192` (an I2S0 input
+            //    signal from `set_pin`), so the address is a 4-byte aligned
+            //    `GPIO_FUNCn_IN_SEL_CFG_REG`.
+            // 2. Memory layout: 32-bit peripheral register.
+            // 3. Provenance: ESP32 GPIO address space.
+            // 4. Aliasing: Only the I2S0 camera input signals are routed.
+            // 5. Volatile semantics: Volatile MMIO write.
+            // 6. Panic safety: MMIO writes cannot unwind.
+            unsafe {
                 xtensa_mmio_write(
                     GPIO_FUNC0_IN_SEL_CFG_REG + 4 * (b.signal_idx as usize),
                     sel_val,
                 );
-                b_idx += 1;
             }
+            b_idx += 1;
         }
-
-        Ok(())
     }
 
     /// Enables and configures the `I2S0` peripheral in parallel camera slave mode
@@ -930,7 +1111,18 @@ impl Esp32I2sCamera {
         volatile_write_u32(&mut self.regs.timing, 1 << 21);
 
         #[cfg(target_arch = "xtensa")]
-        {
+        // JUSTIFICATION: Enables, resets and configures the I2S0 block.
+        // SAFETY:
+        // 1. Alignment & Non-null: Fixed, 4-byte aligned DPORT and I2S0
+        //    registers.
+        // 2. Memory layout: 32-bit peripheral registers.
+        // 3. Provenance: ESP32 DPORT / I2S0 address space.
+        // 4. Aliasing: `&mut self` is the single I2S0 owner (LL-13); the
+        //    DPORT read-modify-writes touch only the I2S0 clock/reset bits.
+        //    `lc_conf` resets the inlink; no DMA is started.
+        // 5. Volatile semantics: Volatile MMIO accesses in program order.
+        // 6. Panic safety: MMIO accesses cannot unwind.
+        unsafe {
             let hw_clk = xtensa_mmio_read(DPORT_PERIP_CLK_EN_REG) | DPORT_I2S0_CLK_EN;
             xtensa_mmio_write(DPORT_PERIP_CLK_EN_REG, hw_clk);
 
@@ -1008,7 +1200,16 @@ impl Esp32I2sCamera {
         volatile_write_u32(&mut self.regs.fifo_conf, fifo_val);
 
         #[cfg(target_arch = "xtensa")]
-        {
+        // JUSTIFICATION: Programs the I2S0 RX FIFO mode.
+        // SAFETY:
+        // 1. Alignment & Non-null: `I2S_FIFO_CONF_REG` is a fixed, 4-byte
+        //    aligned I2S0 register.
+        // 2. Memory layout: 32-bit peripheral register.
+        // 3. Provenance: ESP32 I2S0 address space.
+        // 4. Aliasing: `&mut self` is the single I2S0 owner (LL-13).
+        // 5. Volatile semantics: Volatile MMIO write.
+        // 6. Panic safety: MMIO writes cannot unwind.
+        unsafe {
             xtensa_mmio_write(I2S0_BASE_ADDR + I2S_FIFO_CONF_REG_OFFSET, fifo_val);
         }
 
@@ -1020,9 +1221,107 @@ impl Esp32I2sCamera {
         self.vsync_intr_enabled = en;
     }
 
-    /// Starts I2S0 DMA reception for a frame (`ll_cam_start` in
+    /// Starts I2S0 DMA reception into `ring` and returns the guard that owns
+    /// the running capture (LL-01, `ll_cam_start` in
     /// `target/esp32/ll_cam.c:305-328`).
-    pub fn start(&mut self, dma_cfg: &DmaSizeConfig, first_desc_addr: u32) -> bool {
+    ///
+    /// The ring was validated when it was built ([`DmaRing::new`]: alignment,
+    /// node size, and on Xtensa the DMA-capable SRAM window). While the
+    /// returned [`RunningCapture`] lives, both the camera and the ring are
+    /// mutably borrowed; dropping or [stopping](RunningCapture::stop) it
+    /// halts and resets the inlink DMA. The ring must be `'static` so that
+    /// leaking the guard (`mem::forget`) can never leave the DMA writing into
+    /// freed memory; a leaked guard leaves the ring
+    /// [armed](DmaRing::is_armed) and unusable. Use [`Self::start_scoped`]
+    /// for a borrowed ring.
+    ///
+    /// Fails with [`CameraError::InvalidState`] when the camera is already
+    /// running or the ring is armed, and with [`CameraError::InvalidArg`]
+    /// unless `dma_cfg.dma_half_buffer_size` is a non-zero multiple of the
+    /// ring's node size that divides the ring.
+    pub fn start<'r>(
+        &'r mut self,
+        dma_cfg: &DmaSizeConfig,
+        ring: &'r mut DmaRing<'static>,
+    ) -> Result<RunningCapture<'r>, CameraError> {
+        // JUSTIFICATION: Safe wrapper over `start_scoped` for `'static` rings.
+        // SAFETY:
+        // 1. Alignment & Non-null: Checked by `DmaRing::new`.
+        // 2. Memory layout: Checked by `DmaRing::new` and `start_scoped`.
+        // 3. Provenance & Lifetime: The ring's memory is `'static`, so it
+        //    outlives the DMA even if the guard is leaked, which is the
+        //    only obligation `start_scoped` puts on its caller.
+        // 4. Aliasing: The guard borrows `self` and `ring` mutably for `'r`.
+        // 5. Volatile semantics: See `start_scoped`.
+        // 6. Panic safety: `start_scoped` does not panic.
+        unsafe { self.start_scoped(dma_cfg, ring) }
+    }
+
+    /// Starts I2S0 DMA reception into a borrowed `ring`, like
+    /// [`Self::start`].
+    ///
+    /// # Safety
+    ///
+    /// The returned [`RunningCapture`] must be dropped or
+    /// [stopped](RunningCapture::stop) before the memory `ring` borrows is
+    /// freed or reused: it must not be leaked (`mem::forget`, `Box::leak`,
+    /// reference cycles), or the DMA keeps writing into that memory.
+    pub unsafe fn start_scoped<'r>(
+        &'r mut self,
+        dma_cfg: &DmaSizeConfig,
+        ring: &'r mut DmaRing<'_>,
+    ) -> Result<RunningCapture<'r>, CameraError> {
+        if self.running || ring.is_armed() {
+            return Err(CameraError::InvalidState);
+        }
+        let half = dma_cfg.dma_half_buffer_size;
+        if half == 0
+            || !half.is_multiple_of(ring.node_size())
+            || half > ring.len_bytes()
+            || !ring.len_bytes().is_multiple_of(half)
+        {
+            return Err(CameraError::InvalidArg);
+        }
+        let first_desc_addr = ring.first_desc_addr();
+        let parts = ring.arm()?;
+        if !self.start_hw(dma_cfg, first_desc_addr) {
+            *parts.armed = false;
+            return Err(CameraError::HardwareError);
+        }
+        Ok(RunningCapture {
+            cam: self,
+            ring: parts,
+            _marker: PhantomData,
+        })
+    }
+
+    /// Starts I2S0 DMA at a raw 20-bit descriptor address (the pre-WP-08
+    /// `start`). Kept only so the firmware's static-ring capture loops keep
+    /// working until they move to [`DmaRing`] / [`RunningCapture`].
+    ///
+    /// # Safety
+    ///
+    /// `first_desc_addr` must be the `in_link` address of the first
+    /// descriptor of a circular [`Lldesc`] ring in DMA-capable internal SRAM
+    /// (`0x3FFA_E000..=0x3FFF_FFFF`, see [`crate::validate_dma_ring`]) whose
+    /// descriptors and buffers stay valid, and are not accessed by the CPU
+    /// except through the WP-06 drain, until [`Self::stop`] returns.
+    #[doc(hidden)]
+    pub unsafe fn start_raw(&mut self, dma_cfg: &DmaSizeConfig, first_desc_addr: u32) -> bool {
+        self.start_hw(dma_cfg, first_desc_addr)
+    }
+
+    /// Host simulation of a DMA start for the HAL's software pipeline: marks
+    /// the controller running and programs the shadow registers (with
+    /// descriptor address 0). Not available on Xtensa, where only
+    /// [`Self::start`] starts the DMA.
+    #[cfg(not(target_arch = "xtensa"))]
+    pub fn simulate_start(&mut self, dma_cfg: &DmaSizeConfig) -> bool {
+        self.start_hw(dma_cfg, 0)
+    }
+
+    /// Programs and starts the inlink DMA at `first_desc_addr`.
+    fn start_hw(&mut self, dma_cfg: &DmaSizeConfig, first_desc_addr: u32) -> bool {
         if dma_cfg.dma_half_buffer_size == 0 {
             return false;
         }
@@ -1044,13 +1343,30 @@ impl Esp32I2sCamera {
 
         // `I2S0.in_link.addr = addr & 0xfffff; I2S0.in_link.start = 1;`
         let link_val = (first_desc_addr & I2S_INLINK_ADDR_MASK) | I2S_INLINK_START_BIT;
+        // LL-03: descriptor and buffer writes happen before the start store.
+        dma_fence(Ordering::Release);
         volatile_write_u32(&mut self.regs.in_link, link_val);
 
         // `I2S0.conf.rx_start = 1;`
         volatile_write_u32(&mut self.regs.conf, conf_stopped | I2S_RX_START_BIT);
 
         #[cfg(target_arch = "xtensa")]
-        {
+        // JUSTIFICATION: Resets the I2S0 receiver and inlink, then starts the
+        // DMA at `first_desc_addr`.
+        // SAFETY:
+        // 1. Alignment & Non-null: Fixed, 4-byte aligned I2S0 registers; the
+        //    GPIO-matrix writes reuse the bindings validated by `set_pin`.
+        // 2. Memory layout: 32-bit peripheral registers.
+        // 3. Provenance: ESP32 I2S0 / GPIO address space.
+        // 4. Aliasing: `&mut self` is the single I2S0 owner (LL-13). The
+        //    `in_link` start makes the DMA write into the ring at
+        //    `first_desc_addr`: `start_scoped` passes a validated, armed
+        //    `DmaRing`; `start_raw` callers guarantee the same.
+        // 5. Volatile semantics: Volatile MMIO in program order; the
+        //    `dma_fence(Release)` (`memw`) right before the `in_link` store
+        //    completes every descriptor and buffer write first (LL-03).
+        // 6. Panic safety: MMIO accesses cannot unwind.
+        unsafe {
             let conf_base = (xtensa_mmio_read(I2S0_BASE_ADDR + I2S_CONF_REG_OFFSET)
                 & !I2S_RX_START_BIT)
                 | I2S_RX_SLAVE_MOD_BIT;
@@ -1093,23 +1409,12 @@ impl Esp32I2sCamera {
                 I2S0_BASE_ADDR + I2S_PD_CONF_REG_OFFSET,
                 I2S_PD_FIFO_MEM_FORCE_PU,
             );
-            let mut b_idx = 0;
-            while b_idx < self.gpio_binding_count {
-                let b = self.gpio_bindings[b_idx];
-                let inv = if b.signal_idx == I2S0I_V_SYNC_IDX {
-                    self.vsync_invert
-                } else {
-                    b.inverted
-                };
-                let sel_val = (1u32 << 7) | ((inv as u32) << 6) | ((b.gpio_num as u32) & 0x3F);
-                xtensa_mmio_write(
-                    GPIO_FUNC0_IN_SEL_CFG_REG + 4 * (b.signal_idx as usize),
-                    sel_val,
-                );
-                b_idx += 1;
-            }
+            self.write_gpio_matrix_bindings();
 
             xtensa_mmio_write(I2S0_BASE_ADDR + I2S_RXEOF_NUM_REG_OFFSET, eof_num);
+            // LL-03: `compiler_fence(Release)` + `memw` before the store to
+            // `I2S0.in_link` (`0x3FF4_F034`) that starts the DMA.
+            dma_fence(Ordering::Release);
             xtensa_mmio_write(I2S0_BASE_ADDR + I2S_IN_LINK_REG_OFFSET, link_val);
             xtensa_mmio_write(
                 I2S0_BASE_ADDR + I2S_CONF_REG_OFFSET,
@@ -1121,7 +1426,9 @@ impl Esp32I2sCamera {
         true
     }
 
-    /// Stops I2S0 DMA reception (`ll_cam_stop` in `target/esp32/ll_cam.c:264-270`).
+    /// Stops I2S0 DMA reception (`ll_cam_stop` in `target/esp32/ll_cam.c:264-270`),
+    /// then resets the inlink and AHB master (LL-21) and fences (`memw`), so
+    /// no DMA write lands after it returns.
     pub fn stop(&mut self) -> bool {
         let conf_stopped = volatile_read_u32(&self.regs.conf) & !I2S_RX_START_BIT;
         volatile_write_u32(&mut self.regs.conf, conf_stopped);
@@ -1141,9 +1448,22 @@ impl Esp32I2sCamera {
             I2S_LC_IN_RST_BIT | I2S_LC_AHBM_RST_BIT,
         );
         volatile_write_u32(&mut self.regs.lc_conf, 0);
+        #[cfg(test)]
+        {
+            self.dma_resets += 1;
+        }
 
         #[cfg(target_arch = "xtensa")]
-        {
+        // JUSTIFICATION: Halts the I2S0 receiver and inlink DMA.
+        // SAFETY:
+        // 1. Alignment & Non-null: Fixed, 4-byte aligned I2S0 registers.
+        // 2. Memory layout: 32-bit peripheral registers.
+        // 3. Provenance: ESP32 I2S0 address space.
+        // 4. Aliasing: `&mut self` is the single I2S0 owner (LL-13). Stopping
+        //    and resetting the DMA only ends its writes into the ring.
+        // 5. Volatile semantics: Volatile MMIO in program order.
+        // 6. Panic safety: MMIO accesses cannot unwind.
+        unsafe {
             let hw_conf =
                 xtensa_mmio_read(I2S0_BASE_ADDR + I2S_CONF_REG_OFFSET) & !I2S_RX_START_BIT;
             xtensa_mmio_write(I2S0_BASE_ADDR + I2S_CONF_REG_OFFSET, hw_conf);
@@ -1161,31 +1481,156 @@ impl Esp32I2sCamera {
                 | I2S_INLINK_STOP_BIT;
             xtensa_mmio_write(I2S0_BASE_ADDR + I2S_IN_LINK_REG_OFFSET, hw_in_link);
 
-            // LL-21: reset the inlink state machine and the AHB master, then
-            // drain the write buffers.
+            // LL-21: reset the inlink state machine and the AHB master.
             xtensa_mmio_write(
                 I2S0_BASE_ADDR + I2S_LC_CONF_REG_OFFSET,
                 I2S_LC_IN_RST_BIT | I2S_LC_AHBM_RST_BIT,
             );
             xtensa_mmio_write(I2S0_BASE_ADDR + I2S_LC_CONF_REG_OFFSET, 0);
-            // JUSTIFICATION: Memory barrier after halting and resetting the
-            // I2S0 inlink DMA.
-            // SAFETY:
-            // 1. Alignment & Non-null: `memw` takes no memory operand.
-            // 2. Memory layout: Architectural Xtensa memory barrier instruction.
-            // 3. Provenance: Valid instruction on the ESP32 Xtensa LX6 core.
-            // 4. Aliasing: Touches no Rust-visible memory; it completes the
-            //    preceding MMIO stores before the caller reuses the DMA ring.
-            // 5. Volatile semantics: The `asm!` block is opaque to the compiler,
-            //    which keeps the preceding volatile MMIO stores before it.
-            // 6. Panic safety: `memw` cannot trap or unwind.
-            unsafe {
-                core::arch::asm!("memw");
-            }
         }
+        // Drain the write buffers before the caller reads or reuses the ring
+        // (Acquire side of the DMA hand-back).
+        dma_fence(Ordering::SeqCst);
 
         self.running = false;
         true
+    }
+}
+
+/// A running I2S0 capture into a [`DmaRing`], returned by
+/// [`Esp32I2sCamera::start`] (LL-01).
+///
+/// It mutably borrows the camera and the ring, so neither can be used,
+/// moved or dropped while the DMA writes. Completed halves are consumed
+/// through [`Self::drain_ready_halves`] / [`Self::poll`], which reach the
+/// ring only through the shared WP-06 drain. Dropping the guard, or
+/// [`Self::stop`], stops and resets the DMA (LL-21); after that the
+/// tail half can be drained from [`DmaRing::parts_mut`] (WP-06 order:
+/// stop first, then the tail).
+#[must_use = "dropping a RunningCapture immediately stops the DMA"]
+#[derive(Debug)]
+pub struct RunningCapture<'r> {
+    cam: &'r mut Esp32I2sCamera,
+    ring: RingParts<'r>,
+    _marker: PhantomData<&'r mut [u8]>,
+}
+
+impl RunningCapture<'_> {
+    /// `true` until the capture is stopped.
+    #[inline]
+    pub const fn is_running(&self) -> bool {
+        self.cam.running
+    }
+
+    /// The camera, for inspection (filter, shadow registers).
+    #[inline]
+    pub fn camera(&self) -> &Esp32I2sCamera {
+        self.cam
+    }
+
+    /// The ring's node size in bytes.
+    #[inline]
+    pub const fn node_size(&self) -> usize {
+        self.ring.node_size
+    }
+
+    /// Stops and resets the DMA (the same as dropping the guard).
+    #[inline]
+    pub fn stop(self) {
+        drop(self);
+    }
+
+    /// The ring and the DMA status for one drain call.
+    fn ring_and_status(&mut self) -> (&mut [Lldesc], &mut [u8], I2s0DmaStatus<'_>) {
+        // JUSTIFICATION: Materializes the armed ring for one drain call.
+        // SAFETY:
+        // 1. Alignment & Non-null: The pointers come from the `&mut` slices
+        //    of a validated `DmaRing` (`DmaRing::arm`).
+        // 2. Memory layout: `[Lldesc]` and `[u8]` slices of the original
+        //    lengths.
+        // 3. Provenance & Lifetime: The ring stays mutably borrowed for `'r`
+        //    (and its memory outlives the guard), and the returned
+        //    references are tied to `&mut self`, so they end before the
+        //    guard does.
+        // 4. Aliasing: No other CPU reference to the ring exists while it is
+        //    armed (`DmaRing` accessors fail), and `&mut self` makes these
+        //    the only ones. The DMA engine writes only the halves it owns,
+        //    and the drain reads a half only after the EOF position, the
+        //    owner bit and a `memw` (`I2s0DmaStatus::barrier`) say the DMA
+        //    has finished it (LL-03, WP-06); the headers are atomics.
+        // 5. Volatile semantics: Descriptor headers use atomics; buffer
+        //    reads follow the drain's barrier.
+        // 6. Panic safety: Creating references cannot unwind.
+        let (desc, buf) = unsafe { (self.ring.descriptors.as_mut(), self.ring.buffer.as_mut()) };
+        (desc, buf, self.cam.dma_status())
+    }
+
+    /// Consumes every completed half through `drain`
+    /// ([`HalfDrain::drain_ready_halves`]).
+    pub fn drain_ready_halves<F>(
+        &mut self,
+        drain: &mut HalfDrain,
+        scratch: &mut [u8],
+        sink: F,
+    ) -> Result<usize, CameraError>
+    where
+        F: FnMut(&[u8]) -> ControlFlow<()>,
+    {
+        let (desc, buf, mut status) = self.ring_and_status();
+        drain.drain_ready_halves(desc, buf, &mut status, scratch, sink)
+    }
+
+    /// Runs one [`PolledJpegCapture::poll`] step on this capture. On
+    /// [`CaptureStep::FrameEnded`], stop the capture and call
+    /// [`PolledJpegCapture::finish`] on the ring.
+    pub fn poll<H, V>(
+        &mut self,
+        capture: &mut PolledJpegCapture,
+        jpeg_out: &mut [u8],
+        vsync_active: &mut V,
+        hooks: &mut H,
+    ) -> CaptureStep
+    where
+        H: CaptureHooks,
+        V: FnMut() -> bool,
+    {
+        let (desc, buf, mut status) = self.ring_and_status();
+        capture.poll(desc, buf, &mut status, jpeg_out, vsync_active, hooks)
+    }
+
+    /// Test hook: the DMA writes `bytes` at ring offset `at`.
+    #[cfg(test)]
+    pub(crate) fn simulate_dma_write(&mut self, at: usize, bytes: &[u8]) {
+        let (_, buf, _) = self.ring_and_status();
+        buf[at..at + bytes.len()].copy_from_slice(bytes);
+    }
+
+    /// Test hook: the DMA completes JPEG half `h` (two descriptors): owner
+    /// write-back, EOF on the last descriptor, `IN_SUC_EOF` raised.
+    #[cfg(test)]
+    pub(crate) fn simulate_half_complete(&mut self, h: usize) {
+        let node = self.ring.node_size as u16;
+        let (desc, _, _) = self.ring_and_status();
+        for d in [2 * h, 2 * h + 1] {
+            desc[d].store_flags(Lldesc::pack_flags(
+                node,
+                node,
+                0,
+                false,
+                d == 2 * h + 1,
+                false,
+            ));
+        }
+        let eof_addr = desc[2 * h + 1].link_addr_20bit();
+        self.cam.regs.in_eof_des_addr = eof_addr;
+        self.cam.regs.int_raw |= I2S_IN_SUC_EOF_INT_BIT;
+    }
+}
+
+impl Drop for RunningCapture<'_> {
+    fn drop(&mut self) {
+        let _ = self.cam.stop();
+        *self.ring.armed = false;
     }
 }
 
@@ -1199,21 +1644,20 @@ impl Esp32I2sCamera {
 /// that no concurrent access to I2S0 registers occurs and that halting RX
 /// and DMA in-link is safe in the current execution state (e.g. panic or
 /// reset teardown).
-// JUSTIFICATION: Emergency stop directly manipulates I2S0 hardware MMIO
-// registers without holding an exclusive `&mut Esp32I2sCamera` handle.
-// SAFETY:
-// 1. Alignment & Non-null: All target register addresses are 4-byte aligned
-//    ESP32 I2S0 MMIO addresses (`0x3FF4_F000..0x3FF4_F0FF`).
-// 2. Memory layout: I2S0 MMIO registers are 32-bit memory-mapped words.
-// 3. Provenance: Fixed peripheral memory map on Xtensa ESP32 architecture.
-// 4. Aliasing: Called during emergency teardown/panic; preempts or replaces
-//    normal driver access to halt in-flight DMA immediately.
-// 5. Volatile semantics: MMIO register writes use volatile store operations
-//    preventing compiler reordering or elision.
-// 6. Panic safety: MMIO register writes on Xtensa do not unwind or panic.
 pub unsafe fn emergency_stop_i2s0_hw() {
     #[cfg(target_arch = "xtensa")]
-    {
+    // JUSTIFICATION: Emergency stop directly manipulates I2S0 hardware MMIO
+    // registers without holding an exclusive `&mut Esp32I2sCamera` handle.
+    // SAFETY:
+    // 1. Alignment & Non-null: All target register addresses are 4-byte
+    //    aligned ESP32 I2S0 MMIO addresses (`0x3FF4_F000..0x3FF4_F0FF`).
+    // 2. Memory layout: I2S0 MMIO registers are 32-bit memory-mapped words.
+    // 3. Provenance: Fixed peripheral memory map on Xtensa ESP32.
+    // 4. Aliasing: The caller guarantees no concurrent I2S0 access (function
+    //    contract); halting the DMA only ends its writes.
+    // 5. Volatile semantics: Volatile MMIO stores in program order.
+    // 6. Panic safety: MMIO register writes on Xtensa do not unwind or panic.
+    unsafe {
         let hw_conf = xtensa_mmio_read(I2S0_BASE_ADDR + I2S_CONF_REG_OFFSET) & !I2S_RX_START_BIT;
         xtensa_mmio_write(I2S0_BASE_ADDR + I2S_CONF_REG_OFFSET, hw_conf);
 
@@ -1239,14 +1683,6 @@ impl Esp32I2sCamera {
     /// # Safety
     ///
     /// See module-level [`emergency_stop_i2s0_hw`] for full safety contract.
-    // JUSTIFICATION: Delegates directly to module-level emergency stop function.
-    // SAFETY:
-    // 1. Alignment & Non-null: Forwarded to `emergency_stop_i2s0_hw`.
-    // 2. Memory layout: Forwarded to `emergency_stop_i2s0_hw`.
-    // 3. Provenance: Forwarded to `emergency_stop_i2s0_hw`.
-    // 4. Aliasing: Forwarded to `emergency_stop_i2s0_hw`.
-    // 5. Volatile semantics: Forwarded to `emergency_stop_i2s0_hw`.
-    // 6. Panic safety: Forwarded to `emergency_stop_i2s0_hw`.
     #[inline]
     pub unsafe fn emergency_stop_i2s0_hw() {
         // JUSTIFICATION: Delegates directly to module-level emergency stop function.
@@ -1272,7 +1708,18 @@ impl Esp32I2sCamera {
         volatile_write_u32(&mut self.regs.dport_rst_en, rst);
 
         #[cfg(target_arch = "xtensa")]
-        {
+        // JUSTIFICATION: Resets the inlink and gates the I2S0 clock.
+        // SAFETY:
+        // 1. Alignment & Non-null: Fixed, 4-byte aligned I2S0 and DPORT
+        //    registers.
+        // 2. Memory layout: 32-bit peripheral registers.
+        // 3. Provenance: ESP32 I2S0 / DPORT address space.
+        // 4. Aliasing: `&mut self` is the single I2S0 owner (LL-13); the DMA
+        //    was stopped above and the DPORT read-modify-writes touch only
+        //    the I2S0 bits.
+        // 5. Volatile semantics: Volatile MMIO in program order.
+        // 6. Panic safety: MMIO accesses cannot unwind.
+        unsafe {
             xtensa_mmio_write(
                 I2S0_BASE_ADDR + I2S_LC_CONF_REG_OFFSET,
                 I2S_LC_IN_RST_BIT | I2S_LC_AHBM_RST_BIT | I2S_LC_AHBM_FIFO_RST_BIT,
@@ -1370,30 +1817,19 @@ impl Esp32I2sCamera {
             image_size: jpeg_out.len(),
         };
 
+        // LL-01: the checked constructor validates alignment and node size,
+        // and on Xtensa that the descriptors and the buffer are in the
+        // DMA-capable SRAM window (no PSRAM).
+        let mut ring = DmaRing::new(
+            descriptors,
+            &mut dma_buf[..required_dma_bytes],
+            JPEG_DMA_NODE_SIZE,
+        )?;
+
         #[cfg(target_arch = "xtensa")]
         {
-            let buf_start = dma_buf.as_ptr() as usize;
-            let buf_end = buf_start.saturating_add(required_dma_bytes.saturating_sub(1));
-            let desc_start = descriptors.as_ptr() as usize;
-            let desc_end =
-                desc_start.saturating_add(core::mem::size_of_val(descriptors).saturating_sub(1));
-            if buf_start < 0x3FFA_E000
-                || buf_end > 0x3FFF_FFFF
-                || desc_start < 0x3FFA_E000
-                || desc_end > 0x3FFF_FFFF
-            {
-                return Err(CameraError::InvalidArg);
-            }
-
-            build_circular_ring(
-                descriptors,
-                &dma_buf[..required_dma_bytes],
-                JPEG_DMA_NODE_SIZE,
-            )?;
             // LL-06: no byte of an earlier frame survives anywhere in the ring.
-            dma_buf[..required_dma_bytes].fill(crate::dma_drain::DMA_POISON_BYTE);
-            let first_desc_addr =
-                (core::ptr::from_ref(&descriptors[0]) as usize as u32) & I2S_INLINK_ADDR_MASK;
+            ring.poison()?;
             let vsync_pin = self.vsync_pin.unwrap_or(25);
             let vsync_sync_level = !self.vsync_invert;
 
@@ -1416,35 +1852,50 @@ impl Esp32I2sCamera {
                 self.filter,
                 crate::dma_drain::DrainGate::OwnerWriteback,
             )?;
-            if !self.start(&dma_cfg, first_desc_addr) {
-                return Err(CameraError::HardwareError);
-            }
+            // JUSTIFICATION: Starts the DMA on a ring borrowed for this call.
+            // SAFETY:
+            // 1. Alignment & Non-null: `ring` was validated by `DmaRing::new`
+            //    (including the DMA window on Xtensa).
+            // 2. Memory layout: Checked by `start_scoped`.
+            // 3. Provenance & Lifetime: The guard is consumed by
+            //    `run_polled_capture`, which stops the DMA on every exit
+            //    before this function returns, so the borrowed buffers
+            //    outlive every DMA write.
+            // 4. Aliasing: The guard borrows `self` and `ring` mutably.
+            // 5. Volatile semantics: See `start_scoped`.
+            // 6. Panic safety: The guard is never leaked; on unwind its
+            //    `Drop` stops the DMA.
+            let running = unsafe { self.start_scoped(&dma_cfg, &mut ring) }?;
 
             let mut vsync_active = || xtensa_read_gpio_level(vsync_pin) != vsync_sync_level;
-            self.run_polled_capture(
+            let ended = Self::run_polled_capture(
+                running,
                 &mut capture,
-                descriptors,
-                dma_buf,
                 jpeg_out,
                 max_poll_iters,
                 &mut vsync_active,
                 hooks,
-            )
+            )?;
+            match ended {
+                Some(len) => Ok(len),
+                None => {
+                    // WP-06 order: the DMA is stopped, now drain the tail.
+                    let (desc, buf) = ring.parts_mut()?;
+                    capture.finish(desc, buf, &mut self.dma_status(), jpeg_out)
+                }
+            }
         }
 
         #[cfg(not(target_arch = "xtensa"))]
         {
             let _ = hooks;
-            build_circular_ring(
-                descriptors,
-                &dma_buf[..required_dma_bytes],
-                JPEG_DMA_NODE_SIZE,
-            )?;
-            let first_desc_addr =
-                (core::ptr::from_ref(&descriptors[0]) as usize as u32) & I2S_INLINK_ADDR_MASK;
-            if !self.start(&dma_cfg, first_desc_addr) {
+            let first_desc_addr = ring.first_desc_addr();
+            // Host: no DMA engine exists; this only programs the shadow
+            // registers. The halves were pre-populated by the caller.
+            if !self.start_hw(&dma_cfg, first_desc_addr) {
                 return Err(CameraError::HardwareError);
             }
+            let (descriptors, dma_buf) = ring.parts_mut()?;
 
             let mut written = 0usize;
             let mut soi_found = false;
@@ -1461,8 +1912,8 @@ impl Esp32I2sCamera {
                     &dma_buf[half_offset..half_offset + JPEG_DMA_HALF_BUFFER_SIZE],
                 );
                 let flags = Lldesc::pack_flags(JPEG_DMA_NODE_SIZE as u16, 0, 0, false, false, true);
-                volatile_write_u32(&mut descriptors[2 * h].size_length_flags, flags);
-                volatile_write_u32(&mut descriptors[2 * h + 1].size_length_flags, flags);
+                descriptors[2 * h].store_flags(flags);
+                descriptors[2 * h + 1].store_flags(flags);
 
                 match append_unpacked_jpeg_chunk(
                     &unpacked_chunk,
@@ -1495,48 +1946,40 @@ impl Esp32I2sCamera {
     }
 
     /// Drives a started [`PolledJpegCapture`] for at most `max_poll_iters`
-    /// polls, stopping the DMA on every exit. Target-independent so the host
-    /// build type-checks the loop the Xtensa capture runs.
+    /// polls and stops the DMA on every exit by consuming `running`.
+    /// Returns `Ok(Some(len))` for a complete frame and `Ok(None)` when the
+    /// frame ended and the caller must [finish](PolledJpegCapture::finish)
+    /// it on the stopped ring. Target-independent so the host build
+    /// type-checks the loop the Xtensa capture runs.
     #[cfg_attr(not(target_arch = "xtensa"), allow(dead_code))]
-    #[allow(clippy::too_many_arguments)]
     fn run_polled_capture<H: CaptureHooks, V: FnMut() -> bool>(
-        &mut self,
+        mut running: RunningCapture<'_>,
         capture: &mut PolledJpegCapture,
-        descriptors: &mut [Lldesc],
-        dma_buf: &mut [u8],
         jpeg_out: &mut [u8],
         max_poll_iters: u32,
         vsync_active: &mut V,
         hooks: &mut H,
-    ) -> Result<usize, CameraError> {
+    ) -> Result<Option<usize>, CameraError> {
         let mut poll_iters = 0u32;
         while poll_iters < max_poll_iters {
             poll_iters += 1;
-            let step = capture.poll(
-                descriptors,
-                dma_buf,
-                &mut self.dma_status(),
-                jpeg_out,
-                vsync_active,
-                hooks,
-            );
-            match step {
+            match running.poll(capture, jpeg_out, vsync_active, hooks) {
                 CaptureStep::Pending => {}
                 CaptureStep::Complete(len) => {
-                    let _ = self.stop();
-                    return Ok(len);
+                    running.stop();
+                    return Ok(Some(len));
                 }
                 CaptureStep::Failed(e) => {
-                    let _ = self.stop();
+                    running.stop();
                     return Err(e);
                 }
                 CaptureStep::FrameEnded => {
-                    let _ = self.stop();
-                    return capture.finish(descriptors, dma_buf, &mut self.dma_status(), jpeg_out);
+                    running.stop();
+                    return Ok(None);
                 }
             }
         }
-        let _ = self.stop();
+        running.stop();
         Err(CameraError::Timeout)
     }
 }
@@ -1545,7 +1988,7 @@ impl Esp32I2sCamera {
 mod tests {
     use super::*;
     use crate::dma_filter::DmaElement;
-    use crate::dma_ring::{calc_dma_sizes, DEFAULT_CAMERA_DMA_BUFFER_SIZE_MAX};
+    use crate::dma_ring::{calc_dma_sizes, DmaRingStorage, DEFAULT_CAMERA_DMA_BUFFER_SIZE_MAX};
     use esp32_cam_types::CameraPid;
 
     #[test]
@@ -1670,7 +2113,16 @@ mod tests {
         cam.vsync_intr_enable(true);
         assert!(cam.is_vsync_intr_enabled());
 
-        assert!(cam.start(&dma_cfg, 0x3FFB_1234));
+        // JUSTIFICATION: Exercises the raw migration entry point.
+        // SAFETY:
+        // 1. Alignment & Non-null: On the host no DMA engine exists; the
+        //    address is only stored in the shadow `in_link` register.
+        // 2. Memory layout: No descriptor is dereferenced.
+        // 3. Provenance & Lifetime: Nothing is read or written through it.
+        // 4. Aliasing: `cam` is a host shadow-register simulator.
+        // 5. Volatile semantics: Shadow writes only.
+        // 6. Panic safety: `start_raw` does not panic.
+        assert!(unsafe { cam.start_raw(&dma_cfg, 0x3FFB_1234) });
         assert!(cam.is_running());
         assert_eq!(cam.regs().rx_eof_num, 4096);
         assert_eq!(
@@ -1738,7 +2190,7 @@ mod tests {
             .set_sample_mode(PixelFormat::Jpeg, 20_000_000, CameraPid::OV2640.as_u16())
             .expect("set jpeg sample mode");
 
-        let mut descriptors = [Lldesc::empty(); 4];
+        let mut descriptors = [Lldesc::EMPTY; 4];
         #[repr(C, align(4))]
         struct AlignedBuf([u8; 4 * JPEG_DMA_NODE_SIZE]);
         let mut dma_storage = AlignedBuf([0u8; 4 * JPEG_DMA_NODE_SIZE]);
@@ -1794,7 +2246,7 @@ mod tests {
             .set_sample_mode(PixelFormat::Jpeg, 20_000_000, CameraPid::OV2640.as_u16())
             .expect("set jpeg sample mode");
 
-        let mut descriptors = [Lldesc::empty(); 2];
+        let mut descriptors = [Lldesc::EMPTY; 2];
         #[repr(C, align(4))]
         struct AlignedBuf([u8; 2 * JPEG_DMA_NODE_SIZE]);
         let mut dma_storage = AlignedBuf([0u8; 2 * JPEG_DMA_NODE_SIZE]);
@@ -1848,7 +2300,7 @@ mod tests {
                 lines_per_half_buffer: 1,
                 image_size: 1024,
             };
-            assert!(cam2.start(&dma_cfg, 0x1234));
+            assert!(cam2.simulate_start(&dma_cfg));
             assert!(cam2.is_running());
             drop(cam2); // Drops and executes stop()
         }
@@ -1909,12 +2361,12 @@ mod tests {
         use core::ops::ControlFlow;
 
         let mut cam = Esp32I2sCamera::new();
-        let mut descriptors = [Lldesc::empty(); 4];
+        let mut descriptors = [Lldesc::EMPTY; 4];
         #[repr(C, align(4))]
         struct AlignedBuf([u8; 4 * JPEG_DMA_NODE_SIZE]);
         let mut storage = AlignedBuf([0u8; 4 * JPEG_DMA_NODE_SIZE]);
         let dma_buf = &mut storage.0;
-        crate::dma_ring::build_circular_ring_mut(&mut descriptors, dma_buf, JPEG_DMA_NODE_SIZE)
+        crate::dma_ring::build_circular_ring(&mut descriptors, dma_buf, JPEG_DMA_NODE_SIZE)
             .expect("ring");
         dma_buf[..4].copy_from_slice(&DmaElement::new(0xFF, 0).0);
 
@@ -1948,7 +2400,7 @@ mod tests {
     fn test_capture_with_hooks_matches_plain_capture_on_host() {
         let mut cam = Esp32I2sCamera::new();
         assert_eq!(cam.config(), Ok(()));
-        let mut descriptors = [Lldesc::empty(); 2];
+        let mut descriptors = [Lldesc::EMPTY; 2];
         #[repr(C, align(4))]
         struct AlignedBuf([u8; 2 * JPEG_DMA_NODE_SIZE]);
         let mut storage = AlignedBuf([0u8; 2 * JPEG_DMA_NODE_SIZE]);
@@ -1983,8 +2435,177 @@ mod tests {
             DEFAULT_CAMERA_DMA_BUFFER_SIZE_MAX,
         )
         .expect("dma sizes");
-        assert!(cam.start(&dma_cfg, 0x1000));
+        assert!(cam.simulate_start(&dma_cfg));
         assert_eq!(cam.regs().int_raw, 1, "only the inlink latches are cleared");
         assert_eq!(cam.regs().int_clr, stale);
+    }
+
+    /// JPEG geometry for a ring of `desc_cnt` 2048-byte nodes, two per half.
+    fn jpeg_ring_cfg(desc_cnt: usize) -> DmaSizeConfig {
+        DmaSizeConfig {
+            dma_bytes_per_item: 4,
+            dma_buffer_size: desc_cnt * JPEG_DMA_NODE_SIZE,
+            dma_half_buffer_size: JPEG_DMA_HALF_BUFFER_SIZE,
+            dma_half_buffer_cnt: desc_cnt / 2,
+            dma_node_buffer_size: JPEG_DMA_NODE_SIZE,
+            dma_node_cnt: desc_cnt,
+            lines_per_node: 1,
+            nodes_per_line: 1,
+            lines_per_half_buffer: 1,
+            image_size: 1024,
+        }
+    }
+
+    #[test]
+    fn take_hands_out_i2s0_once_until_the_owner_drops() {
+        let first = Esp32I2sCamera::take().expect("I2S0 is free");
+        assert!(
+            Esp32I2sCamera::take().is_none(),
+            "a second owner of I2S0 must not exist"
+        );
+        drop(first);
+        let again = Esp32I2sCamera::take().expect("released on drop");
+        drop(again);
+    }
+
+    static START_RING: DmaRingStorage<4, { 4 * JPEG_DMA_NODE_SIZE }> = DmaRingStorage::new();
+
+    #[test]
+    fn running_capture_starts_on_the_ring_and_drop_stops_it() {
+        let mut ring = START_RING
+            .take_ring(JPEG_DMA_NODE_SIZE)
+            .expect("storage is free");
+        assert!(
+            START_RING.take_ring(JPEG_DMA_NODE_SIZE).is_err(),
+            "ring storage is handed out once"
+        );
+        let first = ring.first_desc_addr();
+        let mut cam = Esp32I2sCamera::new();
+        assert_eq!(cam.config(), Ok(()));
+        let cfg = jpeg_ring_cfg(4);
+        {
+            let running = cam.start(&cfg, &mut ring).expect("start");
+            assert!(running.is_running());
+            assert_eq!(running.camera().regs().rx_eof_num, 1024);
+            assert_eq!(
+                running.camera().regs().in_link & I2S_INLINK_ADDR_MASK,
+                first
+            );
+            assert_ne!(running.camera().regs().in_link & I2S_INLINK_START_BIT, 0);
+        }
+        // Drop of the guard stopped and reset the DMA.
+        assert!(!cam.is_running());
+        assert_ne!(cam.regs().in_link & I2S_INLINK_STOP_BIT, 0);
+        assert_eq!(cam.regs().conf & I2S_RX_START_BIT, 0);
+        assert_eq!(cam.dma_resets(), 1);
+
+        // The ring is usable again, and can be restarted.
+        assert!(ring.parts_mut().is_ok());
+        let running = cam.start(&cfg, &mut ring).expect("restart");
+        running.stop();
+        assert!(!cam.is_running());
+        assert_eq!(cam.dma_resets(), 2);
+    }
+
+    static GEOMETRY_RING: DmaRingStorage<4, { 4 * JPEG_DMA_NODE_SIZE }> = DmaRingStorage::new();
+
+    #[test]
+    fn start_rejects_geometry_the_ring_cannot_hold() {
+        let mut ring = GEOMETRY_RING.take_ring(JPEG_DMA_NODE_SIZE).expect("ring");
+        let mut cam = Esp32I2sCamera::new();
+        for half in [
+            0,
+            3000,
+            JPEG_DMA_NODE_SIZE / 2,
+            3 * JPEG_DMA_NODE_SIZE,
+            8 * JPEG_DMA_NODE_SIZE,
+        ] {
+            let cfg = DmaSizeConfig {
+                dma_half_buffer_size: half,
+                ..jpeg_ring_cfg(4)
+            };
+            assert!(
+                matches!(cam.start(&cfg, &mut ring), Err(CameraError::InvalidArg)),
+                "half buffer {half}"
+            );
+            assert!(!cam.is_running());
+        }
+        // A camera started through the raw path cannot be started again.
+        assert!(cam.simulate_start(&jpeg_ring_cfg(4)));
+        assert!(matches!(
+            cam.start(&jpeg_ring_cfg(4), &mut ring),
+            Err(CameraError::InvalidState)
+        ));
+        assert!(cam.stop());
+    }
+
+    static DRAIN_RING: DmaRingStorage<4, { 4 * JPEG_DMA_NODE_SIZE }> = DmaRingStorage::new();
+
+    #[test]
+    fn running_capture_drains_halves_and_the_tail_after_stop() {
+        use crate::dma_drain::{DrainGate, HalfDrain};
+        use core::ops::ControlFlow;
+
+        let mut ring = DRAIN_RING.take_ring(JPEG_DMA_NODE_SIZE).expect("ring");
+        ring.poison().expect("idle ring");
+        let mut cam = Esp32I2sCamera::new();
+        let mut drain = HalfDrain::new(
+            2,
+            JPEG_DMA_NODE_SIZE,
+            cam.filter(),
+            DrainGate::OwnerWriteback,
+        )
+        .expect("drain");
+        let mut scratch = [0u8; JPEG_UNPACKED_HALF_BUFFER_SIZE];
+        let mut seen = [0u8; 2];
+        {
+            let mut running = cam.start(&jpeg_ring_cfg(4), &mut ring).expect("start");
+            // Simulate the DMA: write half 0, write back both descriptors
+            // and raise IN_SUC_EOF at descriptor 1; half 1 is partial.
+            running.simulate_dma_write(0, &DmaElement::new(0x11, 0).0);
+            running.simulate_dma_write(JPEG_DMA_HALF_BUFFER_SIZE, &DmaElement::new(0x22, 0).0);
+            running.simulate_half_complete(0);
+
+            let mut n = 0usize;
+            let r = running.drain_ready_halves(&mut drain, &mut scratch, |c| {
+                seen[n] = c[0];
+                n += 1;
+                ControlFlow::Continue(())
+            });
+            assert_eq!(r, Ok(1));
+            assert_eq!(seen[0], 0x11);
+            // Half 1 is still DMA-owned: nothing more is consumed.
+            assert_eq!(
+                running.drain_ready_halves(&mut drain, &mut scratch, |_| ControlFlow::Continue(())),
+                Ok(0)
+            );
+            running.stop();
+        }
+        // WP-06 order: stop first, then the tail half is drained.
+        assert!(!cam.is_running());
+        let (desc, buf) = ring.parts_mut().expect("stopped ring");
+        let n = drain
+            .drain_tail_half(desc, buf, &mut cam.dma_status(), &mut scratch)
+            .expect("tail");
+        assert_eq!(n, JPEG_UNPACKED_HALF_BUFFER_SIZE);
+        assert_eq!(scratch[0], 0x22);
+    }
+
+    static LEAK_RING: DmaRingStorage<4, { 4 * JPEG_DMA_NODE_SIZE }> = DmaRingStorage::new();
+
+    #[test]
+    fn a_leaked_guard_leaves_the_ring_locked() {
+        let mut ring = LEAK_RING.take_ring(JPEG_DMA_NODE_SIZE).expect("ring");
+        let mut cam = Esp32I2sCamera::new();
+        let running = cam.start(&jpeg_ring_cfg(4), &mut ring).expect("start");
+        core::mem::forget(running);
+        // The DMA may still be writing: the CPU gets no access to the ring.
+        assert!(matches!(ring.parts_mut(), Err(CameraError::InvalidState)));
+        assert!(matches!(ring.descriptors(), Err(CameraError::InvalidState)));
+        assert!(cam.is_running());
+        assert!(matches!(
+            cam.start(&jpeg_ring_cfg(4), &mut ring),
+            Err(CameraError::InvalidState)
+        ));
     }
 }

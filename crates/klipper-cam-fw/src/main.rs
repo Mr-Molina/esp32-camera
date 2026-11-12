@@ -32,9 +32,9 @@ use esp_backtrace as _;
 #[cfg(target_arch = "xtensa")]
 esp_bootloader_esp_idf::esp_app_desc!();
 
-use esp32_cam_ll::{
-    build_circular_ring, verify_circular_ring, Lldesc, DEFAULT_CAMERA_DMA_BUFFER_SIZE_MAX,
-};
+#[cfg(target_arch = "xtensa")]
+use esp32_cam_ll::{build_circular_ring, Lldesc};
+use esp32_cam_ll::{verify_circular_ring, DmaRingStorage, DEFAULT_CAMERA_DMA_BUFFER_SIZE_MAX};
 use klipper_cam_fw::{
     calc_dma_sizes, decode_jpeg_to_rgb888, encode_rgb888_to_jpeg, parse_jpeg_dimensions,
     verify_jpeg_eoi, verify_jpeg_soi, verify_partition_table_integrity, BoardPins, CameraDriver,
@@ -131,9 +131,15 @@ fn hil_check_sccb_and_ov2640_hd() -> bool {
     hsize8 == 0xC8 && vsize8 == 0x96 && yoffl == 150
 }
 
+/// DMA ring for the I2S0 self-test: 4 nodes of 128 bytes. A `static`, so it
+/// lies in internal SRAM (DMA-capable) and is 4-byte aligned (WP-08 step 7).
+static SELF_TEST_RING: DmaRingStorage<4, 512> = DmaRingStorage::new();
+
 #[inline(never)]
 fn hil_check_ll_dma_and_i2s0() -> bool {
-    let mut i2s_cam = Esp32I2sCamera::new();
+    let Some(mut i2s_cam) = Esp32I2sCamera::take() else {
+        return false;
+    };
     let ll_pins = WroverKitPins::PINS.to_ll_pin_config(true);
     if i2s_cam.set_pin(&ll_pins).is_err() || i2s_cam.gpio_bindings().len() != 12 {
         return false;
@@ -159,21 +165,43 @@ fn hil_check_ll_dma_and_i2s0() -> bool {
         return false;
     }
 
-    let mut nodes = [Lldesc::empty(); 4];
-    let dma_buf = [0u8; 512];
-    if build_circular_ring(&mut nodes, &dma_buf, 128).is_err() {
+    // WP-08 step 7: a checked, writable, aligned `'static` ring (it used to be
+    // an immutable, 1-byte-aligned stack array) and a geometry that matches
+    // it: 2 nodes per half-buffer.
+    let Ok(mut ring) = SELF_TEST_RING.take_ring(128) else {
         return false;
+    };
+    match ring.parts_mut() {
+        Ok((nodes, dma_buf)) if verify_circular_ring(nodes, dma_buf, 128).is_ok() => {}
+        _ => return false,
     }
-    if verify_circular_ring(&nodes, &dma_buf, 128).is_err() {
-        return false;
-    }
+    let ring_cfg = esp32_cam_ll::DmaSizeConfig {
+        dma_bytes_per_item: 4,
+        dma_buffer_size: 512,
+        dma_half_buffer_size: 256,
+        dma_half_buffer_cnt: 2,
+        dma_node_buffer_size: 128,
+        dma_node_cnt: 4,
+        lines_per_node: 1,
+        nodes_per_line: 1,
+        lines_per_half_buffer: 1,
+        image_size: 512,
+    };
 
     i2s_cam.vsync_intr_enable(true);
     if !i2s_cam.is_vsync_intr_enabled() {
         return false;
     }
-    let started = i2s_cam.start(&dma_sizing, nodes[0].link_addr_20bit()) && i2s_cam.is_running();
-    let stopped = i2s_cam.stop() && !i2s_cam.is_running();
+    let started = match i2s_cam.start(&ring_cfg, &mut ring) {
+        Ok(running) => {
+            let ok = running.is_running();
+            // Dropping the guard would stop the DMA too; stop explicitly.
+            running.stop();
+            ok
+        }
+        Err(_) => false,
+    };
+    let stopped = !i2s_cam.is_running() && ring.parts_mut().is_ok();
     let deinit_ok = i2s_cam.deinit().is_ok();
     started && stopped && deinit_ok
 }
@@ -365,7 +393,7 @@ fn main() {
 struct AlignedDmaBuf([u8; 32768]);
 
 #[cfg(target_arch = "xtensa")]
-static mut I2S_DMA_DESC: [Lldesc; 16] = [Lldesc::empty(); 16];
+static mut I2S_DMA_DESC: [Lldesc; 16] = [Lldesc::EMPTY; 16];
 
 #[cfg(target_arch = "xtensa")]
 static mut I2S_DMA_BUF: AlignedDmaBuf = AlignedDmaBuf([0u8; 32768]);
@@ -2040,7 +2068,19 @@ fn capture_live_hd_jpeg_with_diag(
             }
         }
 
-        if !i2s_cam.start(&dma_cfg, first_desc_addr) {
+        // JUSTIFICATION: Starts I2S0 DMA on the static ring (WP-08 migration
+        // entry point; this loop keeps its WP-06 drain over raw slices).
+        // SAFETY:
+        // 1. Alignment & Non-null: `first_desc_addr` is `I2S_DMA_DESC[0]`, a
+        //    4-byte aligned static in internal DRAM.
+        // 2. Layout: `build_circular_ring` linked 16 x 2048-byte nodes over
+        //    the 4-byte aligned 32 KiB `I2S_DMA_BUF` in internal DRAM.
+        // 3. Provenance: Both statics live for `'static`.
+        // 4. Aliasing: While the DMA runs, the ring is touched only through
+        //    the ll `HalfDrain`; every exit below calls `i2s_cam.stop()`.
+        // 5. Synchronization: `start_raw` fences (`memw`) before `in_link`.
+        // 6. Unwind safety: Bare-metal environment with panic = abort.
+        if !unsafe { i2s_cam.start_raw(&dma_cfg, first_desc_addr) } {
             return Err((0, 0, 0, 0, 0, 0xDEAD));
         }
         drain.reset();
@@ -2502,7 +2542,20 @@ fn core1_camera_producer_loop() -> ! {
         }
         // `start()` clears the stale `IN_SUC_EOF` / `IN_DSCR_ERR` /
         // `IN_DSCR_EMPTY` latches before arming the DMA.
-        if !i2s_cam.start(&dma_cfg, first_desc_addr) {
+        // JUSTIFICATION: Starts I2S0 DMA on the static ring (WP-08 migration
+        // entry point; this loop keeps its WP-06 drain over raw slices).
+        // SAFETY:
+        // 1. Alignment & Non-null: `first_desc_addr` is `I2S_DMA_DESC[0]`, a
+        //    4-byte aligned static in internal DRAM.
+        // 2. Layout: `build_circular_ring` linked 16 x 2048-byte nodes over
+        //    the 4-byte aligned 32 KiB `I2S_DMA_BUF` in internal DRAM.
+        // 3. Provenance: Both statics live for `'static`.
+        // 4. Aliasing: Core 1 owns the ring; while the DMA runs it is touched
+        //    only through the ll `HalfDrain`, and every frame ends with
+        //    `i2s_cam.stop()` before the ring is rebuilt or poisoned.
+        // 5. Synchronization: `start_raw` fences (`memw`) before `in_link`.
+        // 6. Unwind safety: Diverging loop in `no_std` firmware.
+        if !unsafe { i2s_cam.start_raw(&dma_cfg, first_desc_addr) } {
             aligned_from_eof = false;
             continue;
         }
@@ -2948,7 +3001,11 @@ fn init_psram_and_run_hil(psram_ptr: *mut u8, psram_len: usize, xclk_hw_ok: bool
         if all_ok { "ALL PASS (100%)" } else { "FAIL" }
     );
 
-    let mut hw_i2s_cam = Esp32I2sCamera::new();
+    // LL-13: the single I2S0 owner (the self-test above dropped its claim).
+    let Some(mut hw_i2s_cam) = Esp32I2sCamera::take() else {
+        println!("[KLIPPER-CAM-RS] I2S0 is already claimed; camera disabled");
+        return;
+    };
     let ll_pins = WroverKitPins::PINS.to_ll_pin_config(false);
     let _ = hw_i2s_cam.set_pin(&ll_pins);
     let _ = hw_i2s_cam.config();
