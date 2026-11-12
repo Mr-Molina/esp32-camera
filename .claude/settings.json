@@ -21,5 +21,23 @@
       "Read(./.env.local)",
       "Read(./.env*.local)"
     ]
+  },
+  "extraKnownMarketplaces": {
+    "tokeneconomizer": {
+      "source": {
+        "source": "github",
+        "repo": "microsoft/TokenEconomizer"
+      }
+    },
+    "superpowers-dev": {
+      "source": {
+        "source": "github",
+        "repo": "Mr-Molina/superpowers"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "tokeneconomizer@tokeneconomizer": true,
+    "superpowers@superpowers-dev": true
   }
 }
