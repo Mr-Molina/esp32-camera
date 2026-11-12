@@ -350,7 +350,7 @@ Status values: `TODO` · `IN-PROGRESS` · `READY-FOR-HIL` · `DONE` · `BLOCKED 
     - VSYNC-to-return latency is no longer bimodal.
     - FPS is the same or better.
 - **Open dependency:** confirm on hardware that the ESP32 I2S inlink writes back `owner=0` when `check_owner=0` (LL Open question 1). If it does not, gate on the `in_eof_des_addr` position instead of `owner()`.
-- **Status:** TODO
+- **Status:** IN-PROGRESS (2026-11-12, `aa471ad`; host gates green, 314 workspace tests; the ll Xtensa paths type-check and pass clippy with a forced `target_arch="xtensa"` cfg on the host, but the real `cargo +esp` gates were NOT run: no esp toolchain in that session, so the `main.rs` capture edits are uncompiled. Becomes READY-FOR-HIL once they pass. Open on hardware: all three capture paths gate on `DrainGate::OwnerWriteback`; if the inlink does not write back `owner=0` (open dependency above), switch them to `DrainGate::EofPosition`. Also check that the LL-21 reset in `stop()` cannot drop FIFO bytes before the tail half is drained. Added beyond the WP: `start()` clears stale `DSCR_ERR`/`DSCR_EMPTY` latches; a drain rejects an `in_eof_des_addr` that is not a half's last descriptor.)
 
 #### - [ ] WP-08: Make the low-level DMA API sound (Lane D) · P0 · M
 - **Findings:** LL-01, LL-02, LL-03, LL-13, LL-20, HAL-01
