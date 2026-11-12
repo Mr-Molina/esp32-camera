@@ -371,7 +371,7 @@ Status values: `TODO` · `IN-PROGRESS` · `READY-FOR-HIL` · `DONE` · `BLOCKED 
   - Unit tests reject PSRAM and misaligned rings.
   - Miri passes on the ll crate.
   - **[HIL]** Disassembly shows `memw` before the store to `0x3FF4_F034`. A 10k-frame colour-bar CRC soak passes.
-- **Status:** TODO
+- **Status:** IN-PROGRESS (2026-11-12, `81623f4`; steps 1-7 done, host gates green, 331 tests incl. trybuild compile-fail for `.clone()`, ring use/drop while running and a non-`'static` ring; ll/hal Xtensa paths pass clippy under a forced `target_arch="xtensa"` cfg. NOT run: real `cargo +esp` gates (the `main.rs` edits are uncompiled) and Miri (no nightly with miri in that session). Deviation: the safe `start` takes `&mut DmaRing<'static>`, since a leaked guard over a stack ring would let DMA write freed memory; borrowed rings use `unsafe start_scoped`. The WP-06 firmware capture paths stay on `start_raw`. Remaining LL-03 gap: `HalfDrain` still takes whole `&mut` slices that can cover DMA-owned halves (WP-20/WP-25). README still claims a 16-byte aligned `Lldesc` (WP-24).)
 
 #### - [ ] WP-09: Security hardening (Lane G, plus a small main.rs edit) · P1 · S-M
 - **Findings:** FW-NET-04, BUILD-07, FW-NET-03, FW-NET-18, FW-NET-27
