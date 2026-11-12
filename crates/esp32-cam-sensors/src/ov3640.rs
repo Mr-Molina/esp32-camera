@@ -3,10 +3,33 @@
 //!
 //! Ported from `sensors/ov3640.c`, `sensors/private_include/ov3640_regs.h`, and
 //! `sensors/private_include/ov3640_settings.h`.
+//!
+//! # Unverified register map (SENS-04)
+//!
+//! This driver's window, PLL, format and JPEG-quality registers are OV3660
+//! addresses, not OV3640 ones: the window block sits at 0x38xx, the PLL at
+//! 0x303A..0x303D and JPEG quality at 0x4407, and [`RATIO_TABLE`],
+//! [`SENSOR_FMT_JPEG`] and the other format tables are aliased directly from
+//! [`crate::ov3660`]. An OV3640 is an earlier part and does not have that
+//! layout, so programming it through those registers would either do nothing
+//! or corrupt unrelated state.
+//!
+//! Until a register map from an OV3640 reference is ported and checked on
+//! hardware, the setters that depend on those blocks refuse with
+//! [`CameraError::NotSupported`] rather than write another sensor's map into
+//! a real part: [`CameraSensor::set_framesize`], [`CameraSensor::set_pixformat`],
+//! [`CameraSensor::set_quality`], [`CameraSensor::set_res_raw`] and
+//! [`CameraSensor::set_pll`].
+//!
+//! The remaining methods, including [`CameraSensor::reset`], still write the
+//! unverified default table, so this driver has **not** been validated against
+//! real OV3640 hardware. Work order WO-PERF-2026-11, §7 question 6 asks the
+//! repository owner whether any OV3640 is in use; if none is, the whole driver
+//! should be marked unsupported instead.
 
 use crate::{
-    AspectRatio, CameraError, CameraModel, CameraPid, CameraSccbAddr, CameraSensor, CameraStatus,
-    FrameSize, GainCeiling, PixelFormat, RatioSettings, Reg16, SccbBus, SensorId,
+    CameraError, CameraModel, CameraPid, CameraSccbAddr, CameraSensor, CameraStatus, FrameSize,
+    GainCeiling, PixelFormat, RatioSettings, Reg16, SccbBus, SensorId,
 };
 
 pub const SYSTEM_CTROL0: u16 = 0x3008;
@@ -591,53 +614,10 @@ impl Ov3640 {
         Ok((v & mask) == mask)
     }
 
-    fn write_addr_reg<B: SccbBus>(
-        &self,
-        bus: &mut B,
-        reg: u16,
-        x_value: u16,
-        y_value: u16,
-    ) -> Result<(), CameraError> {
-        bus.write_reg16_val16(self.slv_addr, reg, x_value)?;
-        bus.write_reg16_val16(self.slv_addr, reg.wrapping_add(2), y_value)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn configure_pll<B: SccbBus>(
-        &self,
-        bus: &mut B,
-        bypass: bool,
-        multiplier: u8,
-        sys_div: u8,
-        pre_div: u8,
-        root_2x: bool,
-        seld5: u8,
-        pclk_manual: bool,
-        pclk_div: u8,
-    ) -> Result<(), CameraError> {
-        if multiplier > 31 || sys_div > 15 || pre_div > 3 || pclk_div > 31 || seld5 > 3 {
-            return Err(CameraError::InvalidArg);
-        }
-
-        bus.write_reg16(
-            self.slv_addr,
-            SC_PLLS_CTRL0,
-            if bypass { 0x80 } else { 0x00 },
-        )?;
-        bus.write_reg16(self.slv_addr, SC_PLLS_CTRL1, multiplier & 0x1F)?;
-        bus.write_reg16(self.slv_addr, SC_PLLS_CTRL2, 0x10 | (sys_div & 0x0F))?;
-        bus.write_reg16(
-            self.slv_addr,
-            SC_PLLS_CTRL3,
-            ((pre_div & 0x03) << 4) | (seld5 & 0x03) | if root_2x { 0x40 } else { 0x00 },
-        )?;
-        bus.write_reg16(self.slv_addr, PCLK_RATIO, pclk_div & 0x1F)?;
-        bus.write_reg16(
-            self.slv_addr,
-            VFIFO_CTRL0C,
-            if pclk_manual { 0x22 } else { 0x20 },
-        )
-    }
+    // SENS-04: `write_addr_reg` (the 0x38xx window block) and `configure_pll`
+    // (SC_PLLS_CTRL0..3 at 0x303A..0x303D) were removed with the setters that
+    // called them. Both programmed OV3660 registers. Recover them from git
+    // history as a starting point only when porting a verified OV3640 map.
 
     fn apply_mirror_flip<B: SccbBus>(&self, bus: &mut B) -> Result<(), CameraError> {
         let (reg307c, reg3023, reg3090) = match (self.status.vflip, self.status.hmirror) {
@@ -860,83 +840,21 @@ impl<B: SccbBus> CameraSensor<B> for Ov3640 {
         Ok(())
     }
 
-    fn set_pixformat(&mut self, bus: &mut B, pixformat: PixelFormat) -> Result<(), CameraError> {
-        let regs: &[Reg16] = match pixformat {
-            PixelFormat::Yuv422 => &SENSOR_FMT_YUV422,
-            PixelFormat::Grayscale => &SENSOR_FMT_GRAYSCALE,
-            PixelFormat::Rgb565 | PixelFormat::Rgb888 => &SENSOR_FMT_RGB565,
-            PixelFormat::Jpeg => &SENSOR_FMT_JPEG,
-            PixelFormat::Raw => &SENSOR_FMT_RAW,
-            _ => return Err(CameraError::NotSupported),
-        };
-        self.write_regs_with_delay(bus, regs)?;
-        self.pixformat = pixformat;
-        Ok(())
+    /// Always returns [`CameraError::NotSupported`] (SENS-04).
+    ///
+    /// The format tables are aliased straight from [`crate::ov3660`], whose
+    /// registers this sensor does not have. See the module documentation.
+    fn set_pixformat(&mut self, _bus: &mut B, _pixformat: PixelFormat) -> Result<(), CameraError> {
+        Err(CameraError::NotSupported)
     }
 
-    fn set_framesize(&mut self, bus: &mut B, framesize: FrameSize) -> Result<(), CameraError> {
-        if (framesize as u8) > (FrameSize::Qxga as u8) {
-            return Err(CameraError::InvalidArg);
-        }
-        let old_framesize = self.status.framesize;
-        let old_binning = self.status.binning;
-        let old_scale = self.status.scale;
-
-        self.status.framesize = framesize;
-        let res = framesize.resolution();
-        let w = res.width;
-        let h = res.height;
-        let ratio: AspectRatio = res.aspect_ratio;
-        let settings = RATIO_TABLE[ratio as usize];
-
-        self.status.binning = w <= (settings.max_width / 2) && h <= (settings.max_height / 2);
-        self.status.scale = !((w == settings.max_width && h == settings.max_height)
-            || (w == (settings.max_width / 2) && h == (settings.max_height / 2)));
-
-        let step = (|| -> Result<(), CameraError> {
-            self.write_addr_reg(bus, X_ADDR_ST_H, settings.start_x, settings.start_y)?;
-            self.write_addr_reg(bus, X_ADDR_END_H, settings.end_x, settings.end_y)?;
-            self.write_addr_reg(bus, X_OUTPUT_SIZE_H, w, h)?;
-
-            if self.status.binning {
-                self.write_addr_reg(
-                    bus,
-                    X_TOTAL_SIZE_H,
-                    settings.total_x,
-                    (settings.total_y / 2) + 1,
-                )?;
-                self.write_addr_reg(bus, X_OFFSET_H, 8, 2)?;
-            } else {
-                self.write_addr_reg(bus, X_TOTAL_SIZE_H, settings.total_x, settings.total_y)?;
-                self.write_addr_reg(bus, X_OFFSET_H, 16, 6)?;
-            }
-
-            self.write_reg_bits(bus, ISP_CONTROL_01, 0x20, self.status.scale)?;
-            self.set_image_options(bus)?;
-
-            if self.pixformat == PixelFormat::Jpeg {
-                if framesize == FrameSize::Qxga || self.xclk_freq_hz == 16_000_000 {
-                    self.configure_pll(bus, false, 24, 1, 3, false, 0, true, 8)?;
-                } else {
-                    self.configure_pll(bus, false, 30, 1, 3, false, 0, true, 10)?;
-                }
-            } else if (framesize as u8) > (FrameSize::Hvga as u8) {
-                self.configure_pll(bus, false, 4, 1, 0, false, 2, true, 2)?;
-            } else if (framesize as u8) >= (FrameSize::Qvga as u8) {
-                self.configure_pll(bus, false, 8, 1, 0, false, 2, true, 4)?;
-            } else {
-                self.configure_pll(bus, false, 8, 1, 0, false, 0, true, 8)?;
-            }
-            Ok(())
-        })();
-
-        if let Err(err) = step {
-            self.status.framesize = old_framesize;
-            self.status.binning = old_binning;
-            self.status.scale = old_scale;
-            return Err(err);
-        }
-        Ok(())
+    /// Always returns [`CameraError::NotSupported`] (SENS-04).
+    ///
+    /// The window registers this would program (`X_ADDR_ST_H` and friends at
+    /// 0x38xx) and `RATIO_TABLE` both come from [`crate::ov3660`]. See the
+    /// module documentation.
+    fn set_framesize(&mut self, _bus: &mut B, _framesize: FrameSize) -> Result<(), CameraError> {
+        Err(CameraError::NotSupported)
     }
 
     fn set_contrast(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
@@ -1021,14 +939,12 @@ impl<B: SccbBus> CameraSensor<B> for Ov3640 {
         Ok(())
     }
 
-    fn set_quality(&mut self, bus: &mut B, quality: i32) -> Result<(), CameraError> {
-        if !(0..=63).contains(&quality) {
-            return Err(CameraError::InvalidArg);
-        }
-        let qs = (quality as u8) & 0x3F;
-        bus.write_reg16(self.slv_addr, COMPRESSION_CTRL07, qs)?;
-        self.status.quality = qs;
-        Ok(())
+    /// Always returns [`CameraError::NotSupported`] (SENS-04).
+    ///
+    /// `COMPRESSION_CTRL07` is 0x4407, an OV3660 address. See the module
+    /// documentation.
+    fn set_quality(&mut self, _bus: &mut B, _quality: i32) -> Result<(), CameraError> {
+        Err(CameraError::NotSupported)
     }
 
     fn set_colorbar(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
@@ -1233,74 +1149,48 @@ impl<B: SccbBus> CameraSensor<B> for Ov3640 {
         }
     }
 
+    /// Always returns [`CameraError::NotSupported`] (SENS-04).
+    ///
+    /// Programs the same OV3660 window block as `set_framesize`. See the
+    /// module documentation.
+    #[allow(clippy::too_many_arguments)]
     fn set_res_raw(
         &mut self,
-        bus: &mut B,
-        start_x: i32,
-        start_y: i32,
-        end_x: i32,
-        end_y: i32,
-        offset_x: i32,
-        offset_y: i32,
-        total_x: i32,
-        total_y: i32,
-        output_x: i32,
-        output_y: i32,
-        scale: bool,
-        binning: bool,
+        _bus: &mut B,
+        _start_x: i32,
+        _start_y: i32,
+        _end_x: i32,
+        _end_y: i32,
+        _offset_x: i32,
+        _offset_y: i32,
+        _total_x: i32,
+        _total_y: i32,
+        _output_x: i32,
+        _output_y: i32,
+        _scale: bool,
+        _binning: bool,
     ) -> Result<(), CameraError> {
-        if start_x < 0
-            || start_y < 0
-            || end_x < 0
-            || end_y < 0
-            || offset_x < 0
-            || offset_y < 0
-            || total_x <= 0
-            || total_y <= 0
-            || output_x <= 0
-            || output_y <= 0
-        {
-            return Err(CameraError::InvalidArg);
-        }
-        self.write_addr_reg(bus, X_ADDR_ST_H, start_x as u16, start_y as u16)?;
-        self.write_addr_reg(bus, X_ADDR_END_H, end_x as u16, end_y as u16)?;
-        self.write_addr_reg(bus, X_OFFSET_H, offset_x as u16, offset_y as u16)?;
-        self.write_addr_reg(bus, X_TOTAL_SIZE_H, total_x as u16, total_y as u16)?;
-        self.write_addr_reg(bus, X_OUTPUT_SIZE_H, output_x as u16, output_y as u16)?;
-        self.write_reg_bits(bus, ISP_CONTROL_01, 0x20, scale)?;
-        self.status.scale = scale;
-        self.status.binning = binning;
-        self.set_image_options(bus)
+        Err(CameraError::NotSupported)
     }
 
+    /// Always returns [`CameraError::NotSupported`] (SENS-04).
+    ///
+    /// `SC_PLLS_CTRL0..3` are 0x303A..0x303D, OV3660 addresses. See the
+    /// module documentation.
+    #[allow(clippy::too_many_arguments)]
     fn set_pll(
         &mut self,
-        bus: &mut B,
-        bypass: i32,
-        mul: i32,
-        sys: i32,
-        root: i32,
-        pre: i32,
-        seld5: i32,
-        pclken: i32,
-        pclk: i32,
+        _bus: &mut B,
+        _bypass: i32,
+        _mul: i32,
+        _sys: i32,
+        _root: i32,
+        _pre: i32,
+        _seld5: i32,
+        _pclken: i32,
+        _pclk: i32,
     ) -> Result<(), CameraError> {
-        let mul = u8::try_from(mul).map_err(|_| CameraError::InvalidArg)?;
-        let sys = u8::try_from(sys).map_err(|_| CameraError::InvalidArg)?;
-        let pre = u8::try_from(pre).map_err(|_| CameraError::InvalidArg)?;
-        let seld5 = u8::try_from(seld5).map_err(|_| CameraError::InvalidArg)?;
-        let pclk = u8::try_from(pclk).map_err(|_| CameraError::InvalidArg)?;
-        self.configure_pll(
-            bus,
-            bypass > 0,
-            mul,
-            sys,
-            pre,
-            root > 0,
-            seld5,
-            pclken > 0,
-            pclk,
-        )
+        Err(CameraError::NotSupported)
     }
 
     fn set_xclk(&mut self, _bus: &mut B, _timer: i32, xclk: i32) -> Result<(), CameraError> {

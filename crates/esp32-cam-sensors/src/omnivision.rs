@@ -288,9 +288,21 @@ mod tests {
         assert_eq!(bus.reg16(CameraSccbAddr::OV3640, ov3640::PWCOM1), 0x08);
         assert_eq!(bus.reg16(CameraSccbAddr::OV3640, 0x00FF), 0x00);
 
-        assert_eq!(sensor.set_pixformat(&mut bus, PixelFormat::Jpeg), Ok(()));
-        assert_eq!(sensor.set_framesize(&mut bus, FrameSize::Uxga), Ok(()));
-        assert_eq!(sensor.set_framesize(&mut bus, FrameSize::Svga), Ok(()));
+        // SENS-04: format and window programming goes through OV3660
+        // registers this part does not have, so these refuse until a
+        // verified OV3640 map is ported.
+        assert_eq!(
+            sensor.set_pixformat(&mut bus, PixelFormat::Jpeg),
+            Err(CameraError::NotSupported)
+        );
+        assert_eq!(
+            sensor.set_framesize(&mut bus, FrameSize::Uxga),
+            Err(CameraError::NotSupported)
+        );
+        assert_eq!(
+            sensor.set_framesize(&mut bus, FrameSize::Svga),
+            Err(CameraError::NotSupported)
+        );
 
         // Verify mirror and flip update 0x307C, 0x3090, and 0x3023
         assert_eq!(sensor.set_hmirror(&mut bus, true), Ok(()));
@@ -316,14 +328,16 @@ mod tests {
         assert_eq!(sensor.set_agc_gain(&mut bus, 32), Ok(()));
         assert_eq!(sensor.set_aec_value(&mut bus, 500), Ok(()));
 
-        // set_pll bounds validation via u8::try_from
+        // SENS-04: set_pll programmed SC_PLLS_CTRL0..3, which are OV3660
+        // addresses, so it refuses regardless of the arguments. It used to
+        // bounds-check them and then write the wrong registers.
         assert_eq!(
             sensor.set_pll(&mut bus, 0, 256, 1, 0, 1, 0, 1, 1),
-            Err(CameraError::InvalidArg)
+            Err(CameraError::NotSupported)
         );
         assert_eq!(
-            sensor.set_pll(&mut bus, 0, -1, 1, 0, 1, 0, 1, 1),
-            Err(CameraError::InvalidArg)
+            sensor.set_pll(&mut bus, 0, 30, 1, 0, 1, 0, 1, 1),
+            Err(CameraError::NotSupported)
         );
 
         // init_status sharpness and awb_gain decoding verification

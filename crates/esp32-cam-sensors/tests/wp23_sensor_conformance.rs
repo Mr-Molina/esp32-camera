@@ -4,8 +4,9 @@
 use esp32_cam_sccb::MockSccbBus;
 use esp32_cam_sensors::hm1055::{Hm1055, CKCFG2};
 use esp32_cam_sensors::nt99141::Nt99141;
+use esp32_cam_sensors::ov3640::Ov3640;
 use esp32_cam_sensors::CameraSensor;
-use esp32_cam_types::{CameraError, CameraSccbAddr};
+use esp32_cam_types::{CameraError, CameraSccbAddr, FrameSize, PixelFormat};
 
 /// NT99141 auto-exposure level register, first of the five written per level.
 const NT99141_AE_REG: u16 = 0x32B8;
@@ -121,6 +122,49 @@ fn test_sens11_brightness_in_range_levels_are_monotonic() {
             "brightness {level}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// SENS-04: OV3640 window / format / PLL / JPEG registers are OV3660's
+// ---------------------------------------------------------------------------
+
+/// `ov3640.rs` addresses the window block at 0x38xx, the PLL at 0x303A..0x303D
+/// and JPEG quality at 0x4407, and aliases OV3660's ratio and format tables
+/// outright. Those are OV3660-generation registers; an OV3640 does not have
+/// them. Rather than write another sensor's map into real hardware, the
+/// setters that depend on those blocks refuse until a verified OV3640 map is
+/// ported (work order §7, question 6).
+#[test]
+fn test_sens04_ov3640_window_format_setters_refuse() {
+    let mut bus: MockSccbBus<256> = MockSccbBus::new();
+    let mut sensor = Ov3640::new();
+
+    assert_eq!(
+        sensor.set_framesize(&mut bus, FrameSize::Vga),
+        Err(CameraError::NotSupported)
+    );
+    assert_eq!(
+        sensor.set_pixformat(&mut bus, PixelFormat::Jpeg),
+        Err(CameraError::NotSupported)
+    );
+    assert_eq!(
+        sensor.set_quality(&mut bus, 10),
+        Err(CameraError::NotSupported)
+    );
+    assert_eq!(
+        sensor.set_pll(&mut bus, 0, 288, 1, 0, 0, 0, 1, 16),
+        Err(CameraError::NotSupported)
+    );
+    assert_eq!(
+        sensor.set_res_raw(&mut bus, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false, false),
+        Err(CameraError::NotSupported)
+    );
+
+    assert_eq!(
+        bus.transaction_count(),
+        0,
+        "a refusing setter must not touch the bus"
+    );
 }
 
 // ---------------------------------------------------------------------------
