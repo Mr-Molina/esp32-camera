@@ -373,7 +373,7 @@ Status values: `TODO` · `IN-PROGRESS` · `READY-FOR-HIL` · `DONE` · `BLOCKED 
   - **[HIL]** Disassembly shows `memw` before the store to `0x3FF4_F034`. A 10k-frame colour-bar CRC soak passes.
 - **Status:** TODO
 
-#### - [ ] WP-09: Security hardening (Lane G, plus a small main.rs edit) · P1 · S-M
+#### - [x] WP-09: Security hardening (Lane G, plus a small main.rs edit) · P1 · S-M
 - **Findings:** FW-NET-04, BUILD-07, FW-NET-03, FW-NET-18, FW-NET-27
 - **Steps:**
   1. **BUILD-07.** Add `crates/klipper-cam-fw/build.rs` (coordinate with Lane B) that panics for Xtensa release builds when `WIFI_PASS` or `WIFI_OTA_TOKEN` is unset or empty, and emits `rerun-if-env-changed` for both.
@@ -397,7 +397,7 @@ Status values: `TODO` · `IN-PROGRESS` · `READY-FOR-HIL` · `DONE` · `BLOCKED 
     - `GET /control?var=` gives 405.
   - A release build without the environment variables fails.
   - Host `cargo test` is unaffected.
-- **Status:** TODO
+- **Status:** IN-PROGRESS (2026-11-12, `f7cb7ce` + `3688651`; host gates green, 285 tests; Xtensa gates NOT run: no esp toolchain in that session, so the `main.rs` Wi-Fi boot and OTA-auth edits are uncompiled. Becomes READY-FOR-HIL once `cargo +esp` clippy/build pass. HIL: OTA now reads back and re-hashes up to 1.8 MB before commit; check OTA time and the watchdog. Contract: `/control` mutations need POST or `X-Requested-With` (GET → 405), a cross-origin `Origin` → 403, `POST /update` → 403 with the default token.)
 
 #### - [ ] WP-02: Portable build config and release profile (Lane B) · P0/P1 · S · **after WP-07**
 - **Findings:** BUILD-02, BUILD-04, BUILD-11, BUILD-12, BUILD-13, BUILD-14
