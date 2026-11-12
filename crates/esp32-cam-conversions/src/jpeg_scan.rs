@@ -89,6 +89,18 @@ pub fn verify_jpeg_eoi(buf: &[u8], search_forward: bool) -> Option<usize> {
     }
 }
 
+/// Scans only the bounded trailing window
+/// (`eoi_probe_window(tail_bytes, buf.len())`) backward from the end of
+/// `buf` for [`JPEG_EOI_MARKER`] (`[0xFF, 0xD9]`), returning the marker
+/// offset relative to the start of `buf` (`CONV-10`).
+#[inline]
+#[must_use]
+pub fn verify_jpeg_eoi_tail(buf: &[u8], tail_bytes: usize) -> Option<usize> {
+    let window = eoi_probe_window(tail_bytes, buf.len());
+    let start = buf.len() - window;
+    scan_marker_2_backward(&buf[start..], JPEG_EOI_MARKER[1]).map(|rel| start + rel)
+}
+
 #[inline]
 fn extract_jpeg_payload_with_dir(buf: &[u8], search_forward: bool) -> Option<&[u8]> {
     if buf.len() < 4 {
@@ -584,5 +596,33 @@ mod tests {
         let extracted = extract_jpeg_payload(&framed);
         assert_eq!(extracted, Some(&valid_stream[..]));
         assert_eq!(validate_jpeg_frame(&framed), Some((320, 240)));
+    }
+
+    #[test]
+    fn test_verify_jpeg_eoi_tail_bounded_window() {
+        let mut frame = [0xAAu8; 65_536];
+        // Place a decoy EOI strictly before the 1025-byte tail probe window
+        // (start = 65_536 - 1025 = 64_511).
+        frame[64_509] = 0xFF;
+        frame[64_510] = 0xD9;
+        assert_eq!(
+            verify_jpeg_eoi_tail(&frame, 1024),
+            None,
+            "bytes before eoi_probe_window must never be inspected"
+        );
+
+        // Cross-boundary EOI straddling index 64_511..=64_512 must be found.
+        frame[64_511] = 0xFF;
+        frame[64_512] = 0xD9;
+        assert_eq!(verify_jpeg_eoi_tail(&frame, 1024), Some(64_511));
+
+        // EOI near the very end of the 64 KiB frame returns exact offset.
+        frame[65_530] = 0xFF;
+        frame[65_531] = 0xD9;
+        assert_eq!(verify_jpeg_eoi_tail(&frame, 1024), Some(65_530));
+
+        // Short buffer smaller than tail_bytes scans from index 0 cleanly.
+        let short = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x02, 0xFF, 0xD9];
+        assert_eq!(verify_jpeg_eoi_tail(&short, 1024), Some(6));
     }
 }

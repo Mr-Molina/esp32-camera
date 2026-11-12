@@ -43,7 +43,7 @@ pub use config::{
 pub use esp32_cam_conversions::{
     self, decode_jpeg_to_rgb565, decode_jpeg_to_rgb888, encode_grayscale_to_jpeg,
     encode_rgb888_to_jpeg, encode_yuv422_to_jpeg, frame_to_bmp, parse_jpeg_dimensions,
-    verify_jpeg_eoi, verify_jpeg_soi,
+    verify_jpeg_eoi, verify_jpeg_eoi_tail, verify_jpeg_soi,
 };
 pub use esp32_cam_hal::{
     self, AiThinkerPins, BoardPins, CameraConfig as HalCameraConfig,

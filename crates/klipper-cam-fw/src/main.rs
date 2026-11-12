@@ -37,12 +37,12 @@ use esp32_cam_ll::{
 };
 use klipper_cam_fw::{
     calc_dma_sizes, decode_jpeg_to_rgb888, encode_rgb888_to_jpeg, parse_jpeg_dimensions,
-    verify_jpeg_eoi, verify_jpeg_soi, verify_partition_table_integrity, BoardPins, CameraDriver,
-    CameraSensor, DmaElement, Esp32I2sCamera, EspImageHeader, FirmwareRuntime, FramePool,
-    FrameSize, GrabMode, HttpResponseView, Ipv4Addr, KlipperCamConfig, MockSccbBus, OtaSlot,
-    Ov2640, PingPongFrameBuffer, PixelFormat, ServerPort, SliceWriter, WroverKitPins, XclkConfig,
-    XclkController, DEFAULT_JPEG_QUALITY, DEFAULT_OTA_TOKEN, DEFAULT_XCLK_FREQ_HZ,
-    MJPEG_CONTENT_TYPE,
+    verify_jpeg_eoi, verify_jpeg_eoi_tail, verify_jpeg_soi, verify_partition_table_integrity,
+    BoardPins, CameraDriver, CameraError, CameraSensor, DmaElement, Esp32I2sCamera, EspImageHeader,
+    FirmwareRuntime, FramePool, FrameSize, GrabMode, HttpResponseView, Ipv4Addr, KlipperCamConfig,
+    MockSccbBus, OtaSlot, Ov2640, PingPongFrameBuffer, PixelFormat, ServerPort, SliceWriter,
+    WroverKitPins, XclkConfig, XclkController, DEFAULT_JPEG_QUALITY, DEFAULT_OTA_TOKEN,
+    DEFAULT_XCLK_FREQ_HZ, MJPEG_CONTENT_TYPE,
 };
 
 #[cfg(target_arch = "xtensa")]

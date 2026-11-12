@@ -8,11 +8,39 @@
 //! `deinit`, `vsync_intr_enable`, `set_sample_mode`, and
 //! `capture_jpeg_frame_polled`.
 
+#[cfg(target_arch = "xtensa")]
+use core::arch::asm;
 use core::ptr;
+#[cfg(target_arch = "xtensa")]
+use core::sync::atomic::{compiler_fence, Ordering};
 use esp32_cam_types::{CameraError, PixelFormat};
 
 use crate::dma_filter::{select_sample_mode, DmaFilterKind, I2sSamplingMode, SampleModeConfig};
 use crate::dma_ring::{build_circular_ring, DmaSizeConfig, Lldesc};
+
+/// Snapshot of I2S0 RX DMA interrupt and EOF descriptor state (`LL-07`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RxDmaPollStatus {
+    /// Raw `I2S_INT_RAW_REG` value observed during the poll.
+    pub raw_ints: u32,
+    /// `true` if `IN_SUC_EOF` was asserted.
+    pub suc_eof: bool,
+    /// `true` if `IN_DSCR_ERR` was asserted.
+    pub dscr_err: bool,
+    /// `true` if `IN_DSCR_EMPTY` was asserted.
+    pub dscr_empty: bool,
+    /// Masked EOF descriptor address, valid only when `suc_eof` is set.
+    pub eof_desc_addr: u32,
+}
+
+impl RxDmaPollStatus {
+    /// Returns `true` if a descriptor error or empty fault fired.
+    #[must_use]
+    #[inline]
+    pub const fn has_descriptor_fault(self) -> bool {
+        self.dscr_err || self.dscr_empty
+    }
+}
 
 /// Physical base address of the `DPORT` peripheral on ESP32 (`0x3FF0_0000`).
 pub const DPORT_BASE_ADDR: usize = 0x3FF0_0000;
@@ -1042,6 +1070,10 @@ impl Esp32I2sCamera {
             (volatile_read_u32(&self.regs.in_link) & !I2S_INLINK_START_BIT) | I2S_INLINK_STOP_BIT;
         volatile_write_u32(&mut self.regs.in_link, in_link);
 
+        let lc_rst = I2S_LC_IN_RST_BIT | I2S_LC_AHBM_RST_BIT | I2S_LC_AHBM_FIFO_RST_BIT;
+        volatile_write_u32(&mut self.regs.lc_conf, lc_rst);
+        volatile_write_u32(&mut self.regs.lc_conf, 0);
+
         #[cfg(target_arch = "xtensa")]
         {
             let hw_conf =
@@ -1060,6 +1092,23 @@ impl Esp32I2sCamera {
                 & !I2S_INLINK_START_BIT)
                 | I2S_INLINK_STOP_BIT;
             xtensa_mmio_write(I2S0_BASE_ADDR + I2S_IN_LINK_REG_OFFSET, hw_in_link);
+
+            xtensa_mmio_write(I2S0_BASE_ADDR + I2S_LC_CONF_REG_OFFSET, lc_rst);
+            xtensa_mmio_write(I2S0_BASE_ADDR + I2S_LC_CONF_REG_OFFSET, 0);
+
+            // JUSTIFICATION: Hardware memory barrier after halting I2S0 RX DMA
+            // and pulsing LC/AHB resets (`LL-21`).
+            // SAFETY:
+            // 1. Alignment & Non-null: `memw` takes no pointer operands.
+            // 2. Memory layout: Does not reinterpret or mutate Rust types.
+            // 3. Provenance: Preserves all active pointer provenance.
+            // 4. Aliasing: Orders DMA stop/reset before SRAM buffer reuse.
+            // 5. Volatile semantics: Flushes Xtensa MMIO and SRAM store queues.
+            // 6. Panic safety: Architectural barrier cannot trap or unwind.
+            unsafe {
+                asm!("memw");
+            }
+            compiler_fence(Ordering::SeqCst);
         }
 
         self.running = false;
@@ -1163,6 +1212,68 @@ impl Esp32I2sCamera {
         }
 
         Ok(())
+    }
+
+    /// Returns the active DMA filter kind.
+    #[must_use]
+    #[inline]
+    pub const fn filter_kind(&self) -> DmaFilterKind {
+        self.filter
+    }
+
+    /// Clears the RX EOF, descriptor-error and descriptor-empty interrupts.
+    pub fn clear_rx_dma_interrupts(&mut self) {
+        let mask = I2S_IN_SUC_EOF_INT_BIT | I2S_IN_DSCR_ERR_INT_RAW | I2S_IN_DSCR_EMPTY_INT_RAW;
+        volatile_write_u32(&mut self.regs.int_clr, mask);
+        #[cfg(target_arch = "xtensa")]
+        xtensa_mmio_write(I2S0_BASE_ADDR + I2S_INT_CLR_REG_OFFSET, mask);
+    }
+
+    /// Polls and clears RX DMA status, returning what fired (`LL-07`).
+    pub fn poll_and_clear_rx_dma_status(&mut self) -> RxDmaPollStatus {
+        #[cfg(target_arch = "xtensa")]
+        let raw = xtensa_mmio_read(I2S0_BASE_ADDR + I2S_INT_RAW_REG_OFFSET);
+        #[cfg(not(target_arch = "xtensa"))]
+        let raw = volatile_read_u32(&self.regs.int_raw);
+
+        let mask = I2S_IN_SUC_EOF_INT_BIT | I2S_IN_DSCR_ERR_INT_RAW | I2S_IN_DSCR_EMPTY_INT_RAW;
+        let fired = raw & mask;
+        let mut status = RxDmaPollStatus {
+            raw_ints: raw,
+            suc_eof: (fired & I2S_IN_SUC_EOF_INT_BIT) != 0,
+            dscr_err: (fired & I2S_IN_DSCR_ERR_INT_RAW) != 0,
+            dscr_empty: (fired & I2S_IN_DSCR_EMPTY_INT_RAW) != 0,
+            eof_desc_addr: 0,
+        };
+        if fired == 0 {
+            return status;
+        }
+
+        #[cfg(not(target_arch = "xtensa"))]
+        volatile_write_u32(&mut self.regs.int_raw, raw & !fired);
+        volatile_write_u32(&mut self.regs.int_clr, fired);
+        #[cfg(target_arch = "xtensa")]
+        {
+            xtensa_mmio_write(I2S0_BASE_ADDR + I2S_INT_CLR_REG_OFFSET, fired);
+            // JUSTIFICATION: Order the interrupt clear before SRAM DMA reads.
+            // SAFETY:
+            // 1. Alignment & Non-null: `memw` takes no pointer operands.
+            // 2. Layout: No Rust value is reinterpreted.
+            // 3. Provenance: All pointer provenance is preserved.
+            // 4. Aliasing: Orders MMIO against later DMA buffer reads.
+            // 5. Volatile: Drains the Xtensa MMIO store queue.
+            // 6. Unwind: Architectural barrier cannot trap or unwind.
+            unsafe {
+                asm!("memw");
+            }
+            if status.suc_eof {
+                status.eof_desc_addr =
+                    xtensa_mmio_read(I2S0_BASE_ADDR + I2S_IN_EOF_DES_ADDR_REG_OFFSET)
+                        & I2S_INLINK_ADDR_MASK;
+            }
+        }
+        compiler_fence(Ordering::Acquire);
+        status
     }
 
     /// Unpacks a raw DMA half-buffer `src` into `dst` using the active DMA filter

@@ -20,7 +20,7 @@ pub use crate::jpeg_codec::{
 };
 pub use crate::jpeg_scan::{
     eoi_probe_window, extract_jpeg_payload, parse_jpeg_dimensions, validate_jpeg_frame,
-    verify_jpeg_eoi, verify_jpeg_soi, JPEG_EOI_MARKER, JPEG_SOI_MARKER,
+    verify_jpeg_eoi, verify_jpeg_eoi_tail, verify_jpeg_soi, JPEG_EOI_MARKER, JPEG_SOI_MARKER,
 };
 pub use crate::yuv::{
     rgb2yuv_with_range, rgb565_to_yuv422, rgb565_to_yuv422_with_range, unpack_rgb565_be_full,

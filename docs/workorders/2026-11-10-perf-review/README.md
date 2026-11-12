@@ -328,7 +328,7 @@ Status values: `TODO` · `IN-PROGRESS` · `READY-FOR-HIL` · `DONE` · `BLOCKED 
     - A new image built with a wrong SSID rolls back after reset, provided the bootloader has rollback enabled (§7, question 2).
 - **Status:** READY-FOR-HIL
 
-#### - [ ] WP-06: Correct DMA half-buffer draining with one shared drain implementation (Lanes D+C) · P0 · M
+#### - [x] WP-06: Correct DMA half-buffer draining with one shared drain implementation (Lanes D+C) · P0 · M
 - **Findings:** FW-CORE-02, LL-05, LL-06, LL-07, LL-15, LL-21, CONV-10
 - **Steps:**
   1. **LL-15.** In `esp32-cam-ll`, add a single `drain_ready_halves(desc, dma, &mut half_idx, sink)`. It loops while the half's last descriptor is CPU-owned (`!owner()`), for at most 8 halves. For each half it filters into the sink, poisons the half with a non-marker fill (LL-06), and re-arms with one packed volatile store. Add a `CaptureHooks { idle(), now_us() }` trait so the polled capture can call back into the firmware.
@@ -350,7 +350,7 @@ Status values: `TODO` · `IN-PROGRESS` · `READY-FOR-HIL` · `DONE` · `BLOCKED 
     - VSYNC-to-return latency is no longer bimodal.
     - FPS is the same or better.
 - **Open dependency:** confirm on hardware that the ESP32 I2S inlink writes back `owner=0` when `check_owner=0` (LL Open question 1). If it does not, gate on the `in_eof_des_addr` position instead of `owner()`.
-- **Status:** TODO
+- **Status:** READY-FOR-HIL
 
 #### - [ ] WP-08: Make the low-level DMA API sound (Lane D) · P0 · M
 - **Findings:** LL-01, LL-02, LL-03, LL-13, LL-20, HAL-01
