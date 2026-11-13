@@ -20,6 +20,14 @@
 //!   this part does not implement. They now report defaults.
 //! * `set_res_raw` wrote the OV5640 window block at 0x3800..0x3810; it was
 //!   removed under SENS-13, and the unused constants went with it.
+//! * Fifty-five further constants named OV5640 window, format, frame,
+//!   scale, VFIFO, PLL and compression registers and still carried
+//!   OV5640 addresses. None was used. The giveaway is
+//!   `COMPRESSION_CTRL07`, which *was* remapped — to 0x3401 — and is
+//!   used, while its unused siblings sat at 0x4400..0x440E: the port
+//!   remapped exactly the registers it needed and left the rest. They
+//!   are deleted, so this module no longer advertises registers the
+//!   part does not have.
 //!
 //! What is left is in the 0x30xx, 0x32xx, 0x33xx and 0x34xx ranges, which is
 //! consistent with Novatek's own map and with how the rest of the driver is
@@ -46,33 +54,8 @@ pub const CLOCK_POL_CONTROL: u16 = 0x3024;
 pub const DRIVE_CAPABILITY: u16 = 0x306A;
 
 pub const ISP_CONTROL_01: u16 = 0x3021;
-pub const PCLK_RATIO: u16 = 0x3824;
-pub const VFIFO_CTRL0C: u16 = 0x460C;
-pub const VFIFO_X_SIZE_H: u16 = 0x4602;
-pub const VFIFO_X_SIZE_L: u16 = 0x4603;
-pub const VFIFO_Y_SIZE_H: u16 = 0x4604;
-pub const VFIFO_Y_SIZE_L: u16 = 0x4605;
 
-pub const SC_PLLS_CTRL0: u16 = 0x303A;
-pub const SC_PLLS_CTRL1: u16 = 0x303B;
-pub const SC_PLLS_CTRL2: u16 = 0x303C;
-pub const SC_PLLS_CTRL3: u16 = 0x303D;
-
-pub const COMPRESSION_CTRL00: u16 = 0x4400;
-pub const COMPRESSION_CTRL01: u16 = 0x4401;
-pub const COMPRESSION_CTRL02: u16 = 0x4402;
-pub const COMPRESSION_CTRL03: u16 = 0x4403;
-pub const COMPRESSION_CTRL04: u16 = 0x4404;
-pub const COMPRESSION_CTRL05: u16 = 0x4405;
-pub const COMPRESSION_CTRL06: u16 = 0x4406;
 pub const COMPRESSION_CTRL07: u16 = 0x3401;
-pub const COMPRESSION_ISI_CTRL: u16 = 0x4408;
-pub const COMPRESSION_CTRL09: u16 = 0x4409;
-pub const COMPRESSION_CTRL0A: u16 = 0x440A;
-pub const COMPRESSION_CTRL0B: u16 = 0x440B;
-pub const COMPRESSION_CTRL0C: u16 = 0x440C;
-pub const COMPRESSION_CTRL0D: u16 = 0x440D;
-pub const COMPRESSION_CTRL0E: u16 = 0x440E;
 
 pub const TEST_COLOR_BAR: u8 = 0x02;
 pub const AEC_PK_MANUAL_AGC_MANUALEN: u8 = 0x02;
