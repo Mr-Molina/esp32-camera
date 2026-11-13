@@ -261,6 +261,32 @@ Status values: `TODO` · `IN-PROGRESS` · `READY-FOR-HIL` · `DONE` · `BLOCKED 
 - **Status:** READY-FOR-HIL
 
 #### - [x] WP-21: Conversions and types performance and correctness (Lane F) · P1-P3 · M-L
+
+> **Sweep done 2026-11-13 (`069ae1c`), after this WP closed.** Re-applying the
+> WP-23 method — look for code claiming something the implementation does not
+> do — to `esp32-cam-conversions` and `esp32-cam-types`.
+>
+> **Conversions came back clean**, with evidence rather than inspection: a new
+> round-trip test over the RGB cube bounds the YUV error at 4 (full) and 8
+> (limited range) with a mean under 2, and confirms the two `YuvRange` arms
+> differ; the JPEG decoder rejects non-8-bit precision, bad sampling factors
+> and progressive SOF; `frame_to_bmp` returns `InvalidFormat` rather than
+> falling through; `max_encoded_len` is checked arithmetic over the maximum
+> subsampling mode.
+>
+> **One finding in types.** `CameraStatus::clamped()` claimed to clamp "to
+> valid hardware bounds" and forced every signed level into `-2..=2`. The
+> drivers validate against five ranges and only 4 of 19 use `-2..=2`, so it
+> rewrites values real parts accept — `ae_level` 5 is valid on OV3660 and
+> OV5640 and comes back as 2. `is_valid_level` rejects the same levels.
+> Nothing calls either, so it is latent; documented accurately and pinned by
+> tests in both crates rather than deleted, since removing public surface from
+> the shared types crate is the owner's call.
+>
+> `RESOLUTION_TABLE` matches upstream — including portrait FHD at 1088x1920,
+> which looks like a typo for 1080 and is not — and `AspectRatio` is a
+> nine-way bucket into `RATIO_TABLE`, not an exact ratio.
+
 - **Findings:** CONV-01..09, CONV-11..22 (CONV-10 is in WP-06), TYPES-01..05
 - **Steps:** do these in this order. Each is its own commit.
   1. **TYPES-01.** `SccbNack { phase: SccbPhase }` (a `#[repr(u8)]` enum). Add `const _: () = assert!(size_of::<CameraError>() <= 4);`. Also update `esp32-cam-sccb/src/adapter.rs` (SCCB-04 mapping) and every match site.
