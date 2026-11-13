@@ -1113,3 +1113,33 @@ fn test_sens23_ov3660_and_ov5640_issue_identical_control_writes() {
     compare!(set_ae_level(-5));
     compare!(set_wb_mode(3));
 }
+
+/// `esp32_cam_types` declared a canonical signed-level range of `[-2, 2]`
+/// (`CameraStatus::LEVEL_MIN`/`LEVEL_MAX`) covering "brightness, contrast,
+/// saturation, sharpness, ae_level", with a `clamp_level` helper to force a
+/// value into it.
+///
+/// The drivers do not agree. They validate against five different ranges, and
+/// most are wider than `[-2, 2]`, so anything clamping to the declared range
+/// would have silently substituted a different setting for a perfectly valid
+/// one — the behaviour SENS-24 and SENS-25 removed elsewhere. This pins a few
+/// of the counter-examples so the shared constant cannot quietly become a
+/// contract again.
+#[test]
+fn test_sweep_driver_level_ranges_are_wider_than_the_shared_constant() {
+    let mut bus: MockSccbBus<256> = MockSccbBus::new();
+
+    // Ov3660 accepts ae_level -5..=5; clamping to -2 would be a different
+    // exposure target entirely.
+    let mut ov3660 = Ov3660::new();
+    assert_eq!(ov3660.set_ae_level(&mut bus, 5), Ok(()));
+    assert_eq!(ov3660.set_ae_level(&mut bus, -5), Ok(()));
+
+    // Nt99141 accepts brightness -3..=3.
+    let mut nt = Nt99141::new();
+    assert_eq!(nt.set_brightness(&mut bus, 3), Ok(()));
+    assert_eq!(nt.set_brightness(&mut bus, -3), Ok(()));
+
+    // Nt99141 saturation goes wider still, -4..=4.
+    assert_eq!(nt.set_saturation(&mut bus, 4), Ok(()));
+}

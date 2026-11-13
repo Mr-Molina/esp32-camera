@@ -100,8 +100,11 @@ pub struct CameraStatus {
     pub colorbar: bool,
 }
 
-/// Clamps a signed image adjustment level (`brightness`, `contrast`,
-/// `saturation`, `sharpness`, `ae_level`) into `[-2, 2]`.
+/// Clamps a signed image adjustment level into `[-2, 2]`.
+///
+/// `[-2, 2]` is the narrowest range any sensor in this workspace accepts, not
+/// a hardware bound. Clamping into it substitutes a different setting for a
+/// valid one on most parts; see [`CameraStatus::clamped`].
 #[must_use]
 #[inline]
 pub const fn clamp_level(level: i8) -> i8 {
@@ -115,9 +118,13 @@ pub const fn clamp_level(level: i8) -> i8 {
 }
 
 impl CameraStatus {
-    /// Minimum permissible signed level (`brightness`, `contrast`, etc.).
+    /// The narrowest signed level range any sensor here accepts, not a
+    /// workspace-wide contract.
+    ///
+    /// Most drivers are wider; see [`Self::clamped`].
     pub const LEVEL_MIN: i8 = -2;
-    /// Maximum permissible signed level (`brightness`, `contrast`, etc.).
+    /// The upper end of [`Self::LEVEL_MIN`]'s narrowest-common range, not a
+    /// workspace-wide contract.
     pub const LEVEL_MAX: i8 = 2;
     /// Maximum permissible JPEG quality factor (`0..=63`).
     pub const MAX_QUALITY: u8 = 63;
@@ -178,6 +185,10 @@ impl CameraStatus {
     }
 
     /// Returns `true` when `level` is within `-2..=2`.
+    ///
+    /// That is the narrowest range any sensor accepts, so this reports
+    /// `false` for levels most drivers take happily — `-3..=3` is common.
+    /// It is not a validity check for any particular sensor.
     #[must_use]
     #[inline]
     pub const fn is_valid_level(level: i8) -> bool {
@@ -235,8 +246,22 @@ impl CameraStatus {
         }
     }
 
-    /// Returns a copy with all numeric ranges clamped to valid hardware
-    /// bounds.
+    /// Returns a copy with every numeric field forced into this type's own
+    /// declared ranges.
+    ///
+    /// **These are not hardware bounds, despite what this method used to
+    /// claim.** The signed levels are clamped to
+    /// [`Self::LEVEL_MIN`]..=[`Self::LEVEL_MAX`], which is `-2..=2`, while the
+    /// drivers in this workspace accept `-2..=2`, `-3..=3`, `-4..=4`,
+    /// `-5..=5` and `0..=8` depending on the sensor and the control. So this
+    /// silently rewrites values that are perfectly valid on real parts: an
+    /// `ae_level` of 5 is accepted by OV3660 and OV5640 and becomes 2 here,
+    /// a materially different exposure target.
+    ///
+    /// Nothing in this workspace calls it. Validate against the driver's own
+    /// range — `esp32_cam_sensors::level_in` — rather than normalising
+    /// through this. Kept only because removing public API is the owner's
+    /// call; see `test_clamped_narrows_levels_real_sensors_accept`.
     #[must_use]
     pub const fn clamped(self) -> Self {
         Self {
@@ -550,5 +575,46 @@ mod tests {
         assert!(sanitized.hmirror);
         assert!(sanitized.vflip);
         assert!(sanitized.colorbar);
+    }
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use super::*;
+
+    /// `clamped()` advertises "valid hardware bounds" no longer, and this is
+    /// why: the levels it forces into `-2..=2` are accepted as-is by real
+    /// drivers in this workspace. OV3660 and OV5640 take `ae_level -5..=5`;
+    /// NT99141, OV2640, OV3660 and OV5640 all take `brightness -3..=3`.
+    ///
+    /// Nothing calls `clamped()`, so this is a latent trap rather than a live
+    /// defect. The test exists so it cannot quietly become a live one.
+    #[test]
+    fn test_clamped_narrows_levels_real_sensors_accept() {
+        let status = CameraStatus {
+            ae_level: 5,
+            brightness: 3,
+            saturation: -4,
+            ..CameraStatus::new()
+        };
+        let clamped = status.clamped();
+
+        assert_eq!(clamped.ae_level, 2, "OV5640 accepts 5; clamped() gives 2");
+        assert_eq!(
+            clamped.brightness, 2,
+            "NT99141 accepts 3; clamped() gives 2"
+        );
+        assert_eq!(
+            clamped.saturation, -2,
+            "NT99141 accepts -4; clamped() gives -2"
+        );
+    }
+
+    /// The same mismatch seen from the predicate side.
+    #[test]
+    fn test_is_valid_level_rejects_levels_drivers_accept() {
+        assert!(!CameraStatus::is_valid_level(3));
+        assert!(!CameraStatus::is_valid_level(-5));
+        assert!(CameraStatus::is_valid_level(2));
     }
 }

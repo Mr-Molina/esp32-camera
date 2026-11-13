@@ -946,3 +946,81 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod sweep_round_trip_tests {
+    use super::*;
+
+    /// RGB -> YUV -> RGB must come back close to where it started, for each
+    /// range independently.
+    ///
+    /// This is what catches a mismatched pair: the forward transform uses
+    /// integer coefficients while the `Bt601Limited` inverse reads lookup
+    /// tables, so nothing in the types stops one being BT.601 studio-swing
+    /// and the other full-range JFIF. A mismatch of that kind shows up as a
+    /// large, biased round-trip error rather than as a compile failure.
+    fn round_trip_error(range: YuvRange) -> (i32, f64) {
+        let mut worst = 0i32;
+        let mut total = 0f64;
+        let mut n = 0u32;
+        let mut r = 0u16;
+        while r < 256 {
+            let mut g = 0u16;
+            while g < 256 {
+                let mut b = 0u16;
+                while b < 256 {
+                    let (y, u, v) = rgb2yuv_with_range(r as u8, g as u8, b as u8, range);
+                    let (r2, g2, b2) = yuv2rgb_with_range(y, u, v, range);
+                    for (a, c) in [(r as u8, r2), (g as u8, g2), (b as u8, b2)] {
+                        let d = (i32::from(a) - i32::from(c)).abs();
+                        worst = worst.max(d);
+                        total += f64::from(d);
+                        n += 1;
+                    }
+                    b += 17;
+                }
+                g += 17;
+            }
+            r += 17;
+        }
+        (worst, total / f64::from(n))
+    }
+
+    #[test]
+    fn test_sweep_rgb_yuv_round_trip_is_tight_for_each_range() {
+        for (range, worst_allowed) in [(YuvRange::Full, 4), (YuvRange::Bt601Limited, 8)] {
+            let (worst, mean) = round_trip_error(range);
+            assert!(
+                worst <= worst_allowed,
+                "{range:?}: worst round-trip error {worst} exceeds {worst_allowed} \
+                 (mean {mean:.3}) — forward and inverse may not be the same standard"
+            );
+            assert!(
+                mean < 2.0,
+                "{range:?}: mean round-trip error {mean:.3} is biased, which is what a \
+                 mismatched coefficient pair looks like"
+            );
+        }
+    }
+
+    /// Crossing the ranges must be visibly worse than staying within one.
+    /// If it is not, the two `YuvRange` arms are not actually different and
+    /// the parameter is decorative.
+    #[test]
+    fn test_sweep_the_two_ranges_are_genuinely_different() {
+        let (same, _) = round_trip_error(YuvRange::Full);
+        let mut crossed = 0i32;
+        let mut r = 0u16;
+        while r < 256 {
+            let (y, u, v) = rgb2yuv_with_range(r as u8, 128, 64, YuvRange::Full);
+            let (r2, _, _) = yuv2rgb_with_range(y, u, v, YuvRange::Bt601Limited);
+            crossed = crossed.max((i32::from(r as u8) - i32::from(r2)).abs());
+            r += 17;
+        }
+        assert!(
+            crossed > same,
+            "mixing the ranges ({crossed}) is no worse than matching them ({same}); \
+             the YuvRange parameter would then be doing nothing"
+        );
+    }
+}
