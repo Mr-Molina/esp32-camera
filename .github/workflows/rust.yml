@@ -96,7 +96,36 @@ jobs:
         run: cargo build --target xtensa-esp32-none-elf -Zbuild-std=core,alloc -p klipper-cam-fw --release
 
       - name: Generate firmware binary
-        run: espflash save-image --chip esp32 target/xtensa-esp32-none-elf/release/klipper-cam-fw fw.bin
+        shell: bash
+        run: |
+          # espflash.toml points at firmware/bootloader_v554_gpio16.bin, the
+          # GPIO16-patched bootloader that real flashing must use (BUILD-03).
+          # That file is pending upload by the owner and gitignored, so it is
+          # absent here. espflash 4.x reads it with a bare `?`, which the
+          # serialport build reports as "Error while connecting to device"
+          # (os error 2) — misleading, but it is just ENOENT on that path.
+          #
+          # Same tolerance the invariants job uses: package with the real
+          # config when the bootloader is present, otherwise with a CI-local
+          # config that keeps the repo's [flash] settings (dio / 4MB / 40MHz,
+          # copied from espflash.toml at run time so they cannot drift) and
+          # no bootloader. espflash then uses its bundled DIO ESP32 bootloader
+          # only as the app-header template; the application segments come
+          # from the ELF either way, and without --merge the output is the
+          # app image alone, which is what the size gate measures.
+          ELF="$GITHUB_WORKSPACE/target/xtensa-esp32-none-elf/release/klipper-cam-fw"
+          OUT="$GITHUB_WORKSPACE/fw.bin"
+          if [ -f firmware/bootloader_v554_gpio16.bin ]; then
+            echo "GPIO16 bootloader present: packaging with the repository espflash.toml"
+            espflash save-image --chip esp32 "$ELF" "$OUT"
+          else
+            echo "GPIO16 bootloader absent (BUILD-03, pending owner upload): packaging the app image with a CI-local config"
+            CI_CFG="$RUNNER_TEMP/espflash-ci"
+            mkdir -p "$CI_CFG"
+            sed -n '/^\[flash\]/,$p' espflash.toml > "$CI_CFG/espflash.toml"
+            echo "--- CI-local espflash.toml ---"; cat "$CI_CFG/espflash.toml"; echo "---"
+            ( cd "$CI_CFG" && espflash save-image --chip esp32 "$ELF" "$OUT" )
+          fi
 
       - name: Enforce firmware size gate (<= 0x1B0000 / 1,769,472 B)
         shell: bash

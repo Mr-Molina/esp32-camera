@@ -175,6 +175,7 @@ Read this section before starting any work package.
     - `RESOLUTION_TABLE` has portrait FHD at **1088**x1920. That matches upstream and is deliberate (a multiple of 16). It is not a typo for 1080.
     - `AspectRatio` is a nine-way **bucket** indexed into each driver's `RATIO_TABLE[9]`, not an exact ratio. QCIF at `5x4` and CIF at `4x3` are correct.
     - `SYSTEM_CTROL0` and `ISP_CONTROL_01` in `nt99141.rs` are two names for one register, as are `TIMING_TC_REG20`/`21`. Harmless: their bit masks do not overlap.
+    - `espflash save-image` failing with *"Error while connecting to device (os error 2)"* is not a serial-port problem: espflash 4.x wraps every `io::Error` in that message, and os error 2 is ENOENT on the bootloader path in `espflash.toml`. Check `firmware/bootloader_v554_gpio16.bin` exists.
     - `esp32_i2s.rs` keeps an in-memory register block *as well as* doing real MMIO. The block is a shadow for host tests. The S2/S3 modules have only the shadow — see their module docs.
 
     When a value matches the upstream Espressif driver, leave it, even if it looks odd. When you cannot check upstream, leave it and say so.
@@ -294,7 +295,7 @@ Status values: `TODO` · `IN-PROGRESS` · `READY-FOR-HIL` · `DONE` · `BLOCKED 
   - On a fresh clone, `python3 scripts/ota_deploy.py --stage-only --elf <elf>` exits 0.
   - The invariants script exits 1 when the bootloader is missing.
   - `grep -rn 'console-admin\|172\.22\.' scripts README.md` is empty, excluding archived docs.
-- **Status:** DONE (2026-11-11, scripts & provenance merged `199f247`; external bootloader binary gated via `--allow-missing-bootloader` per Ruling Q1)
+- **Status:** DONE (2026-11-11, scripts & provenance merged `199f247`; external bootloader binary gated via `--allow-missing-bootloader` per Ruling Q1) **CI note 2026-11-13:** with the bootloader absent, espflash 4.7 `save-image` fails with the misleading *"Error while connecting to device / os error 2"* — it is ENOENT on `espflash.toml`'s bootloader path, read with a bare `?` that the serialport build reports as a connection error. The xtensa CI job now packages the app image with a CI-local `[flash]`-only config when the file is missing (same tolerance as the invariants job) and with the real config once it is present. Uploading `firmware/bootloader_v554_gpio16.bin` (§7 Q1) remains the actual fix; real flashing must use that bootloader.
 
 #### - [x] WP-04: Instrumentation and observability, the performance baseline (Lane C) · P1 · S
 - **Findings:** FW-CORE-04 (instrumentation half), FW-CORE-15, FW-CORE-21, FW-NET-29; supports BUILD-08 and BUILD-18
