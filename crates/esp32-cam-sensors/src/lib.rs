@@ -32,6 +32,9 @@ pub mod mega_ccm;
 #[cfg(feature = "nt99141")]
 pub mod nt99141;
 pub mod omnivision;
+
+#[cfg(any(feature = "ov3640", feature = "ov3660", feature = "ov5640"))]
+pub mod omnivision16;
 #[cfg(feature = "ov2640")]
 pub mod ov2640;
 #[cfg(feature = "ov3640")]

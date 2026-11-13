@@ -914,15 +914,7 @@ impl<B: SccbBus> CameraSensor<B> for Ov3640 {
     }
 
     fn set_denoise(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
-        if !(0..=8).contains(&level) {
-            return Err(CameraError::InvalidArg);
-        }
-        self.write_reg_bits(bus, 0x5308, 0x10, level > 0)?;
-        if level > 0 {
-            bus.write_reg16(self.slv_addr, 0x5306, ((level - 1) as u8) * 4)?;
-        }
-        self.status.denoise = level as u8;
-        Ok(())
+        crate::omnivision16::set_denoise(bus, self.slv_addr, &mut self.status, level)
     }
 
     fn set_gainceiling(
@@ -930,15 +922,7 @@ impl<B: SccbBus> CameraSensor<B> for Ov3640 {
         bus: &mut B,
         gainceiling: GainCeiling,
     ) -> Result<(), CameraError> {
-        let level = gainceiling as u8;
-        let mut reg_val = 16u16 << (level + 1);
-        if reg_val > 0x03FF {
-            reg_val = 0x03FF;
-        }
-        bus.write_reg16(self.slv_addr, 0x3A18, ((reg_val >> 8) & 0x03) as u8)?;
-        bus.write_reg16(self.slv_addr, 0x3A19, (reg_val & 0xFF) as u8)?;
-        self.status.gainceiling = level;
-        Ok(())
+        crate::omnivision16::set_gainceiling(bus, self.slv_addr, &mut self.status, gainceiling)
     }
 
     /// Always returns [`CameraError::NotSupported`] (SENS-04).
@@ -1000,30 +984,11 @@ impl<B: SccbBus> CameraSensor<B> for Ov3640 {
     }
 
     fn set_agc_gain(&mut self, bus: &mut B, gain: i32) -> Result<(), CameraError> {
-        if !(0..=64).contains(&gain) {
-            return Err(CameraError::InvalidArg);
-        }
-        let gainv = ((gain as u16) << 4).saturating_sub(1);
-        bus.write_reg16(self.slv_addr, 0x350A, (gainv >> 8) as u8)?;
-        bus.write_reg16(self.slv_addr, 0x350B, (gainv & 0xFF) as u8)?;
-        self.status.agc_gain = gain as u8;
-        Ok(())
+        crate::omnivision16::set_agc_gain(bus, self.slv_addr, &mut self.status, gain)
     }
 
     fn set_aec_value(&mut self, bus: &mut B, value: i32) -> Result<(), CameraError> {
-        if !(0..=0xFFFF).contains(&value) {
-            return Err(CameraError::InvalidArg);
-        }
-        let max_val = bus.read_reg16_val16(self.slv_addr, Y_TOTAL_SIZE_H)?;
-        let mut val = value as u16;
-        if max_val > 0 && val > max_val {
-            val = max_val;
-        }
-        bus.write_reg16(self.slv_addr, 0x3500, ((val >> 12) & 0x0F) as u8)?;
-        bus.write_reg16(self.slv_addr, 0x3501, ((val >> 4) & 0xFF) as u8)?;
-        bus.write_reg16(self.slv_addr, 0x3502, ((val << 4) & 0xF0) as u8)?;
-        self.status.aec_value = val;
-        Ok(())
+        crate::omnivision16::set_aec_value(bus, self.slv_addr, &mut self.status, value)
     }
 
     fn set_special_effect(&mut self, bus: &mut B, effect: i32) -> Result<(), CameraError> {

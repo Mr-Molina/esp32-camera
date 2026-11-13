@@ -1069,3 +1069,47 @@ fn test_nt99141_init_status_reads_no_ov5640_isp_registers() {
         }
     }
 }
+
+/// SENS-23 long tail: eight controls whose bodies were copied verbatim
+/// between OV3660 and OV5640 now delegate to `omnivision16`. Every register
+/// constant they share already held the same value in both modules, which is
+/// what makes one implementation correct for both — this pins that by
+/// comparing the transaction logs directly, so a future edit to one driver
+/// cannot silently diverge from the other.
+#[test]
+fn test_sens23_ov3660_and_ov5640_issue_identical_control_writes() {
+    macro_rules! compare {
+        ($method:ident ( $($arg:expr),* )) => {{
+            let mut bus_a: MockSccbBus<256> = MockSccbBus::new();
+            let mut a = Ov3660::new();
+            let mut bus_b: MockSccbBus<256> = MockSccbBus::new();
+            let mut b = Ov5640::new();
+
+            // Both drivers sit at 0x3C, so the logs are directly comparable.
+            let ra = a.$method(&mut bus_a $(, $arg)*);
+            let rb = b.$method(&mut bus_b $(, $arg)*);
+
+            assert_eq!(ra, rb, "return values differ for {}", stringify!($method));
+            assert_eq!(
+                bus_a.transactions(),
+                bus_b.transactions(),
+                "register writes differ for {}",
+                stringify!($method)
+            );
+            assert!(
+                bus_a.transaction_count() > 0,
+                "{} wrote nothing; the comparison proves nothing",
+                stringify!($method)
+            );
+        }};
+    }
+
+    compare!(set_gainceiling(GainCeiling::X16));
+    compare!(set_aec_value(400));
+    compare!(set_agc_gain(12));
+    compare!(set_denoise(4));
+    compare!(set_brightness(-2));
+    compare!(set_sharpness(3));
+    compare!(set_ae_level(-5));
+    compare!(set_wb_mode(3));
+}
