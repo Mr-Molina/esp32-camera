@@ -793,3 +793,116 @@ fn test_sens25_ov3640_saturation_applies_its_five_steps() {
         assert_eq!(sensor.status().saturation, level as i8);
     }
 }
+
+// ---------------------------------------------------------------------------
+// SENS-15: why the default-table rewrite cannot simply be dropped
+// ---------------------------------------------------------------------------
+
+/// SENS-15 asks these drivers to stop re-sending the whole default table on
+/// every `set_framesize` and write "only the framesize-specific delta".
+/// These tests record why that is not safe as stated: the framesize tables do
+/// not cover the same registers as each other, so the default rewrite is what
+/// currently undoes the previous size's settings.
+///
+/// They assert structure over the public tables, not sensor behaviour. If
+/// someone reorganises the tables to make a delta write possible, these fail
+/// and the assumption gets rechecked rather than silently lost.
+fn regs_of(table: &[Reg16]) -> std::collections::BTreeSet<u16> {
+    table.iter().map(|e| e.reg).collect()
+}
+
+#[test]
+fn test_sens15_hm0360_default_table_is_load_bearing() {
+    use esp32_cam_sensors::hm0360::{
+        SENSOR_DEFAULT_REGS, SENSOR_FRAMESIZE_QVGA, SENSOR_FRAMESIZE_VGA,
+    };
+    let default = regs_of(SENSOR_DEFAULT_REGS);
+    let qvga = regs_of(SENSOR_FRAMESIZE_QVGA);
+    let vga = regs_of(SENSOR_FRAMESIZE_VGA);
+
+    // The two tables are disjoint: switching between them leaves the other's
+    // registers set unless something resets them.
+    assert!(
+        qvga.is_disjoint(&vga),
+        "HM0360 QVGA and VGA tables now overlap; recheck the SENS-15 analysis"
+    );
+
+    // Going QVGA -> VGA, the QVGA registers are undone only because the
+    // default table rewrites them. Dropping that rewrite strands all 57.
+    let stranded: Vec<_> = qvga
+        .difference(&vga)
+        .filter(|r| default.contains(r))
+        .collect();
+    assert_eq!(
+        stranded.len(),
+        57,
+        "the default rewrite is what resets the QVGA-only registers"
+    );
+}
+
+#[test]
+fn test_sens15_hm1055_default_table_is_load_bearing() {
+    use esp32_cam_sensors::hm1055::{
+        SENSOR_DEFAULT_REGS, SENSOR_FRAMESIZE_HD, SENSOR_FRAMESIZE_VGA,
+    };
+    let default = regs_of(SENSOR_DEFAULT_REGS);
+    let hd = regs_of(SENSOR_FRAMESIZE_HD);
+    let vga = regs_of(SENSOR_FRAMESIZE_VGA);
+
+    // HD writes four fewer registers than VGA does, so VGA -> HD depends on
+    // the default rewrite to restore them.
+    let only_in_vga: Vec<_> = vga.difference(&hd).copied().collect();
+    assert_eq!(only_in_vga.len(), 4);
+    for reg in &only_in_vga {
+        assert!(
+            default.contains(reg),
+            "{reg:#06x} is written by VGA, not by HD, and not restored by the \
+             default table: VGA -> HD would strand it"
+        );
+    }
+}
+
+/// NT99141 is worse: its framesize tables barely intersect the default table,
+/// so the rewrite does not restore framesize state at all. Nine registers
+/// that other sizes write are absent from the HD table and absent from the
+/// default table, so VGA -> HD leaves them at their VGA values today. This is
+/// a live defect, not something SENS-15 would introduce — recorded here
+/// because the SENS-15 analysis surfaced it.
+#[test]
+fn test_sens15_nt99141_default_rewrite_does_not_restore_framesize_state() {
+    use esp32_cam_sensors::nt99141::{
+        SENSOR_DEFAULT_REGS, SENSOR_FRAMESIZE_HD, SENSOR_FRAMESIZE_QVGA, SENSOR_FRAMESIZE_VGA,
+        SENSOR_FRAMESIZE_VGA_XYSKIP,
+    };
+    let default = regs_of(SENSOR_DEFAULT_REGS);
+    let union: std::collections::BTreeSet<u16> = regs_of(SENSOR_FRAMESIZE_HD)
+        .union(&regs_of(SENSOR_FRAMESIZE_VGA))
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>()
+        .union(&regs_of(SENSOR_FRAMESIZE_QVGA))
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>()
+        .union(&regs_of(SENSOR_FRAMESIZE_VGA_XYSKIP))
+        .copied()
+        .collect();
+
+    let covered = union.intersection(&default).count();
+    assert_eq!(
+        (union.len(), covered),
+        (64, 4),
+        "only 4 of the 64 framesize registers are in the default table, so \
+         re-sending it does not undo the previous size"
+    );
+
+    let hd = regs_of(SENSOR_FRAMESIZE_HD);
+    let stale: Vec<_> = union
+        .difference(&hd)
+        .filter(|r| !default.contains(r))
+        .collect();
+    assert_eq!(
+        stale.len(),
+        9,
+        "registers another size writes that HD neither writes nor has \
+         restored: these go stale on a switch to HD"
+    );
+}

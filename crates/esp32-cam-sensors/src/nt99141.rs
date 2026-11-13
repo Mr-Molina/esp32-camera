@@ -857,6 +857,15 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
         }
         // SENS-24: recorded after the writes land, so a bus fault partway
         // through does not leave status claiming a size the sensor never took.
+        // SENS-15: not converted to a delta write, but for the opposite
+        // reason to HM1055 — only 4 of the 64 registers the framesize tables
+        // touch appear in this one, so the rewrite does not restore
+        // framesize state at all. Nine registers other sizes write are
+        // absent from both the HD table and this one, so VGA -> HD leaves
+        // them stale today. That is a live defect this rewrite does not
+        // cure and a delta write would not cause; it needs per-register
+        // reset values to fix properly. See
+        // `test_sens15_nt99141_default_rewrite_does_not_restore_framesize_state`.
         write_reg_list(bus, self.slv_addr, SENSOR_DEFAULT_REGS)?;
         if framesize == FrameSize::Qvga {
             write_reg_list(bus, self.slv_addr, SENSOR_FRAMESIZE_QVGA)?;

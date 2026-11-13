@@ -823,6 +823,16 @@ impl<B: SccbBus> CameraSensor<B> for Hm0360 {
         // leave the sensor wherever `SENSOR_DEFAULT_REGS` had put it.
         //
         // SENS-24: `status` is updated only after the writes succeed.
+        // SENS-15 asks for only the framesize delta to be written here, to
+        // save this table's ~100 ms of delays. It is not safe as stated: the
+        // QVGA/QQVGA tables (57 registers) and the VGA/240x240 tables (18)
+        // are disjoint, so this rewrite is the only thing that undoes the
+        // previous size's registers. 57 of them exist nowhere else.
+        // `test_sens15_hm0360_default_table_is_load_bearing` pins that.
+        // Note the converse gap is already broken: the 18 VGA/240x240
+        // registers are absent from this table, so VGA -> QVGA strands them
+        // today. Fixing either direction needs each register's reset value,
+        // which means the datasheet or the upstream C driver.
         write_reg_list(bus, self.slv_addr, SENSOR_DEFAULT_REGS)?;
         match framesize {
             FrameSize::Qqvga => {

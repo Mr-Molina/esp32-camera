@@ -1070,6 +1070,10 @@ impl<B: SccbBus> CameraSensor<B> for Hm1055 {
             FrameSize::Hd => SENSOR_FRAMESIZE_HD,
             _ => return Err(CameraError::FailedToSetFrameSize),
         };
+        // SENS-15: not converted to a delta write. The HD and SVGA tables
+        // write four fewer registers than the smaller sizes do, and this
+        // rewrite is what restores those four on a switch up to HD. See
+        // `test_sens15_hm1055_default_table_is_load_bearing`.
         write_reg_list(bus, self.slv_addr, SENSOR_DEFAULT_REGS)?;
         write_reg_list(bus, self.slv_addr, framesize_regs)?;
         if framesize == FrameSize::Hd {
