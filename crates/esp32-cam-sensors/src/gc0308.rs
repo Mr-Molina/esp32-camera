@@ -858,12 +858,20 @@ impl<B: SccbBus> CameraSensor<B> for Gc0308 {
         if !(0..=6).contains(&effect) {
             return Err(CameraError::InvalidArg);
         }
-        bus.write_reg8(self.slv_addr, 0xFE, 0x00)?;
+        // SENS-25: SPECIAL_EFFECT is a two-bit field, so this part can
+        // express normal, negative and grayscale and nothing else. Effects
+        // 3..=6 (the red, green and blue tints and sepia) used to fall
+        // through to grayscale, return Ok and record the effect that was
+        // asked for rather than the one applied. The GC0308 reaches tints
+        // through fixed Cb/Cr registers this driver does not program; until
+        // those are ported from a verified reference, say so.
         let mode = match effect {
             0 => EFFECT_NORMAL,
             1 => EFFECT_NEGATIVE,
-            _ => EFFECT_GRAYSCALE,
+            2 => EFFECT_GRAYSCALE,
+            _ => return Err(CameraError::NotSupported),
         };
+        bus.write_reg8(self.slv_addr, 0xFE, 0x00)?;
         set_reg_bits(bus, self.slv_addr, SPECIAL_EFFECT, 0, 0x03, mode)?;
         self.status.special_effect = effect as u8;
         Ok(())

@@ -890,10 +890,11 @@ impl<B: SccbBus> CameraSensor<B> for Ov3640 {
     }
 
     fn set_saturation(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
-        if !(-4..=4).contains(&level) {
-            return Err(CameraError::InvalidArg);
-        }
-        let clamped = level.clamp(-2, 2);
+        // SENS-25: the table has five entries. The range check used to
+        // admit -4..=4 and then clamp to -2..=2, so -4 and -3 both produced
+        // -2 while the call reported success.
+        let level = crate::level_in(level, -2, 2)?;
+        let clamped = level;
         let s = &OV3640_SATURATION_LEVELS[(clamped + 2) as usize];
         self.enable_sde(bus)?;
         crate::set_reg_bits16(bus, self.slv_addr, OV3640_SDE_ENABLE, 1, 1, 1)?;

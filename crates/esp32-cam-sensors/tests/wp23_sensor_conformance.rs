@@ -727,3 +727,69 @@ fn test_sens12_pll_bypass_ignores_the_multiplier() {
     assert_eq!(sensor.set_pll(&mut bus, 1, 0, 1, 0, 0, 0, 1, 16), Ok(()));
     assert_eq!(bus.reg16(CameraSccbAddr::HM1055, CKCFG2) & 0x1F, 0x00);
 }
+
+// ---------------------------------------------------------------------------
+// SENS-25: controls that silently substituted a different setting
+// ---------------------------------------------------------------------------
+
+/// GC0308's special-effect register field is two bits wide, so it can express
+/// normal, negative and grayscale and nothing else. The driver accepted the
+/// full 0..=6 range anyway and mapped 2 through 6 all onto grayscale, so
+/// asking for a red tint or sepia produced a grayscale image, returned `Ok`
+/// and recorded the effect that was asked for rather than the one applied.
+#[test]
+fn test_sens25_gc0308_refuses_effects_it_cannot_express() {
+    for effect in [3i32, 4, 5, 6] {
+        let mut bus: MockSccbBus<256> = MockSccbBus::new();
+        let mut sensor = Gc0308::new();
+        let before = sensor.status().special_effect;
+
+        assert_eq!(
+            sensor.set_special_effect(&mut bus, effect),
+            Err(CameraError::NotSupported),
+            "effect {effect} has no encoding in a two-bit field"
+        );
+        assert_eq!(
+            sensor.status().special_effect,
+            before,
+            "a refused effect must not be recorded"
+        );
+    }
+}
+
+#[test]
+fn test_sens25_gc0308_still_applies_the_effects_it_has() {
+    for effect in [0i32, 1, 2] {
+        let mut bus: MockSccbBus<256> = MockSccbBus::new();
+        let mut sensor = Gc0308::new();
+        assert_eq!(sensor.set_special_effect(&mut bus, effect), Ok(()));
+        assert_eq!(sensor.status().special_effect, effect as u8);
+    }
+}
+
+/// OV3640 has five saturation steps. `set_saturation` accepted -4..=4 and
+/// then clamped to -2..=2, so -4 and -3 both produced -2 while the call
+/// reported success.
+#[test]
+fn test_sens25_ov3640_saturation_refuses_levels_it_cannot_reach() {
+    for level in [-4i32, -3, 3, 4] {
+        let mut bus: MockSccbBus<256> = MockSccbBus::new();
+        let mut sensor = Ov3640::new();
+
+        assert_eq!(
+            sensor.set_saturation(&mut bus, level),
+            Err(CameraError::InvalidArg),
+            "saturation {level} is outside the five-entry table"
+        );
+    }
+}
+
+#[test]
+fn test_sens25_ov3640_saturation_applies_its_five_steps() {
+    for level in [-2i32, -1, 0, 1, 2] {
+        let mut bus: MockSccbBus<256> = MockSccbBus::new();
+        let mut sensor = Ov3640::new();
+        assert_eq!(sensor.set_saturation(&mut bus, level), Ok(()));
+        assert_eq!(sensor.status().saturation, level as i8);
+    }
+}
