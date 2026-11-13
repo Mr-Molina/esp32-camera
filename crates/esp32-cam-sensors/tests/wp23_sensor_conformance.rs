@@ -949,3 +949,76 @@ fn test_sens15_nt99141_default_rewrite_does_not_restore_framesize_state() {
          restored: these go stale on a switch to HD"
     );
 }
+
+// ---------------------------------------------------------------------------
+// SENS-23: the shared register helpers behave as every copy did
+// ---------------------------------------------------------------------------
+
+/// `write_reg_bits16` replaced two implementations that differed in how much
+/// bus traffic they produced: the OmniVision drivers called
+/// `write_reg16_mask`, while HM1055 and NT99141 went through a
+/// read-modify-write that always read and always wrote. This pins the
+/// contract both of them met — the resulting register value — across every
+/// mask, so the unification cannot drift.
+#[test]
+fn test_sens23_write_reg_bits16_matches_read_modify_write() {
+    for mask in 0u8..=255 {
+        for enable in [false, true] {
+            for initial in [0x00u8, 0x5A, 0xA5, 0xFF] {
+                let mut bus: MockSccbBus<64> = MockSccbBus::new();
+                bus.preset_reg16(0x30, 0x1234, initial);
+
+                assert_eq!(
+                    esp32_cam_sensors::write_reg_bits16(&mut bus, 0x30, 0x1234, mask, enable),
+                    Ok(())
+                );
+
+                let want = (initial & !mask) | (if enable { mask } else { 0 });
+                assert_eq!(
+                    bus.reg16(0x30, 0x1234),
+                    want,
+                    "mask={mask:#04x} enable={enable} initial={initial:#04x}"
+                );
+            }
+        }
+    }
+}
+
+/// `read_masked_reg16` / `write_masked_reg16` replaced five byte-identical
+/// copies. The OmniVision copies masked the read only when it was positive
+/// and the Himax ones masked unconditionally; those agree, because the value
+/// comes from unsigned reads. This pins the round trip over the three mask
+/// widths the helpers switch on.
+#[test]
+fn test_sens23_masked_reg16_round_trips() {
+    for (mask, value) in [(0xFFi32, 0x5A), (0xFFFF, 0x1234), (0xFF_FFFF, 0x12_3456)] {
+        let mut bus: MockSccbBus<64> = MockSccbBus::new();
+
+        assert_eq!(
+            esp32_cam_sensors::write_masked_reg16(&mut bus, 0x30, 0x3000, mask, value),
+            Ok(())
+        );
+        assert_eq!(
+            esp32_cam_sensors::read_masked_reg16(&mut bus, 0x30, 0x3000, mask),
+            Ok(value),
+            "mask {mask:#x}"
+        );
+    }
+}
+
+#[test]
+fn test_sens23_masked_reg16_rejects_bad_arguments() {
+    let mut bus: MockSccbBus<64> = MockSccbBus::new();
+    assert_eq!(
+        esp32_cam_sensors::read_masked_reg16(&mut bus, 0x30, 0x1_0000, 0xFF),
+        Err(CameraError::InvalidArg)
+    );
+    assert_eq!(
+        esp32_cam_sensors::read_masked_reg16(&mut bus, 0x30, 0x3000, -1),
+        Err(CameraError::InvalidArg)
+    );
+    assert_eq!(
+        esp32_cam_sensors::write_masked_reg16(&mut bus, 0x30, -1, 0xFF, 0),
+        Err(CameraError::InvalidArg)
+    );
+}

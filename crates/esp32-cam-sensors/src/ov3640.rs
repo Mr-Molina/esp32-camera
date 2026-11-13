@@ -593,14 +593,7 @@ impl Ov3640 {
         bus: &mut B,
         regs: &[Reg16],
     ) -> Result<(), CameraError> {
-        for entry in regs {
-            if entry.reg == REG_DLY {
-                bus.delay_ms(entry.val as u32);
-            } else {
-                bus.write_reg16(self.slv_addr, entry.reg, entry.val)?;
-            }
-        }
-        Ok(())
+        crate::write_table16(bus, self.slv_addr, regs)
     }
 
     fn write_reg_bits<B: SccbBus>(
@@ -610,7 +603,7 @@ impl Ov3640 {
         mask: u8,
         enable: bool,
     ) -> Result<(), CameraError> {
-        bus.write_reg16_mask(self.slv_addr, reg, if enable { mask } else { 0 }, mask)
+        crate::write_reg_bits16(bus, self.slv_addr, reg, mask, enable)
     }
 
     fn check_reg_mask<B: SccbBus>(
@@ -619,8 +612,7 @@ impl Ov3640 {
         reg: u16,
         mask: u8,
     ) -> Result<bool, CameraError> {
-        let v = bus.read_reg16(self.slv_addr, reg)?;
-        Ok((v & mask) == mask)
+        crate::check_reg_mask16(bus, self.slv_addr, reg, mask)
     }
 
     // SENS-04: `write_addr_reg` (the 0x38xx window block) and `configure_pll`
@@ -1111,52 +1103,11 @@ impl<B: SccbBus> CameraSensor<B> for Ov3640 {
     }
 
     fn get_reg(&mut self, bus: &mut B, reg: i32, mask: i32) -> Result<i32, CameraError> {
-        if !(0..=0xFFFF).contains(&reg) || mask < 0 {
-            return Err(CameraError::InvalidArg);
-        }
-        let addr = reg as u16;
-        let mut ret = if mask > 0xFF {
-            let v16 = bus.read_reg16_val16(self.slv_addr, addr)? as i32;
-            if mask > 0xFFFF {
-                let v_low = bus.read_reg16(self.slv_addr, addr.wrapping_add(2))? as i32;
-                (v16 << 8) | v_low
-            } else {
-                v16
-            }
-        } else {
-            bus.read_reg16(self.slv_addr, addr)? as i32
-        };
-        if ret > 0 {
-            ret &= mask;
-        }
-        Ok(ret)
+        crate::read_masked_reg16(bus, self.slv_addr, reg, mask)
     }
 
     fn set_reg(&mut self, bus: &mut B, reg: i32, mask: i32, value: i32) -> Result<(), CameraError> {
-        if !(0..=0xFFFF).contains(&reg) || mask < 0 {
-            return Err(CameraError::InvalidArg);
-        }
-        let addr = reg as u16;
-        let current = if mask > 0xFF {
-            let v16 = bus.read_reg16_val16(self.slv_addr, addr)? as i32;
-            if mask > 0xFFFF {
-                let v_low = bus.read_reg16(self.slv_addr, addr.wrapping_add(2))? as i32;
-                (v16 << 8) | v_low
-            } else {
-                v16
-            }
-        } else {
-            bus.read_reg16(self.slv_addr, addr)? as i32
-        };
-        let next = (current & !mask) | (value & mask);
-        if mask > 0xFFFF {
-            bus.write_reg16_val16(self.slv_addr, addr, ((next >> 8) & 0xFFFF) as u16)?;
-            bus.write_reg16(self.slv_addr, addr.wrapping_add(2), (next & 0xFF) as u8)
-        } else if mask > 0xFF {
-            bus.write_reg16_val16(self.slv_addr, addr, (next & 0xFFFF) as u16)
-        } else {
-            bus.write_reg16(self.slv_addr, addr, (next & 0xFF) as u8)
-        }
+        crate::write_masked_reg16(bus, self.slv_addr, reg, mask, value)
     }
 
     /// Always returns [`CameraError::NotSupported`] (SENS-04).

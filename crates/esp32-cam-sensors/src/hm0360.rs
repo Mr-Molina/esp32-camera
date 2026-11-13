@@ -600,8 +600,7 @@ fn check_reg_mask<B: SccbBus>(
     reg: u16,
     mask: u8,
 ) -> Result<bool, CameraError> {
-    let val = bus.read_reg16(slv_addr, reg)?;
-    Ok((val & mask) == mask)
+    crate::check_reg_mask16(bus, slv_addr, reg, mask)
 }
 
 /// Writes every entry of `regs` in order, treating an entry whose
@@ -611,19 +610,21 @@ fn check_reg_mask<B: SccbBus>(
 /// 0x0000, so a legitimate write to register 0 ended the table early and
 /// silently dropped the rest. The slice carries its own length, so no
 /// sentinel is needed.
+/// Writes every entry of `regs` in order, treating an entry whose register is
+/// [`crate::REG_DLY`] as a millisecond delay.
+///
+/// SENS-18: no end-of-table marker — the slice carries its own length.
+/// SENS-23: the body is shared with the other 16-bit-addressed drivers.
+///
+/// # Errors
+///
+/// Any error reported by the bus.
 pub fn write_reg_list<B: SccbBus>(
     bus: &mut B,
     slv_addr: u8,
     regs: &[Reg16],
 ) -> Result<(), CameraError> {
-    for entry in regs {
-        if entry.reg == REG_DLY {
-            bus.delay_ms(entry.val as u32);
-        } else {
-            bus.write_reg16(slv_addr, entry.reg, entry.val)?;
-        }
-    }
-    Ok(())
+    crate::write_table16(bus, slv_addr, regs)
 }
 
 /// Detects an HM0360 sensor at `slv_addr` (`0x12` or `0x24`).
@@ -910,48 +911,11 @@ impl<B: SccbBus> CameraSensor<B> for Hm0360 {
     }
 
     fn get_reg(&mut self, bus: &mut B, reg: i32, mask: i32) -> Result<i32, CameraError> {
-        if !(0..=0xFFFF).contains(&reg) || mask < 0 {
-            return Err(CameraError::InvalidArg);
-        }
-        let reg16 = reg as u16;
-        let val = if mask > 0xFF {
-            let mut v = bus.read_reg16_val16(self.slv_addr, reg16)? as i32;
-            if mask > 0xFFFF {
-                let v2 = bus.read_reg16(self.slv_addr, reg16.wrapping_add(2))? as i32;
-                v = (v << 8) | v2;
-            }
-            v
-        } else {
-            bus.read_reg16(self.slv_addr, reg16)? as i32
-        };
-        Ok(val & mask)
+        crate::read_masked_reg16(bus, self.slv_addr, reg, mask)
     }
 
     fn set_reg(&mut self, bus: &mut B, reg: i32, mask: i32, value: i32) -> Result<(), CameraError> {
-        if !(0..=0xFFFF).contains(&reg) || mask < 0 {
-            return Err(CameraError::InvalidArg);
-        }
-        let reg16 = reg as u16;
-        let current = if mask > 0xFF {
-            let mut v = bus.read_reg16_val16(self.slv_addr, reg16)? as i32;
-            if mask > 0xFFFF {
-                let v2 = bus.read_reg16(self.slv_addr, reg16.wrapping_add(2))? as i32;
-                v = (v << 8) | v2;
-            }
-            v
-        } else {
-            bus.read_reg16(self.slv_addr, reg16)? as i32
-        };
-
-        let next = (current & !mask) | (value & mask);
-        if mask > 0xFFFF {
-            bus.write_reg16_val16(self.slv_addr, reg16, ((next >> 8) & 0xFFFF) as u16)?;
-            bus.write_reg16(self.slv_addr, reg16.wrapping_add(2), (next & 0xFF) as u8)
-        } else if mask > 0xFF {
-            bus.write_reg16_val16(self.slv_addr, reg16, (next & 0xFFFF) as u16)
-        } else {
-            bus.write_reg16(self.slv_addr, reg16, (next & 0xFF) as u8)
-        }
+        crate::write_masked_reg16(bus, self.slv_addr, reg, mask, value)
     }
 
     fn set_pll(

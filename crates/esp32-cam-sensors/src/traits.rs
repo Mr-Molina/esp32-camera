@@ -116,6 +116,142 @@ pub fn write_regs16<B: SccbBus>(
     Ok(())
 }
 
+/// Register value that marks a millisecond delay rather than a write, in the
+/// `Reg16` tables of drivers whose registers are 16-bit addressed.
+///
+/// Safe as an in-band marker only because no driver using it addresses
+/// register 0xFFFF. The 8-bit-addressed drivers have no equivalent and must
+/// not grow one — see SENS-18.
+pub const REG_DLY: u16 = 0xFFFF;
+
+/// Reads a 16-bit-addressed register under `mask`, widening to two or three
+/// bytes as the mask requires (SENS-23).
+///
+/// Shared by the OV3640, OV3660, OV5640, HM1055 and HM0360 drivers, which
+/// each carried a byte-identical copy. `mask > 0xFF` reads a 16-bit value,
+/// `mask > 0xFFFF` reads a further byte from `reg + 2` and packs it in.
+///
+/// # Errors
+///
+/// [`CameraError::InvalidArg`] if `reg` is outside `0..=0xFFFF` or `mask` is
+/// negative, else any error from the bus.
+pub fn read_masked_reg16<B: SccbBus>(
+    bus: &mut B,
+    slv_addr: u8,
+    reg: i32,
+    mask: i32,
+) -> Result<i32, CameraError> {
+    Ok(read_wide_reg16(bus, slv_addr, reg, mask)? & mask)
+}
+
+/// Reads the current value `read_masked_reg16` and `write_masked_reg16` work
+/// from, before masking.
+fn read_wide_reg16<B: SccbBus>(
+    bus: &mut B,
+    slv_addr: u8,
+    reg: i32,
+    mask: i32,
+) -> Result<i32, CameraError> {
+    if !(0..=0xFFFF).contains(&reg) || mask < 0 {
+        return Err(CameraError::InvalidArg);
+    }
+    let addr = reg as u16;
+    if mask > 0xFF {
+        let hi = i32::from(bus.read_reg16_val16(slv_addr, addr)?);
+        if mask > 0xFFFF {
+            let lo = i32::from(bus.read_reg16(slv_addr, addr.wrapping_add(2))?);
+            Ok((hi << 8) | lo)
+        } else {
+            Ok(hi)
+        }
+    } else {
+        Ok(i32::from(bus.read_reg16(slv_addr, addr)?))
+    }
+}
+
+/// Read-modify-writes a 16-bit-addressed register under `mask`, widening as
+/// the mask requires (SENS-23).
+///
+/// The counterpart to [`read_masked_reg16`], and shared by the same drivers.
+///
+/// # Errors
+///
+/// [`CameraError::InvalidArg`] if `reg` is outside `0..=0xFFFF` or `mask` is
+/// negative, else any error from the bus.
+pub fn write_masked_reg16<B: SccbBus>(
+    bus: &mut B,
+    slv_addr: u8,
+    reg: i32,
+    mask: i32,
+    value: i32,
+) -> Result<(), CameraError> {
+    let current = read_wide_reg16(bus, slv_addr, reg, mask)?;
+    let addr = reg as u16;
+    let next = (current & !mask) | (value & mask);
+    if mask > 0xFFFF {
+        bus.write_reg16_val16(slv_addr, addr, ((next >> 8) & 0xFFFF) as u16)?;
+        bus.write_reg16(slv_addr, addr.wrapping_add(2), (next & 0xFF) as u8)
+    } else if mask > 0xFF {
+        bus.write_reg16_val16(slv_addr, addr, (next & 0xFFFF) as u16)
+    } else {
+        bus.write_reg16(slv_addr, addr, (next & 0xFF) as u8)
+    }
+}
+
+/// Writes every entry of a 16-bit-addressed register table in order, treating
+/// an entry whose register is [`REG_DLY`] as a millisecond delay (SENS-23).
+///
+/// There is no end-of-table marker: the slice carries its own length. See
+/// SENS-18 for why a tail sentinel was removed.
+///
+/// # Errors
+///
+/// Any error reported by the bus.
+pub fn write_table16<B: SccbBus>(
+    bus: &mut B,
+    slv_addr: u8,
+    regs: &[Reg16],
+) -> Result<(), CameraError> {
+    for entry in regs {
+        if entry.reg == REG_DLY {
+            bus.delay_ms(u32::from(entry.val));
+        } else {
+            bus.write_reg16(slv_addr, entry.reg, entry.val)?;
+        }
+    }
+    Ok(())
+}
+
+/// Sets or clears `mask` in a 16-bit-addressed register (SENS-23).
+///
+/// # Errors
+///
+/// Any error reported by the bus.
+pub fn write_reg_bits16<B: SccbBus>(
+    bus: &mut B,
+    slv_addr: u8,
+    reg: u16,
+    mask: u8,
+    enable: bool,
+) -> Result<(), CameraError> {
+    bus.write_reg16_mask(slv_addr, reg, if enable { mask } else { 0 }, mask)
+}
+
+/// Reports whether every bit of `mask` is set in a 16-bit-addressed register
+/// (SENS-23).
+///
+/// # Errors
+///
+/// Any error reported by the bus.
+pub fn check_reg_mask16<B: SccbBus>(
+    bus: &mut B,
+    slv_addr: u8,
+    reg: u16,
+    mask: u8,
+) -> Result<bool, CameraError> {
+    Ok((bus.read_reg16(slv_addr, reg)? & mask) == mask)
+}
+
 /// Checks that a signed control level lies in `lo..=hi`, returning it
 /// unchanged, or [`CameraError::InvalidArg`] if it does not (SENS-14).
 ///

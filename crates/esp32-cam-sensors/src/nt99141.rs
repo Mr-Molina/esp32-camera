@@ -570,19 +570,21 @@ pub const SENSOR_FRAMESIZE_VGA_XYSKIP: &[Reg16] = &[
 /// 0x0000, so a legitimate write to register 0 ended the table early and
 /// silently dropped the rest. The slice carries its own length, so no
 /// sentinel is needed.
+/// Writes every entry of `regs` in order, treating an entry whose register is
+/// [`crate::REG_DLY`] as a millisecond delay.
+///
+/// SENS-18: no end-of-table marker — the slice carries its own length.
+/// SENS-23: the body is shared with the other 16-bit-addressed drivers.
+///
+/// # Errors
+///
+/// Any error reported by the bus.
 pub fn write_reg_list<B: SccbBus>(
     bus: &mut B,
     slv_addr: u8,
     regs: &[Reg16],
 ) -> Result<(), CameraError> {
-    for entry in regs {
-        if entry.reg == REG_DLY {
-            bus.delay_ms(entry.val as u32);
-        } else {
-            bus.write_reg16(slv_addr, entry.reg, entry.val)?;
-        }
-    }
-    Ok(())
+    crate::write_table16(bus, slv_addr, regs)
 }
 
 #[inline]
@@ -608,7 +610,7 @@ fn write_reg_bits<B: SccbBus>(
     mask: u8,
     enable: bool,
 ) -> Result<(), CameraError> {
-    set_reg_bits(bus, slv_addr, reg, 0, mask, if enable { mask } else { 0 })
+    crate::write_reg_bits16(bus, slv_addr, reg, mask, enable)
 }
 
 #[inline]
@@ -618,8 +620,7 @@ fn check_reg_mask<B: SccbBus>(
     reg: u16,
     mask: u8,
 ) -> Result<bool, CameraError> {
-    let val = bus.read_reg16(slv_addr, reg)?;
-    Ok((val & mask) == mask)
+    crate::check_reg_mask16(bus, slv_addr, reg, mask)
 }
 
 /// Detects an NT99141 sensor at `slv_addr` (`0x2A`).
