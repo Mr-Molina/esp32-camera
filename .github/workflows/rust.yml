@@ -42,6 +42,11 @@ jobs:
   miri:
     name: Miri Undefined Behavior Checks
     runs-on: ubuntu-latest
+    # rust-toolchain.toml pins 1.99.1, which has no miri component, and that
+    # pin overrides the nightly the step below installs. Select nightly
+    # explicitly, as the xtensa job does for `esp`.
+    env:
+      RUSTUP_TOOLCHAIN: nightly
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -59,6 +64,14 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RUSTUP_TOOLCHAIN: esp
+      # WP-09 (BUILD-07): build.rs refuses an Xtensa release build whose OTA
+      # token is unset or the public default, or whose WIFI_PASS is empty.
+      # These CI-only placeholders satisfy that gate so the size check can
+      # run. They are compiled into the artifact, so the uploaded fw.bin is
+      # NOT deployable to a device — it is a size-gate build only.
+      WIFI_SSID: ci-placeholder
+      WIFI_PASS: ci-placeholder-pass
+      WIFI_OTA_TOKEN: ci-placeholder-ota-token-not-for-devices
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -96,7 +109,7 @@ jobs:
             exit 1
           fi
 
-      - name: Upload firmware binary
+      - name: Upload firmware binary (size-gate build, not deployable)
         uses: actions/upload-artifact@v4
         with:
           name: klipper-cam-fw-bin
