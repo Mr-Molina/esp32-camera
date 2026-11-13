@@ -619,6 +619,31 @@ Status values: `TODO` · `IN-PROGRESS` · `READY-FOR-HIL` · `DONE` · `BLOCKED 
 - **Status:** TODO
 
 #### - [ ] WP-20: HAL redesign: owned DMA ring, borrowed pool, concurrent leases (Lane D) · P1-P3 · L · after WP-08
+
+> **Sweep done 2026-11-13 (`d729c53`), ahead of this WP.** Applying the WP-23
+> method — look for code that presents itself as driving hardware it never
+> touches — to the HAL and LL crates found three things, all fixed or
+> recorded:
+>
+> * **HAL-09 is worse than "missing tables".** `HalOv2640Sensor::set_framesize`,
+>   `set_pixformat` and `set_gainceiling` wrote only the bank-select prelude,
+>   recorded the requested value and returned `Ok`. Every setter has that
+>   boilerplate and only `set_quality` finishes the job. They now return
+>   `NotSupported`, and `CameraDriver::init` tolerates it via the existing
+>   `ignore_not_supported` helper.
+> * **LL-17: the S2 and S3 backends perform zero MMIO.** Register blocks held
+>   by value, no `target_arch = "xtensa"` path, against 82 MMIO accesses in
+>   `esp32_i2s`. Retitled as host models and documented; their
+>   `volatile_write_u32` SAFETY text claimed to justify a hardware register
+>   write and has been corrected. They still need real backends.
+> * **The S2 model carries one ESP32 signal index.** `set_pin` binds vertical
+>   sync with `I2S0I_WS_IN_IDX` (28) while the four S2 indices it defines all
+>   sit exactly +3 from their ESP32 counterparts — a leftover, like NT99141's.
+>   A test pins the pattern; the correct value needs the S2 TRM.
+>
+> `xclk.rs` is `forbid(unsafe_code)` and cannot reach LEDC; it records a
+> configuration rather than starting a clock, and now says so.
+
 - **Findings:** HAL-02..12, LL-04, LL-14, LL-16, LL-17
 - **Steps:**
   1. **LL-04.** Make `calc_dma_sizes` match C for JPEG: node 2048, half 4096, cnt 8, total 32 KiB. Derive the `JPEG_DMA_*` constants from it. Fix the test.
