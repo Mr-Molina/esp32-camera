@@ -22,6 +22,64 @@ Detailed evidence, exact line ranges, proposed fixes and verification steps for 
 
 ---
 
+## 0. Start here (executing agents)
+
+Read this section and §2. You do not need the rest until you have picked a work package.
+
+### 0.1 Check your environment first (two minutes, saves hours)
+
+```bash
+cargo +esp --version
+```
+
+- **Prints a version:** you can run every gate in §2.4. Continue.
+- **"toolchain 'esp' is not installed":** you are in a cloud session. **Do not try to install it** — the toolchain is distributed only through GitHub releases from other organisations, and cloud sessions can reach only this repository. Every previous agent that tried, failed. Instead, work from the "host-only" column in §0.2, and when you finish a package mark it `IN-PROGRESS` with the words *"Xtensa gates NOT run: no esp toolchain in this session"* — never `DONE`, never `READY-FOR-HIL`.
+
+Then run the three host gates once, before changing anything, so you know the tree was green when you started:
+
+```bash
+cargo fmt --all -- --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked
+```
+
+### 0.2 What is actually next
+
+Pick from the **leftmost column you can do**. Do not take a package from a column to the right of your capability.
+
+| Host-only (no toolchain needed) | Needs the esp toolchain | Needs the camera board |
+| --- | --- | --- |
+| **WP-24** docs accuracy (§5, Wave 5) | **Run the Xtensa gates on WP-02, WP-06, WP-08, WP-09.** Their code is finished; only these gates are missing. Fix what fails, then mark each `READY-FOR-HIL`. This unblocks Wave 2. | WP-04, WP-05, WP-07, WP-16, WP-22 are `READY-FOR-HIL`: run their [HIL] acceptance lists |
+| **WP-20** HAL redesign (host-testable; WP-08 is landed) | **WP-19** split `main.rs` (behaviour-neutral, but `main.rs` is Xtensa-only, so do not attempt without the toolchain) | WP-10, WP-11, WP-13, WP-25 (all [HIL]) |
+| The audit in §9, on `crates/klipper-cam-fw` (not yet done there) | WP-12, WP-14, WP-15, WP-17, WP-18 (all edit `main.rs`) | |
+
+`WP-01`, `WP-03`, `WP-21`, `WP-23` are `DONE`. Do not reopen them.
+
+### 0.3 The five rules that matter most
+
+1. **Never claim success for work not done.** A setter that cannot do something returns `NotSupported`; it does not select a bank, record the value and return `Ok`. A status field reports what the sensor is in, not what was asked for. This one rule is behind most of the defects fixed so far.
+2. **Never guess a value that belongs to hardware.** Register addresses, reset values, lookup tables, PLL codes, GPIO-matrix indices: if the correct value is not in this repository, **record the gap and stop** — in a comment, in the Status line, and in §7 if it needs the owner. Do not derive it from a pattern, a sibling driver, or an upstream you remember. Several findings here looked like simple extrapolations and were not (§2.11).
+3. **Prove the test fails before the fix** (§2.12). A test that passes against the unfixed code proves nothing and has already been caught once in this work order.
+4. **Run the gates after every change, not at the end.** The three host commands in §0.1 take under a minute.
+5. **When unsure whether something is a bug, it is probably matching upstream.** Check §2.13 before "fixing" anything that looks odd.
+
+### 0.4 How to finish a package
+
+1. All gates you *can* run are green (host always; Xtensa if you have the toolchain).
+2. Each fix has a test you watched fail first.
+3. Commit per finding, not per package, with a message that says what was wrong and what changed. Follow the style of `git log --oneline -20`.
+4. Update the package's **Status** line in §5 (§2.10). Say what you did, what you did not do, and why. If you skipped a step, name it.
+5. Push to the branch you were given. Do not open a pull request unless asked.
+
+### 0.5 Stop and ask the owner when
+
+- the fix needs a value that is not in the repo (rule 2 above) **and** the package cannot be finished without it;
+- a package's steps contradict each other or the findings file, and you cannot tell which is right;
+- you would change the HTTP contract, flash layout, GPIO16 cold-boot behaviour, or Core 1 producer invariants (`README.md`, `firmware/README.md`);
+- anything would flash a device or deploy over the network.
+
+Otherwise do not stop to ask whether to continue. Decide, write the decision into the Status line as *"Ruling: … — because … — costs … if wrong"*, and continue.
+
+---
+
 ## 1. Executive summary
 
 ### 1.1 Where the frame rate goes
@@ -71,7 +129,7 @@ The FPS plan therefore has two halves, and both are needed:
 
 Read this section before starting any work package.
 
-1. **One work package per branch and PR.** Name the branch `wo/<WP-id>-<slug>`, for example `wo/wp05-ota-multicore`. Start from the current `master` unless the WP says otherwise. Do not bundle packages together.
+1. **Branches.** If your session was assigned a branch (cloud sessions are: it starts with `claude/`), **use that branch and only that branch**; this overrides `CLAUDE.md`'s "work on master" and the per-package rule below. Otherwise, one work package per branch, named `wo/<WP-id>-<slug>`, for example `wo/wp05-ota-multicore`, from the current `master`. Either way, do not bundle unrelated packages into one commit, and never force-push.
 2. **Re-verify locations first.** Line numbers in the appendices are against `5a21ce2`. Before editing, re-locate each site with `grep -n` on the quoted evidence. If the evidence no longer matches, record that in the PR and re-assess the finding.
 3. **Respect file ownership (§4).** Two agents must never edit the same file concurrently. `crates/klipper-cam-fw/src/main.rs` is a serialization point until WP-19 splits it.
 4. **Required gates for every PR.** All must pass:
@@ -90,7 +148,9 @@ Read this section before starting any work package.
    ```bash
    cargo +esp build --target xtensa-esp32-none-elf -Zbuild-std=core,alloc -p klipper-cam-fw --release
    ```
-   Until WP-02 lands, override the linker with `CARGO_TARGET_XTENSA_ESP32_NONE_ELF_LINKER=xtensa-esp32-elf-gcc`. In a git worktree nested inside the main checkout, also set `RUSTFLAGS="-C link-arg=-nostartfiles -C link-arg=-Tlinkall.x"`, because otherwise both `.cargo/config.toml` files are loaded and the linker script is passed twice.
+   WP-02's portable `.cargo/config.toml` is committed (`256c864`), so no linker override is needed; WP-02 itself is still `IN-PROGRESS` because its Xtensa gates have not run. In a git worktree nested inside the main checkout, set `RUSTFLAGS="-C link-arg=-nostartfiles -C link-arg=-Tlinkall.x"`, because otherwise both `.cargo/config.toml` files are loaded and the linker script is passed twice.
+
+   **If `cargo +esp` is not installed** (see §0.1): run the three host gates, skip the two Xtensa ones, and say so in the Status line in exactly these words: *"Xtensa gates NOT run: no esp toolchain in this session."* Do not mark the package `DONE` or `READY-FOR-HIL`. Prefer packages whose crates are host-only (`esp32-cam-types`, `-sccb`, `-sensors`, `-conversions`, and the non-MMIO parts of `-ll` and `-hal`); those are fully verified by the host gates.
 5. **Hardware-in-the-loop (HIL).** Items marked **[HIL]** need the ESP32-WROVER-DEV board with the OV2640. An agent without hardware must:
    - implement the change,
    - pass all host and Xtensa gates,
@@ -103,6 +163,22 @@ Read this section before starting any work package.
 8. **The HTTP contract is frozen** except where a WP explicitly changes it: FW-NET-14 changes the stream policy, FW-NET-27 changes `/control` to POST, and WP-04 adds fields to `/status`. Keep `scripts/ota_deploy.py` and `scripts/verify_cold_boot_invariants.py` in sync with any contract change.
 9. **Secrets.** Never commit `.env.local`, Wi-Fi credentials, OTA tokens, or the camera's IP address. Use `<camera-ip>` in docs.
 10. **Update this file when you finish.** Tick the WP's checkbox and fill in its Status line: date, PR link, measured result. Commit messages follow the repo's Conventional Commits style.
+11. **Do not guess hardware values.** These looked like safe derivations and were not:
+    - The HM1055 PLL lookup skipped multipliers 252/264/276. Filling the gap with the formula that fit the other eleven would have written unattested PLL codes into a register that drives PCLK. The gap was evidence, not an omission.
+    - SENS-14 asks for per-sensor level lookup tables. Whether a part reads a register as two's complement or as a magnitude differs per sensor; there is no way to tell from this repo.
+    - SENS-15 asks for a "delta" framesize write. Comparing the tables showed the full rewrite was load-bearing for HM0360 and HM1055; the optimisation would have broken both.
+    - The ESP32-S2 model binds vertical sync with the ESP32 signal index. The other four S2 indices are all ESP32 + 3, but the right value is in the S2 technical reference manual, not here.
+
+    In every case the correct action was the same: fix what the repo proves, refuse rather than substitute where it does not, write the gap into a comment and the Status line, and move on.
+12. **Prove the test fails first.** For each fix: write the test, run it, **read the failure message** and confirm it fails for the reason you expect, then fix, then run again. If you wrote a test after the fix, revert the fix temporarily (`git stash` or `git show HEAD:path > file`) and run the test against the old code before you commit. A test in this work order was once shipped that passed against the unfixed code; a reviewer caught it, you may not have one.
+13. **Things that look wrong and are not.** Check here before "correcting" anything in a table:
+    - `RESOLUTION_TABLE` has portrait FHD at **1088**x1920. That matches upstream and is deliberate (a multiple of 16). It is not a typo for 1080.
+    - `AspectRatio` is a nine-way **bucket** indexed into each driver's `RATIO_TABLE[9]`, not an exact ratio. QCIF at `5x4` and CIF at `4x3` are correct.
+    - `SYSTEM_CTROL0` and `ISP_CONTROL_01` in `nt99141.rs` are two names for one register, as are `TIMING_TC_REG20`/`21`. Harmless: their bit masks do not overlap.
+    - `esp32_i2s.rs` keeps an in-memory register block *as well as* doing real MMIO. The block is a shadow for host tests. The S2/S3 modules have only the shadow — see their module docs.
+
+    When a value matches the upstream Espressif driver, leave it, even if it looks odd. When you cannot check upstream, leave it and say so.
+14. **Cargo features.** `esp32-cam-sensors` has one feature per driver and the workspace dependency carries `default-features = false`. If you add a consumer, name the drivers it needs (`features = ["ov2640"]`). Cargo **ignores** `default-features = false` on a member unless the workspace entry has it too, and feature unification means any member that leaves defaults on hands every binary all 18 drivers. Check with `cargo tree -p <crate> -e features | grep "esp32-cam-sensors feature"`.
 
 ---
 
@@ -869,3 +945,35 @@ Fill this in as work packages land. WP-04 records the first row.
 | Date | WP | FPS (median of 3 × 60 s) | Sensor period (µs) | Core 0 ms/frame | `c1_dropped`/min | Snapshot p95 (ms) | Image size (B) | Notes |
 |---|---|---|---|---|---|---|---|---|
 | 2026-10 (`75625d8`) | baseline | 12.53 | not measured | not measured | not measured | not measured | 817,904 | Figures from the commit message |
+
+## 9. Audit procedure: half-finished ports
+
+This procedure found real defects in four of the six crates (`sensors`, `hal`, `ll`, `types`). It has **not yet been run on `crates/klipper-cam-fw`**. It needs no hardware and no toolchain. An agent with only the host gates can run it end to end.
+
+The thing it looks for: code that was copied from a driver for one piece of hardware and only partly rewritten for another, so that it still carries the first one's register addresses, bit positions or signal indices — and code that reports success for work it does not do.
+
+### 9.1 Steps
+
+1. **List every numeric constant and raw hex literal the crate uses in code** (not in tables, not in comments). For each, ask: does this value belong to the hardware this file says it drives? Addresses are the giveaway — ESP32 I2S is at `0x3FF4_F000`, ESP32-S3 LCD_CAM at `0x6004_1000`, OmniVision 16-bit parts put the ISP at `0x5xxx` and the window at `0x38xx`. A Novatek, Himax or GalaxyCore driver touching `0x5xxx` is wrong.
+2. **Count uses of every `pub const`.** Zero uses is a smell. Zero uses **and** a value belonging to other hardware is the pattern: the port remapped the constants it needed and left the rest. The proof is usually one constant in the family that *was* remapped and *is* used, sitting next to siblings that were not.
+3. **Find every method that takes a bus or a register block and never touches it**, yet returns `Ok`. Also every method that performs only a prelude (a bank select, a page select) and then records the requested value. Both are reporting success for nothing.
+4. **Find every function that claims to drive hardware and count its MMIO calls.** A "driver" with a register block held *by value* and no `target_arch` gate is a model. Say so in its docs; do not hide it.
+5. **For each table that is "re-sent" to undo a previous state, compare register sets.** If the tables for different modes write different registers, the re-send is load-bearing and cannot be replaced with a delta. If they barely overlap the default table, the re-send does not restore anything and there is a live defect.
+6. **For each clamp, check what it clamps *to*** and whether the implementations agree. A shared type that clamps to `-2..=2` while drivers accept `-5..=5` substitutes a different setting for a valid one.
+7. **Write one test per finding that fails on the old code**, then fix. For a defect you cannot fix without a datasheet, make the code refuse rather than substitute, and write the gap into the module docs.
+
+### 9.2 What to do with each kind of finding
+
+| Finding | Action |
+| --- | --- |
+| Setter reports success without acting | Return `NotSupported`. Tolerate it at the call sites with the existing `ignore_not_supported` helper if they must not fail. |
+| Setter writes another part's registers | Return `NotSupported`; document which block is foreign and why you know. Delete the dead constants that named it. |
+| Status read from a register the part does not have | Report the default; say so in a comment. |
+| Model presented as a driver | Retitle it, state "performs no MMIO" in the first paragraph, correct any `SAFETY` comment that claims a hardware write. Keep it visible. |
+| Load-bearing re-send | Leave it; add a structural test over the tables so the next person does not remove it. |
+| Value that would have to be guessed | Do not. Record in a comment, the Status line, and §7. |
+
+### 9.3 False positives to expect
+
+The procedure also flags things that are fine; §2.13 lists the ones hit so far. A value that matches upstream is not a finding. A `pub const` with zero uses is not a finding on its own — only when its value belongs elsewhere.
+
