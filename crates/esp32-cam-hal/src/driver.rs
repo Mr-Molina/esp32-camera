@@ -217,8 +217,24 @@ impl<B: SccbBus, S: esp32_cam_sensors::CameraSensor<B>> HalCameraSensor<B> for S
     }
 }
 
-/// Built-in lightweight OV2640 HAL sensor handle for default [`CameraDriver`]
-/// builds.
+/// Built-in minimal OV2640 handle for default [`CameraDriver`] builds.
+///
+/// # Scope (HAL-09)
+///
+/// This is a stub, not a complete driver. `reset`, `detect` and `set_quality`
+/// are implemented against real registers; `set_framesize`, `set_pixformat`
+/// and `set_gainceiling` are not, and return [`CameraError::NotSupported`].
+///
+/// They used to write the OV2640 bank-select prelude, record the requested
+/// value and return `Ok` — so a caller asking for HD got the bank selected,
+/// nothing else written, success reported, and HD recorded in `status` while
+/// the sensor stayed wherever reset had left it. The single bank-select write
+/// is what made it look functional.
+///
+/// For a complete OV2640 driver use [`esp32_cam_sensors::ov2640::Ov2640`],
+/// which implements the full register tables and is covered by the golden
+/// transaction tests in that crate. [`CameraDriver`] accepts any
+/// [`HalCameraSensor`], so it can be built over that type instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HalOv2640Sensor {
     slv_addr: u8,
@@ -306,37 +322,35 @@ impl<B: SccbBus> HalCameraSensor<B> for HalOv2640Sensor {
         Ok(())
     }
 
-    fn set_pixformat(&mut self, bus: &mut B, pixformat: PixelFormat) -> Result<(), CameraError> {
-        match pixformat {
-            PixelFormat::Rgb565
-            | PixelFormat::Yuv422
-            | PixelFormat::Grayscale
-            | PixelFormat::Jpeg => {
-                bus.write_reg8(self.slv_addr, 0xFF, 0x00)?;
-                self.pixformat = pixformat;
-                Ok(())
-            }
-            _ => Err(CameraError::FailedToSetOutFormat),
-        }
+    /// Always returns [`CameraError::NotSupported`] (HAL-09).
+    ///
+    /// This stub never implemented the registers this needs; it wrote only
+    /// the bank-select prelude, recorded the requested value and returned
+    /// `Ok`. Use [`esp32_cam_sensors::ov2640::Ov2640`] for a complete driver.
+    fn set_pixformat(&mut self, _bus: &mut B, _pixformat: PixelFormat) -> Result<(), CameraError> {
+        Err(CameraError::NotSupported)
     }
 
-    fn set_framesize(&mut self, bus: &mut B, framesize: FrameSize) -> Result<(), CameraError> {
-        if (framesize as u8) > (FrameSize::Uxga as u8) {
-            return Err(CameraError::FailedToSetFrameSize);
-        }
-        bus.write_reg8(self.slv_addr, 0xFF, 0x00)?;
-        self.status.framesize = framesize;
-        Ok(())
+    /// Always returns [`CameraError::NotSupported`] (HAL-09).
+    ///
+    /// This stub never implemented the registers this needs; it wrote only
+    /// the bank-select prelude, recorded the requested value and returned
+    /// `Ok`. Use [`esp32_cam_sensors::ov2640::Ov2640`] for a complete driver.
+    fn set_framesize(&mut self, _bus: &mut B, _framesize: FrameSize) -> Result<(), CameraError> {
+        Err(CameraError::NotSupported)
     }
 
+    /// Always returns [`CameraError::NotSupported`] (HAL-09).
+    ///
+    /// This stub never implemented the registers this needs; it wrote only
+    /// the bank-select prelude, recorded the requested value and returned
+    /// `Ok`. Use [`esp32_cam_sensors::ov2640::Ov2640`] for a complete driver.
     fn set_gainceiling(
         &mut self,
-        bus: &mut B,
-        gainceiling: GainCeiling,
+        _bus: &mut B,
+        _gainceiling: GainCeiling,
     ) -> Result<(), CameraError> {
-        bus.write_reg8(self.slv_addr, 0xFF, 0x01)?;
-        self.status.gainceiling = gainceiling as u8;
-        Ok(())
+        Err(CameraError::NotSupported)
     }
 
     fn set_quality(&mut self, bus: &mut B, quality: i32) -> Result<(), CameraError> {
@@ -417,37 +431,35 @@ impl<B: SccbBus> esp32_cam_sensors::CameraSensor<B> for HalOv2640Sensor {
         Ok(())
     }
 
-    fn set_pixformat(&mut self, bus: &mut B, pixformat: PixelFormat) -> Result<(), CameraError> {
-        match pixformat {
-            PixelFormat::Rgb565
-            | PixelFormat::Yuv422
-            | PixelFormat::Grayscale
-            | PixelFormat::Jpeg => {
-                bus.write_reg8(self.slv_addr, 0xFF, 0x00)?;
-                self.pixformat = pixformat;
-                Ok(())
-            }
-            _ => Err(CameraError::FailedToSetOutFormat),
-        }
+    /// Always returns [`CameraError::NotSupported`] (HAL-09).
+    ///
+    /// This stub never implemented the registers this needs; it wrote only
+    /// the bank-select prelude, recorded the requested value and returned
+    /// `Ok`. Use [`esp32_cam_sensors::ov2640::Ov2640`] for a complete driver.
+    fn set_pixformat(&mut self, _bus: &mut B, _pixformat: PixelFormat) -> Result<(), CameraError> {
+        Err(CameraError::NotSupported)
     }
 
-    fn set_framesize(&mut self, bus: &mut B, framesize: FrameSize) -> Result<(), CameraError> {
-        if (framesize as u8) > (FrameSize::Uxga as u8) {
-            return Err(CameraError::FailedToSetFrameSize);
-        }
-        bus.write_reg8(self.slv_addr, 0xFF, 0x00)?;
-        self.status.framesize = framesize;
-        Ok(())
+    /// Always returns [`CameraError::NotSupported`] (HAL-09).
+    ///
+    /// This stub never implemented the registers this needs; it wrote only
+    /// the bank-select prelude, recorded the requested value and returned
+    /// `Ok`. Use [`esp32_cam_sensors::ov2640::Ov2640`] for a complete driver.
+    fn set_framesize(&mut self, _bus: &mut B, _framesize: FrameSize) -> Result<(), CameraError> {
+        Err(CameraError::NotSupported)
     }
 
+    /// Always returns [`CameraError::NotSupported`] (HAL-09).
+    ///
+    /// This stub never implemented the registers this needs; it wrote only
+    /// the bank-select prelude, recorded the requested value and returned
+    /// `Ok`. Use [`esp32_cam_sensors::ov2640::Ov2640`] for a complete driver.
     fn set_gainceiling(
         &mut self,
-        bus: &mut B,
-        gainceiling: GainCeiling,
+        _bus: &mut B,
+        _gainceiling: GainCeiling,
     ) -> Result<(), CameraError> {
-        bus.write_reg8(self.slv_addr, 0xFF, 0x01)?;
-        self.status.gainceiling = gainceiling as u8;
-        Ok(())
+        Err(CameraError::NotSupported)
     }
 
     fn set_quality(&mut self, bus: &mut B, quality: i32) -> Result<(), CameraError> {
@@ -752,9 +764,17 @@ impl<
 
             // 6. Reset and configure sensor over SCCB (`esp_camera.c:282, 358-385`)
             self.sensor.reset(&mut self.bus)?;
-            self.sensor
-                .set_pixformat(&mut self.bus, self.config.pixel_format)?;
-            self.sensor.set_framesize(&mut self.bus, frame_size)?;
+            // HAL-09: a sensor that cannot do these reports NotSupported
+            // rather than pretending, as the built-in stub now does. Tolerate
+            // it here the same way the other call sites already do, so a
+            // driver built on a partial sensor still initialises — it just no
+            // longer claims the sensor was configured when it was not.
+            let pixformat_res = self
+                .sensor
+                .set_pixformat(&mut self.bus, self.config.pixel_format);
+            ignore_not_supported(pixformat_res)?;
+            let framesize_res = self.sensor.set_framesize(&mut self.bus, frame_size);
+            ignore_not_supported(framesize_res)?;
 
             if sensor_pid == CameraPid::OV2640.as_u16() {
                 ignore_not_supported(

@@ -1,10 +1,34 @@
-//! ESP32-S2 I2S0 camera parallel interface low-level driver
+//! ESP32-S2 I2S0 camera parallel interface host model
 //! (`target/esp32s2/ll_cam.c`).
 //!
 //! Supports 1-byte-per-item DMA packing (`rx_bits_mod = 8`, `rx_fifo_mod = 2`),
 //! high-bit GPIO matrix data alignment (`ESP32S2_I2S0I_DATA_IN0_IDX + 8 + i`),
 //! 64-byte PSRAM DMA alignment, and YUV-to-Grayscale decimation
 //! (`ll_cam_memcpy`).
+//!
+//! # This is a host model, not a driver
+//!
+//! Despite the name, nothing here reaches hardware. The register block is a
+//! plain struct held by value and zero-initialised in `new()`; there is not a
+//! single MMIO access in this module, and no `target_arch = "xtensa"` path.
+//! Compare [`crate::esp32_i2s`], the production ESP32 backend, which performs
+//! 82 MMIO accesses against `I2S0_BASE_ADDR` and keeps an in-memory block
+//! only as a shadow for host tests.
+//!
+//! So on real ESP32-S2 hardware `config`, `start` and `stop` update a struct
+//! in RAM and report success. Treat this as an executable description of what
+//! the S2 backend should do, useful for testing the layers above it, and not
+//! as something to ship. Work order WO-PERF-2026-11, LL-17 tracks giving it a
+//! real backend.
+//!
+//! One known defect in the model itself: `set_pin` binds the vertical-sync
+//! input using [`crate::esp32_i2s::I2S0I_WS_IN_IDX`], which is the **ESP32**
+//! GPIO-matrix index (28). The S2-specific indices this module does define —
+//! `ESP32S2_I2S0I_DATA_IN0_IDX`, `_H_SYNC_IDX`, `_V_SYNC_IDX`,
+//! `_H_ENABLE_IDX` — all sit three above their ESP32 counterparts, so the
+//! port remapped the signals it thought about and left this one behind. The
+//! correct S2 value needs the S2 technical reference manual, which is not in
+//! this repo, so it is recorded rather than guessed at.
 
 use core::ptr;
 use esp32_cam_types::{CameraError, CameraPid, PixelFormat};
@@ -55,7 +79,8 @@ pub struct Esp32S2I2sRegisterBlock {
 #[inline]
 fn volatile_write_u32(reg: &mut u32, val: u32) {
     let ptr = ptr::from_mut(reg);
-    // JUSTIFICATION: Hardware register write requires raw pointer dereference.
+    // JUSTIFICATION: Volatile write to the in-RAM model register block.
+    // This is NOT a hardware register: see the module docs.
     // SAFETY:
     // 1. Alignment & Non-null: `ptr` is from a valid `&mut u32` ref.
     // 2. Memory layout: `u32` register word in `#[repr(C, align(4))]`.
@@ -71,7 +96,8 @@ fn volatile_write_u32(reg: &mut u32, val: u32) {
 #[inline]
 fn volatile_read_u32(reg: &u32) -> u32 {
     let ptr = ptr::from_ref(reg);
-    // JUSTIFICATION: Hardware register read requires raw pointer dereference.
+    // JUSTIFICATION: Volatile read of the in-RAM model register block.
+    // This is NOT a hardware register: see the module docs.
     // SAFETY:
     // 1. Alignment & Non-null: `ptr` is from a valid `&u32` ref.
     // 2. Memory layout: `u32` register word in `#[repr(C, align(4))]`.
@@ -82,8 +108,12 @@ fn volatile_read_u32(reg: &u32) -> u32 {
     unsafe { ptr::read_volatile(ptr) }
 }
 
-/// Low-level ESP32-S2 I2S0 camera peripheral controller
+/// Host model of the ESP32-S2 I2S0 camera peripheral
 /// (`target/esp32s2/ll_cam.c`).
+///
+/// Performs no MMIO: every method updates the in-RAM register block and
+/// reports success. See the module documentation before using it for
+/// anything but testing the layers above.
 #[derive(Debug, Clone)]
 pub struct Esp32S2I2sCamera {
     regs: Esp32S2I2sRegisterBlock,
@@ -525,5 +555,63 @@ mod tests {
         assert!(cam.start(&dma_cfg, 0x3FFB_0000));
         assert!(cam.stop());
         assert_eq!(cam.deinit(), Ok(()));
+    }
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use super::*;
+    use crate::esp32_i2s::{
+        I2S0I_DATA_IN0_IDX, I2S0I_H_ENABLE_IDX, I2S0I_H_SYNC_IDX, I2S0I_V_SYNC_IDX,
+    };
+
+    /// The ESP32-S2 GPIO-matrix indices this module defines all sit exactly
+    /// three above their ESP32 counterparts. That regularity is what makes
+    /// the one remaining ESP32 index in `set_pin` — `I2S0I_WS_IN_IDX`, used
+    /// for the vertical-sync binding — identifiable as a leftover rather than
+    /// a deliberate choice: the port remapped the signals it thought about
+    /// and missed that one.
+    ///
+    /// This pins the pattern so the inconsistency cannot be lost. It does not
+    /// assert what the correct S2 value is; that needs the S2 technical
+    /// reference manual, which is not in this repo.
+    #[test]
+    fn test_sweep_s2_signal_indices_are_offset_three_from_esp32() {
+        for (esp32, s2, name) in [
+            (
+                u32::from(I2S0I_DATA_IN0_IDX),
+                ESP32S2_I2S0I_DATA_IN0_IDX,
+                "DATA_IN0",
+            ),
+            (
+                u32::from(I2S0I_H_SYNC_IDX),
+                ESP32S2_I2S0I_H_SYNC_IDX,
+                "H_SYNC",
+            ),
+            (
+                u32::from(I2S0I_V_SYNC_IDX),
+                ESP32S2_I2S0I_V_SYNC_IDX,
+                "V_SYNC",
+            ),
+            (
+                u32::from(I2S0I_H_ENABLE_IDX),
+                ESP32S2_I2S0I_H_ENABLE_IDX,
+                "H_ENABLE",
+            ),
+        ] {
+            assert_eq!(
+                s2,
+                esp32 + 3,
+                "{name}: the S2 indices follow a +3 offset from ESP32"
+            );
+        }
+
+        // No S2 index is defined for WS_IN, which is why `set_pin` still
+        // binds the ESP32 one. Recorded, not guessed at.
+        assert_eq!(
+            crate::esp32_i2s::I2S0I_WS_IN_IDX,
+            28,
+            "if this ESP32 value changes, the S2 leftover in set_pin moves too"
+        );
     }
 }

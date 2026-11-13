@@ -1,5 +1,12 @@
-//! LEDC XCLK clock generator and PSRAM cache line alignment helpers
+//! LEDC XCLK configuration bookkeeping and PSRAM cache line alignment helpers
 //! (`target/xclk.c`, `driver/cam_hal.c:88-139`).
+//!
+//! This module computes and records LEDC timer/channel settings; it does not
+//! start a clock. It is `forbid(unsafe_code)`, so it cannot reach the LEDC
+//! registers at all — the caller programs the real peripheral (on this
+//! firmware, through `esp-hal`) and uses these types to track what it chose.
+//! `enable_out_clock` and `disable_out_clock` update that record and validate
+//! the request; a successful return does not mean a clock is running.
 
 #![forbid(unsafe_code)]
 
