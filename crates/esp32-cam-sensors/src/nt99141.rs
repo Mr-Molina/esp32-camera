@@ -4,22 +4,33 @@
 //! `sensors/private_include/nt99141_regs.h`, and
 //! `sensors/private_include/nt99141_settings.h`.
 //!
-//! # Suspected foreign registers (unresolved)
+//! # Foreign registers from a half-finished port
 //!
-//! Part of this module addresses registers that look like OmniVision's, not
-//! Novatek's: the window block declared below at 0x3800..0x3810, and the
-//! 0x5000/0x5183/0x5306 reads in `init_status`. Those are OV5640-generation
-//! signatures. `set_res_raw` wrote the 0x38xx block and was removed under
-//! SENS-13; the constants and the `init_status` reads remain, so
-//! `init_status` may report AWB, BPC, WPC and denoise state read from
-//! registers this part does not implement.
+//! This driver was built from an OmniVision skeleton and not all of it was
+//! remapped. The parts that were addressing OV5640 registers have been dealt
+//! with:
 //!
-//! This is the same class of defect SENS-04 records against
-//! [`crate::ov3640`], but it was found while reviewing WP-23 rather than in
-//! the work order, so no behaviour was changed on the strength of it. It
-//! needs the same decision from the repository owner: port a verified
-//! NT99141 map, or mark the affected calls unsupported. Until then, treat
-//! `init_status` output from this driver as unverified.
+//! * `set_sharpness` programmed 0x5300..=0x530C and 0x5308 — the OV5640 ISP
+//!   sharpness block verbatim — while `init_status` read sharpness back from
+//!   0x3301. The two paths could not both be right. It now returns
+//!   [`CameraError::NotSupported`].
+//! * `init_status` reported denoise, dcw, bpc, wpc, raw_gma and lenc from
+//!   0x5306, 0x5183 and 0x5000. Those controls are already `NotSupported`
+//!   here, so it was reporting state nobody could set, read from registers
+//!   this part does not implement. They now report defaults.
+//! * `set_res_raw` wrote the OV5640 window block at 0x3800..0x3810; it was
+//!   removed under SENS-13, and the unused constants went with it.
+//!
+//! What is left is in the 0x30xx, 0x32xx, 0x33xx and 0x34xx ranges, which is
+//! consistent with Novatek's own map and with how the rest of the driver is
+//! written. It has **not** been checked against an NT99141 datasheet or the
+//! upstream C driver, neither of which is in this repo. Two specifics worth
+//! an owner's eye: `status.sharpness` is still read from 0x3301, which is not
+//! demonstrably foreign but is a value `set_sharpness` can no longer change;
+//! and `SYSTEM_CTROL0`/`ISP_CONTROL_01` are two names for 0x3021, as
+//! `TIMING_TC_REG20`/`TIMING_TC_REG21` are for 0x3022 — artefacts of the same
+//! port, harmless as written because the bits within each register do not
+//! overlap.
 
 use crate::{
     CameraError, CameraModel, CameraPid, CameraSccbAddr, CameraSensor, CameraStatus, FrameSize,
@@ -27,10 +38,6 @@ use crate::{
 };
 
 pub const SYSTEM_CTROL0: u16 = 0x3021;
-pub const FORMAT_CTRL: u16 = 0x501F;
-pub const FORMAT_CTRL00: u16 = 0x4300;
-pub const FRAME_CTRL01: u16 = 0x4201;
-pub const FRAME_CTRL02: u16 = 0x4202;
 pub const PRE_ISP_TEST_SETTING_1: u16 = 0x3025;
 pub const AEC_PK_MANUAL: u16 = 0x3201;
 pub const TIMING_TC_REG20: u16 = 0x3022;
@@ -38,36 +45,7 @@ pub const TIMING_TC_REG21: u16 = 0x3022;
 pub const CLOCK_POL_CONTROL: u16 = 0x3024;
 pub const DRIVE_CAPABILITY: u16 = 0x306A;
 
-pub const X_ADDR_ST_H: u16 = 0x3800;
-pub const X_ADDR_ST_L: u16 = 0x3801;
-pub const Y_ADDR_ST_H: u16 = 0x3802;
-pub const Y_ADDR_ST_L: u16 = 0x3803;
-pub const X_ADDR_END_H: u16 = 0x3804;
-pub const X_ADDR_END_L: u16 = 0x3805;
-pub const Y_ADDR_END_H: u16 = 0x3806;
-pub const Y_ADDR_END_L: u16 = 0x3807;
-pub const X_OUTPUT_SIZE_H: u16 = 0x3808;
-pub const X_OUTPUT_SIZE_L: u16 = 0x3809;
-pub const Y_OUTPUT_SIZE_H: u16 = 0x380A;
-pub const Y_OUTPUT_SIZE_L: u16 = 0x380B;
-pub const X_TOTAL_SIZE_H: u16 = 0x380C;
-pub const X_TOTAL_SIZE_L: u16 = 0x380D;
-pub const Y_TOTAL_SIZE_H: u16 = 0x380E;
-pub const Y_TOTAL_SIZE_L: u16 = 0x380F;
-pub const X_OFFSET_H: u16 = 0x3810;
-pub const X_OFFSET_L: u16 = 0x3811;
-pub const Y_OFFSET_H: u16 = 0x3812;
-pub const Y_OFFSET_L: u16 = 0x3813;
-pub const X_INCREMENT: u16 = 0x3814;
-pub const Y_INCREMENT: u16 = 0x3815;
-
 pub const ISP_CONTROL_01: u16 = 0x3021;
-pub const SCALE_CTRL_1: u16 = 0x5601;
-pub const SCALE_CTRL_2: u16 = 0x5602;
-pub const SCALE_CTRL_3: u16 = 0x5603;
-pub const SCALE_CTRL_4: u16 = 0x5604;
-pub const SCALE_CTRL_5: u16 = 0x5605;
-pub const SCALE_CTRL_6: u16 = 0x5606;
 pub const PCLK_RATIO: u16 = 0x3824;
 pub const VFIFO_CTRL0C: u16 = 0x460C;
 pub const VFIFO_X_SIZE_H: u16 = 0x4602;
@@ -800,12 +778,19 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
         self.status.brightness = 0;
         self.status.contrast = 0;
         self.status.saturation = 0;
+        // 0x3301 is not demonstrably foreign — it is outside the OV5640 ISP
+        // block — but `set_sharpness` refuses, so this reports a value
+        // nobody can change. Left in place and flagged rather than guessed at.
         self.status.sharpness = bus.read_reg16(self.slv_addr, 0x3301)? as i8;
-        self.status.denoise = (bus.read_reg16(self.slv_addr, 0x5306)? / 4).wrapping_add(1);
+        // 0x5306, 0x5183 and 0x5000 below are OV5640 ISP addresses, outside
+        // anything else this driver touches, and the controls they described
+        // are already NotSupported here. Reporting defaults beats reporting
+        // whatever a register the part does not implement happens to return.
+        self.status.denoise = 0;
         self.status.ae_level = 0;
         self.status.gainceiling = bus.read_reg16(self.slv_addr, 0x32F0)?;
         self.status.awb = check_reg_mask(bus, self.slv_addr, ISP_CONTROL_01, 0x10)?;
-        self.status.dcw = !check_reg_mask(bus, self.slv_addr, 0x5183, 0x80)?;
+        self.status.dcw = false;
         self.status.agc = !check_reg_mask(
             bus,
             self.slv_addr,
@@ -824,10 +809,10 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
             check_reg_mask(bus, self.slv_addr, TIMING_TC_REG20, TIMING_TC_REG20_VFLIP)?;
         self.status.colorbar =
             check_reg_mask(bus, self.slv_addr, PRE_ISP_TEST_SETTING_1, TEST_COLOR_BAR)?;
-        self.status.bpc = check_reg_mask(bus, self.slv_addr, 0x5000, 0x04)?;
-        self.status.wpc = check_reg_mask(bus, self.slv_addr, 0x5000, 0x02)?;
-        self.status.raw_gma = check_reg_mask(bus, self.slv_addr, 0x5000, 0x20)?;
-        self.status.lenc = check_reg_mask(bus, self.slv_addr, 0x5000, 0x80)?;
+        self.status.bpc = false;
+        self.status.wpc = false;
+        self.status.raw_gma = false;
+        self.status.lenc = false;
         self.status.quality = bus.read_reg16(self.slv_addr, COMPRESSION_CTRL07)? & 0x3F;
         self.status.special_effect = 0;
         self.status.wb_mode = 0;
@@ -936,23 +921,15 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
         Ok(())
     }
 
-    fn set_sharpness(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
-        if !(-3..=3).contains(&level) {
-            return Err(CameraError::InvalidArg);
-        }
-        let mt_offset_2 = ((level + 3) * 8) as u8;
-        let mt_offset_1 = mt_offset_2.wrapping_add(1);
-        write_reg_bits(bus, self.slv_addr, 0x5308, 0x40, false)?;
-        bus.write_reg16(self.slv_addr, 0x5300, 0x10)?;
-        bus.write_reg16(self.slv_addr, 0x5301, 0x10)?;
-        bus.write_reg16(self.slv_addr, 0x5302, mt_offset_1)?;
-        bus.write_reg16(self.slv_addr, 0x5303, mt_offset_2)?;
-        bus.write_reg16(self.slv_addr, 0x5309, 0x10)?;
-        bus.write_reg16(self.slv_addr, 0x530A, 0x10)?;
-        bus.write_reg16(self.slv_addr, 0x530B, 0x04)?;
-        bus.write_reg16(self.slv_addr, 0x530C, 0x06)?;
-        self.status.sharpness = level as i8;
-        Ok(())
+    /// Always returns [`CameraError::NotSupported`].
+    ///
+    /// This programmed 0x5300..=0x530C and 0x5308, the OV5640 ISP sharpness
+    /// block verbatim, on a Novatek part — and `init_status` read sharpness
+    /// back from 0x3301, so the write and read paths could not both be
+    /// right. Refuses until a verified NT99141 sharpness register is ported.
+    /// See the module documentation.
+    fn set_sharpness(&mut self, _bus: &mut B, _level: i32) -> Result<(), CameraError> {
+        Err(CameraError::NotSupported)
     }
 
     fn set_quality(&mut self, bus: &mut B, quality: i32) -> Result<(), CameraError> {

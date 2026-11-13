@@ -1,7 +1,7 @@
 //! Per-driver correctness tests and the shared 18-driver conformance suite
 //! for `WP-23` (non-Ov2640 sensor driver correctness).
 
-use esp32_cam_sccb::MockSccbBus;
+use esp32_cam_sccb::{MockSccbBus, SccbTransaction};
 use esp32_cam_sensors::bf20a6::Bf20a6;
 use esp32_cam_sensors::bf3005::Bf3005;
 use esp32_cam_sensors::gc0308::Gc0308;
@@ -1021,4 +1021,51 @@ fn test_sens23_masked_reg16_rejects_bad_arguments() {
         esp32_cam_sensors::write_masked_reg16(&mut bus, 0x30, -1, 0xFF, 0),
         Err(CameraError::InvalidArg)
     );
+}
+
+// ---------------------------------------------------------------------------
+// NT99141: OV5640 registers in a Novatek driver (found in review, not in the
+// work order)
+// ---------------------------------------------------------------------------
+
+/// `set_sharpness` programmed 0x5300..=0x530C and 0x5308 — the OV5640 ISP
+/// sharpness block, verbatim — on a Novatek part, and returned `Ok`.
+/// `init_status` read sharpness back from 0x3301, a different register
+/// entirely, so the write path and the read path could not both be right.
+#[test]
+fn test_nt99141_sharpness_refuses_rather_than_writing_ov5640_registers() {
+    let mut bus: MockSccbBus<256> = MockSccbBus::new();
+    let mut sensor = Nt99141::new();
+
+    assert_eq!(
+        sensor.set_sharpness(&mut bus, 1),
+        Err(CameraError::NotSupported)
+    );
+    assert_eq!(
+        bus.transaction_count(),
+        0,
+        "a refusing setter must not touch the bus"
+    );
+}
+
+/// `init_status` reported denoise, dcw, bpc, wpc, raw_gma and lenc from
+/// 0x5306, 0x5183 and 0x5000 — OV5640 ISP addresses outside anything else
+/// this driver touches. Those controls are already `NotSupported` here
+/// (SENS-13 removed the no-op setters), so reading back state for them was
+/// reporting a value nobody could set, from registers the part does not have.
+#[test]
+fn test_nt99141_init_status_reads_no_ov5640_isp_registers() {
+    let mut bus: MockSccbBus<256> = MockSccbBus::new();
+    let mut sensor = Nt99141::new();
+
+    assert_eq!(sensor.init_status(&mut bus), Ok(()));
+
+    for tx in bus.transactions() {
+        if let SccbTransaction::Read16 { reg, .. } | SccbTransaction::Write16 { reg, .. } = *tx {
+            assert!(
+                !(0x5000..=0x5FFF).contains(&reg),
+                "init_status touched {reg:#06x}, an OV5640 ISP register"
+            );
+        }
+    }
 }
