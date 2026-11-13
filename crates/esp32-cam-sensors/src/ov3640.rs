@@ -106,7 +106,11 @@ pub const REG_DLY: u16 = 0xFFFF;
 /// Aspect ratio window table matching `ratio_table[]` in `ov3640_settings.h`.
 pub const RATIO_TABLE: [RatioSettings; 9] = crate::ov3660::RATIO_TABLE;
 
-pub const SENSOR_DEFAULT_REGS: [Reg16; 113] = [
+/// SENS-22: `static`, not `const`. A `const` array of this size is a value
+/// that each use site may materialise its own copy of; a `static` is one
+/// read-only allocation. (The slice-typed tables elsewhere in this crate
+/// are `const &[_]`, which already points at a single promoted static.)
+pub static SENSOR_DEFAULT_REGS: [Reg16; 113] = [
     Reg16::new(SYSTEM_CTROL0, 0x82),
     Reg16::new(REG_DLY, 10),
     Reg16::new(0x3012, 0x80),

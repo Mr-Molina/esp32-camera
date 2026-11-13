@@ -3,10 +3,42 @@
 use esp32_cam_sccb::SccbBus;
 use esp32_cam_types::{CameraError, CameraModel, CameraSccbAddr, SensorId};
 
-use crate::{
-    bf20a6, bf3005, gc0308, gc032a, gc2145, hm0360, hm1055, mega_ccm, nt99141, ov2640, ov3640,
-    ov3660, ov5640, ov7670, ov7725, sc030iot, sc031gs, sc101iot,
-};
+#[cfg(feature = "bf20a6")]
+use crate::bf20a6;
+#[cfg(feature = "bf3005")]
+use crate::bf3005;
+#[cfg(feature = "gc0308")]
+use crate::gc0308;
+#[cfg(feature = "gc032a")]
+use crate::gc032a;
+#[cfg(feature = "gc2145")]
+use crate::gc2145;
+#[cfg(feature = "hm0360")]
+use crate::hm0360;
+#[cfg(feature = "hm1055")]
+use crate::hm1055;
+#[cfg(feature = "mega_ccm")]
+use crate::mega_ccm;
+#[cfg(feature = "nt99141")]
+use crate::nt99141;
+#[cfg(feature = "ov2640")]
+use crate::ov2640;
+#[cfg(feature = "ov3640")]
+use crate::ov3640;
+#[cfg(feature = "ov3660")]
+use crate::ov3660;
+#[cfg(feature = "ov5640")]
+use crate::ov5640;
+#[cfg(feature = "ov7670")]
+use crate::ov7670;
+#[cfg(feature = "ov7725")]
+use crate::ov7725;
+#[cfg(feature = "sc030iot")]
+use crate::sc030iot;
+#[cfg(feature = "sc031gs")]
+use crate::sc031gs;
+#[cfg(feature = "sc101iot")]
+use crate::sc101iot;
 
 /// Automatically detects an attached camera sensor by querying each of
 /// the 18 supported sensor models at their canonical SCCB addresses in order.
@@ -50,60 +82,70 @@ pub fn detect_sensor<B: SccbBus>(bus: &mut B) -> Result<(CameraModel, u8, Sensor
 
     // --- 8-bit register addressing ---
     // Ov7725 (0x21)
+    #[cfg(feature = "ov7725")]
     probe!(
         ov7725::Ov7725::detect(bus, CameraSccbAddr::OV7725),
         CameraModel::Ov7725,
         CameraSccbAddr::OV7725
     );
     // Sc101Iot (0x68)
+    #[cfg(feature = "sc101iot")]
     probe!(
         sc101iot::Sc101Iot::detect(bus, CameraSccbAddr::SC101IOT),
         CameraModel::Sc101Iot,
         CameraSccbAddr::SC101IOT
     );
     // Sc030Iot (0x68)
+    #[cfg(feature = "sc030iot")]
     probe!(
         sc030iot::Sc030Iot::detect(bus, CameraSccbAddr::SC030IOT),
         CameraModel::Sc030Iot,
         CameraSccbAddr::SC030IOT
     );
     // Ov2640 (0x30) — before Sc031Gs, which shares the address
+    #[cfg(feature = "ov2640")]
     probe!(
         ov2640::Ov2640::detect(bus, CameraSccbAddr::OV2640),
         CameraModel::Ov2640,
         CameraSccbAddr::OV2640
     );
     // Ov7670 (0x21)
+    #[cfg(feature = "ov7670")]
     probe!(
         ov7670::Ov7670::detect(bus, CameraSccbAddr::OV7670),
         CameraModel::Ov7670,
         CameraSccbAddr::OV7670
     );
     // Gc2145 (0x3C) — before the Ov3660/Ov3640/Ov5640 trio at the same address
+    #[cfg(feature = "gc2145")]
     probe!(
         gc2145::Gc2145::detect(bus, CameraSccbAddr::GC2145),
         CameraModel::Gc2145,
         CameraSccbAddr::GC2145
     );
     // Gc032a (0x21)
+    #[cfg(feature = "gc032a")]
     probe!(
         gc032a::Gc032a::detect(bus, CameraSccbAddr::GC032A),
         CameraModel::Gc032a,
         CameraSccbAddr::GC032A
     );
     // Gc0308 (0x21)
+    #[cfg(feature = "gc0308")]
     probe!(
         gc0308::Gc0308::detect(bus, CameraSccbAddr::GC0308),
         CameraModel::Gc0308,
         CameraSccbAddr::GC0308
     );
     // Bf3005 (0x6E)
+    #[cfg(feature = "bf3005")]
     probe!(
         bf3005::Bf3005::detect(bus, CameraSccbAddr::BF3005),
         CameraModel::Bf3005,
         CameraSccbAddr::BF3005
     );
     // Bf20a6 (0x6E)
+    #[cfg(feature = "bf20a6")]
     probe!(
         bf20a6::Bf20a6::detect(bus, CameraSccbAddr::BF20A6),
         CameraModel::Bf20a6,
@@ -112,48 +154,56 @@ pub fn detect_sensor<B: SccbBus>(bus: &mut B) -> Result<(CameraModel, u8, Sensor
 
     // --- 16-bit register addressing ---
     // Sc031Gs (0x30)
+    #[cfg(feature = "sc031gs")]
     probe!(
         sc031gs::Sc031Gs::detect(bus, CameraSccbAddr::SC031GS),
         CameraModel::Sc031Gs,
         CameraSccbAddr::SC031GS
     );
     // Ov3660 (0x3C)
+    #[cfg(feature = "ov3660")]
     probe!(
         ov3660::Ov3660::detect(bus, CameraSccbAddr::OV3660),
         CameraModel::Ov3660,
         CameraSccbAddr::OV3660
     );
     // Ov3640 (0x3C)
+    #[cfg(feature = "ov3640")]
     probe!(
         ov3640::Ov3640::detect(bus, CameraSccbAddr::OV3640),
         CameraModel::Ov3640,
         CameraSccbAddr::OV3640
     );
     // Ov5640 (0x3C)
+    #[cfg(feature = "ov5640")]
     probe!(
         ov5640::Ov5640::detect(bus, CameraSccbAddr::OV5640),
         CameraModel::Ov5640,
         CameraSccbAddr::OV5640
     );
     // Nt99141 (0x2A)
+    #[cfg(feature = "nt99141")]
     probe!(
         nt99141::Nt99141::detect(bus, CameraSccbAddr::NT99141),
         CameraModel::Nt99141,
         CameraSccbAddr::NT99141
     );
     // MegaCcm (0x1F)
+    #[cfg(feature = "mega_ccm")]
     probe!(
         mega_ccm::MegaCcm::detect(bus, CameraSccbAddr::MEGA_CCM),
         CameraModel::MegaCcm,
         CameraSccbAddr::MEGA_CCM
     );
     // Hm1055 (0x24)
+    #[cfg(feature = "hm1055")]
     probe!(
         hm1055::Hm1055::detect(bus, CameraSccbAddr::HM1055),
         CameraModel::Hm1055,
         CameraSccbAddr::HM1055
     );
     // Hm0360 (0x12)
+    #[cfg(feature = "hm0360")]
     probe!(
         hm0360::Hm0360::detect(bus, CameraSccbAddr::HM0360),
         CameraModel::Hm0360,

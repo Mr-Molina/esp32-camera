@@ -20,7 +20,7 @@ use esp32_cam_sensors::ov7725::{self, Ov7725};
 use esp32_cam_sensors::sc030iot::Sc030Iot;
 use esp32_cam_sensors::sc031gs::Sc031Gs;
 use esp32_cam_sensors::sc101iot::Sc101Iot;
-use esp32_cam_sensors::{CameraSensor, Reg16};
+use esp32_cam_sensors::{CameraSensor, Reg16, Reg8};
 use esp32_cam_types::{
     CameraError, CameraSccbAddr, FrameSize, GainCeiling, PixelFormat, ALL_FRAMESIZES,
 };
@@ -428,7 +428,14 @@ fn test_sens14_bf3005_keeps_its_declared_range() {
 /// `0x0000`, so a legitimate write to register 0 ended it. Either way the
 /// rest of the table was dropped without an error. Slices carry their own
 /// length, so the sentinel is gone.
-macro_rules! table_writer_cases {
+///
+/// The drivers split into two groups. Gc2145, Gc032a and Bf20a6 address
+/// 8-bit registers, so SENS-22 moved their tables to [`Reg8`]; they have no
+/// delay sentinel at all, because an in-band marker in a `u8` register space
+/// would have to collide with a real register. The rest keep `Reg16` tables
+/// and treat `REG_DLY` (0xFFFF, outside their 16-bit register use) as a
+/// delay.
+macro_rules! reg16_writer_cases {
     ($($name:ident => $writer:path;)*) => {
         $(
             #[test]
@@ -460,13 +467,49 @@ macro_rules! table_writer_cases {
     };
 }
 
-table_writer_cases! {
-    test_sens18_bf20a6_writes_every_entry  => esp32_cam_sensors::bf20a6::write_reg_list;
+macro_rules! reg8_writer_cases {
+    ($($name:ident => $writer:path;)*) => {
+        $(
+            #[test]
+            fn $name() {
+                let mut bus: MockSccbBus<64> = MockSccbBus::new();
+                let table = [
+                    Reg8::new(0x12, 0xAA),
+                    // A real write to register 0: the old 0x0000 sentinel.
+                    Reg8::new(0x00, 0xBB),
+                    // 0xFF is an ordinary register here, not a marker.
+                    Reg8::new(0xFF, 0x05),
+                    Reg8::new(0x34, 0xCC),
+                ];
+
+                assert_eq!($writer(&mut bus, 0x30, &table), Ok(()));
+
+                assert_eq!(
+                    bus.transaction_count(),
+                    table.len(),
+                    "every entry of the table must reach the bus"
+                );
+                assert_eq!(
+                    bus.total_delay_ms(),
+                    0,
+                    "a Reg8 table has no delay sentinel; 0xFF is a register"
+                );
+                assert_eq!(bus.reg8(0x30, 0xFF), 0x05);
+            }
+        )*
+    };
+}
+
+reg16_writer_cases! {
     test_sens18_hm1055_writes_every_entry  => esp32_cam_sensors::hm1055::write_reg_list;
-    test_sens18_gc032a_writes_every_entry  => esp32_cam_sensors::gc032a::write_reg_list;
-    test_sens18_gc2145_writes_every_entry  => esp32_cam_sensors::gc2145::write_reg_list;
     test_sens18_hm0360_writes_every_entry  => esp32_cam_sensors::hm0360::write_reg_list;
     test_sens18_nt99141_writes_every_entry => esp32_cam_sensors::nt99141::write_reg_list;
+}
+
+reg8_writer_cases! {
+    test_sens18_bf20a6_writes_every_entry => esp32_cam_sensors::bf20a6::write_reg_list;
+    test_sens18_gc032a_writes_every_entry => esp32_cam_sensors::gc032a::write_reg_list;
+    test_sens18_gc2145_writes_every_entry => esp32_cam_sensors::gc2145::write_reg_list;
 }
 
 // ---------------------------------------------------------------------------

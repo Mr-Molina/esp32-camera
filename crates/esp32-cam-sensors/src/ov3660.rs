@@ -182,7 +182,11 @@ pub const RATIO_TABLE: [RatioSettings; 9] = [
     }, // 9x16
 ];
 
-pub const SENSOR_DEFAULT_REGS: [Reg16; 198] = [
+/// SENS-22: `static`, not `const`. A `const` array of this size is a value
+/// that each use site may materialise its own copy of; a `static` is one
+/// read-only allocation. (The slice-typed tables elsewhere in this crate
+/// are `const &[_]`, which already points at a single promoted static.)
+pub static SENSOR_DEFAULT_REGS: [Reg16; 198] = [
     Reg16::new(SYSTEM_CTROL0, 0x82),
     Reg16::new(REG_DLY, 10),
     Reg16::new(0x3103, 0x13),

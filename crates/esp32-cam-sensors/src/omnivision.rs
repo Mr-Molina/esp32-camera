@@ -4,11 +4,17 @@
 //! Exposes all 6 OmniVision drivers (`OV2640`, `OV3660`, `OV3640`,
 //! `OV5640` + `OV5640-AF`, `OV7725`, and `OV7670`).
 
+#[cfg(feature = "ov2640")]
 pub use crate::ov2640::{self, Ov2640, Ov2640Bank};
+#[cfg(feature = "ov3640")]
 pub use crate::ov3640::{self, Ov3640};
+#[cfg(feature = "ov3660")]
 pub use crate::ov3660::{self, Ov3660};
+#[cfg(feature = "ov5640")]
 pub use crate::ov5640::{self, Ov5640, Ov5640Af, Ov5640AfStatus};
+#[cfg(feature = "ov7670")]
 pub use crate::ov7670::{self, Ov7670};
+#[cfg(feature = "ov7725")]
 pub use crate::ov7725::{self, Ov7725};
 
 #[cfg(test)]

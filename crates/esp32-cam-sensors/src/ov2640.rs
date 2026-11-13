@@ -286,7 +286,11 @@ pub const RATIO_TABLE: [Ov2640RatioSettings; 9] = [
     }, // 9x16
 ];
 
-pub const OV2640_SETTINGS_CIF: [Reg8; 157] = [
+/// SENS-22: `static`, not `const`. A `const` array of this size is a value
+/// that each use site may materialise its own copy of; a `static` is one
+/// read-only allocation. (The slice-typed tables elsewhere in this crate
+/// are `const &[_]`, which already points at a single promoted static.)
+pub static OV2640_SETTINGS_CIF: [Reg8; 157] = [
     Reg8::new(BANK_SEL, Ov2640Bank::Dsp as u8),
     Reg8::new(0x2c, 0xff),
     Reg8::new(0x2e, 0xdf),
