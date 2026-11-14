@@ -19,10 +19,17 @@ jobs:
         with:
           python-version: "3.x"
 
+      # The cargo-fmt hook runs under rust-toolchain.toml, which pins 1.99.1
+      # with rustfmt and clippy. Installing only "stable + rustfmt" here left
+      # rustup to auto-install the pinned toolchain mid-hook, and on some
+      # runner images that fails with "detected conflict: 'bin/cargo-clippy'".
+      # Install exactly what the pin asks for, as the host job does, so there
+      # is nothing left for rustup to fetch when the hook runs.
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
-          components: rustfmt
+          toolchain: "1.99.1"
+          components: rustfmt, clippy
 
       - name: Install pre-commit
         run: pip install pre-commit

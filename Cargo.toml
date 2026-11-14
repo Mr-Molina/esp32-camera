@@ -26,7 +26,10 @@ undocumented_unsafe_blocks = "warn"
 [workspace.dependencies]
 esp32-cam-types = { path = "crates/esp32-cam-types" }
 esp32-cam-sccb = { path = "crates/esp32-cam-sccb" }
-esp32-cam-sensors = { path = "crates/esp32-cam-sensors" }
+# SENS-22: no drivers by default. A member names the sensors it needs
+# (`features = ["ov2640"]`); cargo ignores a member's
+# `default-features = false` unless the workspace entry sets it too.
+esp32-cam-sensors = { path = "crates/esp32-cam-sensors", default-features = false }
 esp32-cam-conversions = { path = "crates/esp32-cam-conversions" }
 esp32-cam-ll = { path = "crates/esp32-cam-ll" }
 esp32-cam-hal = { path = "crates/esp32-cam-hal" }

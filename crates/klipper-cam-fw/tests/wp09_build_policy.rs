@@ -130,3 +130,46 @@ fn default_token_copy_matches_firmware() {
         klipper_cam_fw::DEFAULT_OTA_TOKEN
     );
 }
+
+/// The CI xtensa job supplies placeholder credentials so this gate lets the
+/// size-gate build through. Read them out of the workflow file itself, so
+/// the workflow and the policy cannot drift apart without this failing.
+#[test]
+fn ci_placeholder_secrets_satisfy_the_release_gate() {
+    const WORKFLOW: &str = include_str!("../../../.github/workflows/rust.yml");
+
+    let value_of = |key: &str| -> String {
+        WORKFLOW
+            .lines()
+            .map(str::trim)
+            .find_map(|line| {
+                line.strip_prefix(key)
+                    .and_then(|rest| rest.strip_prefix(':'))
+            })
+            .map(|v| v.trim().to_string())
+            .unwrap_or_else(|| panic!("{key} is not set in .github/workflows/rust.yml"))
+    };
+    let pass = value_of("WIFI_PASS");
+    let token = value_of("WIFI_OTA_TOKEN");
+
+    assert_ne!(
+        token,
+        build_script::DEFAULT_OTA_TOKEN,
+        "CI must not use the public default token"
+    );
+    assert!(
+        (8..=63).contains(&pass.len()),
+        "CI WIFI_PASS must satisfy the WPA2-PSK length rule"
+    );
+
+    let pairs = [
+        ("WIFI_PASS", pass.as_str()),
+        ("WIFI_OTA_TOKEN", token.as_str()),
+    ];
+    let ci = env_of(&pairs);
+    assert_eq!(
+        check_release_secrets("xtensa", "release", false, &ci),
+        Ok(()),
+        "the xtensa CI job's placeholders must pass the gate"
+    );
+}

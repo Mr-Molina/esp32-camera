@@ -63,7 +63,6 @@ pub const WIN_MODE: u16 = 0x3030;
 pub const PAD_REGISTER_07: u16 = 0x3112;
 
 pub const REG_DLY: u16 = 0xFFFF;
-pub const REGLIST_TAIL: u16 = 0x0000;
 
 pub const SENSOR_DEFAULT_REGS: &[Reg16] = &[
     Reg16::new(0x0103, 0x00),
@@ -601,26 +600,31 @@ fn check_reg_mask<B: SccbBus>(
     reg: u16,
     mask: u8,
 ) -> Result<bool, CameraError> {
-    let val = bus.read_reg16(slv_addr, reg)?;
-    Ok((val & mask) == mask)
+    crate::check_reg_mask16(bus, slv_addr, reg, mask)
 }
 
-fn write_reg_list<B: SccbBus>(
+/// Writes every entry of `regs` in order, treating an entry whose
+/// register is [`REG_DLY`] as a millisecond delay.
+///
+/// SENS-18: there is no end-of-table marker. The sentinel here used to be
+/// 0x0000, so a legitimate write to register 0 ended the table early and
+/// silently dropped the rest. The slice carries its own length, so no
+/// sentinel is needed.
+/// Writes every entry of `regs` in order, treating an entry whose register is
+/// [`crate::REG_DLY`] as a millisecond delay.
+///
+/// SENS-18: no end-of-table marker — the slice carries its own length.
+/// SENS-23: the body is shared with the other 16-bit-addressed drivers.
+///
+/// # Errors
+///
+/// Any error reported by the bus.
+pub fn write_reg_list<B: SccbBus>(
     bus: &mut B,
     slv_addr: u8,
     regs: &[Reg16],
 ) -> Result<(), CameraError> {
-    for entry in regs {
-        if entry.reg == REGLIST_TAIL {
-            break;
-        }
-        if entry.reg == REG_DLY {
-            bus.delay_ms(entry.val as u32);
-        } else {
-            bus.write_reg16(slv_addr, entry.reg, entry.val)?;
-        }
-    }
-    Ok(())
+    crate::write_table16(bus, slv_addr, regs)
 }
 
 /// Detects an HM0360 sensor at `slv_addr` (`0x12` or `0x24`).
@@ -815,10 +819,21 @@ impl<B: SccbBus> CameraSensor<B> for Hm0360 {
     }
 
     fn set_framesize(&mut self, bus: &mut B, framesize: FrameSize) -> Result<(), CameraError> {
-        if framesize > FrameSize::Vga {
-            return Err(CameraError::FailedToSetFrameSize);
-        }
-        self.status.framesize = framesize;
+        // SENS-10: only these four sizes have register tables. A catch-all
+        // arm used to accept every other size below VGA, return `Ok` and
+        // leave the sensor wherever `SENSOR_DEFAULT_REGS` had put it.
+        //
+        // SENS-24: `status` is updated only after the writes succeed.
+        // SENS-15 asks for only the framesize delta to be written here, to
+        // save this table's ~100 ms of delays. It is not safe as stated: the
+        // QVGA/QQVGA tables (57 registers) and the VGA/240x240 tables (18)
+        // are disjoint, so this rewrite is the only thing that undoes the
+        // previous size's registers. 57 of them exist nowhere else.
+        // `test_sens15_hm0360_default_table_is_load_bearing` pins that.
+        // Note the converse gap is already broken: the 18 VGA/240x240
+        // registers are absent from this table, so VGA -> QVGA strands them
+        // today. Fixing either direction needs each register's reset value,
+        // which means the datasheet or the upstream C driver.
         write_reg_list(bus, self.slv_addr, SENSOR_DEFAULT_REGS)?;
         match framesize {
             FrameSize::Qqvga => {
@@ -829,15 +844,24 @@ impl<B: SccbBus> CameraSensor<B> for Hm0360 {
                 write_reg_list(bus, self.slv_addr, SENSOR_FRAMESIZE_QVGA)?;
                 set_reg_bits(bus, self.slv_addr, PMU_CFG_3, 0, 0x01, 1)?;
             }
+            FrameSize::Size240x240 => {
+                write_reg_list(bus, self.slv_addr, SENSOR_FRAMESIZE_240X240)?;
+                // Unverified: QQVGA and QVGA are sub-sampled readouts and set
+                // this bit, VGA is full readout and clears it. 240x240 is a
+                // window crop (it programs the 0x05Ex crop block, not the
+                // 0x355x sub-sample block), so it is grouped with VGA here.
+                // Confirm against an HM0360 on hardware.
+                set_reg_bits(bus, self.slv_addr, PMU_CFG_3, 0, 0x01, 0)?;
+            }
             FrameSize::Vga => {
                 set_reg_bits(bus, self.slv_addr, PMU_CFG_3, 0, 0x01, 0)?;
             }
-            _ => {
-                set_reg_bits(bus, self.slv_addr, PMU_CFG_3, 0, 0x01, 0)?;
-            }
+            _ => return Err(CameraError::FailedToSetFrameSize),
         }
         self.set_pll(bus, 0, 0, 0, 0, 0, 0, 0, 0)?;
-        bus.write_reg16(self.slv_addr, COMMAND_UPDATE, 0x01)
+        bus.write_reg16(self.slv_addr, COMMAND_UPDATE, 0x01)?;
+        self.status.framesize = framesize;
+        Ok(())
     }
 
     fn set_brightness(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
@@ -887,48 +911,11 @@ impl<B: SccbBus> CameraSensor<B> for Hm0360 {
     }
 
     fn get_reg(&mut self, bus: &mut B, reg: i32, mask: i32) -> Result<i32, CameraError> {
-        if !(0..=0xFFFF).contains(&reg) || mask < 0 {
-            return Err(CameraError::InvalidArg);
-        }
-        let reg16 = reg as u16;
-        let val = if mask > 0xFF {
-            let mut v = bus.read_reg16_val16(self.slv_addr, reg16)? as i32;
-            if mask > 0xFFFF {
-                let v2 = bus.read_reg16(self.slv_addr, reg16.wrapping_add(2))? as i32;
-                v = (v << 8) | v2;
-            }
-            v
-        } else {
-            bus.read_reg16(self.slv_addr, reg16)? as i32
-        };
-        Ok(val & mask)
+        crate::read_masked_reg16(bus, self.slv_addr, reg, mask)
     }
 
     fn set_reg(&mut self, bus: &mut B, reg: i32, mask: i32, value: i32) -> Result<(), CameraError> {
-        if !(0..=0xFFFF).contains(&reg) || mask < 0 {
-            return Err(CameraError::InvalidArg);
-        }
-        let reg16 = reg as u16;
-        let current = if mask > 0xFF {
-            let mut v = bus.read_reg16_val16(self.slv_addr, reg16)? as i32;
-            if mask > 0xFFFF {
-                let v2 = bus.read_reg16(self.slv_addr, reg16.wrapping_add(2))? as i32;
-                v = (v << 8) | v2;
-            }
-            v
-        } else {
-            bus.read_reg16(self.slv_addr, reg16)? as i32
-        };
-
-        let next = (current & !mask) | (value & mask);
-        if mask > 0xFFFF {
-            bus.write_reg16_val16(self.slv_addr, reg16, ((next >> 8) & 0xFFFF) as u16)?;
-            bus.write_reg16(self.slv_addr, reg16.wrapping_add(2), (next & 0xFF) as u8)
-        } else if mask > 0xFF {
-            bus.write_reg16_val16(self.slv_addr, reg16, (next & 0xFFFF) as u16)
-        } else {
-            bus.write_reg16(self.slv_addr, reg16, (next & 0xFF) as u8)
-        }
+        crate::write_masked_reg16(bus, self.slv_addr, reg, mask, value)
     }
 
     fn set_pll(

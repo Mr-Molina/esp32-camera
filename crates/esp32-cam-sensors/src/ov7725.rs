@@ -445,13 +445,20 @@ impl<B: SccbBus> CameraSensor<B> for Ov7725 {
     }
 
     fn set_pixformat(&mut self, bus: &mut B, pixformat: PixelFormat) -> Result<(), CameraError> {
+        // SENS-25: the two arms used to mask the format constants with
+        // different values (`& 0x0C` and `& 0x03`) before OR-ing them in.
+        // Both masks were no-ops — COM7_FMT_RGB565 is 0x04 and COM7_FMT_YUV
+        // is 0x00 — so this is a readability fix, not a behaviour change.
+        // The format field is bits [2:1]; `& 0xF0` clears it along with the
+        // rest of the low nibble and leaves COM7_RES_QVGA (0x40, bit 6)
+        // alone, so changing pixel format does not disturb the resolution.
         let mut reg = bus.read_reg8(self.slv_addr, COM7)?;
         match pixformat {
             PixelFormat::Rgb565 => {
-                reg = (reg & 0xF0) | (COM7_FMT_RGB565 & 0x0C) | COM7_FMT_RGB;
+                reg = (reg & 0xF0) | COM7_FMT_RGB565 | COM7_FMT_RGB;
             }
             PixelFormat::Yuv422 | PixelFormat::Grayscale => {
-                reg = (reg & 0xF0) | (COM7_FMT_YUV & 0x03);
+                reg = (reg & 0xF0) | COM7_FMT_YUV;
             }
             _ => return Err(CameraError::NotSupported),
         }
@@ -463,7 +470,7 @@ impl<B: SccbBus> CameraSensor<B> for Ov7725 {
 
     fn set_framesize(&mut self, bus: &mut B, framesize: FrameSize) -> Result<(), CameraError> {
         if (framesize as u8) > (FrameSize::Vga as u8) {
-            return Err(CameraError::InvalidArg);
+            return Err(CameraError::FailedToSetFrameSize);
         }
         let res = framesize.resolution();
         let w = res.width;
@@ -482,7 +489,12 @@ impl<B: SccbBus> CameraSensor<B> for Ov7725 {
             ((w & 0x03) as u8) | (((h & 0x01) as u8) << 2),
         )?;
 
-        if !(w > 320 || h > 240) {
+        // SENS-25: the QVGA/VGA split. Written as `!(w > 320 || h > 240)`,
+        // which is `w <= 320 && h <= 240`. Flagged in review as a possible
+        // deviation from the upstream C driver's threshold; that driver is
+        // not in this repo, so the condition is left as it stands and only
+        // restated here. Confirming it needs `ov7725.c`.
+        if w <= 320 && h <= 240 {
             bus.write_reg8(self.slv_addr, DSPAUTO, 0xFF)?;
             bus.write_reg8(self.slv_addr, HSTART, 0x3F)?;
             bus.write_reg8(self.slv_addr, VSTART, 0x03)?;
@@ -504,12 +516,22 @@ impl<B: SccbBus> CameraSensor<B> for Ov7725 {
     }
 
     fn set_contrast(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
+        // SENS-14: bounded to the signed range that survives the cast
+        // below, so an out-of-range level is refused rather than truncated
+        // into an unrelated setting. This is wider than the levels the
+        // sensor actually accepts and narrower than the register's 0..=255,
+        // because the true range has not been confirmed against the upstream
+        // C driver; a caller passing 0x80..=0xFF as an unsigned byte is now
+        // refused where it previously wrote through.
+        let level = crate::level_in(level, i8::MIN as i32, i8::MAX as i32)?;
         bus.write_reg8(self.slv_addr, CONTRAST, (level & 0xFF) as u8)?;
         self.status.contrast = level as i8;
         Ok(())
     }
 
     fn set_brightness(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
+        // SENS-14: see `set_contrast`.
+        let level = crate::level_in(level, i8::MIN as i32, i8::MAX as i32)?;
         bus.write_reg8(self.slv_addr, BRIGHTNESS, (level & 0xFF) as u8)?;
         self.status.brightness = level as i8;
         Ok(())

@@ -116,6 +116,165 @@ pub fn write_regs16<B: SccbBus>(
     Ok(())
 }
 
+/// Register value that marks a millisecond delay rather than a write, in the
+/// `Reg16` tables of drivers whose registers are 16-bit addressed.
+///
+/// Safe as an in-band marker only because no driver using it addresses
+/// register 0xFFFF. The 8-bit-addressed drivers have no equivalent and must
+/// not grow one — see SENS-18.
+pub const REG_DLY: u16 = 0xFFFF;
+
+/// Reads a 16-bit-addressed register under `mask`, widening to two or three
+/// bytes as the mask requires (SENS-23).
+///
+/// Shared by the OV3640, OV3660, OV5640, HM1055 and HM0360 drivers, which
+/// each carried a byte-identical copy. `mask > 0xFF` reads a 16-bit value,
+/// `mask > 0xFFFF` reads a further byte from `reg + 2` and packs it in.
+///
+/// # Errors
+///
+/// [`CameraError::InvalidArg`] if `reg` is outside `0..=0xFFFF` or `mask` is
+/// negative, else any error from the bus.
+pub fn read_masked_reg16<B: SccbBus>(
+    bus: &mut B,
+    slv_addr: u8,
+    reg: i32,
+    mask: i32,
+) -> Result<i32, CameraError> {
+    Ok(read_wide_reg16(bus, slv_addr, reg, mask)? & mask)
+}
+
+/// Reads the current value `read_masked_reg16` and `write_masked_reg16` work
+/// from, before masking.
+fn read_wide_reg16<B: SccbBus>(
+    bus: &mut B,
+    slv_addr: u8,
+    reg: i32,
+    mask: i32,
+) -> Result<i32, CameraError> {
+    if !(0..=0xFFFF).contains(&reg) || mask < 0 {
+        return Err(CameraError::InvalidArg);
+    }
+    let addr = reg as u16;
+    if mask > 0xFF {
+        let hi = i32::from(bus.read_reg16_val16(slv_addr, addr)?);
+        if mask > 0xFFFF {
+            let lo = i32::from(bus.read_reg16(slv_addr, addr.wrapping_add(2))?);
+            Ok((hi << 8) | lo)
+        } else {
+            Ok(hi)
+        }
+    } else {
+        Ok(i32::from(bus.read_reg16(slv_addr, addr)?))
+    }
+}
+
+/// Read-modify-writes a 16-bit-addressed register under `mask`, widening as
+/// the mask requires (SENS-23).
+///
+/// The counterpart to [`read_masked_reg16`], and shared by the same drivers.
+///
+/// # Errors
+///
+/// [`CameraError::InvalidArg`] if `reg` is outside `0..=0xFFFF` or `mask` is
+/// negative, else any error from the bus.
+pub fn write_masked_reg16<B: SccbBus>(
+    bus: &mut B,
+    slv_addr: u8,
+    reg: i32,
+    mask: i32,
+    value: i32,
+) -> Result<(), CameraError> {
+    let current = read_wide_reg16(bus, slv_addr, reg, mask)?;
+    let addr = reg as u16;
+    let next = (current & !mask) | (value & mask);
+    if mask > 0xFFFF {
+        bus.write_reg16_val16(slv_addr, addr, ((next >> 8) & 0xFFFF) as u16)?;
+        bus.write_reg16(slv_addr, addr.wrapping_add(2), (next & 0xFF) as u8)
+    } else if mask > 0xFF {
+        bus.write_reg16_val16(slv_addr, addr, (next & 0xFFFF) as u16)
+    } else {
+        bus.write_reg16(slv_addr, addr, (next & 0xFF) as u8)
+    }
+}
+
+/// Writes every entry of a 16-bit-addressed register table in order, treating
+/// an entry whose register is [`REG_DLY`] as a millisecond delay (SENS-23).
+///
+/// There is no end-of-table marker: the slice carries its own length. See
+/// SENS-18 for why a tail sentinel was removed.
+///
+/// # Errors
+///
+/// Any error reported by the bus.
+pub fn write_table16<B: SccbBus>(
+    bus: &mut B,
+    slv_addr: u8,
+    regs: &[Reg16],
+) -> Result<(), CameraError> {
+    for entry in regs {
+        if entry.reg == REG_DLY {
+            bus.delay_ms(u32::from(entry.val));
+        } else {
+            bus.write_reg16(slv_addr, entry.reg, entry.val)?;
+        }
+    }
+    Ok(())
+}
+
+/// Sets or clears `mask` in a 16-bit-addressed register (SENS-23).
+///
+/// # Errors
+///
+/// Any error reported by the bus.
+pub fn write_reg_bits16<B: SccbBus>(
+    bus: &mut B,
+    slv_addr: u8,
+    reg: u16,
+    mask: u8,
+    enable: bool,
+) -> Result<(), CameraError> {
+    bus.write_reg16_mask(slv_addr, reg, if enable { mask } else { 0 }, mask)
+}
+
+/// Reports whether every bit of `mask` is set in a 16-bit-addressed register
+/// (SENS-23).
+///
+/// # Errors
+///
+/// Any error reported by the bus.
+pub fn check_reg_mask16<B: SccbBus>(
+    bus: &mut B,
+    slv_addr: u8,
+    reg: u16,
+    mask: u8,
+) -> Result<bool, CameraError> {
+    Ok((bus.read_reg16(slv_addr, reg)? & mask) == mask)
+}
+
+/// Checks that a signed control level lies in `lo..=hi`, returning it
+/// unchanged, or [`CameraError::InvalidArg`] if it does not (SENS-14).
+///
+/// Drivers write these levels into a register with `(level & 0xFF) as u8`.
+/// Without a bound, that silently truncates: a level of 300 reaches the
+/// sensor as 0x2C, an arbitrary setting the caller never asked for and is
+/// never told about, because the firmware discards errors from `/control`
+/// setters. Rejecting the value is the honest answer.
+///
+/// # Note on encoding
+///
+/// This validates the *range* only. Whether a given sensor reads that
+/// register as two's complement (so -2 is 0xFE) or as an index into a
+/// vendor lookup table has not been checked against the upstream C driver
+/// for every part, and differs between them. Where a driver already
+/// declares a narrower range, that range is kept.
+pub fn level_in(level: i32, lo: i32, hi: i32) -> Result<i32, CameraError> {
+    if level < lo || level > hi {
+        return Err(CameraError::InvalidArg);
+    }
+    Ok(level)
+}
+
 /// Modifies selected bits in an 8-bit register using bit offset and bitmask.
 pub fn set_reg_bits8<B: SccbBus>(
     bus: &mut B,
@@ -379,7 +538,19 @@ pub trait CameraSensor<B: SccbBus> {
         Err(CameraError::NotSupported)
     }
 
-    /// Configures external clock frequency (`sensor_t::set_xclk`).
+    /// Records the external clock frequency the host is driving into XCLK,
+    /// in MHz (`sensor_t::set_xclk`).
+    ///
+    /// SENS-13: this is the one setter that legitimately does not reach the
+    /// bus. XCLK is generated by the host SoC, not by the sensor, so a driver
+    /// that implements this only stores the value for its own timing
+    /// arithmetic — PLL and framesize code reads it back. Calling it does
+    /// **not** change the clock; the caller must program the real clock
+    /// source (on ESP32, LEDC or the APLL) itself and then tell the driver
+    /// what it chose.
+    ///
+    /// Drivers that do not need the value leave this returning
+    /// [`CameraError::NotSupported`].
     fn set_xclk(&mut self, _bus: &mut B, _timer: i32, _xclk: i32) -> Result<(), CameraError> {
         Err(CameraError::NotSupported)
     }
