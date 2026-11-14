@@ -2,5 +2,3 @@
 skip = build,*.drawio,*.svg,*.pdf
 ignore-words-list = laf,OT,totalY,ORE,statics
 write-changes = true
-
-
