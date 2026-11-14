@@ -2602,6 +2602,9 @@ mod tests {
     }
 
     #[test]
+    // Exhaustive sweep: minutes to hours under Miri's interpreter, and the
+    // same code path as the representative-input tests that do run there.
+    #[cfg_attr(miri, ignore)]
     fn test_conv02_reciprocal_quant_exhaustive() {
         for qi in 1..=255u32 {
             let qt = compute_quant_table(&[qi as i32; 64], 50);
@@ -2750,6 +2753,9 @@ mod tests {
     }
 
     #[test]
+    // Exhaustive sweep: minutes to hours under Miri's interpreter, and the
+    // same code path as the representative-input tests that do run there.
+    #[cfg_attr(miri, ignore)]
     fn test_conv01_idct_i32_matches_i64_ref() {
         let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut out_i32 = [0u8; 64];

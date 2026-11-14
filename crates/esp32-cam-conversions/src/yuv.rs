@@ -623,6 +623,9 @@ mod tests {
     }
 
     #[test]
+    // Exhaustive sweep: minutes to hours under Miri's interpreter, and the
+    // same code path as the representative-input tests that do run there.
+    #[cfg_attr(miri, ignore)]
     fn test_conv12_yuv_table_size_and_all_24bit_inputs() {
         assert_eq!(
             core::mem::size_of_val(&YUV_V_Y),
@@ -729,6 +732,9 @@ mod tests {
     }
 
     #[test]
+    // Exhaustive sweep: minutes to hours under Miri's interpreter, and the
+    // same code path as the representative-input tests that do run there.
+    #[cfg_attr(miri, ignore)]
     fn test_conv09_yuv_range_and_all_65536_rgb565_roundtrip() {
         assert_eq!(YuvRange::default(), YuvRange::Bt601Limited);
 
