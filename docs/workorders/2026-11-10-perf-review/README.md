@@ -33,7 +33,7 @@ cargo +esp --version
 ```
 
 - **Prints a version:** you can run every gate in §2.4. Continue.
-- **"toolchain 'esp' is not installed":** you are in a cloud session. **Do not try to install it** — the toolchain is distributed only through GitHub releases from other organisations, and cloud sessions can reach only this repository. Every previous agent that tried, failed. (CI *does* have the toolchain and now runs these gates on every push, so a package you cannot gate locally still gets gated when you push.) Instead, work from the "host-only" column in §0.2, and when you finish a package mark it `IN-PROGRESS` with the words *"Xtensa gates NOT run: no esp toolchain in this session"* — never `DONE`, never `READY-FOR-HIL`.
+- **"toolchain 'esp' is not installed":** you are in a cloud session. **Do not try to install it** — the toolchain is distributed only through GitHub releases from other organisations, and cloud sessions can reach only this repository. Every previous agent that tried, failed. (CI *does* have the toolchain and runs these gates on every push — as of `845cfc4` the whole xtensa job is green, through `espflash save-image` and the 0x1B0000 size gate, even without the owner's bootloader — so a package you cannot gate locally still gets gated when you push.) Instead, work from the "host-only" column in §0.2, and when you finish a package mark it `IN-PROGRESS` with the words *"Xtensa gates NOT run: no esp toolchain in this session"* — never `DONE`, never `READY-FOR-HIL`.
 
 Then run the three host gates once, before changing anything, so you know the tree was green when you started:
 
@@ -271,7 +271,7 @@ Status values: `TODO` · `IN-PROGRESS` · `READY-FOR-HIL` · `DONE` · `BLOCKED 
   6. Add `deny.toml` (licenses, bans with `multiple-versions="warn"`, advisories) and a `cargo-deny-action` job. Add `clippy.toml` with `msrv = "1.99"` and `too-many-lines-threshold = 150` as a warning; it becomes enforced after WP-19. Add `CHANGELOG.md`.
 - **Acceptance:** A PR shows all jobs green. A deliberately injected clippy warning fails the `host` job. The size gate prints the image size.
 - **Note:** the `xtensa` job needs WP-02's portable `.cargo/config.toml`. Until then, set `CARGO_TARGET_XTENSA_ESP32_NONE_ELF_LINKER` in the job. The `invariants` job needs WP-03.
-- **Status:** DONE (2026-11-11, merged `86d6a93e`)
+- **Status:** DONE (2026-11-11, merged `86d6a93e`) **Miri job, first real run 2026-11-13/14:** it had never executed before — `rust-toolchain.toml`'s 1.99.1 pin redirected `cargo miri` to a toolchain without miri, fixed with `RUSTUP_TOOLCHAIN: nightly`. The first run found **no undefined behaviour** (56/56 conversions unit tests pass under Miri) but took ~5.5 h wall-clock, against GitHub's 6 h job limit: the exhaustive sweeps (`conv12` over all 2^24 inputs alone took 43 min) are impractical under the interpreter, and `tests/conv22_fixture_and_proptest.rs` then aborted because proptest's failure persistence calls `getcwd`, which Miri's isolation forbids. Five exhaustive tests carry `#[cfg_attr(miri, ignore)]` and the proptest file is `#![cfg(not(miri))]`; the representative-input tests exercise the same code paths under Miri. Expect the job to drop to minutes.
 
 #### - [x] WP-03: Bootloader provenance and script hardening (Lane A) · P0 · S-M · BLOCKED on owner for the binary
 - **Findings:** BUILD-03, BUILD-08, BUILD-17, BUILD-18, BUILD-19, BUILD-26, BUILD-27
@@ -946,6 +946,7 @@ Fill this in as work packages land. WP-04 records the first row.
 | Date | WP | FPS (median of 3 × 60 s) | Sensor period (µs) | Core 0 ms/frame | `c1_dropped`/min | Snapshot p95 (ms) | Image size (B) | Notes |
 |---|---|---|---|---|---|---|---|---|
 | 2026-10 (`75625d8`) | baseline | 12.53 | not measured | not measured | not measured | not measured | 817,904 | Figures from the commit message |
+| 2026-11-13 (`845cfc4`, PR #2 CI run 43495706756) | WP-02/06/08/09 + WP-23 on top of the baseline | not measured (no board in CI) | not measured | not measured | not measured | not measured | **801,712** | Xtensa release build in CI: `espflash save-image`, app image only (`Merge: false`), 19.42% of the 0x1B0000 slot. −16,192 B against the baseline, in the direction WP-02's LTO/`codegen-units=1` predicted (~−25 KB); SENS-22 also drops 17 drivers from the link. Built with CI placeholder credentials baked in by `option_env!`, so a real build differs by the credential string lengths. |
 
 ## 9. Audit procedure: half-finished ports
 
