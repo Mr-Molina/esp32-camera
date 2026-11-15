@@ -4016,7 +4016,7 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                         // auth-first promotion into shared http80_ota_accum
                         if let Ok(parsed) = parse_http_request(&p80_hdr_bufs[idx][..st.req_len]) {
                             let needed_body = match parsed.content_length {
-                                Some(cl) if cl > 0 => cl as usize,
+                                Some(cl) if cl > 0 => cl,
                                 _ => 0,
                             };
                             let hdr_bytes = st.req_len.saturating_sub(parsed.body.len());
@@ -4146,9 +4146,7 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                             };
                             if let Ok(parsed) = parse_http_request(req_slice) {
                                 let needed_body = match parsed.content_length {
-                                    Some(cl) if cl > 0 => {
-                                        (cl as usize).min(OTA_PARTITION_MAX_SIZE + 4096)
-                                    }
+                                    Some(cl) if cl > 0 => cl.min(OTA_PARTITION_MAX_SIZE + 4096),
                                     _ => 0,
                                 };
                                 if parsed.body.len() >= needed_body || peer_closed_rx {
@@ -4162,7 +4160,12 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
                                             || (parsed.path == "/"
                                                 && parsed
                                                     .query
-                                                    .map(|q| q.contains("action=snapshot"))
+                                                    .map(|q| {
+                                                        klipper_cam_fw::http::query_has_pair(
+                                                            q,
+                                                            "action=snapshot",
+                                                        )
+                                                    })
                                                     .unwrap_or(false)))
                                     {
                                         is_snapshot_req = true;

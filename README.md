@@ -2,7 +2,7 @@
 
 A 100% pure `#![no_std]` bare-metal Rust camera driver workspace and production Klipper 3D printer camera firmware (`klipper-cam-fw`) for the Espressif **ESP32** (`ESP32-WROVER-DEV` / `ESP32-CAM` / `ESP32-S3`).
 
-Zero C/C++ files or `esp-idf` C runtime dependencies remain in the workspace. Six of the seven crates enforce `#![forbid(unsafe_code)]` at the crate root, while all hardware memory-mapped I/O (`I2S0` parallel DVP DMA, `GPIO` matrix, `RTC_IO`, `IO_MUX`) is isolated and Miri-verified inside `esp32-cam-ll`.
+Zero C/C++ files or `esp-idf` C runtime dependencies remain in the workspace. Five of the seven crates enforce `#![forbid(unsafe_code)]` at the crate root (`esp32-cam-ll` enforces `#![deny(unsafe_op_in_unsafe_fn)]` with Miri verification on non-MMIO code only; `klipper-cam-fw` enforces `#![deny(unsafe_code)]` in `lib.rs` with `spsc_ring.rs` override and hardware memory-mapped I/O in `main.rs`).
 
 ---
 
@@ -14,9 +14,9 @@ Zero C/C++ files or `esp-idf` C runtime dependencies remain in the workspace. Si
 | **`esp32-cam-sccb`** | `crates/esp32-cam-sccb` | `#![forbid(unsafe_code)]` | `SccbBus` trait and `EmbeddedHalSccb<I2C>` adapter over `embedded_hal::i2c::I2c` supporting 8-bit and 16-bit register addressing, bank switching, bitmask updates, and register table batch programming. |
 | **`esp32-cam-sensors`** | `crates/esp32-cam-sensors` | `#![forbid(unsafe_code)]` | Complete `#![no_std]` driver implementations for **all 18 camera sensors** implementing the `CameraSensor` trait, plus `detect_and_init()` auto-probing. |
 | **`esp32-cam-conversions`** | `crates/esp32-cam-conversions` | `#![forbid(unsafe_code)]` | Safe image codecs & frame validators: `validate_jpeg_frame` (`SOI`/`EOI`/`SOF0` dimension parser), `rgb565`/`yuv422`/`grayscale` to `rgb888`, `frame_to_bmp`, and baseline `encode_rgb888_to_jpeg`. |
-| **`esp32-cam-ll`** | `crates/esp32-cam-ll` | `#![deny(unsafe_op_in_unsafe_fn)]` + Miri | ESP32 `I2S0` (`0x3FF4_F000`) parallel camera DMA engine, 16-byte aligned `Lldesc` descriptor ring, `GPIO` matrix (`I2S0I_DATA_IN0..7`, `V_SYNC`, `H_ENABLE`, `WS_IN`), `RTC_IO` analog mux disable (`GPIO 36`/`39`), and `XclkConfig` (`LEDC` 20 MHz). |
+| **`esp32-cam-ll`** | `crates/esp32-cam-ll` | `#![deny(unsafe_op_in_unsafe_fn)]` + Miri (non-MMIO only) | ESP32 `I2S0` (`0x3FF4_F000`) parallel camera DMA engine, 4-byte aligned `Lldesc` descriptor ring, `GPIO` matrix (`I2S0I_DATA_IN0..7`, `V_SYNC`, `H_ENABLE`, `WS_IN`), `RTC_IO` analog mux disable (`GPIO 36`/`39`), and `XclkConfig` (`LEDC` 20 MHz). |
 | **`esp32-cam-hal`** | `crates/esp32-cam-hal` | `#![forbid(unsafe_code)]` | Type-state `CameraDriver<State, B>` (`Uninitialized` -> `Configured` -> `Streaming`), RAII `FrameLease`, bounded `FramePool` in PSRAM, and pre-defined board pinouts (`WROVER-KIT`, `AI-Thinker`, `ESP32-S3`). |
-| **`klipper-cam-fw`** | `crates/klipper-cam-fw` | `#![forbid(unsafe_code)]` | Production bare-metal Xtensa firmware (`esp-hal` + `esp-radio` + `smoltcp` + `esp-alloc` + `esp-storage`) featuring `PingPongFrameBuffer` in 80 MHz PSRAM, 4-socket Port 80 HTTP control/snapshot/OTA server, Port 81 MJPEG streamer, `/control` + `/panel` live `OV2640` tuning, and dual-slot `otadata` rollback manager. |
+| **`klipper-cam-fw`** | `crates/klipper-cam-fw` | `#![deny(unsafe_code)]` in `lib.rs` (`spsc_ring.rs` override + `main.rs` MMIO) | Production bare-metal Xtensa firmware (`esp-hal` + `esp-radio` + `smoltcp` + `esp-alloc` + `esp-storage`) featuring Core 1 SPSC to `TripleFrameBuffer` in 40 MHz PSRAM (`PsramCacheF40mS40m`), 4-socket Port 80 HTTP control/snapshot/OTA server, 2-socket Port 81 MJPEG streamer (`12.53–12.59 FPS` @ `1280x720`), `/control` + `/panel` live `OV2640` tuning, and dual-slot `otadata` rollback manager. |
 
 ---
 
@@ -59,20 +59,19 @@ Zero C/C++ files or `esp-idf` C runtime dependencies remain in the workspace. Si
 | **`PCLK`** | `GPIO 22` | Input (`I2S0I_WS_IN`) | Pixel clock (`signal index 28`) |
 | **`D7` .. `D4`** | `GPIO 35, 34, 39, 36` | Input (`I2S0I_DATA_IN7..4`) | Input-only pads (`RTC_IO_SENSOR_PADS_REG` digital mux enabled) |
 | **`D3` .. `D0`** | `GPIO 19, 18, 5, 4` | Input (`I2S0I_DATA_IN3..0`) | `GPIO 4` is strictly `D0` on `WROVER-KIT` (never driven as Flash LED) |
-| **`PSRAM CS# / CLK`** | `GPIO 16, 17` | Internal (`80 MHz` QSPI) | `4 MB` external PSRAM (`VDD_SDIO = 3.3V`) |
+| **`PSRAM CS# / CLK`** | `GPIO 16, 17` | Internal (`40 MHz` QSPI) | `4 MB` external PSRAM (`PsramCacheF40mS40m`, `VDD_SDIO = 3.3V`) |
 
-### Non-Blocking `PingPongFrameBuffer` & 4-Socket `smoltcp` Pool
+### Core 1 SPSC -> `TripleFrameBuffer` in 40 MHz PSRAM & Multi-Socket `smoltcp` Pool
 
-1. **Double-Buffered PSRAM Frame Pool (`PingPongFrameBuffer`)**:
-   - Allocates two disjoint `128 KB` buffers (`slot_a`, `slot_b`) in external `80 MHz` PSRAM via `esp-alloc`.
-   - While HTTP clients on Port 80 (`/snapshot`) and Port 81 (`/stream`) read the immutable **active** slot, the `I2S0` DMA engine captures the next `OV2640` JPEG frame into the **inactive** slot.
-   - Once `validate_jpeg_frame` confirms valid `SOI (0xFFD8)` and `EOI (0xFFD9)` markers, `commit_inactive()` atomically swaps the active slot and increments `frame_seq`.
-2. **Interleaved Non-Blocking DMA & TCP Polling (`DmaCapturePhase`)**:
-   - `VSYNC` alignment (`WaitVsyncHigh` -> `WaitVsyncFalling`) runs as a non-blocking state machine inside the main network loop, polling `iface.poll()` every iteration so `/status` and `/control` queries experience zero VSYNC wait blocking.
-   - During active `I2S0` pixel transfer (~30–40 ms per 720p frame), `iface.poll()` is interleaved every 16 DMA half-buffer drains so ARP, ICMP, and TCP ACKs are processed continuously.
+1. **Triple-Buffered PSRAM Frame Pool (`TripleFrameBuffer`)**:
+   - Allocates three disjoint `128 KB` buffers (`slot_a`, `slot_b`, `slot_c`) in external `40 MHz` PSRAM (`PsramCacheF40mS40m`) via `esp-alloc`.
+   - Core 1 captures `OV2640` JPEG frames via 4-byte aligned `Lldesc` DMA descriptors and pushes chunks into an SPSC ring buffer; Core 0 drains the ring into the staging/write slot and promotes it through the ready slot to the active front-buffer slot (`12.53–12.59 FPS` @ `1280x720` HD).
+   - Instantaneous snapshot reads access the latest committed frame without stalling stream transmission.
+2. **Interleaved Non-Blocking DMA & TCP Polling**:
+   - Core 1 handles camera DMA capture while Core 0 handles network polling (`poll_net_burst`) and SPSC draining, ensuring zero VSYNC blocking on HTTP endpoints.
 3. **Dual-Port TCP Socket Pool**:
    - **Port 80 (`PORT80_SOCKET_COUNT = 4`)**: 4 independent `smoltcp` TCP server sockets handle concurrent `/status`, `/snapshot`, `/control`, `/panel`, and `/update` requests without head-of-line blocking.
-   - **Port 81 (`1` Dedicated Stream Socket)**: Streams continuous `multipart/x-mixed-replace` MJPEG frames without starving Port 80 control or snapshot endpoints.
+   - **Port 81 (`PORT81_SOCKET_COUNT = 2`)**: 2 symmetric `smoltcp` stream sockets support continuous `multipart/x-mixed-replace` MJPEG streaming with clean client preemption and zero starvation of Port 80 control or snapshot endpoints.
 
 ---
 
@@ -83,8 +82,8 @@ Zero C/C++ files or `esp-idf` C runtime dependencies remain in the workspace. Si
 | Method & Path | Content-Type | Description |
 | :--- | :--- | :--- |
 | **`GET /`** | `text/html` | Landing page linking to `/status`, `/snapshot`, `:81/stream`, `/panel`, and `/update`. |
-| **`GET /status`** | `application/json` | 7-key JSON health & memory telemetry: `{"uptime_ms":...,"free_heap":...,"free_psram":...,"wifi_rssi":...,"active_partition":"ota_0","framesize":"1280x720","stream_active":false}`. |
-| **`GET /snapshot`** | `image/jpeg` | Latest validated `1280x720` JFIF frame from the active `PingPongFrameBuffer` slot (`Cache-Control: no-store`). |
+| **`GET /status`** | `application/json` | Extended JSON health, memory & diagnostic telemetry (including `uptime_ms`, `free_heap`, `free_psram`, `wifi_rssi`, `active_partition`, `framesize`, `stream_active`, `reset_reason`, `app_sha256`, `free_dram`, `core1_stack_hwm`, and EWMA/cycle counters: `sensor_frame_period_us`, `frame_bytes`, `c1_pushed`, `c1_dropped`, `ring_full_events`, `soi_miss`, `overflow_aborts`, `c0_spsc_cycles`, `c0_net_cycles`, `c0_p80_cycles`, `c0_p81_cycles`, `max_loop_latency_us`, `p81_frames_sent`, `p81_frames_superseded`, `c0_validation_failures`, `sccb_errors`, `send_partial`, `ring_build_failures`, `i2s_stop_timeouts`). |
+| **`GET /snapshot`** | `image/jpeg` | Latest validated `1280x720` JFIF frame from the `TripleFrameBuffer` (`Cache-Control: no-store`). |
 | **`GET /control`** | `application/json` | Read-only. Current `OV2640` camera parameters: `framesize`, `framesize_label`, `quality`, `brightness`, `contrast`, `saturation`, `special_effect`, `hmirror`, `vflip`, `awb`, `agc`, `aec`, `ae_level` (`Access-Control-Allow-Origin: *`). |
 | **`POST /control?var=<k>&val=<v>`** | `application/json` | Live `OV2640` `I2C0` SCCB register update (`quality` `4..=63`, `brightness`/`contrast`/`saturation`/`ae_level` `-2..=2`, `special_effect` `0..=6`, `hmirror`/`vflip`/`awb`/`agc`/`aec` `0..=1`, `framesize` `5..=13` or width `320..=1600`). `var`/`val` may also be sent as a form-encoded body. A `GET` with `var=` is accepted only with an `X-Requested-With` header and otherwise returns `405 Method Not Allowed` (`Allow: POST`). A browser `Origin` that does not match `Host` returns `403 Forbidden`. Returns `400 Bad Request` on invalid input. Responses to setting changes carry no `Access-Control-Allow-Origin` header. |
 | **`GET /panel`** | `text/html` | Self-contained dark-mode interactive Camera Control & Live Preview dashboard. |
@@ -95,7 +94,7 @@ Zero C/C++ files or `esp-idf` C runtime dependencies remain in the workspace. Si
 
 | Method & Path | Content-Type | Description |
 | :--- | :--- | :--- |
-| **`GET :81/stream`** | `multipart/x-mixed-replace;boundary=123456789000000000000987654321` | Continuous MJPEG video stream for Klipper / Crowsnest / Moonraker / Mainsail / Fluidd. |
+| **`GET :81/stream`** | `multipart/x-mixed-replace;boundary=123456789000000000000987654321` | Continuous MJPEG video stream for Klipper / Crowsnest / Moonraker / Mainsail / Fluidd (`Cache-Control: no-store`, `12.53–12.59 FPS` @ `1280x720`). |
 
 ---
 
@@ -106,7 +105,7 @@ Zero C/C++ files or `esp-idf` C runtime dependencies remain in the workspace. Si
 All 7 crates compile and run their unit and integration test suites on the host (`x86_64-unknown-linux-gnu`) without hardware attached:
 
 ```bash
-# Run all workspace unit & integration tests (92+ tests)
+# Run all workspace unit & integration tests (300+ host tests)
 cargo test --workspace --offline
 
 # Zero-warning Clippy lint gate across all host targets
@@ -147,6 +146,9 @@ cargo +esp build --target xtensa-esp32-none-elf -Zbuild-std=core,alloc --offline
 The repository includes `partitions_rust_ota.csv`, which provisions two `1,728 KB` (`0x1B0000`) application slots (`ota_0 @ 0x20000` and `ota_1 @ 0x1D0000`) and the `8 KB` `otadata` selector partition (`0x17000`):
 
 ```csv
+# Starts at 0x11000 to reserve headroom for the 2nd-stage bootloader at 0x1000
+# (ESP-IDF v5.5.4 GPIO16 patched bootloader, ~26 KB), partition table binary
+# at 0x8000, and alignment/guard space before NVS.
 # Name,   Type, SubType, Offset,   Size,     Flags
 nvs,      data, nvs,     0x11000,  0x6000,
 otadata,  data, ota,     0x17000,  0x2000,

@@ -1,3 +1,5 @@
+> **HISTORICAL DOCUMENT (C / ESP-IDF Era):** Retained for historical reference only; superseded by the pure `#![no_std]` bare-metal Rust workspace.
+
 # Specification: 720p HD High-Performance Klipper Camera (ESP32-WROVER-DEV)
 
 - **Date:** 2026-10-05

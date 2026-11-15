@@ -1,7 +1,6 @@
 //! Firmware lifecycle coordinator, Wi-Fi event handler, and capture runtime.
 //!
-//! Replaces `examples/camera_example/main/klipper_cam.c` and
-//! `examples/camera_example/main/take_picture.c`.
+//! Replaces legacy camera runtime and capture modules with native Rust modules.
 
 #![forbid(unsafe_code)]
 
@@ -278,8 +277,7 @@ impl Default for FirmwareRuntime<'static> {
     }
 }
 
-/// Periodic picture capture state machine replacing
-/// `examples/camera_example/main/take_picture.c`.
+/// Periodic picture capture state machine implemented in native Rust modules.
 pub struct TakePictureRunner<'a> {
     pub config: TakePictureConfig,
     pub camera: CameraDriver<'a>,
@@ -552,7 +550,8 @@ mod tests {
             let hdr_view = HttpResponseView::parse(hdrs).expect("parse stream headers");
             assert_eq!(hdr_view.status_code, 200);
             assert_eq!(hdr_view.content_type, Some(MJPEG_CONTENT_TYPE));
-            assert_eq!(hdr_view.x_framerate, Some("5"));
+            assert_eq!(hdr_view.x_framerate, None);
+            assert_eq!(hdr_view.cache_control, Some("no-store"));
 
             let chunk = stream_guard
                 .write_next_frame_chunk(&runtime.server.camera, &mut resp_buf)

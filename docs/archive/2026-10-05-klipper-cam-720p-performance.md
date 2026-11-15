@@ -1,3 +1,5 @@
+> **HISTORICAL DOCUMENT (C / ESP-IDF Era):** Retained for historical reference only; superseded by the pure `#![no_std]` bare-metal Rust workspace.
+
 # 720p HD High-Performance Klipper Camera Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

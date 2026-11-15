@@ -2,10 +2,8 @@
 //! image header validation (`0xE9` magic), and `otadata` IEEE 802.3 CRC32
 //! rollback state machine.
 //!
-//! Replaces the OTA subsystem in
-//! `examples/camera_example/main/klipper_cam.c`,
-//! `examples/camera_example/main/ota_minimal.c`, and
-//! `examples/camera_example/partitions.csv`.
+//! Replaces the legacy OTA subsystem with native Rust modules matching
+//! `partitions_rust_ota.csv`.
 
 #![forbid(unsafe_code)]
 
@@ -185,7 +183,7 @@ impl OtaSlot {
 }
 
 /// Static flash partition descriptor matching
-/// `examples/camera_example/partitions.csv`.
+/// `partitions_rust_ota.csv`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PartitionEntry {
     pub label: &'static str,
@@ -204,7 +202,7 @@ impl PartitionEntry {
 }
 
 /// Complete 5-entry partition table matching
-/// `examples/camera_example/partitions.csv`:
+/// `partitions_rust_ota.csv`:
 /// - `nvs`      @ `0x011000` (`0x006000`)
 /// - `otadata`  @ `0x017000` (`0x002000`)
 /// - `phy_init` @ `0x019000` (`0x001000`)

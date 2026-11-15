@@ -47,11 +47,11 @@ Pick from the **leftmost column you can do**. Do not take a package from a colum
 
 | Host-only (no toolchain needed) | Needs the esp toolchain | Needs the camera board |
 | --- | --- | --- |
-| **WP-24** docs accuracy (§5, Wave 5) | *(nothing — WP-02/06/08/09 passed the Xtensa gates in CI on 2026-11-13 and moved to the board column)* | WP-02, WP-04, WP-05, WP-06, WP-07, WP-08, WP-09, WP-16, WP-22 are `READY-FOR-HIL`: run their [HIL] acceptance lists |
-| **WP-20** HAL redesign (host-testable; WP-08 is landed) | **WP-19** split `main.rs` (behaviour-neutral, but `main.rs` is Xtensa-only, so do not attempt without the toolchain) | WP-10, WP-11, WP-13, WP-25 (all [HIL]) |
-| The audit in §9, on `crates/klipper-cam-fw` (not yet done there) | WP-12, WP-14, WP-15, WP-17, WP-18 (all edit `main.rs`) | |
+| **WP-20** HAL redesign (host-testable; WP-08 is landed) | *(nothing — WP-02/06/08/09 passed the Xtensa gates in CI on 2026-11-13 and moved to the board column)* | WP-02, WP-04, WP-05, WP-06, WP-07, WP-08, WP-09, WP-16, WP-22 are `READY-FOR-HIL`: run their [HIL] acceptance lists |
+| The audit in §9, on `crates/klipper-cam-fw` (not yet done there) | **WP-19** split `main.rs` (behaviour-neutral, but `main.rs` is Xtensa-only, so do not attempt without the toolchain) | WP-10, WP-11, WP-13, WP-25 (all [HIL]) |
+| | WP-12, WP-14, WP-15, WP-17, WP-18 (all edit `main.rs`) | |
 
-`WP-01`, `WP-03`, `WP-21`, `WP-23` are `DONE`. Do not reopen them.
+`WP-01`, `WP-03`, `WP-21`, `WP-23`, `WP-24` are `DONE`. Do not reopen them.
 
 ### 0.3 The five rules that matter most
 
@@ -242,7 +242,7 @@ Wave 5 (docs)                   WP-24
 - **WP-10 against WP-11 to WP-14:** raising the sensor rate is pointless if Core 0 cannot keep up, and Core 0 work alone cannot exceed 12.5 FPS. Land both halves, then measure the combination.
 - **WP-12 needs WP-07 and the `FrameRef` part of WP-12 itself.** Zero-copy snapshot depends on removing the `&'static` slice laundering (FW-CORE-08).
 - **WP-06** shares a drain helper between `esp32-cam-ll` and the firmware. Do the ll API first, then switch both firmware capture paths to it.
-- **WP-03 is blocked on the repository owner,** who must supply `firmware/bootloader_v554_gpio16.bin` (§7, question 1).
+- **WP-03 is unblocked:** `firmware/bootloader_v554_gpio16.bin` committed (SHA-256 `ba5710973d625b420b3bb44178f807131e89c7901ce1b3074879e9f810c4744d`), CI unconditional.
 
 ---
 
@@ -273,7 +273,7 @@ Status values: `TODO` · `IN-PROGRESS` · `READY-FOR-HIL` · `DONE` · `BLOCKED 
 - **Note:** the `xtensa` job needs WP-02's portable `.cargo/config.toml`. Until then, set `CARGO_TARGET_XTENSA_ESP32_NONE_ELF_LINKER` in the job. The `invariants` job needs WP-03.
 - **Status:** DONE (2026-11-11, merged `86d6a93e`) **Miri job, first real run 2026-11-13/14:** it had never executed before — `rust-toolchain.toml`'s 1.99.1 pin redirected `cargo miri` to a toolchain without miri, fixed with `RUSTUP_TOOLCHAIN: nightly`. The first run found **no undefined behaviour** (56/56 conversions unit tests pass under Miri) but took ~5.5 h wall-clock, against GitHub's 6 h job limit: the exhaustive sweeps (`conv12` over all 2^24 inputs alone took 43 min) are impractical under the interpreter, and `tests/conv22_fixture_and_proptest.rs` then aborted because proptest's failure persistence calls `getcwd`, which Miri's isolation forbids. Five exhaustive tests carry `#[cfg_attr(miri, ignore)]` and the proptest file is `#![cfg(not(miri))]`; the representative-input tests exercise the same code paths under Miri. Expect the job to drop to minutes.
 
-#### - [x] WP-03: Bootloader provenance and script hardening (Lane A) · P0 · S-M · BLOCKED on owner for the binary
+#### - [x] WP-03: Bootloader provenance and script hardening (Lane A) · P0 · S-M
 - **Findings:** BUILD-03, BUILD-08, BUILD-17, BUILD-18, BUILD-19, BUILD-26, BUILD-27
 - **Steps:**
   1. Commit `firmware/bootloader_v554_gpio16.bin` with a `.gitignore` exception (`!firmware/bootloader_v554_gpio16.bin`). Add `firmware/README.md` with its SHA-256, the IDF v5.5.4 commit and the patch description.
@@ -295,7 +295,7 @@ Status values: `TODO` · `IN-PROGRESS` · `READY-FOR-HIL` · `DONE` · `BLOCKED 
   - On a fresh clone, `python3 scripts/ota_deploy.py --stage-only --elf <elf>` exits 0.
   - The invariants script exits 1 when the bootloader is missing.
   - `grep -rn 'console-admin\|172\.22\.' scripts README.md` is empty, excluding archived docs.
-- **Status:** DONE (2026-11-11, scripts & provenance merged `199f247`; external bootloader binary gated via `--allow-missing-bootloader` per Ruling Q1) **CI note 2026-11-13:** with the bootloader absent, espflash 4.7 `save-image` fails with the misleading *"Error while connecting to device / os error 2"* — it is ENOENT on `espflash.toml`'s bootloader path, read with a bare `?` that the serialport build reports as a connection error. The xtensa CI job now packages the app image with a CI-local `[flash]`-only config when the file is missing (same tolerance as the invariants job) and with the real config once it is present. Uploading `firmware/bootloader_v554_gpio16.bin` (§7 Q1) remains the actual fix; real flashing must use that bootloader.
+- **Status:** DONE (2026-11-11, scripts & provenance merged `199f247`; `firmware/bootloader_v554_gpio16.bin` committed with SHA-256 `ba5710973d625b420b3bb44178f807131e89c7901ce1b3074879e9f810c4744d`, CI unconditional)
 
 #### - [x] WP-04: Instrumentation and observability, the performance baseline (Lane C) · P1 · S
 - **Findings:** FW-CORE-04 (instrumentation half), FW-CORE-15, FW-CORE-21, FW-NET-29; supports BUILD-08 and BUILD-18
@@ -820,7 +820,7 @@ Status values: `TODO` · `IN-PROGRESS` · `READY-FOR-HIL` · `DONE` · `BLOCKED 
 
 ### Wave 5: documentation
 
-#### - [ ] WP-24: Docs accuracy and small cleanups (Lanes H+G) · P2-P3 · S
+#### - [x] WP-24: Docs accuracy and small cleanups (Lanes H+G) · P2-P3 · S
 - **Findings:** BUILD-15, BUILD-16, BUILD-22, BUILD-25, LL-17 (README claim), FW-NET-21, FW-NET-22, FW-NET-23
 - **Steps:**
   1. Fix the README:
@@ -840,7 +840,7 @@ Status values: `TODO` · `IN-PROGRESS` · `READY-FOR-HIL` · `DONE` · `BLOCKED 
   - `grep` of the safety attributes matches the README.
   - `grep -rn 'examples/' crates docs README.md` matches only archived files.
   - Unit tests cover the FW-NET-23 changes.
-- **Status:** TODO
+- **Status:** DONE (2026-11-14)
 
 ---
 
@@ -929,7 +929,7 @@ Every finding maps to exactly one primary WP. A secondary WP is listed in parent
 
 These need a human decision or information that is not in the repo. The affected WPs note where they are blocked.
 
-1. **Bootloader binary.** Can `firmware/bootloader_v554_gpio16.bin` be committed (it is Apache-2.0 ESP-IDF output)? Where is its source patch? This blocks WP-03, the `invariants` job in WP-01, and WP-11's bootloader header change.
+1. **Bootloader binary.** [RESOLVED 2026-11-14] `firmware/bootloader_v554_gpio16.bin` committed (SHA-256 `ba5710973d625b420b3bb44178f807131e89c7901ce1b3074879e9f810c4744d`, Apache-2.0 ESP-IDF v5.5.4 output). WP-03 unblocked and CI runs unconditionally.
 2. **Rollback.** Was that bootloader built with `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`? This decides whether FW-NET-01 means "every OTA reverts" (P0) or "rollback does nothing" (P1). It also sets WP-05's HIL test plan.
 3. **40 MHz PSRAM and flash.** Was this a deliberate cold-boot stability workaround? It decides whether WP-11 is an experiment or only a docs fix.
 4. **Release priority.** Is FPS or UART panic text more important in release builds? This decides `opt-level` 3 vs `"s"` and whether to adopt the immediate-abort profile (WP-02).

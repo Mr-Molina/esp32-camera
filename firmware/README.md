@@ -4,22 +4,20 @@ This directory holds the 2nd-stage bootloader binary required for flashing and o
 
 - **Target Binary:** `firmware/bootloader_v554_gpio16.bin` (flash offset `0x1000`)
 - **Base Toolchain:** ESP-IDF v5.5.4 (`components/bootloader_support`)
-- **Status:** **Pending repository owner upload** (`BUILD-03`)
+- **Status:** **Committed & Verified** (`BUILD-03`, `26,256 bytes`, SHA-256 `ba5710973d625b420b3bb44178f807131e89c7901ce1b3074879e9f810c4744d`)
 
 ---
 
-## 1. Status & Upload Notice (BUILD-03)
+## 1. Status & CI Verification (BUILD-03)
 
-The pre-compiled binary `firmware/bootloader_v554_gpio16.bin` is currently pending drop-in upload by the repository owner.
+The pre-compiled binary `firmware/bootloader_v554_gpio16.bin` is committed to the repository, tracked via `.gitignore`, and verified unconditionally in CI.
 
 - `.gitignore` includes an explicit exception rule:
   ```gitignore
   *.bin
   !firmware/bootloader_v554_gpio16.bin
   ```
-- Until the repository owner uploads `firmware/bootloader_v554_gpio16.bin`:
-  - `espflash flash`, `espflash save-image`, and `ota_deploy.py --stage-only` will fail on clean clones with file-not-found errors when attempting to package the bootloader.
-  - `scripts/verify_cold_boot_invariants.py` defaults to exit 1 to protect production gates; pass `--allow-missing-bootloader` in development or CI environments to report an informational skip for the binary verification step while asserting static source and udev invariants.
+- The binary is verified unconditionally in CI (`python3 scripts/verify_cold_boot_invariants.py`) and packaged during firmware image generation (`espflash save-image`).
 
 ---
 

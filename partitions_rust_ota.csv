@@ -1,6 +1,12 @@
-# Name,   Type, SubType, Offset,   Size,     Flags
-nvs,      data, nvs,     0x11000,  0x6000,
-otadata,  data, ota,     0x17000,  0x2000,
-phy_init, data, phy,     0x19000,  0x1000,
-ota_0,    app,  ota_0,   0x20000,  0x1B0000,
-ota_1,    app,  ota_1,   0x1D0000, 0x1B0000,
+# ESP32-WROVER 4MB Dual-OTA Partition Table (BUILD-25)
+# Starts at 0x11000 to reserve headroom for the 2nd-stage bootloader at 0x1000
+# (ESP-IDF v5.5.4 GPIO16 patched bootloader, ~26 KB), partition table binary
+# at 0x8000, and alignment/guard space before NVS.
+#
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x11000,  0x6000,
+otadata,    data, ota,      0x17000,  0x2000,
+phy_init,   data, phy,      0x19000,  0x1000,
+ota_0,      app,  ota_0,    0x20000,  0x1B0000,
+ota_1,      app,  ota_1,    0x1D0000, 0x1B0000,
+# Optional coredump region: coredump, data, coredump, 0x380000, 0x10000,

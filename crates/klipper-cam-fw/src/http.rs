@@ -3,10 +3,6 @@
 //! (Port 81),
 //! and OTA upload handler (`POST /update`).
 //!
-//! Replaces the HTTP/MJPEG/OTA server handlers in
-//! `examples/camera_example/main/klipper_cam.c`
-//! and `examples/camera_example/main/ota_minimal.c`.
-
 #![forbid(unsafe_code)]
 
 use core::fmt::{self, Write};
@@ -50,10 +46,9 @@ pub const STREAM_MAX_CAPTURE_FAILURES: u8 = 5;
 pub const KLIPPER_ROOT_STATUS_PAGE: &str = "\
 Klipper 3D Printer Camera (ESP32-WROVER-DEV)\n\
 Resolution: 1280x720 HD 16:9 (OV2640 Hardware JPEG)\n\
-Framerate:  4-5 FPS (OV2640 Hardware HD Limit with LwIP Pacing)\n\
 \n\
 Endpoints:\n\
-  - Dedicated Stream: http://<this-ip>:81/stream (Isolated Worker Task)\n\
+  - Dedicated Stream: http://<this-ip>:81/stream\n\
   - Snapshot:         http://<this-ip>/snapshot  (Instantaneous, Zero-Block)\n\
   - Status JSON:      http://<this-ip>/status\n\
   - OTA Update:       http://<this-ip>/update\n\
@@ -126,9 +121,8 @@ pub struct HttpRequest<'a> {
     pub version: &'a str,
     /// Value of the `X-OTA-Token` header if present.
     pub ota_token: Option<&'a [u8]>,
-    /// Parsed `Content-Length` header if present (may be negative or zero if
-    /// invalid).
-    pub content_length: Option<isize>,
+    /// Parsed `Content-Length` header if present (`FW-NET-23`).
+    pub content_length: Option<usize>,
     /// Value of the `Content-Type` header if present.
     pub content_type: Option<&'a str>,
     /// Value of the `Host` header if present.
@@ -248,6 +242,14 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     None
 }
 
+/// Returns whether the URL query string contains the exact key-value `pair`
+/// as an ampersand-separated token (`FW-NET-23`).
+#[inline]
+pub fn query_has_pair(query: &str, pair: &str) -> bool {
+    let q = query.strip_prefix('?').unwrap_or(query);
+    q.split('&').any(|param| param == pair)
+}
+
 /// Parses an ASCII signed integer (`isize`) from a trimmed header value.
 fn parse_isize_ascii(s: &str) -> Option<isize> {
     let trimmed = s.trim();
@@ -330,7 +332,7 @@ pub fn parse_http_request(raw: &[u8]) -> Result<HttpRequest<'_>, HttpError> {
     };
 
     let mut ota_token: Option<&[u8]> = None;
-    let mut content_length: Option<isize> = None;
+    let mut content_length: Option<usize> = None;
     let mut content_type: Option<&str> = None;
     let mut host: Option<&str> = None;
     let mut origin: Option<&str> = None;
@@ -357,13 +359,16 @@ pub fn parse_http_request(raw: &[u8]) -> Result<HttpRequest<'_>, HttpError> {
             if content_length.is_some() {
                 return Err(HttpError::MalformedRequest);
             }
+            if val.is_empty() || !val.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(HttpError::MalformedRequest);
+            }
             let cl = val
                 .parse::<usize>()
                 .map_err(|_| HttpError::MalformedRequest)?;
             if cl > isize::MAX as usize {
                 return Err(HttpError::MalformedRequest);
             }
-            content_length = Some(cl as isize);
+            content_length = Some(cl);
         } else if name.eq_ignore_ascii_case("Content-Type") {
             content_type = Some(val);
         } else if name.eq_ignore_ascii_case("Host") {
@@ -383,11 +388,8 @@ pub fn parse_http_request(raw: &[u8]) -> Result<HttpRequest<'_>, HttpError> {
 
     let mut body = &raw[hdr_end + 4..];
     if let Some(cl) = content_length {
-        if cl >= 0 {
-            let cl_usize = cl as usize;
-            if raw.len() > hdr_end + 4 + cl_usize {
-                body = &raw[hdr_end + 4..hdr_end + 4 + cl_usize];
-            }
+        if raw.len() > hdr_end + 4 + cl {
+            body = &raw[hdr_end + 4..hdr_end + 4 + cl];
         }
     }
 
@@ -455,6 +457,8 @@ pub struct HttpResponseView<'a> {
     pub content_disposition: Option<&'a str>,
     /// `Access-Control-Allow-Origin` header value if present.
     pub access_control_allow_origin: Option<&'a str>,
+    /// `Cache-Control` header value if present (`FW-NET-21`).
+    pub cache_control: Option<&'a str>,
     /// `X-Framerate` header value if present.
     pub x_framerate: Option<&'a str>,
     /// Response body bytes following `\r\n\r\n`.
@@ -481,6 +485,7 @@ impl<'a> HttpResponseView<'a> {
         let mut content_type = None;
         let mut content_disposition = None;
         let mut access_control_allow_origin = None;
+        let mut cache_control = None;
         let mut x_framerate = None;
 
         for line in lines {
@@ -493,6 +498,8 @@ impl<'a> HttpResponseView<'a> {
                     content_disposition = Some(val);
                 } else if name.eq_ignore_ascii_case("Access-Control-Allow-Origin") {
                     access_control_allow_origin = Some(val);
+                } else if name.eq_ignore_ascii_case("Cache-Control") {
+                    cache_control = Some(val);
                 } else if name.eq_ignore_ascii_case("X-Framerate") {
                     x_framerate = Some(val);
                 }
@@ -506,6 +513,7 @@ impl<'a> HttpResponseView<'a> {
             content_type,
             content_disposition,
             access_control_allow_origin,
+            cache_control,
             x_framerate,
             body,
         })
@@ -1225,13 +1233,13 @@ impl<'a> StreamSessionGuard<'a> {
     /// - `Content-Type: multipart/x-mixed-
     /// replace;boundary=123456789000000000000987654321`
     /// - `Access-Control-Allow-Origin: *`
-    /// - `X-Framerate: 5`
+    /// - `Cache-Control: no-store` (`FW-NET-21`)
     pub fn write_stream_headers<'b>(&self, out_buf: &'b mut [u8]) -> Result<&'b [u8], HttpError> {
         let mut writer = SliceWriter::new(out_buf);
         write!(
             writer,
             "HTTP/1.1 200 OK\r\nContent-Type: {}\r\n\
-            Access-Control-Allow-Origin: *\r\nX-Framerate: 5\r\n\r\n",
+            Access-Control-Allow-Origin: *\r\nCache-Control: no-store\r\n\r\n",
             MJPEG_CONTENT_TYPE
         )
         .map_err(|_| HttpError::BufferTooSmall)?;
@@ -1609,18 +1617,16 @@ impl<'a> KlipperCamServer<'a> {
                     false,
                 );
             }
-            for param in q.split('&') {
-                if param == "action=snapshot" {
-                    return self.handle_snapshot(out_buf);
-                } else if param == "action=stream" {
-                    return write_http_error(
-                        out_buf,
-                        400,
-                        "Bad Request",
-                        "Stream available only on port 81 (/stream)",
-                        false,
-                    );
-                }
+            if query_has_pair(q, "action=snapshot") {
+                return self.handle_snapshot(out_buf);
+            } else if query_has_pair(q, "action=stream") {
+                return write_http_error(
+                    out_buf,
+                    400,
+                    "Bad Request",
+                    "Stream available only on port 81 (/stream)",
+                    false,
+                );
             }
         }
 
@@ -1667,6 +1673,7 @@ impl<'a> KlipperCamServer<'a> {
             "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\n\
             Content-Disposition: inline; filename=capture.jpg\r\n\
             Access-Control-Allow-Origin: *\r\nConnection: close\r\n\
+            Cache-Control: no-store\r\n\
             Content-Length: {}\r\n\r\n",
             guard.len()
         )
@@ -1987,7 +1994,7 @@ impl<'a> KlipperCamServer<'a> {
         let mut writer = SliceWriter::new(out_buf);
         write!(
             writer,
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{}\
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\n{}\
             Connection: close\r\nContent-Length: {}\r\n\r\n{}",
             if cors {
                 "Access-Control-Allow-Origin: *\r\n"
@@ -2107,7 +2114,7 @@ xhr.send(file);}</script></body></html>";
         }
 
         let content_len = match req.content_length {
-            Some(len) if len > 0 => len as usize,
+            Some(len) if len > 0 => len,
             _ => {
                 return write_http_error(
                     out_buf,
@@ -2568,6 +2575,7 @@ mod tests {
                 Some("inline; filename=capture.jpg")
             );
             assert_eq!(view.access_control_allow_origin, Some("*"));
+            assert_eq!(view.cache_control, Some("no-store"));
 
             // Verify JFIF SOI, APP0 "JFIF\0", SOF0 1280x720, and EOI
             assert!(view.body.len() >= 20);
@@ -2651,7 +2659,8 @@ mod tests {
             assert_eq!(view.status_code, 200);
             assert_eq!(view.content_type, Some(MJPEG_CONTENT_TYPE));
             assert_eq!(view.access_control_allow_origin, Some("*"));
-            assert_eq!(view.x_framerate, Some("5"));
+            assert_eq!(view.cache_control, Some("no-store"));
+            assert_eq!(view.x_framerate, None);
 
             // Verify multipart boundary header and embedded JPEG SOI/EOI
             let expected_prefix = b"\r\n--123456789000000000000987654321\r\n\
@@ -3976,6 +3985,7 @@ Content-Type: image/jpeg\r\nContent-Length: 51200\r\n\r\n";
             let view = HttpResponseView::parse(resp).expect("parse 200");
             assert_eq!(view.status_code, 200);
             assert_eq!(view.access_control_allow_origin, Some("*"));
+            assert_eq!(view.cache_control, Some("no-store"));
         }
         assert_eq!(server.take_pending_control_update(), None);
     }
@@ -4127,5 +4137,61 @@ Content-Type: image/jpeg\r\nContent-Length: 51200\r\n\r\n";
         assert_eq!(plain.host, None);
         assert_eq!(plain.origin, None);
         assert!(!plain.x_requested_with);
+    }
+
+    #[test]
+    fn test_fw_net_23_query_has_pair() {
+        assert!(query_has_pair("action=snapshot", "action=snapshot"));
+        assert!(query_has_pair("?action=snapshot", "action=snapshot"));
+        assert!(query_has_pair(
+            "foo=1&action=snapshot&bar=2",
+            "action=snapshot"
+        ));
+        assert!(query_has_pair("action=snapshot&bar=2", "action=snapshot"));
+        assert!(query_has_pair("foo=1&action=snapshot", "action=snapshot"));
+
+        // Negative matches
+        assert!(!query_has_pair("subaction=snapshot", "action=snapshot"));
+        assert!(!query_has_pair("action=snapshot_extra", "action=snapshot"));
+        assert!(!query_has_pair("action=stream", "action=snapshot"));
+        assert!(!query_has_pair("", "action=snapshot"));
+    }
+
+    #[test]
+    fn test_fw_net_23_content_length_digits_only_and_option_usize() {
+        // Valid Content-Length with digits only
+        let valid_req =
+            b"POST /update HTTP/1.1\r\nHost: 172.22.1.52\r\nContent-Length: 42\r\n\r\nhello";
+        let req = parse_http_request(valid_req).expect("valid digits-only content-length");
+        assert_eq!(req.content_length, Some(42usize));
+
+        // Rejection of +5
+        let plus_req =
+            b"POST /update HTTP/1.1\r\nHost: 172.22.1.52\r\nContent-Length: +5\r\n\r\nhello";
+        assert_eq!(
+            parse_http_request(plus_req),
+            Err(HttpError::MalformedRequest)
+        );
+
+        // Rejection of negative -5
+        let neg_req =
+            b"POST /update HTTP/1.1\r\nHost: 172.22.1.52\r\nContent-Length: -5\r\n\r\nhello";
+        assert_eq!(
+            parse_http_request(neg_req),
+            Err(HttpError::MalformedRequest)
+        );
+
+        // Rejection of non-digit text
+        let bad_req =
+            b"POST /update HTTP/1.1\r\nHost: 172.22.1.52\r\nContent-Length: 12a\r\n\r\nhello";
+        assert_eq!(
+            parse_http_request(bad_req),
+            Err(HttpError::MalformedRequest)
+        );
+
+        // Missing Content-Length yields None
+        let get_req = b"GET /snapshot HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n";
+        let parsed_get = parse_http_request(get_req).expect("valid get request");
+        assert_eq!(parsed_get.content_length, None);
     }
 }

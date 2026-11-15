@@ -35,7 +35,7 @@ cargo build --target xtensa-esp32-none-elf -Zbuild-std=core,alloc -p klipper-cam
 ```
 
 - Use `--locked`. Do not change `Cargo.lock` unless a dependency change requires it.
-- `firmware/bootloader_v554_gpio16.bin` is pending upload by the owner. Image packaging and `ota_deploy.py --stage-only` fail without it. `scripts/verify_cold_boot_invariants.py` accepts `--allow-missing-bootloader` for development only.
+- `firmware/bootloader_v554_gpio16.bin` is committed (`26,256 B`, SHA-256 `ba5710973d625b420b3bb44178f807131e89c7901ce1b3074879e9f810c4744d`) and verified unconditionally by `scripts/verify_cold_boot_invariants.py`.
 - Flashing and live OTA deploys touch real hardware and a LAN device. Never run them without explicit user confirmation.
 
 ## Workspace layout

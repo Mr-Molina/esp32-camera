@@ -1,12 +1,13 @@
-//! Bare-metal `#![no_std]` Klipper 3D Printer Camera & OTA firmware library
-//! (`HTTP`, `MJPEG`, `OTA`).
+//! Bare-metal `#![no_std]` Klipper 3D Printer Camera & OTA firmware library.
 //!
-//! Replaces:
-//! - `examples/camera_example/main/klipper_cam.c`
-//! - `examples/camera_example/main/ota_minimal.c`
-//! - `examples/camera_example/main/take_picture.c`
-//! - `examples/camera_example/main/klipper_cam_config.h`
-//! - `examples/camera_example/main/camera_pinout.h`
+//! # Modules
+//!
+//! - [`config`]: Hardware pinout, camera sensor, network, and security configuration.
+//! - [`http`]: Non-blocking HTTP control server and multipart MJPEG stream server.
+//! - [`ota`]: Flash partition layout, constant-time token verification, and rollback state machine.
+//! - [`runtime`]: Bare-metal multi-core execution environment and cooperative scheduling.
+//! - [`spsc_ring`]: Lock-free single-producer single-consumer ring buffer for inter-core JPEG transfer.
+//! - [`telemetry`]: Performance counters, stream diagnostics, and system telemetry.
 
 #![no_std]
 #![deny(unsafe_code)]

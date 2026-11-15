@@ -1,9 +1,5 @@
 //! Hardware pinout, camera sensor, network, and OTA security configuration
 //! for the bare-metal Klipper camera firmware (`klipper-cam-fw`).
-//!
-//! Replaces `examples/camera_example/main/camera_pinout.h`,
-//! `examples/camera_example/main/klipper_cam_config.h`, and configuration
-//! blocks from `klipper_cam.c` and `take_picture.c`.
 
 #![forbid(unsafe_code)]
 
@@ -56,13 +52,6 @@ pub const DEFAULT_CONTROL_PORT: u16 = 80;
 /// Default MJPEG stream port (`81`).
 pub const DEFAULT_STREAM_PORT: u16 = 81;
 
-/// Default internal control socket port for the Port 80 server (`32768`).
-pub const DEFAULT_CONTROL_CTRL_PORT: u16 = 32768;
-
-/// Default internal control socket port for the Port 81 stream server
-/// (`32769`).
-pub const DEFAULT_STREAM_CTRL_PORT: u16 = 32769;
-
 /// Default socket pacing delay between MJPEG frames in milliseconds (`50 ms`).
 pub const DEFAULT_STREAM_PACING_MS: u32 = 50;
 
@@ -107,25 +96,6 @@ pub const fn active_ota_token() -> &'static str {
 /// variables are set, defaults to [`DEFAULT_OTA_TOKEN`] so offline builds and
 /// tests compile cleanly without environment requirements.
 pub const OTA_TOKEN: &str = active_ota_token();
-
-/// Returns `true` if the active OTA token matches the factory default
-/// (`SEC-171`).
-#[inline]
-pub const fn is_using_default_ota_token() -> bool {
-    let active = active_ota_token().as_bytes();
-    let default = DEFAULT_OTA_TOKEN.as_bytes();
-    if active.len() != default.len() {
-        return false;
-    }
-    let mut i = 0;
-    while i < active.len() {
-        if active[i] != default[i] {
-            return false;
-        }
-        i += 1;
-    }
-    true
-}
 
 /// `true` when the crate is built with the `allow-open-wifi` feature, the
 /// only way an empty `WIFI_PASS` may join an Open (unencrypted) network
@@ -544,45 +514,24 @@ impl Default for StaticIpConfig {
 /// Wi-Fi and IPv4 network configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NetworkConfig {
-    /// Whether to use dynamic DHCP (`true`) or static IP (`false`).
-    pub use_dhcp: bool,
     /// Static IPv4 settings (`172.22.1.52/24`, GW `172.22.1.1`).
     pub static_ip: StaticIpConfig,
     /// 2.4 GHz Wi-Fi SSID.
     pub wifi_ssid: &'static str,
     /// WPA2-PSK passphrase.
     pub wifi_password: &'static str,
-    /// Disable Wi-Fi modem sleep (`WIFI_PS_NONE`) for line-rate MJPEG throughput.
-    pub disable_modem_sleep: bool,
     /// Non-blocking reconnect timer delay in milliseconds (`2000 ms`, `APP-009`).
     pub reconnect_delay_ms: u32,
 }
 
 impl NetworkConfig {
-    /// Default network configuration with DHCP enabled and `172.22.1.52/24`
-    /// static profile ready.
+    /// Default network configuration and `172.22.1.52/24` static profile ready.
     pub const DEFAULT: Self = Self {
-        use_dhcp: true,
         static_ip: StaticIpConfig::KLIPPER_DEFAULT,
         wifi_ssid: active_wifi_ssid(),
         wifi_password: active_wifi_pass(),
-        disable_modem_sleep: true,
         reconnect_delay_ms: DEFAULT_WIFI_RECONNECT_MS,
     };
-
-    /// Returns a network configuration pinned to static IP `172.22.1.52/24`
-    /// (GW `172.22.1.1`).
-    #[inline]
-    pub const fn with_static_ip() -> Self {
-        Self {
-            use_dhcp: false,
-            static_ip: StaticIpConfig::KLIPPER_DEFAULT,
-            wifi_ssid: active_wifi_ssid(),
-            wifi_password: active_wifi_pass(),
-            disable_modem_sleep: true,
-            reconnect_delay_ms: DEFAULT_WIFI_RECONNECT_MS,
-        }
-    }
 }
 
 impl Default for NetworkConfig {
@@ -626,14 +575,6 @@ pub struct KlipperCamConfig {
     pub control_port: u16,
     /// Dedicated MJPEG stream HTTP server port (`81`).
     pub stream_port: u16,
-    /// Control HTTP server internal ctrl port (`32768`).
-    pub control_ctrl_port: u16,
-    /// Stream HTTP server internal ctrl port (`32769`).
-    pub stream_ctrl_port: u16,
-    /// Maximum open sockets on Port 80 (`4`).
-    pub control_max_sockets: u8,
-    /// Maximum open sockets on Port 81 (`2`).
-    pub stream_max_sockets: u8,
     /// Inter-frame socket pacing delay in milliseconds (`50`).
     pub stream_pacing_ms: u32,
     /// Advertised `X-Framerate` header value (`5`).
@@ -662,10 +603,6 @@ impl KlipperCamConfig {
         hmirror: false,
         control_port: DEFAULT_CONTROL_PORT,
         stream_port: DEFAULT_STREAM_PORT,
-        control_ctrl_port: DEFAULT_CONTROL_CTRL_PORT,
-        stream_ctrl_port: DEFAULT_STREAM_CTRL_PORT,
-        control_max_sockets: 4,
-        stream_max_sockets: 2,
         stream_pacing_ms: DEFAULT_STREAM_PACING_MS,
         target_fps: 5,
         network: NetworkConfig::DEFAULT,
@@ -700,18 +637,7 @@ impl KlipperCamConfig {
     /// Returns `true` if the configured OTA token matches the factory default.
     #[inline]
     pub fn is_default_ota_token(&self) -> bool {
-        let expected = Self::DEFAULT_OTA_TOKEN.as_bytes();
-        let actual = self.ota_token.as_bytes();
-        if expected.len() != actual.len() {
-            return false;
-        }
-        let mut diff = 0usize;
-        let mut i = 0;
-        while i < expected.len() {
-            diff |= (expected[i] ^ actual[i]) as usize;
-            i += 1;
-        }
-        diff == 0
+        crate::ota::verify_ota_token(self.ota_token.as_bytes(), DEFAULT_OTA_TOKEN.as_bytes())
     }
 
     /// Returns the HTTP control port.
@@ -930,7 +856,6 @@ mod tests {
         let cfg = KlipperCamConfig::default();
         assert!(cfg.is_valid());
         assert!(cfg.is_default_ota_token());
-        assert!(is_using_default_ota_token());
         assert_eq!(cfg.http_port(), 80);
         assert_eq!(cfg.static_ip().prefix_len, 24);
 
