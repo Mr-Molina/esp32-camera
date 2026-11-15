@@ -1,9 +1,24 @@
-//! ESP32-S3 `LCD_CAM` + `GDMA` camera parallel interface low-level driver
+//! ESP32-S3 `LCD_CAM` + `GDMA` camera parallel interface host model
 //! (`target/esp32s3/ll_cam.c`).
 //!
 //! Models the `LCD_CAM` camera peripheral (`0x6004_1000`), `GDMA` RX channel
 //! (`0x6003_F000`), integrated `160 MHz` `CAM_CLK` divider (`xclk_timer_conf`),
 //! and hardware YUV/RGB color converter.
+//!
+//! # This is a host model, not a driver
+//!
+//! Despite the name, nothing here reaches hardware. The register block is a
+//! plain struct held by value and zero-initialised in `new()`; there is not a
+//! single MMIO access in this module, and no `target_arch = "xtensa"` path.
+//! The `LCD_CAM` and `GDMA` base addresses below are declared for reference
+//! and never dereferenced. Compare [`crate::esp32_i2s`], the production ESP32
+//! backend, which does real MMIO and keeps an in-memory block only as a
+//! shadow for host tests.
+//!
+//! So on real ESP32-S3 hardware `config`, `start` and `stop` update a struct
+//! in RAM and report success. Treat this as an executable description of what
+//! the S3 backend should do, not as something to ship. Work order
+//! WO-PERF-2026-11, LL-17 tracks giving it a real backend.
 
 use core::ptr;
 use esp32_cam_types::{CameraConvMode, CameraError, CameraPid, PixelFormat};
@@ -14,14 +29,16 @@ use crate::esp32_i2s::{CamPinConfig, GpioMatrixBinding};
 /// Physical base address of `LCD_CAM` peripheral on ESP32-S3 (`0x6004_1000`).
 pub const ESP32S3_LCD_CAM_BASE_ADDR: usize = 0x6004_1000;
 
+/// Physical base address of `GDMA` peripheral on ESP32-S3 (`0x6003_F000`).
+///
+/// Reference only: this module never dereferences it. See the module docs.
+pub const ESP32S3_GDMA_BASE_ADDR: usize = 0x6003_F000;
+
 /// Physical register address for `LCD_CAM_CAM_CTRL1_REG` (`0x6004_1008`).
 pub const LCD_CAM_CAM_CTRL1_REG: usize = ESP32S3_LCD_CAM_BASE_ADDR + 0x08;
 
 /// Enable VH DE mode in `LCD_CAM_CAM_CTRL1_REG` (`1 << 28`).
 pub const LCD_CAM_CAM_VH_DE_MODE_EN: u32 = 1 << 28;
-
-/// Physical base address of `GDMA` peripheral on ESP32-S3 (`0x6003_F000`).
-pub const ESP32S3_GDMA_BASE_ADDR: usize = 0x6003_F000;
 
 /// Maximum valid GPIO number on ESP32-S3 (`GPIO_NUM_MAX = 49`, valid 0..=48).
 pub const ESP32S3_GPIO_NUM_MAX: u8 = 49;
@@ -86,8 +103,12 @@ fn volatile_read_u32(reg: &u32) -> u32 {
     unsafe { ptr::read_volatile(ptr) }
 }
 
-/// Low-level ESP32-S3 `LCD_CAM` + `GDMA` camera controller
+/// Host model of the ESP32-S3 `LCD_CAM` + `GDMA` camera peripheral
 /// (`target/esp32s3/ll_cam.c`).
+///
+/// Performs no MMIO: every method updates the in-RAM register block and
+/// reports success. See the module documentation before using it for
+/// anything but testing the layers above.
 #[derive(Debug, Clone)]
 pub struct Esp32S3LcdCam {
     regs: Esp32S3LcdCamRegisterBlock,

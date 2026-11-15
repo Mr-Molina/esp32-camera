@@ -182,7 +182,11 @@ pub const RATIO_TABLE: [RatioSettings; 9] = [
     }, // 9x16
 ];
 
-pub const SENSOR_DEFAULT_REGS: [Reg16; 198] = [
+/// SENS-22: `static`, not `const`. A `const` array of this size is a value
+/// that each use site may materialise its own copy of; a `static` is one
+/// read-only allocation. (The slice-typed tables elsewhere in this crate
+/// are `const &[_]`, which already points at a single promoted static.)
+pub static SENSOR_DEFAULT_REGS: [Reg16; 198] = [
     Reg16::new(SYSTEM_CTROL0, 0x82),
     Reg16::new(REG_DLY, 10),
     Reg16::new(0x3103, 0x13),
@@ -593,14 +597,7 @@ impl Ov3660 {
         bus: &mut B,
         regs: &[Reg16],
     ) -> Result<(), CameraError> {
-        for entry in regs {
-            if entry.reg == REG_DLY {
-                bus.delay_ms(entry.val as u32);
-            } else {
-                bus.write_reg16(self.slv_addr, entry.reg, entry.val)?;
-            }
-        }
-        Ok(())
+        crate::write_table16(bus, self.slv_addr, regs)
     }
 
     fn write_reg_bits<B: SccbBus>(
@@ -610,7 +607,7 @@ impl Ov3660 {
         mask: u8,
         enable: bool,
     ) -> Result<(), CameraError> {
-        bus.write_reg16_mask(self.slv_addr, reg, if enable { mask } else { 0 }, mask)
+        crate::write_reg_bits16(bus, self.slv_addr, reg, mask, enable)
     }
 
     fn check_reg_mask<B: SccbBus>(
@@ -619,8 +616,7 @@ impl Ov3660 {
         reg: u16,
         mask: u8,
     ) -> Result<bool, CameraError> {
-        let v = bus.read_reg16(self.slv_addr, reg)?;
-        Ok((v & mask) == mask)
+        crate::check_reg_mask16(bus, self.slv_addr, reg, mask)
     }
 
     fn write_addr_reg<B: SccbBus>(
@@ -824,7 +820,7 @@ impl<B: SccbBus> CameraSensor<B> for Ov3660 {
 
     fn set_framesize(&mut self, bus: &mut B, framesize: FrameSize) -> Result<(), CameraError> {
         if (framesize as u8) > (FrameSize::Qxga as u8) {
-            return Err(CameraError::InvalidArg);
+            return Err(CameraError::FailedToSetFrameSize);
         }
         let old_framesize = self.status.framesize;
         let old_binning = self.status.binning;
@@ -897,22 +893,7 @@ impl<B: SccbBus> CameraSensor<B> for Ov3660 {
     }
 
     fn set_brightness(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
-        if !(-3..=3).contains(&level) {
-            return Err(CameraError::InvalidArg);
-        }
-        let (value, negative) = match level {
-            3 => (0x30u8, false),
-            2 => (0x20u8, false),
-            1 => (0x10u8, false),
-            -1 => (0x10u8, true),
-            -2 => (0x20u8, true),
-            -3 => (0x30u8, true),
-            _ => (0x00u8, false),
-        };
-        bus.write_reg16(self.slv_addr, 0x5587, value)?;
-        self.write_reg_bits(bus, 0x5588, 0x08, negative)?;
-        self.status.brightness = level as i8;
-        Ok(())
+        crate::omnivision16::set_brightness(bus, self.slv_addr, &mut self.status, level)
     }
 
     fn set_saturation(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
@@ -928,36 +909,11 @@ impl<B: SccbBus> CameraSensor<B> for Ov3660 {
     }
 
     fn set_sharpness(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
-        if !(-3..=3).contains(&level) {
-            return Err(CameraError::InvalidArg);
-        }
-        let mt_offset_2 = ((level + 3) as u8) * 8;
-        let mt_offset_1 = mt_offset_2 + 1;
-
-        self.write_reg_bits(bus, 0x5308, 0x40, false)?;
-        bus.write_reg16(self.slv_addr, 0x5300, 0x10)?;
-        bus.write_reg16(self.slv_addr, 0x5301, 0x10)?;
-        bus.write_reg16(self.slv_addr, 0x5302, mt_offset_1)?;
-        bus.write_reg16(self.slv_addr, 0x5303, mt_offset_2)?;
-        bus.write_reg16(self.slv_addr, 0x5309, 0x10)?;
-        bus.write_reg16(self.slv_addr, 0x530A, 0x10)?;
-        bus.write_reg16(self.slv_addr, 0x530B, 0x04)?;
-        bus.write_reg16(self.slv_addr, 0x530C, 0x06)?;
-
-        self.status.sharpness = level as i8;
-        Ok(())
+        crate::omnivision16::set_sharpness(bus, self.slv_addr, &mut self.status, level)
     }
 
     fn set_denoise(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
-        if !(0..=8).contains(&level) {
-            return Err(CameraError::InvalidArg);
-        }
-        self.write_reg_bits(bus, 0x5308, 0x10, level > 0)?;
-        if level > 0 {
-            bus.write_reg16(self.slv_addr, 0x5306, ((level - 1) as u8) * 4)?;
-        }
-        self.status.denoise = level as u8;
-        Ok(())
+        crate::omnivision16::set_denoise(bus, self.slv_addr, &mut self.status, level)
     }
 
     fn set_gainceiling(
@@ -965,15 +921,7 @@ impl<B: SccbBus> CameraSensor<B> for Ov3660 {
         bus: &mut B,
         gainceiling: GainCeiling,
     ) -> Result<(), CameraError> {
-        let level = gainceiling as u8;
-        let mut reg_val = 16u16 << (level + 1);
-        if reg_val > 0x03FF {
-            reg_val = 0x03FF;
-        }
-        bus.write_reg16(self.slv_addr, 0x3A18, ((reg_val >> 8) & 0x03) as u8)?;
-        bus.write_reg16(self.slv_addr, 0x3A19, (reg_val & 0xFF) as u8)?;
-        self.status.gainceiling = level;
-        Ok(())
+        crate::omnivision16::set_gainceiling(bus, self.slv_addr, &mut self.status, gainceiling)
     }
 
     fn set_quality(&mut self, bus: &mut B, quality: i32) -> Result<(), CameraError> {
@@ -1041,30 +989,11 @@ impl<B: SccbBus> CameraSensor<B> for Ov3660 {
     }
 
     fn set_agc_gain(&mut self, bus: &mut B, gain: i32) -> Result<(), CameraError> {
-        if !(0..=64).contains(&gain) {
-            return Err(CameraError::InvalidArg);
-        }
-        let gainv = ((gain as u16) << 4).saturating_sub(1);
-        bus.write_reg16(self.slv_addr, 0x350A, (gainv >> 8) as u8)?;
-        bus.write_reg16(self.slv_addr, 0x350B, (gainv & 0xFF) as u8)?;
-        self.status.agc_gain = gain as u8;
-        Ok(())
+        crate::omnivision16::set_agc_gain(bus, self.slv_addr, &mut self.status, gain)
     }
 
     fn set_aec_value(&mut self, bus: &mut B, value: i32) -> Result<(), CameraError> {
-        if !(0..=0xFFFF).contains(&value) {
-            return Err(CameraError::InvalidArg);
-        }
-        let max_val = bus.read_reg16_val16(self.slv_addr, Y_TOTAL_SIZE_H)?;
-        let mut val = value as u16;
-        if max_val > 0 && val > max_val {
-            val = max_val;
-        }
-        bus.write_reg16(self.slv_addr, 0x3500, ((val >> 12) & 0x0F) as u8)?;
-        bus.write_reg16(self.slv_addr, 0x3501, ((val >> 4) & 0xFF) as u8)?;
-        bus.write_reg16(self.slv_addr, 0x3502, ((val << 4) & 0xF0) as u8)?;
-        self.status.aec_value = val;
-        Ok(())
+        crate::omnivision16::set_aec_value(bus, self.slv_addr, &mut self.status, value)
     }
 
     fn set_special_effect(&mut self, bus: &mut B, effect: i32) -> Result<(), CameraError> {
@@ -1081,59 +1010,11 @@ impl<B: SccbBus> CameraSensor<B> for Ov3660 {
     }
 
     fn set_wb_mode(&mut self, bus: &mut B, mode: i32) -> Result<(), CameraError> {
-        if !(0..=4).contains(&mode) {
-            return Err(CameraError::InvalidArg);
-        }
-        bus.write_reg16(self.slv_addr, 0x3406, u8::from(mode != 0))?;
-        match mode {
-            1 => {
-                bus.write_reg16_val16(self.slv_addr, 0x3400, 0x05E0)?;
-                bus.write_reg16_val16(self.slv_addr, 0x3402, 0x0410)?;
-                bus.write_reg16_val16(self.slv_addr, 0x3404, 0x0540)?;
-            }
-            2 => {
-                bus.write_reg16_val16(self.slv_addr, 0x3400, 0x0650)?;
-                bus.write_reg16_val16(self.slv_addr, 0x3402, 0x0410)?;
-                bus.write_reg16_val16(self.slv_addr, 0x3404, 0x04F0)?;
-            }
-            3 => {
-                bus.write_reg16_val16(self.slv_addr, 0x3400, 0x0520)?;
-                bus.write_reg16_val16(self.slv_addr, 0x3402, 0x0410)?;
-                bus.write_reg16_val16(self.slv_addr, 0x3404, 0x0660)?;
-            }
-            4 => {
-                bus.write_reg16_val16(self.slv_addr, 0x3400, 0x0420)?;
-                bus.write_reg16_val16(self.slv_addr, 0x3402, 0x03F0)?;
-                bus.write_reg16_val16(self.slv_addr, 0x3404, 0x0710)?;
-            }
-            _ => {}
-        }
-        self.status.wb_mode = mode as u8;
-        Ok(())
+        crate::omnivision16::set_wb_mode(bus, self.slv_addr, &mut self.status, mode)
     }
 
     fn set_ae_level(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
-        if !(-5..=5).contains(&level) {
-            return Err(CameraError::InvalidArg);
-        }
-        let target_level = ((level + 5) * 10) + 5;
-        let level_low = (target_level * 23) / 25;
-        let level_high = (target_level * 27) / 25;
-        let fast_low = level_low >> 1;
-        let mut fast_high = level_high << 1;
-        if fast_high > 255 {
-            fast_high = 255;
-        }
-
-        bus.write_reg16(self.slv_addr, 0x3A0F, level_high as u8)?;
-        bus.write_reg16(self.slv_addr, 0x3A10, level_low as u8)?;
-        bus.write_reg16(self.slv_addr, 0x3A1B, level_high as u8)?;
-        bus.write_reg16(self.slv_addr, 0x3A1E, level_low as u8)?;
-        bus.write_reg16(self.slv_addr, 0x3A11, fast_high as u8)?;
-        bus.write_reg16(self.slv_addr, 0x3A1F, fast_low as u8)?;
-
-        self.status.ae_level = level as i8;
-        Ok(())
+        crate::omnivision16::set_ae_level(bus, self.slv_addr, &mut self.status, level)
     }
 
     fn set_dcw(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
@@ -1167,52 +1048,11 @@ impl<B: SccbBus> CameraSensor<B> for Ov3660 {
     }
 
     fn get_reg(&mut self, bus: &mut B, reg: i32, mask: i32) -> Result<i32, CameraError> {
-        if !(0..=0xFFFF).contains(&reg) || mask < 0 {
-            return Err(CameraError::InvalidArg);
-        }
-        let addr = reg as u16;
-        let mut ret = if mask > 0xFF {
-            let v16 = bus.read_reg16_val16(self.slv_addr, addr)? as i32;
-            if mask > 0xFFFF {
-                let v_low = bus.read_reg16(self.slv_addr, addr.wrapping_add(2))? as i32;
-                (v16 << 8) | v_low
-            } else {
-                v16
-            }
-        } else {
-            bus.read_reg16(self.slv_addr, addr)? as i32
-        };
-        if ret > 0 {
-            ret &= mask;
-        }
-        Ok(ret)
+        crate::read_masked_reg16(bus, self.slv_addr, reg, mask)
     }
 
     fn set_reg(&mut self, bus: &mut B, reg: i32, mask: i32, value: i32) -> Result<(), CameraError> {
-        if !(0..=0xFFFF).contains(&reg) || mask < 0 {
-            return Err(CameraError::InvalidArg);
-        }
-        let addr = reg as u16;
-        let current = if mask > 0xFF {
-            let v16 = bus.read_reg16_val16(self.slv_addr, addr)? as i32;
-            if mask > 0xFFFF {
-                let v_low = bus.read_reg16(self.slv_addr, addr.wrapping_add(2))? as i32;
-                (v16 << 8) | v_low
-            } else {
-                v16
-            }
-        } else {
-            bus.read_reg16(self.slv_addr, addr)? as i32
-        };
-        let next = (current & !mask) | (value & mask);
-        if mask > 0xFFFF {
-            bus.write_reg16_val16(self.slv_addr, addr, ((next >> 8) & 0xFFFF) as u16)?;
-            bus.write_reg16(self.slv_addr, addr.wrapping_add(2), (next & 0xFF) as u8)
-        } else if mask > 0xFF {
-            bus.write_reg16_val16(self.slv_addr, addr, (next & 0xFFFF) as u16)
-        } else {
-            bus.write_reg16(self.slv_addr, addr, (next & 0xFF) as u8)
-        }
+        crate::write_masked_reg16(bus, self.slv_addr, reg, mask, value)
     }
 
     fn set_res_raw(

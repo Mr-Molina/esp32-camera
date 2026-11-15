@@ -4,11 +4,17 @@
 //! Exposes all 6 OmniVision drivers (`OV2640`, `OV3660`, `OV3640`,
 //! `OV5640` + `OV5640-AF`, `OV7725`, and `OV7670`).
 
+#[cfg(feature = "ov2640")]
 pub use crate::ov2640::{self, Ov2640, Ov2640Bank};
+#[cfg(feature = "ov3640")]
 pub use crate::ov3640::{self, Ov3640};
+#[cfg(feature = "ov3660")]
 pub use crate::ov3660::{self, Ov3660};
+#[cfg(feature = "ov5640")]
 pub use crate::ov5640::{self, Ov5640, Ov5640Af, Ov5640AfStatus};
+#[cfg(feature = "ov7670")]
 pub use crate::ov7670::{self, Ov7670};
+#[cfg(feature = "ov7725")]
 pub use crate::ov7725::{self, Ov7725};
 
 #[cfg(test)]
@@ -208,7 +214,7 @@ mod tests {
 
         assert_eq!(
             sensor.set_framesize(&mut bus, FrameSize::Qhd),
-            Err(CameraError::InvalidArg)
+            Err(CameraError::FailedToSetFrameSize)
         );
 
         // Enforce 16-bit register upper bounds on `set_aec_value` and `set_agc_gain`
@@ -288,9 +294,21 @@ mod tests {
         assert_eq!(bus.reg16(CameraSccbAddr::OV3640, ov3640::PWCOM1), 0x08);
         assert_eq!(bus.reg16(CameraSccbAddr::OV3640, 0x00FF), 0x00);
 
-        assert_eq!(sensor.set_pixformat(&mut bus, PixelFormat::Jpeg), Ok(()));
-        assert_eq!(sensor.set_framesize(&mut bus, FrameSize::Uxga), Ok(()));
-        assert_eq!(sensor.set_framesize(&mut bus, FrameSize::Svga), Ok(()));
+        // SENS-04: format and window programming goes through OV3660
+        // registers this part does not have, so these refuse until a
+        // verified OV3640 map is ported.
+        assert_eq!(
+            sensor.set_pixformat(&mut bus, PixelFormat::Jpeg),
+            Err(CameraError::NotSupported)
+        );
+        assert_eq!(
+            sensor.set_framesize(&mut bus, FrameSize::Uxga),
+            Err(CameraError::NotSupported)
+        );
+        assert_eq!(
+            sensor.set_framesize(&mut bus, FrameSize::Svga),
+            Err(CameraError::NotSupported)
+        );
 
         // Verify mirror and flip update 0x307C, 0x3090, and 0x3023
         assert_eq!(sensor.set_hmirror(&mut bus, true), Ok(()));
@@ -316,14 +334,16 @@ mod tests {
         assert_eq!(sensor.set_agc_gain(&mut bus, 32), Ok(()));
         assert_eq!(sensor.set_aec_value(&mut bus, 500), Ok(()));
 
-        // set_pll bounds validation via u8::try_from
+        // SENS-04: set_pll programmed SC_PLLS_CTRL0..3, which are OV3660
+        // addresses, so it refuses regardless of the arguments. It used to
+        // bounds-check them and then write the wrong registers.
         assert_eq!(
             sensor.set_pll(&mut bus, 0, 256, 1, 0, 1, 0, 1, 1),
-            Err(CameraError::InvalidArg)
+            Err(CameraError::NotSupported)
         );
         assert_eq!(
-            sensor.set_pll(&mut bus, 0, -1, 1, 0, 1, 0, 1, 1),
-            Err(CameraError::InvalidArg)
+            sensor.set_pll(&mut bus, 0, 30, 1, 0, 1, 0, 1, 1),
+            Err(CameraError::NotSupported)
         );
 
         // init_status sharpness and awb_gain decoding verification
@@ -506,7 +526,7 @@ mod tests {
         assert_eq!(bus.reg8(CameraSccbAddr::OV7725, ov7725::DSPAUTO), 0xF3);
         assert_eq!(
             sensor.set_framesize(&mut bus, FrameSize::Svga),
-            Err(CameraError::InvalidArg)
+            Err(CameraError::FailedToSetFrameSize)
         );
 
         // Gain ceiling: Gain64x and Gain128x unsupported on OV7725
@@ -569,7 +589,7 @@ mod tests {
         assert_eq!(sensor.set_framesize(&mut bus, FrameSize::Qqvga), Ok(()));
         assert_eq!(
             sensor.set_framesize(&mut bus, FrameSize::Cif),
-            Err(CameraError::InvalidArg)
+            Err(CameraError::FailedToSetFrameSize)
         );
         assert_eq!(
             sensor.set_framesize(&mut bus, FrameSize::Uxga),

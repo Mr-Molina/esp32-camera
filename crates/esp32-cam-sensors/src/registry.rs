@@ -3,10 +3,42 @@
 use esp32_cam_sccb::SccbBus;
 use esp32_cam_types::{CameraError, CameraModel, CameraSccbAddr, SensorId};
 
-use crate::{
-    bf20a6, bf3005, gc0308, gc032a, gc2145, hm0360, hm1055, mega_ccm, nt99141, ov2640, ov3640,
-    ov3660, ov5640, ov7670, ov7725, sc030iot, sc031gs, sc101iot,
-};
+#[cfg(feature = "bf20a6")]
+use crate::bf20a6;
+#[cfg(feature = "bf3005")]
+use crate::bf3005;
+#[cfg(feature = "gc0308")]
+use crate::gc0308;
+#[cfg(feature = "gc032a")]
+use crate::gc032a;
+#[cfg(feature = "gc2145")]
+use crate::gc2145;
+#[cfg(feature = "hm0360")]
+use crate::hm0360;
+#[cfg(feature = "hm1055")]
+use crate::hm1055;
+#[cfg(feature = "mega_ccm")]
+use crate::mega_ccm;
+#[cfg(feature = "nt99141")]
+use crate::nt99141;
+#[cfg(feature = "ov2640")]
+use crate::ov2640;
+#[cfg(feature = "ov3640")]
+use crate::ov3640;
+#[cfg(feature = "ov3660")]
+use crate::ov3660;
+#[cfg(feature = "ov5640")]
+use crate::ov5640;
+#[cfg(feature = "ov7670")]
+use crate::ov7670;
+#[cfg(feature = "ov7725")]
+use crate::ov7725;
+#[cfg(feature = "sc030iot")]
+use crate::sc030iot;
+#[cfg(feature = "sc031gs")]
+use crate::sc031gs;
+#[cfg(feature = "sc101iot")]
+use crate::sc101iot;
 
 /// Automatically detects an attached camera sensor by querying each of
 /// the 18 supported sensor models at their canonical SCCB addresses in order.
@@ -21,108 +53,157 @@ pub fn detect_sensor<B: SccbBus>(bus: &mut B) -> Result<(CameraModel, u8, Sensor
         };
     }
 
-    // 1. Ov7725 (0x21)
+    // SENS-09: every 8-bit-addressed sensor is probed before any
+    // 16-bit-addressed one.
+    //
+    // Three slave addresses are shared by sensors of both kinds: 0x30
+    // (Ov2640 / Sc031Gs) and 0x3C (Gc2145 / Ov3660 / Ov3640 / Ov5640). A
+    // 16-bit read puts two address bytes on the wire, and an 8-bit sensor
+    // sitting at that address latches them as a register index and a value,
+    // so merely probing for the 16-bit part *writes* into the 8-bit one.
+    //
+    // The reverse order is believed safer, not proven safe. Most of the
+    // 8-bit probes are reads, and a 16-bit sensor that receives a single
+    // address byte sees a truncated read and writes nothing. But two of the
+    // now-earlier probes are not pure reads: `Ov2640::detect` opens with a
+    // BANK_SEL *write*, which is two bytes an Sc031Gs at 0x30 could parse as
+    // a complete 16-bit address with the data byte missing, and
+    // `Gc2145::detect` leaves an Ov5640/Ov3660/Ov3640 at 0x3C holding half
+    // an address. Both should be harmless, because an I2C slave resynchronises
+    // on the next START, but that is a part-specific claim this repo cannot
+    // settle. The old order was a deliberate choice about the same hazard in
+    // the other direction; this swaps a write-corruption hazard for a
+    // resynchronisation one. SENS-09 asks for a hardware A/B, which has not
+    // been run.
+    //
+    // Within each group the order is the historical preference order.
+    // `registry::tests::test_probe_order_8bit_before_16bit_at_each_address`
+    // enforces the split.
+
+    // --- 8-bit register addressing ---
+    // Ov7725 (0x21)
+    #[cfg(feature = "ov7725")]
     probe!(
         ov7725::Ov7725::detect(bus, CameraSccbAddr::OV7725),
         CameraModel::Ov7725,
         CameraSccbAddr::OV7725
     );
-    // 2. 16-bit SmartSens sensors at 0x30 / 0x68 probed before Ov2640
-    // (which writes bank register 0xFF)
-    probe!(
-        sc031gs::Sc031Gs::detect(bus, CameraSccbAddr::SC031GS),
-        CameraModel::Sc031Gs,
-        CameraSccbAddr::SC031GS
-    );
+    // Sc101Iot (0x68)
+    #[cfg(feature = "sc101iot")]
     probe!(
         sc101iot::Sc101Iot::detect(bus, CameraSccbAddr::SC101IOT),
         CameraModel::Sc101Iot,
         CameraSccbAddr::SC101IOT
     );
+    // Sc030Iot (0x68)
+    #[cfg(feature = "sc030iot")]
     probe!(
         sc030iot::Sc030Iot::detect(bus, CameraSccbAddr::SC030IOT),
         CameraModel::Sc030Iot,
         CameraSccbAddr::SC030IOT
     );
-    // 3. Ov2640 (0x30)
+    // Ov2640 (0x30) — before Sc031Gs, which shares the address
+    #[cfg(feature = "ov2640")]
     probe!(
         ov2640::Ov2640::detect(bus, CameraSccbAddr::OV2640),
         CameraModel::Ov2640,
         CameraSccbAddr::OV2640
     );
-    // 4. Ov3660 (0x3C)
-    probe!(
-        ov3660::Ov3660::detect(bus, CameraSccbAddr::OV3660),
-        CameraModel::Ov3660,
-        CameraSccbAddr::OV3660
-    );
-    // 5. Ov3640 (0x3C)
-    probe!(
-        ov3640::Ov3640::detect(bus, CameraSccbAddr::OV3640),
-        CameraModel::Ov3640,
-        CameraSccbAddr::OV3640
-    );
-    // 6. Ov5640 (0x3C)
-    probe!(
-        ov5640::Ov5640::detect(bus, CameraSccbAddr::OV5640),
-        CameraModel::Ov5640,
-        CameraSccbAddr::OV5640
-    );
-    // 7. Ov7670 (0x21)
+    // Ov7670 (0x21)
+    #[cfg(feature = "ov7670")]
     probe!(
         ov7670::Ov7670::detect(bus, CameraSccbAddr::OV7670),
         CameraModel::Ov7670,
         CameraSccbAddr::OV7670
     );
-    // 8. Nt99141 (0x2A)
-    probe!(
-        nt99141::Nt99141::detect(bus, CameraSccbAddr::NT99141),
-        CameraModel::Nt99141,
-        CameraSccbAddr::NT99141
-    );
-    // 9. Gc2145 (0x3C)
+    // Gc2145 (0x3C) — before the Ov3660/Ov3640/Ov5640 trio at the same address
+    #[cfg(feature = "gc2145")]
     probe!(
         gc2145::Gc2145::detect(bus, CameraSccbAddr::GC2145),
         CameraModel::Gc2145,
         CameraSccbAddr::GC2145
     );
-    // 10. Gc032a (0x21)
+    // Gc032a (0x21)
+    #[cfg(feature = "gc032a")]
     probe!(
         gc032a::Gc032a::detect(bus, CameraSccbAddr::GC032A),
         CameraModel::Gc032a,
         CameraSccbAddr::GC032A
     );
-    // 11. Gc0308 (0x21)
+    // Gc0308 (0x21)
+    #[cfg(feature = "gc0308")]
     probe!(
         gc0308::Gc0308::detect(bus, CameraSccbAddr::GC0308),
         CameraModel::Gc0308,
         CameraSccbAddr::GC0308
     );
-    // 12. Bf3005 (0x6E)
+    // Bf3005 (0x6E)
+    #[cfg(feature = "bf3005")]
     probe!(
         bf3005::Bf3005::detect(bus, CameraSccbAddr::BF3005),
         CameraModel::Bf3005,
         CameraSccbAddr::BF3005
     );
-    // 13. Bf20a6 (0x6E)
+    // Bf20a6 (0x6E)
+    #[cfg(feature = "bf20a6")]
     probe!(
         bf20a6::Bf20a6::detect(bus, CameraSccbAddr::BF20A6),
         CameraModel::Bf20a6,
         CameraSccbAddr::BF20A6
     );
-    // 14. MegaCcm (0x1F)
+
+    // --- 16-bit register addressing ---
+    // Sc031Gs (0x30)
+    #[cfg(feature = "sc031gs")]
+    probe!(
+        sc031gs::Sc031Gs::detect(bus, CameraSccbAddr::SC031GS),
+        CameraModel::Sc031Gs,
+        CameraSccbAddr::SC031GS
+    );
+    // Ov3660 (0x3C)
+    #[cfg(feature = "ov3660")]
+    probe!(
+        ov3660::Ov3660::detect(bus, CameraSccbAddr::OV3660),
+        CameraModel::Ov3660,
+        CameraSccbAddr::OV3660
+    );
+    // Ov3640 (0x3C)
+    #[cfg(feature = "ov3640")]
+    probe!(
+        ov3640::Ov3640::detect(bus, CameraSccbAddr::OV3640),
+        CameraModel::Ov3640,
+        CameraSccbAddr::OV3640
+    );
+    // Ov5640 (0x3C)
+    #[cfg(feature = "ov5640")]
+    probe!(
+        ov5640::Ov5640::detect(bus, CameraSccbAddr::OV5640),
+        CameraModel::Ov5640,
+        CameraSccbAddr::OV5640
+    );
+    // Nt99141 (0x2A)
+    #[cfg(feature = "nt99141")]
+    probe!(
+        nt99141::Nt99141::detect(bus, CameraSccbAddr::NT99141),
+        CameraModel::Nt99141,
+        CameraSccbAddr::NT99141
+    );
+    // MegaCcm (0x1F)
+    #[cfg(feature = "mega_ccm")]
     probe!(
         mega_ccm::MegaCcm::detect(bus, CameraSccbAddr::MEGA_CCM),
         CameraModel::MegaCcm,
         CameraSccbAddr::MEGA_CCM
     );
-    // 15. Hm1055 (0x24)
+    // Hm1055 (0x24)
+    #[cfg(feature = "hm1055")]
     probe!(
         hm1055::Hm1055::detect(bus, CameraSccbAddr::HM1055),
         CameraModel::Hm1055,
         CameraSccbAddr::HM1055
     );
-    // 16. Hm0360 (0x12)
+    // Hm0360 (0x12)
+    #[cfg(feature = "hm0360")]
     probe!(
         hm0360::Hm0360::detect(bus, CameraSccbAddr::HM0360),
         CameraModel::Hm0360,
@@ -136,7 +217,7 @@ pub fn detect_sensor<B: SccbBus>(bus: &mut B) -> Result<(CameraModel, u8, Sensor
 mod tests {
     use super::*;
     use crate::traits::{set_reg_bits16, set_reg_bits8};
-    use esp32_cam_sccb::MockSccbBus;
+    use esp32_cam_sccb::{MockSccbBus, SccbTransaction};
 
     struct FaultyI2cBus;
 
@@ -160,6 +241,84 @@ mod tests {
     fn test_detect_sensor_i2c_error_early_abort() {
         let mut bus = FaultyI2cBus;
         assert_eq!(detect_sensor(&mut bus), Err(CameraError::I2cError));
+    }
+
+    /// SENS-09: at any slave address shared by an 8-bit-addressed and a
+    /// 16-bit-addressed sensor, the 8-bit sensor must be probed first.
+    ///
+    /// A 16-bit read puts two address bytes on the wire. An 8-bit sensor at
+    /// the same address latches the first as a register index and the second
+    /// as the value, so the probe performs a stray *write* into the sensor it
+    /// is only meant to look at. The reverse order is harmless: a 16-bit
+    /// sensor that receives a single address byte sees an incomplete read and
+    /// writes nothing.
+    #[test]
+    fn test_probe_order_8bit_before_16bit_at_each_address() {
+        let mut bus: MockSccbBus<256> = MockSccbBus::new();
+        assert_eq!(detect_sensor(&mut bus), Err(CameraError::NotDetected));
+        assert_eq!(
+            bus.dropped_count(),
+            0,
+            "probe sequence overflowed the mock transaction log"
+        );
+
+        let mut saw_16bit = [false; 256];
+        for tx in bus.transactions() {
+            match *tx {
+                SccbTransaction::Read16 { slv_addr, .. }
+                | SccbTransaction::Write16 { slv_addr, .. }
+                | SccbTransaction::Write16Seq { slv_addr, .. } => {
+                    saw_16bit[slv_addr as usize] = true;
+                }
+                SccbTransaction::Read8 { slv_addr, .. }
+                | SccbTransaction::Write8 { slv_addr, .. }
+                | SccbTransaction::Write8Seq { slv_addr, .. } => {
+                    assert!(
+                        !saw_16bit[slv_addr as usize],
+                        "8-bit probe at {slv_addr:#04x} follows a 16-bit probe at the \
+                         same address; the 16-bit probe writes stray data into the \
+                         8-bit sensor (SENS-09)"
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// SENS-09: an OV2640 must be detected even though SC031GS shares 0x30.
+    #[test]
+    fn test_detect_ov2640_takes_no_16bit_probe_at_its_address_first() {
+        let mut bus: MockSccbBus<256> = MockSccbBus::new();
+        bus.preset_reg8(CameraSccbAddr::OV2640, ov2640::REG_PID, 0x26);
+        bus.preset_reg8(CameraSccbAddr::OV2640, ov2640::REG_VER, 0x42);
+        bus.preset_reg8(CameraSccbAddr::OV2640, ov2640::REG_MIDH, 0x7F);
+        bus.preset_reg8(CameraSccbAddr::OV2640, ov2640::REG_MIDL, 0xA2);
+
+        assert!(matches!(
+            detect_sensor(&mut bus),
+            Ok((CameraModel::Ov2640, CameraSccbAddr::OV2640, _))
+        ));
+
+        let first_at_0x30 = bus
+            .transactions()
+            .iter()
+            .find(|tx| match tx {
+                SccbTransaction::Read8 { slv_addr, .. }
+                | SccbTransaction::Write8 { slv_addr, .. }
+                | SccbTransaction::Read16 { slv_addr, .. }
+                | SccbTransaction::Write16 { slv_addr, .. } => *slv_addr == CameraSccbAddr::OV2640,
+                _ => false,
+            })
+            .copied();
+        // The first access may be Ov2640's own BANK_SEL write; what matters is
+        // that it is 8-bit addressed, so nothing 16-bit has touched 0x30 yet.
+        assert!(
+            matches!(
+                first_at_0x30,
+                Some(SccbTransaction::Read8 { .. } | SccbTransaction::Write8 { .. })
+            ),
+            "first transaction at 0x30 must be 8-bit addressed, was {first_at_0x30:?}"
+        );
     }
 
     #[test]

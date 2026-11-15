@@ -7,6 +7,14 @@
 //! Live `172.22.1.52` OV2640 hardware capture remains gated on `[HIL]` network
 //! reachability (`README §2.1 Rule 5`).
 
+// Not run under Miri. proptest persists failing cases to a file next to the
+// test source, which calls `getcwd`; Miri's isolation forbids that and aborts
+// the whole binary. Even with isolation off, hundreds of generated cases per
+// property under the interpreter take longer than the job limit. The unit
+// tests in src/ cover the same scanners and parsers under Miri with fixed
+// inputs.
+#![cfg(not(miri))]
+
 #[cfg(test)]
 mod conv22_tests {
     use esp32_cam_conversions::{

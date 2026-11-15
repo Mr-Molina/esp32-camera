@@ -109,7 +109,6 @@ pub const WINYEDL: u16 = 0x05EA;
 pub const WINYEDH: u16 = 0x05EB;
 
 pub const REG_DLY: u16 = 0xFFFF;
-pub const REGLIST_TAIL: u16 = 0xFFFF;
 
 pub const SENSOR_DEFAULT_REGS: &[Reg16] = &[
     Reg16::new(0x0022, 0x00),
@@ -792,24 +791,6 @@ pub const SENSOR_FRAMESIZE_QQVGA: &[Reg16] = &[
 ];
 
 #[inline]
-fn set_reg_bits<B: SccbBus>(
-    bus: &mut B,
-    slv_addr: u8,
-    reg: u16,
-    offset: u8,
-    mask: u8,
-    value: u8,
-) -> Result<(), CameraError> {
-    let c_value = bus.read_reg16(slv_addr, reg)?;
-    let shifted_mask = mask << offset;
-    let new_value = (c_value & !shifted_mask) | ((value & mask) << offset);
-    if new_value == c_value {
-        return Ok(());
-    }
-    bus.write_reg16(slv_addr, reg, new_value)
-}
-
-#[inline]
 fn write_reg_bits<B: SccbBus>(
     bus: &mut B,
     slv_addr: u8,
@@ -817,7 +798,7 @@ fn write_reg_bits<B: SccbBus>(
     mask: u8,
     enable: bool,
 ) -> Result<(), CameraError> {
-    set_reg_bits(bus, slv_addr, reg, 0, mask, if enable { mask } else { 0 })
+    crate::write_reg_bits16(bus, slv_addr, reg, mask, enable)
 }
 
 #[inline]
@@ -827,22 +808,31 @@ fn check_reg_mask<B: SccbBus>(
     reg: u16,
     mask: u8,
 ) -> Result<bool, CameraError> {
-    let val = bus.read_reg16(slv_addr, reg)?;
-    Ok((val & mask) == mask)
+    crate::check_reg_mask16(bus, slv_addr, reg, mask)
 }
 
-fn write_reg_list<B: SccbBus>(
+/// Writes every entry of `regs` in order, treating an entry whose
+/// register is [`REG_DLY`] as a millisecond delay.
+///
+/// SENS-18: there is no end-of-table marker. The sentinel here used to be
+/// 0xFFFF — the same value as `REG_DLY` — so the first delay entry in a
+/// table would have ended it and silently dropped the rest. The slice
+/// carries its own length, so no sentinel is needed.
+/// Writes every entry of `regs` in order, treating an entry whose register is
+/// [`crate::REG_DLY`] as a millisecond delay.
+///
+/// SENS-18: no end-of-table marker — the slice carries its own length.
+/// SENS-23: the body is shared with the other 16-bit-addressed drivers.
+///
+/// # Errors
+///
+/// Any error reported by the bus.
+pub fn write_reg_list<B: SccbBus>(
     bus: &mut B,
     slv_addr: u8,
     regs: &[Reg16],
 ) -> Result<(), CameraError> {
-    for entry in regs {
-        if entry.reg == REGLIST_TAIL {
-            break;
-        }
-        bus.write_reg16(slv_addr, entry.reg, entry.val)?;
-    }
-    Ok(())
+    crate::write_table16(bus, slv_addr, regs)
 }
 
 /// Detects an HM1055 sensor at `slv_addr` (`0x24`).
@@ -1063,6 +1053,10 @@ impl<B: SccbBus> CameraSensor<B> for Hm1055 {
             FrameSize::Hd => SENSOR_FRAMESIZE_HD,
             _ => return Err(CameraError::FailedToSetFrameSize),
         };
+        // SENS-15: not converted to a delta write. The HD and SVGA tables
+        // write four fewer registers than the smaller sizes do, and this
+        // rewrite is what restores those four on a switch up to HD. See
+        // `test_sens15_hm1055_default_table_is_load_bearing`.
         write_reg_list(bus, self.slv_addr, SENSOR_DEFAULT_REGS)?;
         write_reg_list(bus, self.slv_addr, framesize_regs)?;
         if framesize == FrameSize::Hd {
@@ -1134,11 +1128,6 @@ impl<B: SccbBus> CameraSensor<B> for Hm1055 {
         bus.write_reg16(self.slv_addr, YDN, val)?;
         bus.write_reg16(self.slv_addr, CMU, 0x01)?;
         self.status.denoise = (level & 0xFF) as u8;
-        Ok(())
-    }
-
-    fn set_quality(&mut self, _bus: &mut B, quality: i32) -> Result<(), CameraError> {
-        self.status.quality = (quality & 0xFF) as u8;
         Ok(())
     }
 
@@ -1230,67 +1219,11 @@ impl<B: SccbBus> CameraSensor<B> for Hm1055 {
     }
 
     fn get_reg(&mut self, bus: &mut B, reg: i32, mask: i32) -> Result<i32, CameraError> {
-        if !(0..=0xFFFF).contains(&reg) || mask < 0 {
-            return Err(CameraError::InvalidArg);
-        }
-        let reg16 = reg as u16;
-        let val = if mask > 0xFF {
-            let mut v = bus.read_reg16_val16(self.slv_addr, reg16)? as i32;
-            if mask > 0xFFFF {
-                let v2 = bus.read_reg16(self.slv_addr, reg16.wrapping_add(2))? as i32;
-                v = (v << 8) | v2;
-            }
-            v
-        } else {
-            bus.read_reg16(self.slv_addr, reg16)? as i32
-        };
-        Ok(val & mask)
+        crate::read_masked_reg16(bus, self.slv_addr, reg, mask)
     }
 
     fn set_reg(&mut self, bus: &mut B, reg: i32, mask: i32, value: i32) -> Result<(), CameraError> {
-        if !(0..=0xFFFF).contains(&reg) || mask < 0 {
-            return Err(CameraError::InvalidArg);
-        }
-        let reg16 = reg as u16;
-        let current = if mask > 0xFF {
-            let mut v = bus.read_reg16_val16(self.slv_addr, reg16)? as i32;
-            if mask > 0xFFFF {
-                let v2 = bus.read_reg16(self.slv_addr, reg16.wrapping_add(2))? as i32;
-                v = (v << 8) | v2;
-            }
-            v
-        } else {
-            bus.read_reg16(self.slv_addr, reg16)? as i32
-        };
-
-        let next = (current & !mask) | (value & mask);
-        if mask > 0xFFFF {
-            bus.write_reg16_val16(self.slv_addr, reg16, ((next >> 8) & 0xFFFF) as u16)?;
-            bus.write_reg16(self.slv_addr, reg16.wrapping_add(2), (next & 0xFF) as u8)
-        } else if mask > 0xFF {
-            bus.write_reg16_val16(self.slv_addr, reg16, (next & 0xFFFF) as u16)
-        } else {
-            bus.write_reg16(self.slv_addr, reg16, (next & 0xFF) as u8)
-        }
-    }
-
-    fn set_res_raw(
-        &mut self,
-        _bus: &mut B,
-        _start_x: i32,
-        _start_y: i32,
-        _end_x: i32,
-        _end_y: i32,
-        _offset_x: i32,
-        _offset_y: i32,
-        _total_x: i32,
-        _total_y: i32,
-        _output_x: i32,
-        _output_y: i32,
-        _scale: bool,
-        _binning: bool,
-    ) -> Result<(), CameraError> {
-        Ok(())
+        crate::write_masked_reg16(bus, self.slv_addr, reg, mask, value)
     }
 
     fn set_pll(
@@ -1325,20 +1258,26 @@ impl<B: SccbBus> CameraSensor<B> for Hm1055 {
         };
 
         if bypass == 0 {
-            ckcfg2 |= match mul {
-                204 => 10,
-                216 => 11,
-                228 => 0x12,
-                240 => 0x13,
-                288 => 0x17,
-                300 => 0x18,
-                312 => 0x19,
-                324 => 0x1A,
-                336 => 0x1B,
-                348 => 0x1C,
-                360 => 0x1D,
-                _ => 0x17,
-            };
+            // SENS-12: the multiplier codes run consecutively from 0x10 at
+            // mul 204, one code per step of 12. Two arms of the old lookup
+            // were written in decimal (`10`, `11`), so multipliers 204 and
+            // 216 programmed 0x0A and 0x0B — a different PLL setting — and
+            // every unlisted multiplier silently fell back to 0x17.
+            // The codes run consecutively from 0x10 at mul 204, one per step
+            // of 12, and that formula reproduces every multiplier the
+            // original lookup attested. It deliberately does NOT extend to
+            // 252, 264 and 276: the old table jumped from 240 straight to
+            // 288, and three consecutive omissions are evidence the real
+            // encoding is not uniform there. Those three are refused rather
+            // than given invented codes, which on this part would mean an
+            // unverified PLL divider driving PCLK.
+            const SKIPPED: [i32; 3] = [252, 264, 276];
+            if !(204..=360).contains(&mul) || (mul - 204) % 12 != 0 || SKIPPED.contains(&mul) {
+                return Err(CameraError::InvalidArg);
+            }
+            let code =
+                0x10 + u8::try_from((mul - 204) / 12).map_err(|_| CameraError::InvalidArg)?;
+            ckcfg2 |= code;
         }
 
         if pclken > 0 {

@@ -15,7 +15,10 @@ allow-open-wifi = []
 [dependencies]
 esp32-cam-types.workspace = true
 esp32-cam-sccb.workspace = true
-esp32-cam-sensors.workspace = true
+# SENS-22: this firmware talks to one sensor. The other 17 drivers and
+# their register tables are not compiled in at all, rather than left
+# for the linker to drop.
+esp32-cam-sensors = { workspace = true, features = ["ov2640"] }
 esp32-cam-conversions.workspace = true
 esp32-cam-ll.workspace = true
 esp32-cam-hal = { workspace = true, features = ["sensors"] }

@@ -3,17 +3,49 @@
 //! Ported from `sensors/nt99141.c`,
 //! `sensors/private_include/nt99141_regs.h`, and
 //! `sensors/private_include/nt99141_settings.h`.
+//!
+//! # Foreign registers from a half-finished port
+//!
+//! This driver was built from an OmniVision skeleton and not all of it was
+//! remapped. The parts that were addressing OV5640 registers have been dealt
+//! with:
+//!
+//! * `set_sharpness` programmed 0x5300..=0x530C and 0x5308 — the OV5640 ISP
+//!   sharpness block verbatim — while `init_status` read sharpness back from
+//!   0x3301. The two paths could not both be right. It now returns
+//!   [`CameraError::NotSupported`].
+//! * `init_status` reported denoise, dcw, bpc, wpc, raw_gma and lenc from
+//!   0x5306, 0x5183 and 0x5000. Those controls are already `NotSupported`
+//!   here, so it was reporting state nobody could set, read from registers
+//!   this part does not implement. They now report defaults.
+//! * `set_res_raw` wrote the OV5640 window block at 0x3800..0x3810; it was
+//!   removed under SENS-13, and the unused constants went with it.
+//! * Fifty-five further constants named OV5640 window, format, frame,
+//!   scale, VFIFO, PLL and compression registers and still carried
+//!   OV5640 addresses. None was used. The giveaway is
+//!   `COMPRESSION_CTRL07`, which *was* remapped — to 0x3401 — and is
+//!   used, while its unused siblings sat at 0x4400..0x440E: the port
+//!   remapped exactly the registers it needed and left the rest. They
+//!   are deleted, so this module no longer advertises registers the
+//!   part does not have.
+//!
+//! What is left is in the 0x30xx, 0x32xx, 0x33xx and 0x34xx ranges, which is
+//! consistent with Novatek's own map and with how the rest of the driver is
+//! written. It has **not** been checked against an NT99141 datasheet or the
+//! upstream C driver, neither of which is in this repo. Two specifics worth
+//! an owner's eye: `status.sharpness` is still read from 0x3301, which is not
+//! demonstrably foreign but is a value `set_sharpness` can no longer change;
+//! and `SYSTEM_CTROL0`/`ISP_CONTROL_01` are two names for 0x3021, as
+//! `TIMING_TC_REG20`/`TIMING_TC_REG21` are for 0x3022 — artefacts of the same
+//! port, harmless as written because the bits within each register do not
+//! overlap.
 
 use crate::{
     CameraError, CameraModel, CameraPid, CameraSccbAddr, CameraSensor, CameraStatus, FrameSize,
-    GainCeiling, PixelFormat, RatioSettings, Reg16, SccbBus, SensorId,
+    PixelFormat, RatioSettings, Reg16, SccbBus, SensorId,
 };
 
 pub const SYSTEM_CTROL0: u16 = 0x3021;
-pub const FORMAT_CTRL: u16 = 0x501F;
-pub const FORMAT_CTRL00: u16 = 0x4300;
-pub const FRAME_CTRL01: u16 = 0x4201;
-pub const FRAME_CTRL02: u16 = 0x4202;
 pub const PRE_ISP_TEST_SETTING_1: u16 = 0x3025;
 pub const AEC_PK_MANUAL: u16 = 0x3201;
 pub const TIMING_TC_REG20: u16 = 0x3022;
@@ -21,63 +53,9 @@ pub const TIMING_TC_REG21: u16 = 0x3022;
 pub const CLOCK_POL_CONTROL: u16 = 0x3024;
 pub const DRIVE_CAPABILITY: u16 = 0x306A;
 
-pub const X_ADDR_ST_H: u16 = 0x3800;
-pub const X_ADDR_ST_L: u16 = 0x3801;
-pub const Y_ADDR_ST_H: u16 = 0x3802;
-pub const Y_ADDR_ST_L: u16 = 0x3803;
-pub const X_ADDR_END_H: u16 = 0x3804;
-pub const X_ADDR_END_L: u16 = 0x3805;
-pub const Y_ADDR_END_H: u16 = 0x3806;
-pub const Y_ADDR_END_L: u16 = 0x3807;
-pub const X_OUTPUT_SIZE_H: u16 = 0x3808;
-pub const X_OUTPUT_SIZE_L: u16 = 0x3809;
-pub const Y_OUTPUT_SIZE_H: u16 = 0x380A;
-pub const Y_OUTPUT_SIZE_L: u16 = 0x380B;
-pub const X_TOTAL_SIZE_H: u16 = 0x380C;
-pub const X_TOTAL_SIZE_L: u16 = 0x380D;
-pub const Y_TOTAL_SIZE_H: u16 = 0x380E;
-pub const Y_TOTAL_SIZE_L: u16 = 0x380F;
-pub const X_OFFSET_H: u16 = 0x3810;
-pub const X_OFFSET_L: u16 = 0x3811;
-pub const Y_OFFSET_H: u16 = 0x3812;
-pub const Y_OFFSET_L: u16 = 0x3813;
-pub const X_INCREMENT: u16 = 0x3814;
-pub const Y_INCREMENT: u16 = 0x3815;
-
 pub const ISP_CONTROL_01: u16 = 0x3021;
-pub const SCALE_CTRL_1: u16 = 0x5601;
-pub const SCALE_CTRL_2: u16 = 0x5602;
-pub const SCALE_CTRL_3: u16 = 0x5603;
-pub const SCALE_CTRL_4: u16 = 0x5604;
-pub const SCALE_CTRL_5: u16 = 0x5605;
-pub const SCALE_CTRL_6: u16 = 0x5606;
-pub const PCLK_RATIO: u16 = 0x3824;
-pub const VFIFO_CTRL0C: u16 = 0x460C;
-pub const VFIFO_X_SIZE_H: u16 = 0x4602;
-pub const VFIFO_X_SIZE_L: u16 = 0x4603;
-pub const VFIFO_Y_SIZE_H: u16 = 0x4604;
-pub const VFIFO_Y_SIZE_L: u16 = 0x4605;
 
-pub const SC_PLLS_CTRL0: u16 = 0x303A;
-pub const SC_PLLS_CTRL1: u16 = 0x303B;
-pub const SC_PLLS_CTRL2: u16 = 0x303C;
-pub const SC_PLLS_CTRL3: u16 = 0x303D;
-
-pub const COMPRESSION_CTRL00: u16 = 0x4400;
-pub const COMPRESSION_CTRL01: u16 = 0x4401;
-pub const COMPRESSION_CTRL02: u16 = 0x4402;
-pub const COMPRESSION_CTRL03: u16 = 0x4403;
-pub const COMPRESSION_CTRL04: u16 = 0x4404;
-pub const COMPRESSION_CTRL05: u16 = 0x4405;
-pub const COMPRESSION_CTRL06: u16 = 0x4406;
 pub const COMPRESSION_CTRL07: u16 = 0x3401;
-pub const COMPRESSION_ISI_CTRL: u16 = 0x4408;
-pub const COMPRESSION_CTRL09: u16 = 0x4409;
-pub const COMPRESSION_CTRL0A: u16 = 0x440A;
-pub const COMPRESSION_CTRL0B: u16 = 0x440B;
-pub const COMPRESSION_CTRL0C: u16 = 0x440C;
-pub const COMPRESSION_CTRL0D: u16 = 0x440D;
-pub const COMPRESSION_CTRL0E: u16 = 0x440E;
 
 pub const TEST_COLOR_BAR: u8 = 0x02;
 pub const AEC_PK_MANUAL_AGC_MANUALEN: u8 = 0x02;
@@ -86,7 +64,6 @@ pub const TIMING_TC_REG20_VFLIP: u8 = 0x01;
 pub const TIMING_TC_REG21_HMIRROR: u8 = 0x02;
 
 pub const REG_DLY: u16 = 0xFFFF;
-pub const REGLIST_TAIL: u16 = 0x0000;
 
 pub const RATIO_TABLE: [RatioSettings; 1] = [RatioSettings {
     max_width: 1280,
@@ -547,25 +524,28 @@ pub const SENSOR_FRAMESIZE_VGA_XYSKIP: &[Reg16] = &[
     Reg16::new(0x3060, 0x01),
 ];
 
-/// Writes a slice of [`Reg16`] entries to `slv_addr`, interpreting `REG_DLY`
-/// (`0xFFFF`) as a delay in ms and `REGLIST_TAIL` (`0x0000`) as an early
-/// list terminator.
+/// Writes every entry of `regs` in order, treating an entry whose
+/// register is [`REG_DLY`] as a millisecond delay.
+///
+/// SENS-18: there is no end-of-table marker. The sentinel here used to be
+/// 0x0000, so a legitimate write to register 0 ended the table early and
+/// silently dropped the rest. The slice carries its own length, so no
+/// sentinel is needed.
+/// Writes every entry of `regs` in order, treating an entry whose register is
+/// [`crate::REG_DLY`] as a millisecond delay.
+///
+/// SENS-18: no end-of-table marker — the slice carries its own length.
+/// SENS-23: the body is shared with the other 16-bit-addressed drivers.
+///
+/// # Errors
+///
+/// Any error reported by the bus.
 pub fn write_reg_list<B: SccbBus>(
     bus: &mut B,
     slv_addr: u8,
     regs: &[Reg16],
 ) -> Result<(), CameraError> {
-    for entry in regs {
-        if entry.reg == REGLIST_TAIL {
-            break;
-        }
-        if entry.reg == REG_DLY {
-            bus.delay_ms(entry.val as u32);
-        } else {
-            bus.write_reg16(slv_addr, entry.reg, entry.val)?;
-        }
-    }
-    Ok(())
+    crate::write_table16(bus, slv_addr, regs)
 }
 
 #[inline]
@@ -591,7 +571,7 @@ fn write_reg_bits<B: SccbBus>(
     mask: u8,
     enable: bool,
 ) -> Result<(), CameraError> {
-    set_reg_bits(bus, slv_addr, reg, 0, mask, if enable { mask } else { 0 })
+    crate::write_reg_bits16(bus, slv_addr, reg, mask, enable)
 }
 
 #[inline]
@@ -601,20 +581,7 @@ fn check_reg_mask<B: SccbBus>(
     reg: u16,
     mask: u8,
 ) -> Result<bool, CameraError> {
-    let val = bus.read_reg16(slv_addr, reg)?;
-    Ok((val & mask) == mask)
-}
-
-#[inline]
-fn write_addr_reg<B: SccbBus>(
-    bus: &mut B,
-    slv_addr: u8,
-    reg: u16,
-    x_value: u16,
-    y_value: u16,
-) -> Result<(), CameraError> {
-    bus.write_reg16_val16(slv_addr, reg, x_value)?;
-    bus.write_reg16_val16(slv_addr, reg.wrapping_add(2), y_value)
+    crate::check_reg_mask16(bus, slv_addr, reg, mask)
 }
 
 /// Detects an NT99141 sensor at `slv_addr` (`0x2A`).
@@ -794,12 +761,19 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
         self.status.brightness = 0;
         self.status.contrast = 0;
         self.status.saturation = 0;
+        // 0x3301 is not demonstrably foreign — it is outside the OV5640 ISP
+        // block — but `set_sharpness` refuses, so this reports a value
+        // nobody can change. Left in place and flagged rather than guessed at.
         self.status.sharpness = bus.read_reg16(self.slv_addr, 0x3301)? as i8;
-        self.status.denoise = (bus.read_reg16(self.slv_addr, 0x5306)? / 4).wrapping_add(1);
+        // 0x5306, 0x5183 and 0x5000 below are OV5640 ISP addresses, outside
+        // anything else this driver touches, and the controls they described
+        // are already NotSupported here. Reporting defaults beats reporting
+        // whatever a register the part does not implement happens to return.
+        self.status.denoise = 0;
         self.status.ae_level = 0;
         self.status.gainceiling = bus.read_reg16(self.slv_addr, 0x32F0)?;
         self.status.awb = check_reg_mask(bus, self.slv_addr, ISP_CONTROL_01, 0x10)?;
-        self.status.dcw = !check_reg_mask(bus, self.slv_addr, 0x5183, 0x80)?;
+        self.status.dcw = false;
         self.status.agc = !check_reg_mask(
             bus,
             self.slv_addr,
@@ -818,10 +792,10 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
             check_reg_mask(bus, self.slv_addr, TIMING_TC_REG20, TIMING_TC_REG20_VFLIP)?;
         self.status.colorbar =
             check_reg_mask(bus, self.slv_addr, PRE_ISP_TEST_SETTING_1, TEST_COLOR_BAR)?;
-        self.status.bpc = check_reg_mask(bus, self.slv_addr, 0x5000, 0x04)?;
-        self.status.wpc = check_reg_mask(bus, self.slv_addr, 0x5000, 0x02)?;
-        self.status.raw_gma = check_reg_mask(bus, self.slv_addr, 0x5000, 0x20)?;
-        self.status.lenc = check_reg_mask(bus, self.slv_addr, 0x5000, 0x80)?;
+        self.status.bpc = false;
+        self.status.wpc = false;
+        self.status.raw_gma = false;
+        self.status.lenc = false;
         self.status.quality = bus.read_reg16(self.slv_addr, COMPRESSION_CTRL07)? & 0x3F;
         self.status.special_effect = 0;
         self.status.wb_mode = 0;
@@ -850,7 +824,17 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
         if framesize > FrameSize::Hd {
             return Err(CameraError::FailedToSetFrameSize);
         }
-        self.status.framesize = framesize;
+        // SENS-24: recorded after the writes land, so a bus fault partway
+        // through does not leave status claiming a size the sensor never took.
+        // SENS-15: not converted to a delta write, but for the opposite
+        // reason to HM1055 — only 4 of the 64 registers the framesize tables
+        // touch appear in this one, so the rewrite does not restore
+        // framesize state at all. Nine registers other sizes write are
+        // absent from both the HD table and this one, so VGA -> HD leaves
+        // them stale today. That is a live defect this rewrite does not
+        // cure and a delta write would not cause; it needs per-register
+        // reset values to fix properly. See
+        // `test_sens15_nt99141_default_rewrite_does_not_restore_framesize_state`.
         write_reg_list(bus, self.slv_addr, SENSOR_DEFAULT_REGS)?;
         if framesize == FrameSize::Qvga {
             write_reg_list(bus, self.slv_addr, SENSOR_FRAMESIZE_QVGA)?;
@@ -862,11 +846,17 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
             write_reg_list(bus, self.slv_addr, SENSOR_FRAMESIZE_VGA)?;
         }
         let pixformat = self.pixformat;
-        self.set_pixformat(bus, pixformat)
+        self.set_pixformat(bus, pixformat)?;
+        self.status.framesize = framesize;
+        Ok(())
     }
 
     fn set_contrast(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
-        let (value1, value2) = match level {
+        // SENS-11: 0x32F2 below is the register `set_brightness` also writes,
+        // where 0x80 is the neutral midpoint. The catch-all arm used to write
+        // 0x00 — the darkest value — for any level outside -3..=3 and report
+        // success, so `set_contrast(4)` blacked the image out.
+        let (value1, value2): (u8, u8) = match level {
             3 => (0xD0, 0xB0),
             2 => (0xE0, 0xA0),
             1 => (0xF0, 0x90),
@@ -874,7 +864,7 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
             -1 => (0x10, 0x70),
             -2 => (0x20, 0x60),
             -3 => (0x30, 0x50),
-            _ => (0x00, 0x00),
+            _ => return Err(CameraError::InvalidArg),
         };
         bus.write_reg16(self.slv_addr, 0x32FC, value1)?;
         bus.write_reg16(self.slv_addr, 0x32F2, value2)?;
@@ -884,14 +874,18 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
     }
 
     fn set_brightness(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
-        let value = match level {
+        // SENS-11: 0x32F2 is shared with contrast, where 0x80 is the neutral
+        // midpoint. Level 0 used to fall through to the catch-all and write
+        // 0x00, the darkest value.
+        let value: u8 = match level {
             3 => 0xA0,
             2 => 0x90,
             1 => 0x88,
+            0 => 0x80,
             -1 => 0x78,
             -2 => 0x70,
             -3 => 0x60,
-            _ => 0x00,
+            _ => return Err(CameraError::InvalidArg),
         };
         bus.write_reg16(self.slv_addr, 0x32F2, value)?;
         bus.write_reg16(self.slv_addr, 0x3060, 0x01)?;
@@ -910,35 +904,15 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
         Ok(())
     }
 
-    fn set_sharpness(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
-        if !(-3..=3).contains(&level) {
-            return Err(CameraError::InvalidArg);
-        }
-        let mt_offset_2 = ((level + 3) * 8) as u8;
-        let mt_offset_1 = mt_offset_2.wrapping_add(1);
-        write_reg_bits(bus, self.slv_addr, 0x5308, 0x40, false)?;
-        bus.write_reg16(self.slv_addr, 0x5300, 0x10)?;
-        bus.write_reg16(self.slv_addr, 0x5301, 0x10)?;
-        bus.write_reg16(self.slv_addr, 0x5302, mt_offset_1)?;
-        bus.write_reg16(self.slv_addr, 0x5303, mt_offset_2)?;
-        bus.write_reg16(self.slv_addr, 0x5309, 0x10)?;
-        bus.write_reg16(self.slv_addr, 0x530A, 0x10)?;
-        bus.write_reg16(self.slv_addr, 0x530B, 0x04)?;
-        bus.write_reg16(self.slv_addr, 0x530C, 0x06)?;
-        self.status.sharpness = level as i8;
-        Ok(())
-    }
-
-    fn set_denoise(&mut self, _bus: &mut B, _level: i32) -> Result<(), CameraError> {
-        Ok(())
-    }
-
-    fn set_gainceiling(
-        &mut self,
-        _bus: &mut B,
-        _gainceiling: GainCeiling,
-    ) -> Result<(), CameraError> {
-        Ok(())
+    /// Always returns [`CameraError::NotSupported`].
+    ///
+    /// This programmed 0x5300..=0x530C and 0x5308, the OV5640 ISP sharpness
+    /// block verbatim, on a Novatek part — and `init_status` read sharpness
+    /// back from 0x3301, so the write and read paths could not both be
+    /// right. Refuses until a verified NT99141 sharpness register is ported.
+    /// See the module documentation.
+    fn set_sharpness(&mut self, _bus: &mut B, _level: i32) -> Result<(), CameraError> {
+        Err(CameraError::NotSupported)
     }
 
     fn set_quality(&mut self, bus: &mut B, quality: i32) -> Result<(), CameraError> {
@@ -957,11 +931,6 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
             enable,
         )?;
         self.status.colorbar = enable;
-        Ok(())
-    }
-
-    fn set_whitebal(&mut self, _bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.awb = enable;
         Ok(())
     }
 
@@ -991,11 +960,6 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
     fn set_vflip(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
         self.status.vflip = enable;
         self.set_image_options(bus)
-    }
-
-    fn set_aec2(&mut self, _bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.aec2 = enable;
-        Ok(())
     }
 
     fn set_awb_gain(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
@@ -1068,39 +1032,16 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
     }
 
     fn set_ae_level(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
-        let clamped = level.clamp(0, 8) as usize;
-        let base = clamped * 5;
+        // SENS-05: `SENSOR_AE_LEVEL` holds nine five-register groups for
+        // levels -4..=4, so the neutral level 0 is group 4, not group 0.
+        let clamped = level.clamp(-4, 4);
+        let base = ((clamped + 4) as usize) * 5;
         for i in 0..5 {
             let entry = SENSOR_AE_LEVEL[base + i];
             bus.write_reg16(self.slv_addr, entry.reg, entry.val)?;
         }
         bus.write_reg16(self.slv_addr, 0x3060, 0x01)?;
         self.status.ae_level = clamped as i8;
-        Ok(())
-    }
-
-    fn set_dcw(&mut self, _bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.dcw = enable;
-        Ok(())
-    }
-
-    fn set_bpc(&mut self, _bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.bpc = enable;
-        Ok(())
-    }
-
-    fn set_wpc(&mut self, _bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.wpc = enable;
-        Ok(())
-    }
-
-    fn set_raw_gma(&mut self, _bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.raw_gma = enable;
-        Ok(())
-    }
-
-    fn set_lenc(&mut self, _bus: &mut B, enable: bool) -> Result<(), CameraError> {
-        self.status.lenc = enable;
         Ok(())
     }
 
@@ -1149,71 +1090,6 @@ impl<B: SccbBus> CameraSensor<B> for Nt99141 {
         } else {
             bus.write_reg16(self.slv_addr, reg16, (next & 0xFF) as u8)
         }
-    }
-
-    fn set_res_raw(
-        &mut self,
-        bus: &mut B,
-        start_x: i32,
-        start_y: i32,
-        end_x: i32,
-        end_y: i32,
-        offset_x: i32,
-        offset_y: i32,
-        total_x: i32,
-        total_y: i32,
-        output_x: i32,
-        output_y: i32,
-        scale: bool,
-        binning: bool,
-    ) -> Result<(), CameraError> {
-        write_addr_reg(
-            bus,
-            self.slv_addr,
-            X_ADDR_ST_H,
-            start_x as u16,
-            start_y as u16,
-        )?;
-        write_addr_reg(bus, self.slv_addr, X_ADDR_END_H, end_x as u16, end_y as u16)?;
-        write_addr_reg(
-            bus,
-            self.slv_addr,
-            X_OFFSET_H,
-            offset_x as u16,
-            offset_y as u16,
-        )?;
-        write_addr_reg(
-            bus,
-            self.slv_addr,
-            X_TOTAL_SIZE_H,
-            total_x as u16,
-            total_y as u16,
-        )?;
-        write_addr_reg(
-            bus,
-            self.slv_addr,
-            X_OUTPUT_SIZE_H,
-            output_x as u16,
-            output_y as u16,
-        )?;
-        self.status.scale = scale;
-        self.status.binning = binning;
-        self.set_image_options(bus)
-    }
-
-    fn set_pll(
-        &mut self,
-        _bus: &mut B,
-        _bypass: i32,
-        _mul: i32,
-        _sys: i32,
-        _root: i32,
-        _pre: i32,
-        _seld5: i32,
-        _pclken: i32,
-        _pclk: i32,
-    ) -> Result<(), CameraError> {
-        Err(CameraError::NotSupported)
     }
 
     fn set_xclk(&mut self, _bus: &mut B, _timer: i32, xclk: i32) -> Result<(), CameraError> {

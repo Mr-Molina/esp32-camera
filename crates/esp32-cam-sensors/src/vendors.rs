@@ -2,22 +2,54 @@
 //! `gc032a`, `bf3005`, `bf20a6`, `sc101iot`, `sc030iot`, `sc031gs`,
 //! `mega_ccm`, `hm1055`, `hm0360`).
 
+#[cfg(feature = "bf20a6")]
+pub use crate::bf20a6;
+#[cfg(feature = "bf20a6")]
 pub use crate::bf20a6::{Bf20A6, Bf20a6, BF20A6};
+#[cfg(feature = "bf3005")]
+pub use crate::bf3005;
+#[cfg(feature = "bf3005")]
 pub use crate::bf3005::{Bf3005, BF3005};
+#[cfg(feature = "gc0308")]
+pub use crate::gc0308;
+#[cfg(feature = "gc0308")]
 pub use crate::gc0308::{Gc0308, GC0308};
+#[cfg(feature = "gc032a")]
+pub use crate::gc032a;
+#[cfg(feature = "gc032a")]
 pub use crate::gc032a::{Gc032A, Gc032a, GC032A};
+#[cfg(feature = "gc2145")]
+pub use crate::gc2145;
+#[cfg(feature = "gc2145")]
 pub use crate::gc2145::{Gc2145, GC2145};
+#[cfg(feature = "hm0360")]
+pub use crate::hm0360;
+#[cfg(feature = "hm0360")]
 pub use crate::hm0360::{Hm0360, HM0360};
+#[cfg(feature = "hm1055")]
+pub use crate::hm1055;
+#[cfg(feature = "hm1055")]
 pub use crate::hm1055::{Hm1055, HM1055};
+#[cfg(feature = "mega_ccm")]
+pub use crate::mega_ccm;
+#[cfg(feature = "mega_ccm")]
 pub use crate::mega_ccm::{MegaCcm, MEGA_CCM};
+#[cfg(feature = "nt99141")]
+pub use crate::nt99141;
+#[cfg(feature = "nt99141")]
 pub use crate::nt99141::{Nt99141, NT99141};
+#[cfg(feature = "sc030iot")]
+pub use crate::sc030iot;
+#[cfg(feature = "sc030iot")]
 pub use crate::sc030iot::{Sc030Iot, Sc030iot, SC030IOT};
+#[cfg(feature = "sc031gs")]
+pub use crate::sc031gs;
+#[cfg(feature = "sc031gs")]
 pub use crate::sc031gs::{Sc031Gs, Sc031gs, SC031GS};
+#[cfg(feature = "sc101iot")]
+pub use crate::sc101iot;
+#[cfg(feature = "sc101iot")]
 pub use crate::sc101iot::{Sc101Iot, Sc101iot, SC101IOT};
-pub use crate::{
-    bf20a6, bf3005, gc0308, gc032a, gc2145, hm0360, hm1055, mega_ccm, nt99141, sc030iot, sc031gs,
-    sc101iot,
-};
 
 #[cfg(test)]
 mod tests {

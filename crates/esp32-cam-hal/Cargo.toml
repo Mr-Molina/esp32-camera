@@ -10,6 +10,10 @@ esp32-cam-conversions.workspace = true
 esp32-cam-types.workspace = true
 esp32-cam-sccb.workspace = true
 esp32-cam-ll.workspace = true
+# SENS-22: the HAL is generic over `CameraSensor` and names no concrete
+# driver (`HalOv2640Sensor` is its own type), so it enables none. A
+# binary picks the drivers it needs; cargo unions the selections, so
+# leaving defaults on here would hand every binary all 18.
 esp32-cam-sensors = { workspace = true, optional = true }
 
 [features]

@@ -332,6 +332,9 @@ mod tests {
     }
 
     #[test]
+    // Exhaustive sweep: minutes to hours under Miri's interpreter, and the
+    // same code path as the representative-input tests that do run there.
+    #[cfg_attr(miri, ignore)]
     fn test_unified_swar_kernel_all_alignments_and_borrow_patterns() {
         // Test 3-byte SOI and 2-byte SOI/EOI across lengths 0..=24, every
         // alignment offset, and 0xFF/0xFE borrow false-positive patterns.

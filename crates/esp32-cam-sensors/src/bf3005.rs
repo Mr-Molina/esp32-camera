@@ -371,7 +371,7 @@ impl<B: SccbBus> CameraSensor<B> for Bf3005 {
         }
         let w = framesize.width();
         let h = framesize.height();
-        self.status.framesize = framesize;
+        // SENS-24: recorded after the writes land, not before.
 
         if w <= 320 && h <= 240 {
             set_reg_bits(bus, self.slv_addr, 0x12, 4, 1, 1)?;
@@ -390,31 +390,26 @@ impl<B: SccbBus> CameraSensor<B> for Bf3005 {
         }
 
         bus.delay_ms(30);
+        self.status.framesize = framesize;
         Ok(())
     }
 
     fn set_contrast(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
-        if !(-2..=2).contains(&level) {
-            return Err(CameraError::InvalidArg);
-        }
+        let level = crate::level_in(level, -2, 2)?;
         bus.write_reg8(self.slv_addr, 0x56, (level & 0xFF) as u8)?;
         self.status.contrast = level as i8;
         Ok(())
     }
 
     fn set_brightness(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
-        if !(-2..=2).contains(&level) {
-            return Err(CameraError::InvalidArg);
-        }
+        let level = crate::level_in(level, -2, 2)?;
         bus.write_reg8(self.slv_addr, 0x55, (level & 0xFF) as u8)?;
         self.status.brightness = level as i8;
         Ok(())
     }
 
     fn set_sharpness(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
-        if !(-2..=2).contains(&level) {
-            return Err(CameraError::InvalidArg);
-        }
+        let level = crate::level_in(level, -2, 2)?;
         bus.write_reg8(self.slv_addr, 0x70, (level & 0xFF) as u8)?;
         self.status.sharpness = level as i8;
         Ok(())

@@ -695,12 +695,13 @@ impl<B: SccbBus> CameraSensor<B> for Gc0308 {
     }
 
     fn set_framesize(&mut self, bus: &mut B, framesize: FrameSize) -> Result<(), CameraError> {
-        let fs = if framesize > FrameSize::Vga {
-            FrameSize::Vga
-        } else {
-            framesize
-        };
-        self.status.framesize = fs;
+        // SENS-24: see Gc032a. An oversized request was clamped to VGA and
+        // reported as success; it is refused now, and the size is recorded
+        // only after the writes succeed.
+        if framesize > FrameSize::Vga {
+            return Err(CameraError::FailedToSetFrameSize);
+        }
+        let fs = framesize;
         let w = fs.width();
         let h = fs.height();
         let vga_w = FrameSize::Vga.width();
@@ -750,7 +751,9 @@ impl<B: SccbBus> CameraSensor<B> for Gc0308 {
         bus.write_reg8(self.slv_addr, SUBSAMPLE_UV0, chosen.reg0x58)?;
         bus.write_reg8(self.slv_addr, SUBSAMPLE_UV1, chosen.reg0x59)?;
 
-        bus.write_reg8(self.slv_addr, 0xFE, 0x00)
+        bus.write_reg8(self.slv_addr, 0xFE, 0x00)?;
+        self.status.framesize = fs;
+        Ok(())
     }
 
     fn set_contrast(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
@@ -855,12 +858,20 @@ impl<B: SccbBus> CameraSensor<B> for Gc0308 {
         if !(0..=6).contains(&effect) {
             return Err(CameraError::InvalidArg);
         }
-        bus.write_reg8(self.slv_addr, 0xFE, 0x00)?;
+        // SENS-25: SPECIAL_EFFECT is a two-bit field, so this part can
+        // express normal, negative and grayscale and nothing else. Effects
+        // 3..=6 (the red, green and blue tints and sepia) used to fall
+        // through to grayscale, return Ok and record the effect that was
+        // asked for rather than the one applied. The GC0308 reaches tints
+        // through fixed Cb/Cr registers this driver does not program; until
+        // those are ported from a verified reference, say so.
         let mode = match effect {
             0 => EFFECT_NORMAL,
             1 => EFFECT_NEGATIVE,
-            _ => EFFECT_GRAYSCALE,
+            2 => EFFECT_GRAYSCALE,
+            _ => return Err(CameraError::NotSupported),
         };
+        bus.write_reg8(self.slv_addr, 0xFE, 0x00)?;
         set_reg_bits(bus, self.slv_addr, SPECIAL_EFFECT, 0, 0x03, mode)?;
         self.status.special_effect = effect as u8;
         Ok(())

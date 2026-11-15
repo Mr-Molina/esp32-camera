@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Unit tests for repository automation and verification scripts."""
 
 import hashlib
@@ -9,12 +8,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO_ROOT / "scripts"))
+# ``scripts/`` is placed on sys.path by tests/conftest.py before this module
+# loads, which is what lets these sit with the other imports.
+import ensure_serial_passive
+import ota_deploy
+import verify_cold_boot_invariants
 
-import ensure_serial_passive  # noqa: E402
-import ota_deploy  # noqa: E402
-import verify_cold_boot_invariants  # noqa: E402
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 class TestOtaDeploy(unittest.TestCase):
@@ -33,9 +33,11 @@ class TestOtaDeploy(unittest.TestCase):
                 self.assertIn("Unknown active_partition label", str(ctx.exception))
 
     def test_missing_host_exit_1(self):
-        with patch.object(sys, "argv", ["ota_deploy.py"]), \
-             patch.dict(os.environ, {"CAM_HOST": "", "CAM_OTA_TOKEN": ""}), \
-             patch("sys.stderr"):
+        with (
+            patch.object(sys, "argv", ["ota_deploy.py"]),
+            patch.dict(os.environ, {"CAM_HOST": "", "CAM_OTA_TOKEN": ""}),
+            patch("sys.stderr"),
+        ):
             exit_code = ota_deploy.main()
             self.assertEqual(exit_code, 1)
 
@@ -58,7 +60,10 @@ class TestOtaDeploy(unittest.TestCase):
 
     def test_read_http_response_invalid_raises_runtime_error(self):
         mock_sock = MagicMock()
-        mock_sock.recv.side_effect = [b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n", b""]
+        mock_sock.recv.side_effect = [
+            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n",
+            b"",
+        ]
 
         with self.assertRaises(RuntimeError) as ctx:
             ota_deploy.read_http_response(mock_sock)
@@ -85,9 +90,11 @@ class TestOtaDeploy(unittest.TestCase):
             corrupt_payload = payload_body + b"\x00" * 32
             bin_file.write_bytes(corrupt_payload)
 
-            with patch("shutil.which", return_value="/bin/espflash"), \
-                 patch("os.path.isfile", side_effect=lambda p: True), \
-                 patch("subprocess.run") as mock_run:
+            with (
+                patch("shutil.which", return_value="/bin/espflash"),
+                patch("os.path.isfile", side_effect=lambda p: True),
+                patch("subprocess.run") as mock_run,
+            ):
                 mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
                 with self.assertRaises(ValueError) as ctx:
                     ota_deploy.stage_and_validate_image(
@@ -98,9 +105,11 @@ class TestOtaDeploy(unittest.TestCase):
             # Case B: Valid appended SHA-256
             valid_payload = payload_body + valid_digest
             bin_file.write_bytes(valid_payload)
-            with patch("shutil.which", return_value="/bin/espflash"), \
-                 patch("os.path.isfile", side_effect=lambda p: True), \
-                 patch("subprocess.run") as mock_run:
+            with (
+                patch("shutil.which", return_value="/bin/espflash"),
+                patch("os.path.isfile", side_effect=lambda p: True),
+                patch("subprocess.run") as mock_run,
+            ):
                 mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
                 res_bytes = ota_deploy.stage_and_validate_image(
                     str(elf_file), str(bin_file), host="127.0.0.1", port=80
@@ -112,19 +121,29 @@ class TestEnsureSerialPassive(unittest.TestCase):
     """Tests for ensure_serial_passive.py CLI and environment handling."""
 
     def test_cli_and_env_defaults(self):
-        with patch.dict(os.environ, {"CAM_SERIAL_PORT": "/dev/ttyUSB-test", "CAM_HOST": "192.0.2.1"}):
+        with patch.dict(
+            os.environ, {"CAM_SERIAL_PORT": "/dev/ttyUSB-test", "CAM_HOST": "192.0.2.1"}
+        ):
             import importlib
+
             importlib.reload(ensure_serial_passive)
 
-            self.assertEqual(ensure_serial_passive.DEFAULT_SERIAL_PORT, "/dev/ttyUSB-test")
+            self.assertEqual(
+                ensure_serial_passive.DEFAULT_SERIAL_PORT, "/dev/ttyUSB-test"
+            )
             self.assertEqual(ensure_serial_passive.DEFAULT_HOST, "192.0.2.1")
-            self.assertEqual(ensure_serial_passive.DEFAULT_STATUS_URL, "http://192.0.2.1/status")
+            self.assertEqual(
+                ensure_serial_passive.DEFAULT_STATUS_URL, "http://192.0.2.1/status"
+            )
 
         # Reload with clean env
         with patch.dict(os.environ, {}, clear=True):
             import importlib
+
             importlib.reload(ensure_serial_passive)
-            self.assertEqual(ensure_serial_passive.DEFAULT_SERIAL_PORT, "/dev/ttyUSB-esp32")
+            self.assertEqual(
+                ensure_serial_passive.DEFAULT_SERIAL_PORT, "/dev/ttyUSB-esp32"
+            )
             self.assertEqual(ensure_serial_passive.DEFAULT_HOST, "")
             self.assertEqual(ensure_serial_passive.DEFAULT_STATUS_URL, "")
 
@@ -165,7 +184,9 @@ class TestVerifyColdBootInvariants(unittest.TestCase):
             errors = verify_cold_boot_invariants.verify_bootloader_bin(
                 allow_missing=False, bootloader_path=corrupt_bin
             )
-            self.assertTrue(any("Invalid ESP32 bootloader header or size" in e for e in errors))
+            self.assertTrue(
+                any("Invalid ESP32 bootloader header or size" in e for e in errors)
+            )
 
             # Case B: Correct magic and size, but missing MMIO register and 0x2B00 sequence
             valid_header_empty_body = bytearray(16384)
@@ -175,10 +196,16 @@ class TestVerifyColdBootInvariants(unittest.TestCase):
                 allow_missing=False, bootloader_path=corrupt_bin
             )
             self.assertTrue(any("missing IO_MUX_GPIO16_REG" in e for e in errors))
-            self.assertTrue(any("missing GPIO 16 pull-up constant 0x2B00" in e for e in errors))
+            self.assertTrue(
+                any("missing GPIO 16 pull-up constant 0x2B00" in e for e in errors)
+            )
 
     def test_full_script_allow_missing_bootloader_main(self):
-        with patch.object(sys, "argv", ["verify_cold_boot_invariants.py", "--allow-missing-bootloader"]):
+        with patch.object(
+            sys,
+            "argv",
+            ["verify_cold_boot_invariants.py", "--allow-missing-bootloader"],
+        ):
             ret = verify_cold_boot_invariants.main()
             self.assertEqual(ret, 0)
 

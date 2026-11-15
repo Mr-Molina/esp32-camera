@@ -239,11 +239,15 @@ impl<B: SccbBus> CameraSensor<B> for MegaCcm {
     }
 
     fn set_framesize(&mut self, bus: &mut B, framesize: FrameSize) -> Result<(), CameraError> {
-        let fs = if framesize > FrameSize::Size5Mp {
-            FrameSize::Size5Mp
-        } else {
-            framesize
-        };
+        // SENS-24: `Size5Mp` is the last discriminant, so this clamp is
+        // unreachable today and the conformance sweep cannot exercise it.
+        // Made a refusal so the policy still holds if a larger variant is
+        // ever added; unsupported sizes below it already return
+        // `FailedToSetFrameSize` from the match below.
+        if framesize > FrameSize::Size5Mp {
+            return Err(CameraError::FailedToSetFrameSize);
+        }
+        let fs = framesize;
         match fs {
             FrameSize::Qvga => {
                 bus.write_reg16(self.slv_addr, RESOLUTION_REG, 0x01)?;

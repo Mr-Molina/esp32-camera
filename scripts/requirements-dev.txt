@@ -1,4 +1,6 @@
 # Python dev and CI tooling requirements
 # Requires Python >= 3.10
 pytest>=8.0.0
-ruff>=0.4.0
+# Pinned to the ruff-pre-commit rev in .pre-commit-config.yaml so the
+# lint step and the hook agree on which rules are enabled.
+ruff==0.9.10

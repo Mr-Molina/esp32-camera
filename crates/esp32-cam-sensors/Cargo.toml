@@ -5,6 +5,36 @@ edition.workspace = true
 license.workspace = true
 description = "Safe no_std CameraSensor trait and 18 sensor drivers for esp32-camera"
 
+[features]
+# SENS-22: one feature per driver, all on by default so a plain dependency
+# behaves as before. A firmware that talks to one sensor turns the rest off
+# (`default-features = false, features = ["ov2640"]`) and stops linking their
+# register tables and code instead of relying on the linker to drop them.
+default = ["bf20a6", "bf3005", "gc0308", "gc032a", "gc2145", "hm0360", "hm1055", "mega_ccm", "nt99141", "ov2640", "ov3640", "ov3660", "ov5640", "ov7670", "ov7725", "sc030iot", "sc031gs", "sc101iot"]
+
+bf20a6 = []
+bf3005 = []
+gc0308 = []
+gc032a = []
+gc2145 = []
+hm0360 = []
+hm1055 = []
+mega_ccm = []
+nt99141 = []
+ov2640 = []
+# SENS-04/SENS-22: ov3640 cannot be built on its own. Its ratio and
+# format tables are aliased straight out of `ov3660`, whose registers
+# are not this part's. The dependency is declared rather than hidden;
+# it disappears when a verified OV3640 register map is ported.
+ov3640 = ["ov3660"]
+ov3660 = []
+ov5640 = []
+ov7670 = []
+ov7725 = []
+sc030iot = []
+sc031gs = []
+sc101iot = []
+
 [dependencies]
 esp32-cam-types.workspace = true
 esp32-cam-sccb.workspace = true
