@@ -308,7 +308,11 @@ pub fn estimate_tx_duration_us(mpdu_len: usize, rate: WifiPhyRate) -> u16 {
 }
 
 /// Ordered ladder of data rates for Station rate adaptation.
-const RATE_LADDER: [WifiPhyRate; 12] = [
+///
+/// Legacy 802.11b/g only: the Association Request advertises no HT
+/// Capabilities (Tag 45) and data frames are non-QoS, so 802.11n MCS rates
+/// must not be used for data until both are implemented.
+const RATE_LADDER: [WifiPhyRate; 7] = [
     WifiPhyRate::Rate1mL,
     WifiPhyRate::Rate2mL,
     WifiPhyRate::Rate5m5L,
@@ -316,12 +320,10 @@ const RATE_LADDER: [WifiPhyRate; 12] = [
     WifiPhyRate::Rate6m,
     WifiPhyRate::Rate12m,
     WifiPhyRate::Rate24m,
-    WifiPhyRate::Mcs2Lgi,
-    WifiPhyRate::Mcs3Lgi,
-    WifiPhyRate::Mcs4Lgi,
-    WifiPhyRate::Mcs5Lgi,
-    WifiPhyRate::Mcs7Lgi,
 ];
+
+/// Ladder index of the default data rate (24 Mbps 802.11g OFDM).
+const DEFAULT_RATE_INDEX: usize = 6;
 
 /// Adaptive rate controller tracking transmission successes and failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -343,11 +345,12 @@ impl RateController {
     /// Consecutive failures that trigger a rate step down.
     pub const FAILURE_STEP_DOWN_THRESHOLD: u16 = 2;
 
-    /// Creates a new rate controller starting at a robust default rate (MCS3).
+    /// Creates a new rate controller starting at the default legacy rate
+    /// (24 Mbps 802.11g OFDM).
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            current_index: 8, // Mcs3Lgi
+            current_index: DEFAULT_RATE_INDEX,
             consecutive_success: 0,
             consecutive_failures: 0,
         }
@@ -391,7 +394,7 @@ impl RateController {
 
     /// Resets the rate controller back to the initial default state.
     pub fn reset(&mut self) {
-        self.current_index = 8;
+        self.current_index = DEFAULT_RATE_INDEX;
         self.consecutive_success = 0;
         self.consecutive_failures = 0;
     }
@@ -434,21 +437,44 @@ mod tests {
     #[test]
     fn test_rate_controller_transitions() {
         let mut rc = RateController::new();
-        assert_eq!(rc.current_data_rate(), WifiPhyRate::Mcs3Lgi);
+        assert_eq!(rc.current_data_rate(), WifiPhyRate::Rate24m);
 
         // 2 failures trigger a step down
         rc.on_tx_failure();
-        assert_eq!(rc.current_data_rate(), WifiPhyRate::Mcs3Lgi);
+        assert_eq!(rc.current_data_rate(), WifiPhyRate::Rate24m);
         rc.on_tx_failure();
-        assert_eq!(rc.current_data_rate(), WifiPhyRate::Mcs2Lgi);
+        assert_eq!(rc.current_data_rate(), WifiPhyRate::Rate12m);
 
         // 10 successes trigger a step up
         for _ in 0..10 {
             rc.on_tx_success();
         }
-        assert_eq!(rc.current_data_rate(), WifiPhyRate::Mcs3Lgi);
+        assert_eq!(rc.current_data_rate(), WifiPhyRate::Rate24m);
 
+        rc.on_tx_failure();
+        rc.on_tx_failure();
         rc.reset();
-        assert_eq!(rc.current_data_rate(), WifiPhyRate::Mcs3Lgi);
+        assert_eq!(rc.current_data_rate(), WifiPhyRate::Rate24m);
+    }
+
+    #[test]
+    fn test_rate_controller_never_selects_ht_rates() {
+        // The Association Request advertises no HT Capabilities and data
+        // frames are non-QoS, so data TX must stay on legacy rates.
+        let mut rc = RateController::new();
+        for _ in 0..200 {
+            rc.on_tx_success();
+            assert!(!rc.current_data_rate().is_ht());
+        }
+        assert_eq!(rc.current_data_rate(), WifiPhyRate::Rate24m);
+    }
+
+    #[test]
+    fn test_rate_controller_steps_down_to_floor_and_stays() {
+        let mut rc = RateController::new();
+        for _ in 0..100 {
+            rc.on_tx_failure();
+        }
+        assert_eq!(rc.current_data_rate(), WifiPhyRate::Rate1mL);
     }
 }

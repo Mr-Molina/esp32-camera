@@ -492,7 +492,7 @@ mod tests {
             buf[28..32].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
         }
         if let Some(desc) = driver.rx_ring.desc_mut(0) {
-            desc.word0 = WifiRxDmaDesc::EOF_BIT | ((1600 & 0xFFF) << 12) | (28 + 4);
+            desc.word0 = WifiRxDmaDesc::EOF_BIT | ((28 + 4) << 12) | (1600 & 0xFFF);
         }
 
         // Slot 1: Valid frame with > 4 bytes payload (including 4-byte FCS).
@@ -510,7 +510,7 @@ mod tests {
             buf[38..42].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
         }
         if let Some(desc) = driver.rx_ring.desc_mut(1) {
-            desc.word0 = WifiRxDmaDesc::EOF_BIT | ((1600 & 0xFFF) << 12) | (28 + 14);
+            desc.word0 = WifiRxDmaDesc::EOF_BIT | ((28 + 14) << 12) | (1600 & 0xFFF);
         }
 
         // Poll should process slot 0 (dropping runt and recycling it) and slot 1.

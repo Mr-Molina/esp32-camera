@@ -537,6 +537,9 @@ impl<B: WifiMmioBus> LmacHal<B> {
     }
 
     /// Configures RX policy for passive scanning (promiscuous BSSID bypass).
+    ///
+    /// Vendor `hal_mac_rx_set_policy` only toggles `0x110` in the policy
+    /// register; bit 1 is never written and is preserved as found.
     pub fn set_scan_rx_policy(&mut self) {
         let ctrl_reg = regs::bssid_mask_high_ctrl_reg(0);
         let val = self.bus.read_reg(ctrl_reg);
@@ -544,14 +547,13 @@ impl<B: WifiMmioBus> LmacHal<B> {
 
         let pol_reg = regs::RX_POLICY_BASE_REG;
         let pol = self.bus.read_reg(pol_reg);
-        self.bus.write_reg(
-            pol_reg,
-            (pol & !regs::RX_POLICY_BIT_BSSID_CHECK) | regs::RX_POLICY_PROMISC_BYPASS,
-        );
+        self.bus
+            .write_reg(pol_reg, pol | regs::RX_POLICY_PROMISC_BYPASS);
     }
 
     /// Sets the hardware BSSID filter address in slot 0 and enforces
-    /// BSSID checking.
+    /// BSSID checking through the BSSID mask enable bit (bit 16 of
+    /// `0x3FF7_3024`) and by clearing the promiscuous bypass (`0x110`).
     pub fn set_associated_bssid(&mut self, bssid: [u8; 6]) {
         let ctrl_reg = regs::bssid_mask_high_ctrl_reg(0);
         let ctrl = self.bus.read_reg(ctrl_reg);
@@ -570,10 +572,8 @@ impl<B: WifiMmioBus> LmacHal<B> {
 
         let pol_reg = regs::RX_POLICY_BASE_REG;
         let pol = self.bus.read_reg(pol_reg);
-        self.bus.write_reg(
-            pol_reg,
-            (pol & !regs::RX_POLICY_PROMISC_BYPASS) | regs::RX_POLICY_BIT_BSSID_CHECK,
-        );
+        self.bus
+            .write_reg(pol_reg, pol & !regs::RX_POLICY_PROMISC_BYPASS);
     }
 
     /// Reads the factory MAC address from ESP32 eFuse Block 0.
@@ -696,18 +696,26 @@ impl<B: WifiMmioBus> LmacHal<B> {
             (u32::from(dur_us) << 16) | u32::from(dur_us),
         );
 
-        // 5. If 802.11n HT rate, program HT-SIG1 and HT-SIG2.
-        // Hardware TX_HTSIG1_REG bits [23:8] require the PSDU length
-        // (MPDU length + 4-byte 802.11 FCS).
+        // 5. If 802.11n HT rate, program HT-SIG1 and HT-SIG2 (vendor
+        // `mac_tx_set_htsig` parity).
+        // TX_HTSIG1_REG: MCS in [6:0], PSDU length (MPDU length + 4-byte
+        // 802.11 FCS) in [23:8], and the low byte of the 802.11n HT-SIG2
+        // field in [31:24]: smoothing | not-sounding | reserved = 0x07, with
+        // short GI as HT-SIG2 bit 7 (register bit 31).
+        // TX_HTSIG2_REG: PSDU length in [15:0] under the fixed 0x0005_0000.
         if rate.is_ht() {
-            let htsig1 = ((psdu_len & 0xFFFF) << 8) | u32::from(rate.hw_code() & 0x07);
-            self.bus.write_reg(regs::TX_HTSIG1_REG, htsig1);
-
-            let htsig2 = if (rate.hw_code() & 0x08) != 0 {
-                0x80
+            let short_gi = if (rate.hw_code() & 0x08) != 0 {
+                regs::TX_HTSIG1_SHORT_GI
             } else {
                 0
             };
+            let htsig1 = regs::TX_HTSIG1_FIXED
+                | short_gi
+                | ((psdu_len & 0xFFFF) << 8)
+                | u32::from(rate.hw_code() & 0x07);
+            self.bus.write_reg(regs::TX_HTSIG1_REG, htsig1);
+
+            let htsig2 = (psdu_len & 0xFFFF) | regs::TX_HTSIG2_FIXED;
             self.bus.write_reg(regs::TX_HTSIG2_REG, htsig2);
         }
 
@@ -857,10 +865,9 @@ mod tests {
         let bssid = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
         hal.set_associated_bssid(bssid);
         let assoc_pol = hal.bus().reg(regs::RX_POLICY_BASE_REG);
-        assert_eq!(
-            assoc_pol & regs::RX_POLICY_BIT_BSSID_CHECK,
-            regs::RX_POLICY_BIT_BSSID_CHECK
-        );
+        // Vendor hal_mac_rx_set_policy only toggles 0x110; it never sets
+        // bit 1.
+        assert_eq!(assoc_pol & regs::RX_POLICY_BIT_BSSID_CHECK, 0);
         assert_eq!(assoc_pol & regs::RX_POLICY_PROMISC_BYPASS, 0);
 
         assert_eq!(hal.bus().reg(regs::bssid_filter_low_reg(0)), 0xDDCC_BBAA);
@@ -870,6 +877,59 @@ mod tests {
             hal.bus().reg(regs::bssid_mask_high_ctrl_reg(0)),
             0x0001_FFFF
         );
+    }
+
+    #[test]
+    fn test_rx_policy_toggles_only_promisc_bypass_bits() {
+        let mut mock = MockWifiMmioBus::new();
+        mock.set_reg(regs::RX_POLICY_BASE_REG, 0x8000_0002);
+        let mut hal = LmacHal::new(mock);
+
+        hal.set_scan_rx_policy();
+        assert_eq!(hal.bus().reg(regs::RX_POLICY_BASE_REG), 0x8000_0112);
+
+        hal.set_associated_bssid([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+        assert_eq!(hal.bus().reg(regs::RX_POLICY_BASE_REG), 0x8000_0002);
+    }
+
+    #[test]
+    fn test_submit_and_poll_tx_ht_writes_vendor_htsig_words() {
+        let mut mock = MockWifiMmioBus::new();
+        mock.auto_tx_done = true;
+        mock.auto_tx_status = 0;
+        let mut hal = LmacHal::new(mock);
+
+        let res = hal.submit_and_poll_tx(0x1000, 128, WifiPhyRate::Mcs7Lgi, 40, true, 100);
+        assert_eq!(res, Ok(()));
+
+        // mac_tx_set_htsig parity: HT-SIG2 smoothing | not-sounding |
+        // reserved (0x07) sits in HTSIG1 [26:24] above HT length [23:8] and
+        // MCS [6:0]; HTSIG2 carries the PSDU length under 0x0005_0000.
+        let psdu_len = 132u32;
+        assert_eq!(
+            hal.bus().reg(regs::TX_HTSIG1_REG),
+            0x0700_0000 | (psdu_len << 8) | 7
+        );
+        assert_eq!(hal.bus().reg(regs::TX_HTSIG2_REG), psdu_len | 0x0005_0000);
+    }
+
+    #[test]
+    fn test_submit_and_poll_tx_ht_short_gi_sets_htsig1_bit_31() {
+        let mut mock = MockWifiMmioBus::new();
+        mock.auto_tx_done = true;
+        mock.auto_tx_status = 0;
+        let mut hal = LmacHal::new(mock);
+
+        let res = hal.submit_and_poll_tx(0x1000, 128, WifiPhyRate::Mcs7Sgi, 40, true, 100);
+        assert_eq!(res, Ok(()));
+
+        let psdu_len = 132u32;
+        assert_eq!(
+            hal.bus().reg(regs::TX_HTSIG1_REG),
+            0x8700_0000 | (psdu_len << 8) | 7
+        );
+        // Short GI must not corrupt the length field in HTSIG2.
+        assert_eq!(hal.bus().reg(regs::TX_HTSIG2_REG), psdu_len | 0x0005_0000);
     }
 
     #[test]
@@ -955,6 +1015,44 @@ mod tests {
 
         let res = hal.submit_and_poll_tx(0x1000, 128, WifiPhyRate::Rate1mL, 40, false, 10);
         assert_eq!(res, Err(LmacError::TxTimeout));
+    }
+
+    #[test]
+    fn test_submit_and_poll_tx_broadcast_sets_no_ack_bits() {
+        let mut mock = MockWifiMmioBus::new();
+        mock.auto_tx_done = true;
+        mock.auto_tx_status = 0;
+        let mut hal = LmacHal::new(mock);
+
+        // Broadcast Probe Request: legacy 1 Mbps, no ACK expected.
+        let res = hal.submit_and_poll_tx(0x1000, 64, WifiPhyRate::Rate1mL, 0, false, 100);
+        assert_eq!(res, Ok(()));
+
+        // Bits [25:24] must be 3 (No-ACK). 0 selects hardware RTS/CTS, which
+        // times out against a broadcast DA and latches TX_PMD status 4.
+        let plcp0 = hal.bus().reg(regs::TX_PLCP0_TRIG_REG);
+        assert_eq!(
+            plcp0 & 0x0360_0000,
+            regs::TX_PLCP0_NO_ACK | regs::TX_PLCP0_MODE_LEGACY
+        );
+        assert_eq!(regs::TX_PLCP0_NO_ACK, 0x0300_0000);
+    }
+
+    #[test]
+    fn test_submit_and_poll_tx_unicast_sets_wait_ack_bits() {
+        let mut mock = MockWifiMmioBus::new();
+        mock.auto_tx_done = true;
+        mock.auto_tx_status = 0;
+        let mut hal = LmacHal::new(mock);
+
+        let res = hal.submit_and_poll_tx(0x1000, 64, WifiPhyRate::Rate1mL, 314, true, 100);
+        assert_eq!(res, Ok(()));
+
+        let plcp0 = hal.bus().reg(regs::TX_PLCP0_TRIG_REG);
+        assert_eq!(
+            plcp0 & 0x0360_0000,
+            regs::TX_PLCP0_WAIT_ACK | regs::TX_PLCP0_MODE_LEGACY
+        );
     }
 
     #[test]

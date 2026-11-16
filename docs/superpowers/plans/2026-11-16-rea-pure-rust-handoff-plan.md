@@ -54,11 +54,31 @@
 
 ---
 
+## 2A. Phase 3C Code Status Addendum (`2026-11-16`, Windows host, no board attached)
+
+Fixes `3C-1`, `3C-2` and `3C-3` in Section 3 are **implemented and unit-tested**. Only the silicon steps remain: flash `ota_0` and run the live `172.22.1.52` certification in Section 3, item 3. Nothing below has been flashed.
+
+- **`3C-1`**: `test_submit_and_poll_tx_broadcast_sets_no_ack_bits` and `test_submit_and_poll_tx_unicast_sets_wait_ack_bits` added in `lmac_mmio.rs`. The first was proven to fail against the old value (`0`) before the fix was restored.
+- **`3C-2`** (`dma_ring.rs`): RX and TX descriptors use the ROM `lldesc_t` layout (`size` `[11:0]`, `length` `[23:12]`). `WifiRxDmaDesc::arm` writes `0x8000_0000 | (cap << 12) | cap`. `WifiTxDmaDesc` writes `0xC000_0000 | (len << 12) | cap`. `peek_received` prefers `sig_len`.
+  - **Deviation from the literal formula**: a `sig_len` larger than the whole DMA descriptor length falls back to the descriptor length instead of being clamped to the buffer, so a corrupt `rx_ctrl` cannot expose stale bytes. The comparison is against the full descriptor length, so it holds whether or not silicon counts the 28-byte `rx_ctrl` in that length. If the descriptor length is below `RX_CTRL_LEN`, the plan's buffer clamp applies unchanged.
+- **`3C-3`**:
+  - RX policy (`lmac_mmio.rs`): `set_scan_rx_policy` and `set_associated_bssid` toggle only `0x110`; bit `1` is left as found.
+  - Extended Supported Rates IE (`frames_80211.rs`, `EXT_SUPPORTED_RATES_IE`) appended in Probe Request and Association Request, before the RSN IE.
+  - Data rate (`rate_ctrl.rs`): ladder truncated to the seven legacy entries, default and cap `Rate24m`. `Rate36m`/`Rate48m`/`Rate54m` were **not** added, to keep one variable per flash cycle.
+  - HT-SIG (`lmac_mmio.rs`, `regs.rs`): `TX_HTSIG1_REG = 0x0700_0000 | (psdu_len << 8) | mcs`, `TX_HTSIG2_REG = (psdu_len & 0xFFFF) | 0x0005_0000`. Short GI moved to `TX_HTSIG1_REG` bit `31` because the old `0x80` in `TX_HTSIG2_REG` would collide with the length field. **The bit-31 position is provisional**: it is derived from the 802.11n HT-SIG2 field order, not from the `mac_tx_set_htsig` disassembly, which was not available on this host. It is dormant while the ladder has no HT rates. Confirm it against `hal_mac.o.objdump.txt` before re-enabling HT.
+- **Not applied**: the lower-priority `hal_mac.o` / `phy_bridge.rs` observations, per the plan's condition.
+- **Gates run on the Windows host**: `cargo fmt`, host clippy `-D warnings`, `cargo test --workspace` (`602` passed), `cargo deny check`, `cargo xtask verify-invariants` (with the built bootloader), `verify-pure-rust --allow-phase1`, pre-commit (`8/8`), Miri on `esp32-cam-wifi-mac`, Xtensa clippy and release build, bootloader `15,904` B, image `471,488` B (`26.65%`), and `5` C DWARF CUs (`phy.c`, `phy_chip_v7.c`, `phy_chip_v7_cal.c`, `phy_chip_v7_ana.c`, `esp_rom_spiflash.c`) with `0` `net80211`/`pp`/`wpa_supplicant`. The Xtensa image was built with CI placeholder credentials and is **not deployable**; rebuild on the hardware host with `.env.local`.
+- **Not run** (need the Linux host, the board, or `.agents/rea_evidence/`): `google_rust_audit.py --strict`, the `rea` parity bundle, flashing, and live certification.
+- **Open questions for silicon** (flagged by review, not resolvable from source): whether the TX descriptor `length` should be MPDU or MPDU+4 (PLCP1 already gets MPDU+4); whether `sig_len` includes the FCS (the driver assumes it does and strips 4 bytes); whether `sosf = 0` is right on TX.
+- **Also fixed**: `crates/xtask/tests/cli_parity.rs` mock HTTP servers now read the whole request before replying. They closed with unread bytes, which reset the connection on Windows about one run in twelve.
+
+---
+
 ## 3. Verified Phase 3C Root Causes & Exact Remediation Steps
 
 Per **Rule 2 / Invariant 14 (`/3strikes`)** and **Rule 5 (one logical variable per flash/test cycle)**, execute Fixes `3C-1` through `3C-3` sequentially with UART0 verification if any step stops before `172.22.1.52` comes online. Local Ghidra/objdump disassembly in `.agents/rea_evidence/phase3c_wifi_mac_decomp/pp/` and ESP-IDF SDK headers are already extracted, OR run external cross-verification (e.g., `esp32-open-mac` / ESP32 LMAC TRM research) first if confirming register edge cases.
 
-### Fix 3C-1: `TX_PLCP0` No-ACK Bits `[25:24] = 3` (`0x0300_0000`) — `[SOURCE EDITED IN TREE; NEEDS UNIT TEST & SILICON TEST]`
+### Fix 3C-1: `TX_PLCP0` No-ACK Bits `[25:24] = 3` (`0x0300_0000`) — `[CODE + UNIT TEST DONE; NEEDS SILICON TEST]`
 - **Failure Observed (`Attempts 58–60`)**:
   - `connect('iot') start error: Sta(Hardware(TxAckFailed(4)))` on the initial Channel 1 broadcast Probe Request (`DA = FF:FF:FF:FF:FF:FF`, `Rate1mL`).
 - **Disassembly Proof** (`.agents/rea_evidence/phase3c_wifi_mac_decomp/pp/hal_mac.o.objdump.txt` `<mac_tx_set_plcp0>` `0x58..0x90`, `hal_mac.o.ghidra.c` `L9-44`, `lmac.o.ghidra.c` `lmacProcessTxComplete`/`lmacProcessTxError`):
@@ -73,7 +93,7 @@ Per **Rule 2 / Invariant 14 (`/3strikes`)** and **Rule 5 (one logical variable p
 - **Remaining Code Action**:
   - Add unit test `test_submit_and_poll_tx_broadcast_sets_no_ack_bits` in `crates/esp32-cam-wifi-mac/src/lmac_mmio.rs` asserting `TX_PLCP0_NO_ACK | TX_PLCP0_MODE_LEGACY` on `0x3FF7_3D20` when `wait_ack == false`.
 
-### Fix 3C-2: `lldesc_t` Swapped `size` `[11:0]` vs. `length` `[23:12]` & `sig_len` (`crates/esp32-cam-wifi-mac/src/dma_ring.rs`) — `[REQUIRED]`
+### Fix 3C-2: `lldesc_t` Swapped `size` `[11:0]` vs. `length` `[23:12]` & `sig_len` (`crates/esp32-cam-wifi-mac/src/dma_ring.rs`) — `[CODE + UNIT TESTS DONE; NEEDS SILICON TEST]`
 - **Vendor SDK & Disassembly Proof** (`/home/console-admin/esp-matter-build/esp-idf/components/esp_rom/include/esp_rom_lldesc.h:28-41`, `esp32/rom/lldesc.h:74-93`, `.agents/rea_evidence/phase3c_wifi_mac_decomp/pp/wdev.o.ghidra.c:1370-1386, 1689-1707, 2195`):
   - `LLDESC_SIZE_MASK = 0x0000_0FFF` (bits `[11:0]` = buffer capacity `size`).
   - `LLDESC_LENGTH_MASK = 0x00FF_F000` (bits `[23:12]` = DMA frame `length`).
@@ -88,7 +108,7 @@ Per **Rule 2 / Invariant 14 (`/3strikes`)** and **Rule 5 (one logical variable p
   3. `WifiRxRing::peek_received` (`L544-555`): prioritize `ctrl.sig_len > 0` over `desc_len - RX_CTRL_LEN`.
   4. Unit tests (`L796`, `L837-839`): update `test_rx_ring_lifecycle_and_recycling` (`d.word0 = WifiRxDmaDesc::EOF_BIT | (32 << 12) | (256 & 0xFFF);`) and add bit-position checks in `test_tx_slot_prepare_and_completion`.
 
-### Fix 3C-3: RX Policy Bit `1`, Extended Supported Rates, Legacy Data Rate & `TX_HTSIG1/2` (Verify/Apply After 3C-1 + 3C-2)
+### Fix 3C-3: RX Policy Bit `1`, Extended Supported Rates, Legacy Data Rate & `TX_HTSIG1/2` (Verify/Apply After 3C-1 + 3C-2) — `[CODE + UNIT TESTS DONE; NEEDS SILICON TEST]`
 - **`0x3FF7_30D8` Bit `1` (`lmac_mmio.rs:540-577`)**: `<hal_mac_rx_set_policy>` (`hal_mac.o.objdump.txt:1405-1513`) only toggles `0x110` (`RX_POLICY_PROMISC_BYPASS`) on `0x3FF7_30D8` and bit `16` (`0x0001_0000`) on `0x3FF7_3024`, never setting bit `1` (`RX_POLICY_BIT_BSSID_CHECK = 0x2`). Remove bit `1` writes in `set_scan_rx_policy` & `set_associated_bssid` and update `test_rx_policy_scan_vs_associated_bssid` (`L846-860`).
 - **802.11g Extended Supported Rates & Non-HT Data Rate**:
   - `frames_80211.rs` (`build_probe_req` `L405-440` & `build_assoc_req` `L470-518`): append Extended Supported Rates IE Tag 50 (`[0x32, 0x04, 0x30, 0x48, 0x60, 0x6C]`) because `AssocReq` currently advertises Non-HT/Non-QoS (`0x0108`/`0x4108`) up to `18 Mbps`, while `RateController::new()` (`rate_ctrl.rs:349-355`) defaults to HT `WifiPhyRate::Mcs3Lgi` (`hw_code = 0x13`).

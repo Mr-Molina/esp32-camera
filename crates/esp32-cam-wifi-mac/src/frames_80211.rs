@@ -401,6 +401,9 @@ pub fn parse_addba_req(mpdu: &[u8]) -> Result<(u8, u16, u16, u16), FrameError> {
     Ok((dialog_token, ba_param_set, ba_timeout, start_seq))
 }
 
+/// Extended Supported Rates IE (Tag 50): 24, 36, 48, 54 Mbps.
+pub const EXT_SUPPORTED_RATES_IE: [u8; 6] = [0x32, 0x04, 0x30, 0x48, 0x60, 0x6C];
+
 /// Builds an 802.11 Probe Request management frame.
 pub fn build_probe_req(
     buf: &mut [u8],
@@ -409,7 +412,7 @@ pub fn build_probe_req(
     seq: u16,
 ) -> Result<usize, FrameError> {
     let ssid_bytes = ssid.unwrap_or(&[]);
-    let total_len = 24 + 2 + ssid_bytes.len() + 2 + 8;
+    let total_len = 24 + 2 + ssid_bytes.len() + 2 + 8 + EXT_SUPPORTED_RATES_IE.len();
     if buf.len() < total_len {
         return Err(FrameError::BufferTooSmall);
     }
@@ -435,6 +438,10 @@ pub fn build_probe_req(
     buf[pos..pos + 10]
         .copy_from_slice(&[0x01, 0x08, 0x82, 0x84, 0x8B, 0x96, 0x0C, 0x12, 0x18, 0x24]);
     pos += 10;
+
+    // Extended Supported Rates IE (Tag 50): 24, 36, 48, 54 Mbps
+    buf[pos..pos + EXT_SUPPORTED_RATES_IE.len()].copy_from_slice(&EXT_SUPPORTED_RATES_IE);
+    pos += EXT_SUPPORTED_RATES_IE.len();
 
     Ok(pos)
 }
@@ -476,7 +483,7 @@ pub fn build_assoc_req(
     seq: u16,
     listen_interval: u16,
 ) -> Result<usize, FrameError> {
-    let rates_ie_len = 10;
+    let rates_ie_len = 10 + EXT_SUPPORTED_RATES_IE.len();
     let total_len = 24 + 4 + (2 + ssid.len()) + rates_ie_len + rsn_ie.len();
     if buf.len() < total_len {
         return Err(FrameError::BufferTooSmall);
@@ -507,6 +514,11 @@ pub fn build_assoc_req(
     buf[pos..pos + 10]
         .copy_from_slice(&[0x01, 0x08, 0x82, 0x84, 0x8B, 0x96, 0x0C, 0x12, 0x18, 0x24]);
     pos += 10;
+
+    // Extended Supported Rates IE (Tag 50), ordered before RSN (Tag 48) as
+    // in the 802.11 Association Request element order.
+    buf[pos..pos + EXT_SUPPORTED_RATES_IE.len()].copy_from_slice(&EXT_SUPPORTED_RATES_IE);
+    pos += EXT_SUPPORTED_RATES_IE.len();
 
     // RSN IE if present
     if !rsn_ie.is_empty() {
@@ -777,6 +789,14 @@ mod tests {
         assert_eq!(parsed.frame_type, FrameType::Mgmt);
         assert_eq!(parsed.subtype, 0x04);
         assert_eq!(parsed.addr2, sta_mac);
+
+        // header + SSID IE + Supported Rates IE + Extended Supported Rates IE
+        assert_eq!(len, 24 + (2 + 8) + 10 + 6);
+        // Supported Rates (Tag 1) then Extended Supported Rates (Tag 50):
+        // 24, 36, 48, 54 Mbps.
+        assert_eq!(&buf[34..36], &[0x01, 0x08]);
+        assert_eq!(&buf[44..50], &EXT_SUPPORTED_RATES_IE);
+        assert_eq!(EXT_SUPPORTED_RATES_IE, [0x32, 0x04, 0x30, 0x48, 0x60, 0x6C]);
     }
 
     #[test]
@@ -800,6 +820,42 @@ mod tests {
         let len =
             build_assoc_req(&mut buf, bssid, sta, b"MySsid", &[], 3, 10).expect("valid assoc req");
         assert!(len > 30);
+        // header + caps/listen + SSID IE + Supported Rates + Ext Supported Rates
+        assert_eq!(len, 24 + 4 + (2 + 6) + 10 + 6);
+        assert_eq!(&buf[len - 6..len], &EXT_SUPPORTED_RATES_IE);
+    }
+
+    #[test]
+    fn test_build_assoc_req_orders_ext_rates_before_rsn_ie() {
+        let mut buf = [0u8; 128];
+        let bssid = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let sta = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let rsn = [0x30, 0x02, 0x01, 0x00];
+        let len =
+            build_assoc_req(&mut buf, bssid, sta, b"MySsid", &rsn, 3, 10).expect("valid assoc req");
+
+        // IEs start at 28: SSID (8), Supported Rates (10), Extended
+        // Supported Rates (6), then RSN.
+        assert_eq!(len, 28 + 8 + 10 + 6 + rsn.len());
+        assert_eq!(&buf[36..38], &[0x01, 0x08]);
+        assert_eq!(&buf[46..52], &EXT_SUPPORTED_RATES_IE);
+        assert_eq!(&buf[52..len], &rsn);
+    }
+
+    #[test]
+    fn test_builders_reject_buffer_one_byte_short_of_ext_rates() {
+        let bssid = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let sta = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let mut buf = [0u8; 24 + 4 + 8 + 10 + 6 - 1];
+        assert_eq!(
+            build_assoc_req(&mut buf, bssid, sta, b"MySsid", &[], 3, 10),
+            Err(FrameError::BufferTooSmall)
+        );
+        let mut probe = [0u8; 24 + 10 + 10 + 6 - 1];
+        assert_eq!(
+            build_probe_req(&mut probe, sta, Some(b"TestSsid"), 1),
+            Err(FrameError::BufferTooSmall)
+        );
     }
 
     #[test]

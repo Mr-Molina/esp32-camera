@@ -6,7 +6,7 @@
 
 use std::fs;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
@@ -100,6 +100,34 @@ fn test_missing_host_exit_error() {
     );
 }
 
+/// Reads a whole HTTP request (headers plus `body_len` body bytes) from a
+/// mock-server connection before the server replies.
+///
+/// A server that closes a socket with unread request bytes makes Windows
+/// reset the connection (`os error 10054`), which discards the response the
+/// client has not read yet. The client sends headers and body in separate
+/// writes, so a single `read` can return before the body arrives.
+fn drain_http_request(stream: &mut TcpStream, body_len: usize) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+    let mut received = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        let header_end = received
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|pos| pos + 4);
+        if let Some(end) = header_end {
+            if received.len() >= end + body_len {
+                return;
+            }
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => received.extend_from_slice(&chunk[..n]),
+        }
+    }
+}
+
 #[test]
 fn test_read_http_response_content_length() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
@@ -107,8 +135,7 @@ fn test_read_http_response_content_length() {
 
     let server_thread = thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
-            let mut req_buf = [0u8; 1024];
-            let _ = stream.read(&mut req_buf);
+            drain_http_request(&mut stream, 64);
             let body = "Firmware update successful! Rebooting...\n";
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -142,8 +169,7 @@ fn test_read_http_response_invalid_raises_error() {
 
     let server_thread = thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
-            let mut req_buf = [0u8; 1024];
-            let _ = stream.read(&mut req_buf);
+            drain_http_request(&mut stream, 64);
             let response = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
             let _ = stream.write_all(response.as_bytes());
         }

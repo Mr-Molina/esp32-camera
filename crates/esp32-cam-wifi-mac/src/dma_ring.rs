@@ -176,8 +176,8 @@ impl WifiRxCtrl {
 ///   - Bit 31: Owner (1 = Hardware/DMA, 0 = Software/CPU).
 ///   - Bit 30: EOF (End of Frame).
 ///   - Bit 29: SOF (Start of Frame).
-///   - Bits 23..12: Buffer capacity in bytes.
-///   - Bits 11..0: Received frame payload length in bytes.
+///   - Bits 23..12: `length`, received DMA length in bytes (4-byte padded).
+///   - Bits 11..0: `size`, buffer capacity in bytes.
 /// - `buf_ptr`: Physical address of 4-byte aligned payload buffer.
 /// - `next_desc`: Physical address of next descriptor in circular ring.
 #[repr(C, align(4))]
@@ -237,18 +237,20 @@ impl WifiRxDmaDesc {
         (self.word0 & Self::SOF_BIT) != 0
     }
 
-    /// Returns the received payload length from bits [11:0].
+    /// Returns the received DMA length from the `lldesc_t` `length` field,
+    /// bits [23:12]. Hardware pads this up to a 4-byte boundary.
     #[inline]
     #[must_use]
     pub const fn payload_len(&self) -> u16 {
-        (self.word0 & 0xFFF) as u16
+        ((self.word0 >> 12) & 0xFFF) as u16
     }
 
-    /// Returns the buffer capacity from bits [23:12].
+    /// Returns the buffer capacity from the `lldesc_t` `size` field,
+    /// bits [11:0].
     #[inline]
     #[must_use]
     pub const fn buffer_cap(&self) -> u16 {
-        ((self.word0 >> 12) & 0xFFF) as u16
+        (self.word0 & 0xFFF) as u16
     }
 
     /// Sets ownership to hardware/DMA.
@@ -265,10 +267,14 @@ impl WifiRxDmaDesc {
 
     /// Prepares and arms this descriptor for hardware DMA reception with
     /// the given capacity.
+    ///
+    /// Matches vendor `wDev_AppendRxBlocks`: the capacity goes in both the
+    /// `size` field (bits [11:0]) and the `length` field (bits [23:12]).
+    /// A zero `size` makes the RX DMA drop every incoming frame.
     #[inline]
     pub fn arm(&mut self, capacity: u16) {
-        let cap_field = ((capacity as u32) & 0xFFF) << 12;
-        self.word0 = Self::OWNER_HW | cap_field;
+        let cap = (capacity as u32) & 0xFFF;
+        self.word0 = Self::OWNER_HW | (cap << 12) | cap;
     }
 }
 
@@ -282,12 +288,13 @@ impl Default for WifiRxDmaDesc {
 /// 4-byte aligned hardware TX DMA descriptor (12 bytes).
 ///
 /// Matches the ESP32 Wi-Fi MAC TX DMA descriptor memory layout:
-/// - `ctrl`: Control word (`0xE000_0000 | (cap << 12) | len`).
+/// - `ctrl`: Control word (`0xC000_0000 | (len << 12) | cap`), the ROM
+///   `lldesc_t` layout.
 ///   - Bit 31: Owner (1 = Hardware/DMA, 0 = Software/CPU).
 ///   - Bit 30: EOF (End of Frame).
-///   - Bit 29: SOF (Start of Frame).
-///   - Bits 23..12: Buffer capacity in bytes.
-///   - Bits 11..0: Packet payload length in bytes.
+///   - Bit 29: SOSF (clear for single-buffer vendor TX).
+///   - Bits 23..12: `length`, packet payload length in bytes.
+///   - Bits 11..0: `size`, buffer capacity in bytes.
 /// - `buf_ptr`: Physical address of 4-byte aligned payload buffer.
 /// - `next_desc`: Physical address of next descriptor (0 for single frame).
 #[repr(C, align(4))]
@@ -302,8 +309,9 @@ pub struct WifiTxDmaDesc {
 }
 
 impl WifiTxDmaDesc {
-    /// Combined control bits: Owner (bit 31), EOF (bit 30), SOF (bit 29).
-    pub const CTRL_FLAGS: u32 = 0xE000_0000;
+    /// Combined control bits: Owner (bit 31) and EOF (bit 30). SOSF
+    /// (bit 29) stays clear, as in single-buffer vendor TX.
+    pub const CTRL_FLAGS: u32 = 0xC000_0000;
 
     /// Creates an empty TX descriptor owned by software.
     #[must_use]
@@ -329,26 +337,28 @@ impl WifiTxDmaDesc {
         !self.is_owner_hw()
     }
 
-    /// Returns the configured payload length from bits [11:0].
+    /// Returns the configured payload length from the `lldesc_t` `length`
+    /// field, bits [23:12].
     #[inline]
     #[must_use]
     pub const fn payload_len(&self) -> u16 {
-        (self.ctrl & 0xFFF) as u16
+        ((self.ctrl >> 12) & 0xFFF) as u16
     }
 
-    /// Returns the buffer capacity from bits [23:12].
+    /// Returns the buffer capacity from the `lldesc_t` `size` field,
+    /// bits [11:0].
     #[inline]
     #[must_use]
     pub const fn buffer_cap(&self) -> u16 {
-        ((self.ctrl >> 12) & 0xFFF) as u16
+        (self.ctrl & 0xFFF) as u16
     }
 
     /// Prepares the TX descriptor for single-frame hardware transmission.
     #[inline]
     pub fn prepare(&mut self, buf_addr: u32, cap: u16, len: u16) {
-        let cap_bits = ((cap as u32) & 0xFFF) << 12;
-        let len_bits = (len as u32) & 0xFFF;
-        self.ctrl = Self::CTRL_FLAGS | cap_bits | len_bits;
+        let len_bits = ((len as u32) & 0xFFF) << 12;
+        let cap_bits = (cap as u32) & 0xFFF;
+        self.ctrl = Self::CTRL_FLAGS | len_bits | cap_bits;
         self.buf_ptr = buf_addr;
         self.next_desc = 0;
     }
@@ -541,13 +551,25 @@ impl<const N: usize, const BUF_LEN: usize> WifiRxRing<N, BUF_LEN> {
         let raw_buf = &self.buffers[self.head].0;
         let ctrl = WifiRxCtrl::parse_slice(raw_buf).ok()?;
 
+        // The SLC DMA pads the descriptor length up to a 4-byte boundary, so
+        // the unpadded `sig_len` from rx_ctrl is authoritative whenever it is
+        // set; trailing pad bytes would otherwise corrupt FCS stripping and
+        // CCMP MIC checks. The descriptor length is the fallback.
+        //
+        // A `sig_len` above the whole DMA length cannot describe the frame
+        // in this buffer (corrupt rx_ctrl, or a continuation buffer whose
+        // first bytes are payload), so it falls back to the descriptor
+        // length rather than exposing stale bytes from earlier frames. The
+        // comparison is against the full DMA length, not the length minus
+        // the header, so it holds whether or not silicon counts rx_ctrl in
+        // the descriptor length.
         let desc_len = desc.payload_len() as usize;
-        let payload_len = if desc_len >= RX_CTRL_LEN {
-            desc_len - RX_CTRL_LEN
-        } else if ctrl.sig_len > 0 {
-            (ctrl.sig_len as usize).min(BUF_LEN.saturating_sub(RX_CTRL_LEN))
+        let sig_len = ctrl.sig_len as usize;
+        let desc_usable = desc_len >= RX_CTRL_LEN;
+        let payload_len = if sig_len > 0 && !(desc_usable && sig_len > desc_len) {
+            sig_len.min(BUF_LEN.saturating_sub(RX_CTRL_LEN))
         } else {
-            0
+            desc_len.saturating_sub(RX_CTRL_LEN)
         };
 
         let payload_end = (RX_CTRL_LEN + payload_len).min(BUF_LEN);
@@ -792,8 +814,9 @@ mod tests {
         let desc0 = ring.desc_mut(0);
         assert!(desc0.is_some());
         if let Some(d) = desc0 {
-            // HW sets SW ownership, EOF, and length (28 + 4 = 32 bytes)
-            d.word0 = WifiRxDmaDesc::EOF_BIT | ((256 & 0xFFF) << 12) | 32;
+            // HW sets SW ownership, EOF, and length (28 + 4 = 32 bytes) in
+            // lldesc_t `length` bits [23:12]; `size` bits [11:0] keep capacity.
+            d.word0 = WifiRxDmaDesc::EOF_BIT | (32 << 12) | (256 & 0xFFF);
         }
 
         // Now pop_received should see frame
@@ -837,6 +860,9 @@ mod tests {
         assert!(d.is_owner_hw());
         assert_eq!(d.payload_len(), 5);
         assert_eq!(d.buffer_cap(), 256);
+        // lldesc_t: owner (31) + eof (30), sosf (29) clear, length [23:12],
+        // size [11:0].
+        assert_eq!(d.ctrl, 0xC000_0000 | (5 << 12) | 256);
         assert_eq!(&slot.buffer_slice()[..5], &payload);
 
         // In-flight slot returns TxBusy
@@ -854,5 +880,114 @@ mod tests {
             slot.tx_prepare(&oversized),
             Err(DmaRingError::BufferTooLarge)
         );
+    }
+
+    #[test]
+    fn test_rx_desc_arm_writes_capacity_to_size_and_length_fields() {
+        let mut d = WifiRxDmaDesc::new();
+        d.arm(1600);
+        // Vendor wDev_AppendRxBlocks: owner | (cap << 12) | cap. A zero
+        // `size` field (bits [11:0]) makes the RX DMA drop every frame.
+        assert_eq!(d.word0, 0x8000_0000 | (1600 << 12) | 1600);
+        assert_eq!(d.buffer_cap(), 1600);
+        assert!(d.is_owner_hw());
+        assert!(!d.is_eof());
+    }
+
+    #[test]
+    fn test_rx_desc_reads_length_from_bits_23_12_and_size_from_bits_11_0() {
+        let mut d = WifiRxDmaDesc::new();
+        d.word0 = WifiRxDmaDesc::EOF_BIT | (0x123 << 12) | 0x640;
+        assert_eq!(d.payload_len(), 0x123);
+        assert_eq!(d.buffer_cap(), 0x640);
+    }
+
+    #[test]
+    fn test_tx_desc_prepare_uses_lldesc_bit_layout_without_sosf() {
+        let mut d = WifiTxDmaDesc::new();
+        d.prepare(0x3FFB_0000, 1600, 42);
+        assert_eq!(d.ctrl, 0xC000_0000 | (42 << 12) | 1600);
+        assert_eq!(d.ctrl & (1 << 29), 0);
+        assert_eq!(d.payload_len(), 42);
+        assert_eq!(d.buffer_cap(), 1600);
+        assert_eq!(d.buf_ptr, 0x3FFB_0000);
+        assert_eq!(d.next_desc, 0);
+    }
+
+    /// Writes an rx_ctrl header with the given `sig_len` plus `body` into
+    /// slot 0 and hands the descriptor to software with `desc_len` in the
+    /// lldesc_t `length` field.
+    fn simulate_rx(ring: &mut WifiRxRing<2, 256>, sig_len: u32, desc_len: u32, body: &[u8]) {
+        if let Some(b) = ring.raw_buffer_mut(0) {
+            b[24..28].copy_from_slice(&sig_len.to_le_bytes());
+            b[RX_CTRL_LEN..RX_CTRL_LEN + body.len()].copy_from_slice(body);
+        }
+        if let Some(d) = ring.desc_mut(0) {
+            d.word0 = WifiRxDmaDesc::EOF_BIT | ((desc_len & 0xFFF) << 12) | 256;
+        }
+    }
+
+    #[test]
+    fn test_peek_received_prefers_sig_len_over_padded_descriptor_length() {
+        let mut ring = WifiRxRing::<2, 256>::new();
+        assert!(ring.arm_ring().is_ok());
+
+        // 6-byte frame; SLC DMA pads the descriptor length to 4 bytes
+        // (28 + 8 = 36), leaving 2 trailing pad bytes after the frame.
+        simulate_rx(&mut ring, 6, 36, &[1, 2, 3, 4, 5, 6, 0xEE, 0xEE]);
+
+        let rx = ring.peek_received();
+        assert!(rx.is_some());
+        if let Some((ctrl, payload)) = rx {
+            assert_eq!(ctrl.sig_len, 6);
+            assert_eq!(payload, &[1, 2, 3, 4, 5, 6]);
+        }
+    }
+
+    #[test]
+    fn test_peek_received_falls_back_to_descriptor_length_when_sig_len_is_zero() {
+        let mut ring = WifiRxRing::<2, 256>::new();
+        assert!(ring.arm_ring().is_ok());
+
+        simulate_rx(&mut ring, 0, 28 + 8, &[1, 2, 3, 4, 5, 6, 7, 8]);
+
+        let rx = ring.peek_received();
+        assert!(rx.is_some());
+        if let Some((_, payload)) = rx {
+            assert_eq!(payload, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        }
+    }
+
+    #[test]
+    fn test_peek_received_rejects_sig_len_larger_than_dma_length() {
+        let mut ring = WifiRxRing::<2, 256>::new();
+        assert!(ring.arm_ring().is_ok());
+
+        // The DMA wrote 36 bytes (28 rx_ctrl + 8 payload). A sig_len above
+        // the whole DMA length cannot describe this frame, so it must not
+        // expose stale bytes left in the buffer by earlier frames.
+        simulate_rx(&mut ring, 0xFFF, 36, &[9; 8]);
+
+        let rx = ring.peek_received();
+        assert!(rx.is_some());
+        if let Some((_, payload)) = rx {
+            assert_eq!(payload, &[9; 8]);
+        }
+    }
+
+    #[test]
+    fn test_peek_received_clamps_sig_len_to_buffer_when_dma_length_unusable() {
+        let mut ring = WifiRxRing::<2, 256>::new();
+        assert!(ring.arm_ring().is_ok());
+
+        // Descriptor length shorter than the rx_ctrl header carries no
+        // usable bound, so sig_len is clamped to the buffer only.
+        simulate_rx(&mut ring, 0xFFF, 0, &[9; 8]);
+
+        let rx = ring.peek_received();
+        assert!(rx.is_some());
+        if let Some((_, payload)) = rx {
+            assert_eq!(payload.len(), 256 - RX_CTRL_LEN);
+        }
     }
 }

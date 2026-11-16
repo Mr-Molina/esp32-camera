@@ -88,7 +88,8 @@ pub const fn sta_mac_mask_high_ctrl_reg(slot: usize) -> u32 {
 
 /// Base address of RX policy registers (slots 0..=2).
 pub const RX_POLICY_BASE_REG: u32 = 0x3FF7_30D8;
-/// BSSID check policy bit (`1 << 1`).
+/// RX policy bit 1 (`1 << 1`). Vendor `hal_mac_rx_set_policy` never writes
+/// it, so the driver leaves it as found; kept for tests and diagnostics.
 pub const RX_POLICY_BIT_BSSID_CHECK: u32 = 1 << 1;
 /// Promiscuous bypass mask for RX policy (`0x110`).
 pub const RX_POLICY_PROMISC_BYPASS: u32 = 0x110;
@@ -263,6 +264,18 @@ pub const TX_PLCP2_REG: u32 = 0x3FF7_425C;
 pub const TX_HTSIG1_REG: u32 = 0x3FF7_4260;
 /// TX HT-SIG2 register.
 pub const TX_HTSIG2_REG: u32 = 0x3FF7_4264;
+/// Fixed `TX_HTSIG1_REG` bits [26:24]: HT-SIG2 smoothing | not-sounding |
+/// reserved.
+pub const TX_HTSIG1_FIXED: u32 = 0x0700_0000;
+/// `TX_HTSIG1_REG` bit 31: HT-SIG2 short guard interval.
+///
+/// Provisional: derived from the 802.11n HT-SIG2 field order (short GI is
+/// HT-SIG2 bit 7, with HT-SIG2 bits 2:0 at register bits [26:24]) and not
+/// yet confirmed against the vendor `mac_tx_set_htsig` disassembly. Dormant
+/// while the data rate ladder holds no HT rates.
+pub const TX_HTSIG1_SHORT_GI: u32 = 0x8000_0000;
+/// Fixed `TX_HTSIG2_REG` bits above the PSDU length in [15:0].
+pub const TX_HTSIG2_FIXED: u32 = 0x0005_0000;
 /// TX duration register.
 pub const TX_DURATION_REG: u32 = 0x3FF7_4268;
 /// TX PMD parameter register.
