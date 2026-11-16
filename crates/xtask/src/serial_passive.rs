@@ -7,6 +7,7 @@
 use std::env;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+#[cfg(target_os = "linux")]
 use std::path::Path;
 use std::time::Duration;
 

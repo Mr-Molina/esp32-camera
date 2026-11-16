@@ -23,4 +23,7 @@ fw-tiny = [
     "-p", "klipper-cam-fw", "--profile", "release-tiny",
     "--config", "target.xtensa-esp32-none-elf.rustflags=[\"-Zunstable-options\", \"-Cpanic=immediate-abort\"]",
 ]
-xtask = "run --package xtask --target x86_64-unknown-linux-gnu --"
+# `cargo xtask <subcommand>` builds the host tooling crate for the current
+# host (Linux CI and Windows developer machines alike). Do not pin a
+# `--target` here: a pinned Linux triple fails on Windows with E0463.
+xtask = "run --package xtask --"
