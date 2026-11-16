@@ -4,7 +4,7 @@ Pure bare-metal `#![no_std]` Rust workspace for an ESP32-WROVER OV2640 camera an
 
 ## Where work stands (read first)
 
-- Current handoff: `docs/superpowers/plans/2026-11-16-rea-pure-rust-handoff-plan.md` (base plan: `docs/superpowers/plans/2026-11-14-rea-full-rust-firmware-plan.md`). Phases 0–3B are executed and verified. Phase 3C (`esp32-cam-wifi-mac`) passes every static gate but is halted at `/3strikes` on live STA association, with root causes and ordered fixes 3C-1..3C-3 listed in the handoff. Phases 3D (PHY crate) and 3E (app-desc cutover, drop `--allow-phase1`) are queued.
+- Current handoff: `docs/superpowers/plans/2026-11-16-rea-pure-rust-handoff-plan.md` (base plan: `docs/superpowers/plans/2026-11-14-rea-full-rust-firmware-plan.md`). Phases 0–3B are executed and verified. Phase 3C (`esp32-cam-wifi-mac`) fixes 3C-1..3C-3 are implemented, unit-tested and on `master`, but not yet flashed: the next action is the live STA association test on the Linux host with the board, which needs explicit user confirmation. Start at the "Resume Here" section of the handoff. Phases 3D (PHY crate) and 3E (app-desc cutover, drop `--allow-phase1`) are queued; do not start 3D before 3C is certified on silicon.
 - The handoff was written on a Linux host (`/home/console-admin/...`, `/dev/serial/by-id/...`, `eno1`). The repo is also worked on from Windows; see the host notes under "Build and verify".
 - Older workorder findings live in `docs/workorders/`; superseded designs in `docs/archive/`.
 

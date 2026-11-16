@@ -3,7 +3,36 @@
 - **Date**: `2026-11-16`
 - **Repository**: `esp32-camera` (`/home/console-admin/Github/esp32-camera`, branch `master`)
 - **Base Plan**: `docs/superpowers/plans/2026-11-14-rea-full-rust-firmware-plan.md`
-- **Handoff Status**: Phases `0–3B` `[EXECUTED & VERIFIED]`; Phase `3C` (`esp32-cam-wifi-mac`) passes host, Miri, Xtensa, and REA static gates and is paused at `/3strikes` during live silicon association with verified Xtensa disassembly root causes isolated below; Phases `3D` (`libphy.a`) and `3E` (`esp-bootloader-esp-idf` retirement) are queued for completion by the receiving agent.
+- **Handoff Status**: Phases `0–3B` `[EXECUTED & VERIFIED]`; Phase `3C` (`esp32-cam-wifi-mac`) passes host, Miri, Xtensa, and REA static gates and has Fixes `3C-1`..`3C-3` implemented, unit-tested and pushed to `master` (`d773df7`, CI green) but **not yet flashed**, so the live silicon association test is the next action (see "Resume Here" and Section 2A); Phases `3D` (`libphy.a`) and `3E` (`esp-bootloader-esp-idf` retirement) are queued for completion by the receiving agent.
+
+---
+
+## Resume Here (`2026-11-16` session handoff)
+
+**State.** `master` is clean and pushed. Phase 3C code landed in `d773df7` and both CI workflows passed on it (`Rust CI`, `Pre-Commit Checks`). Nothing has been flashed since Attempt 60. Details, rulings and open silicon questions are in Section 2A.
+
+**Next action: silicon test of Phase 3C.** Needs the Linux host with the board attached. Flashing and any serial or LAN access need explicit user confirmation in that session.
+
+1. `git pull` on `master`, then rerun the Section 3 static gates plus `google_rust_audit.py --strict` and the `rea` parity bundle, which could not run on the Windows host.
+2. Rebuild `klipper-cam-fw` with the real credentials from `.env.local` (the Windows build used CI placeholders and is not deployable).
+3. Flash `ota_0`, run `cargo xtask ensure-serial-passive`, then the live `172.22.1.52` certification in Section 3, item 3.
+4. If association still fails: read UART0, change one logical variable per flash cycle, and apply the lower-priority `hal_mac.o` observations in Section 3 only if the diagnostics implicate them. `/3strikes` still applies.
+5. While on that host, settle the provisional short-GI bit and the three open silicon questions in Section 2A against `.agents/rea_evidence/`.
+
+**Do not start Phase 3D** until 3C is certified on silicon. It also needs the disassembly evidence and Ghidra setup that exist only on the Linux host.
+
+**Work that can proceed on any host, no board needed:**
+
+- Phase 3E, first half: the clean-room `EspAppDesc` in `crates/klipper-cam-fw` (Section 5, item 1). Dropping `--allow-phase1` waits for 3D.
+- Review leftovers from 3C: reject `BUF_LEN > 0xFFF` in `WifiRxRing::arm_ring` (the 12-bit `size` field would arm as zero); add a driver-level test in `smoltcp_phy.rs` for a padded descriptor length with FCS stripping; strengthen the three new tests that pass with or without the production change (rate floor, `sig_len == 0` fallback, unicast wait-ACK).
+- Doc drift: `README.md` still says "All 7 crates"; the workspace has 13.
+
+**Environment notes for the next agent:**
+
+- Read `CLAUDE.md` first. Gates there match CI. `cargo xtask` now builds for the current host on Linux and Windows.
+- `.claude/settings.json` enables the Superpowers and TokenEconomizer plugins, allows the read-only gates, and denies flashing, OTA deploy and force-push. Cloud sessions install the plugins with `cargo xtask bootstrap-env`.
+- The pre-commit git hook is per clone: `pip install pre-commit && pre-commit install`. `.codespellrc` has `write-changes = true`, so codespell edits files in place; check its diff before committing (it once renamed a variable).
+- A worktree nested under `.claude/worktrees/` doubles the Xtensa linker flags; see the nested worktree note in `CLAUDE.md`.
 
 ---
 
@@ -16,7 +45,7 @@
 | **Phase 2A–2C** (`Bootloader`) | `crates/esp32-cam-bootloader` (`0x1000`) | `[EXECUTED & VERIFIED]` | `15,904` B <= `28,672` B (`0x7000`), `0` `"GCC:"` strings, GPIO 16 pull-up (`0x3FF4_904C = 0x2B00`), 32-bit `s32i` IRAM loader (`mmu_jump.rs`), live `ota_0`/`ota_1` + OTADATA rollback Drill 3 certified; legacy `firmware/bootloader_v554_gpio16.bin` deleted |
 | **Phase 3A** (`RF/Clock & Seam`) | `crates/esp32-cam-rf-clock`, `crates/esp-wifi-sys-esp32-seam` | `[EXECUTED & VERIFIED]` | Retired `10 / 14` Espressif C archives (`libbtdm_app.a`, `libcoexist.a`, `libcore.a`, `libespnow.a`, `libmesh.a`, `libprintf.a`, `libregulatory.a`, `librtc.a`, `libsmartconfig.a`, `libwapi.a`) |
 | **Phase 3B** (`WPA2 Supplicant`) | `crates/esp32-cam-wpa2` | `[EXECUTED & VERIFIED]` | Retired `libwpa_supplicant.a`; live STA association, `1280x720` `/snapshot` & `:81/stream` certified in Attempt 53 |
-| **Phase 3C** (`Wi-Fi MAC & LMAC`) | `crates/esp32-cam-wifi-mac`, `klipper-cam-fw` | `[HALTED AT /3strikes — ROOT CAUSES ISOLATED]` | Retired `libnet80211.a`, `libpp.a`, `esp-radio`, `esp-rtos`; `586` host tests, `129` Miri tests, `klipper-cam-fw.bin` `471,408` B (`26.64%`), `5` non-Rust DWARF CUs left (`phy*` + `esp_rom_spiflash.c`); live `172.22.1.52` association blocked on `TxAckFailed(4)` + swapped `lldesc_t` fields |
+| **Phase 3C** (`Wi-Fi MAC & LMAC`) | `crates/esp32-cam-wifi-mac`, `klipper-cam-fw` | `[FIXES 3C-1..3C-3 CODED & UNIT-TESTED (d773df7) — AWAITING SILICON TEST]` | Retired `libnet80211.a`, `libpp.a`, `esp-radio`, `esp-rtos`; `586` host tests, `129` Miri tests, `klipper-cam-fw.bin` `471,408` B (`26.64%`), `5` non-Rust DWARF CUs left (`phy*` + `esp_rom_spiflash.c`); live `172.22.1.52` association blocked on `TxAckFailed(4)` + swapped `lldesc_t` fields |
 | **Phase 3D** (`PHY Crate`) | `crates/esp32-cam-phy` (retire `libphy.a` + seam) | `[QUEUED]` | Replace `phy_chip_v7.c`, `phy.c`, `phy_chip_v7_cal.c`, `phy_chip_v7_ana.c` |
 | **Phase 3E** (`App Desc & Cutover`) | `crates/klipper-cam-fw`, `crates/xtask`, CI | `[QUEUED]` | Retire `esp-bootloader-esp-idf::esp_app_desc!()`, remove `--allow-phase1`, enforce `0` C/Assembly DWARF CUs |
 
@@ -36,7 +65,7 @@
   - `0x18000`: `otadata`.
   - `0x20000`: `ota_0` (`1,769,472` B / `0x1B0000` max).
   - `0x1D0000`: `ota_1`.
-- **Board-Currently-Flashed State**: The ESP32 flash currently holds Attempt 60 firmware (`471,408` B). Fix `3C-1` (`TX_PLCP0_NO_ACK` in `regs.rs` & `lmac_mmio.rs`) is edited in the working tree (passes `cargo fmt` and `46` `esp32-cam-wifi-mac` lib unit tests) and has **not** yet been compiled or flashed to hardware.
+- **Board-Currently-Flashed State**: The ESP32 flash currently holds Attempt 60 firmware (`471,408` B). Fixes `3C-1`..`3C-3` are committed on `master` (`d773df7`) and have **not** been flashed: the board still runs Attempt 60.
 
 ### Network & Credentials
 - **STA Config**: Static IP `172.22.1.52/24`, Gateway `172.22.1.1`, HTTP control port `80`, MJPEG stream port `81`, SSID `'iot'` (Channel 1, `bssid=02:ec:da:b7:c8:b4`).
