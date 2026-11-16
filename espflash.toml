@@ -9,11 +9,11 @@ format = "EspIdf"
 # All file paths are relative to the repository root; invoke espflash with cwd=REPO_ROOT.
 #
 # GPIO16 Bootloader Role (BUILD-03):
-# Requires the ESP-IDF v5.5.4 2nd-stage bootloader patched in `bootloader_before_init`
-# to configure IO_MUX_GPIO16_REG (0x3FF4_904C) with 0x2B00 (MCU_SEL=1 + FUN_PU).
-# This pulls the PSRAM CS line HIGH before SPI peripheral initialization, preventing
-# SPI bus contention and cold-boot hangs on ESP32-WROVER hardware.
-bootloader = "firmware/bootloader_v554_gpio16.bin"
+# Uses the pure-Rust 2nd-stage bootloader `esp32-cam-bootloader` (built via
+# `cargo xtask build-bootloader`), which configures IO_MUX_GPIO16_REG (0x3FF4_904C)
+# with 0x2B00 (MCU_SEL=1 + FUN_PU) to pull PSRAM CS HIGH before SPI peripheral
+# initialization, preventing SPI bus contention and cold-boot hangs on ESP32-WROVER hardware.
+bootloader = "target/xtensa-esp32-none-elf/release/esp32-cam-bootloader.bin"
 
 # Dual-Slot 0x1B0000 Partition Table:
 # Points to partitions_rust_ota.csv defining:

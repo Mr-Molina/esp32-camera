@@ -8,6 +8,12 @@ members = [
     "crates/esp32-cam-ll",
     "crates/esp32-cam-hal",
     "crates/klipper-cam-fw",
+    "crates/xtask",
+    "crates/esp32-cam-bootloader",
+    "crates/esp32-cam-rf-clock",
+    "crates/esp-wifi-sys-esp32-seam",
+    "crates/esp32-cam-wpa2",
+    "crates/esp32-cam-wifi-mac",
 ]
 
 [workspace.package]
@@ -35,6 +41,8 @@ esp32-cam-ll = { path = "crates/esp32-cam-ll" }
 esp32-cam-hal = { path = "crates/esp32-cam-hal" }
 embedded-hal = { version = "1.0.0", default-features = false }
 
+[patch.crates-io]
+esp-wifi-sys-esp32 = { path = "crates/esp-wifi-sys-esp32-seam" }
 
 # BUILD-04: cross-crate inlining of the ll, conversions and SPSC hot paths into
 # the firmware. `opt-level = 3` is pending a hardware A/B against "s" (WP-02).
