@@ -28,6 +28,17 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
 
+      - name: Stage upstream esp-wifi-sys-esp32 0.3.0 sources & 1 retained archive (phy)
+        shell: bash
+        run: |
+          set -euo pipefail
+          CRATE="$RUNNER_TEMP/esp-wifi-sys-esp32-0.3.0.crate"
+          curl -fsSL "https://static.crates.io/crates/esp-wifi-sys-esp32/esp-wifi-sys-esp32-0.3.0.crate" -o "$CRATE"
+          echo "c4644d49bde1bdeb3cd20fcc8c08be09f8f67af4b80123e54f665fdebd9a3358  $CRATE" | sha256sum -c -
+          tar -xzf "$CRATE" -C "$RUNNER_TEMP"
+          test -f "$RUNNER_TEMP/esp-wifi-sys-esp32-0.3.0/src/include.rs"
+          echo "ESP_WIFI_SYS_ESP32_UPSTREAM_DIR=$RUNNER_TEMP/esp-wifi-sys-esp32-0.3.0" >> "$GITHUB_ENV"
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
@@ -57,7 +68,7 @@ jobs:
           components: miri
 
       - name: Run Miri tests
-        run: cargo miri test -p esp32-cam-ll -p esp32-cam-conversions -p esp32-cam-types
+        run: cargo miri test -p esp32-cam-ll -p esp32-cam-conversions -p esp32-cam-types -p esp32-cam-bootloader -p esp32-cam-rf-clock -p esp32-cam-wpa2 -p esp32-cam-wifi-mac
 
   xtensa:
     name: Xtensa ESP32 Build & Size Gate
@@ -89,43 +100,37 @@ jobs:
         with:
           tool: espflash
 
+      - name: Stage upstream esp-wifi-sys-esp32 0.3.0 sources & 1 retained archive (phy)
+        shell: bash
+        run: |
+          set -euo pipefail
+          CRATE="$RUNNER_TEMP/esp-wifi-sys-esp32-0.3.0.crate"
+          curl -fsSL "https://static.crates.io/crates/esp-wifi-sys-esp32/esp-wifi-sys-esp32-0.3.0.crate" -o "$CRATE"
+          echo "c4644d49bde1bdeb3cd20fcc8c08be09f8f67af4b80123e54f665fdebd9a3358  $CRATE" | sha256sum -c -
+          tar -xzf "$CRATE" -C "$RUNNER_TEMP"
+          test -f "$RUNNER_TEMP/esp-wifi-sys-esp32-0.3.0/src/include.rs"
+          echo "ESP_WIFI_SYS_ESP32_UPSTREAM_DIR=$RUNNER_TEMP/esp-wifi-sys-esp32-0.3.0" >> "$GITHUB_ENV"
+
       - name: Xtensa Clippy
         run: cargo clippy --target xtensa-esp32-none-elf -Zbuild-std=core,alloc --workspace --release -- -D warnings
 
       - name: Xtensa Release Build
         run: cargo build --target xtensa-esp32-none-elf -Zbuild-std=core,alloc -p klipper-cam-fw --release
 
+      - name: Build pure-Rust 2nd-stage bootloader
+        run: cargo xtask build-bootloader
+
+      - name: Verify cold boot invariants (with built bootloader)
+        run: cargo xtask verify-invariants
+
       - name: Generate firmware binary
         shell: bash
         run: |
-          # espflash.toml points at firmware/bootloader_v554_gpio16.bin, the
-          # GPIO16-patched bootloader that real flashing must use (BUILD-03).
-          # That file is pending upload by the owner and gitignored, so it is
-          # absent here. espflash 4.x reads it with a bare `?`, which the
-          # serialport build reports as "Error while connecting to device"
-          # (os error 2) — misleading, but it is just ENOENT on that path.
-          #
-          # Same tolerance the invariants job uses: package with the real
-          # config when the bootloader is present, otherwise with a CI-local
-          # config that keeps the repo's [flash] settings (dio / 4MB / 40MHz,
-          # copied from espflash.toml at run time so they cannot drift) and
-          # no bootloader. espflash then uses its bundled DIO ESP32 bootloader
-          # only as the app-header template; the application segments come
-          # from the ELF either way, and without --merge the output is the
-          # app image alone, which is what the size gate measures.
+          # espflash.toml points directly at target/xtensa-esp32-none-elf/release/esp32-cam-bootloader.bin
+          # produced by `cargo xtask build-bootloader` above (no legacy C bootloader blob).
           ELF="$GITHUB_WORKSPACE/target/xtensa-esp32-none-elf/release/klipper-cam-fw"
           OUT="$GITHUB_WORKSPACE/fw.bin"
-          if [ -f firmware/bootloader_v554_gpio16.bin ]; then
-            echo "GPIO16 bootloader present: packaging with the repository espflash.toml"
-            espflash save-image --chip esp32 "$ELF" "$OUT"
-          else
-            echo "GPIO16 bootloader absent (BUILD-03, pending owner upload): packaging the app image with a CI-local config"
-            CI_CFG="$RUNNER_TEMP/espflash-ci"
-            mkdir -p "$CI_CFG"
-            sed -n '/^\[flash\]/,$p' espflash.toml > "$CI_CFG/espflash.toml"
-            echo "--- CI-local espflash.toml ---"; cat "$CI_CFG/espflash.toml"; echo "---"
-            ( cd "$CI_CFG" && espflash save-image --chip esp32 "$ELF" "$OUT" )
-          fi
+          espflash save-image --chip esp32 "$ELF" "$OUT"
 
       - name: Enforce firmware size gate (<= 0x1B0000 / 1,769,472 B)
         shell: bash
@@ -152,25 +157,16 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
         with:
-          python-version: "3.x"
+          toolchain: "1.99.1"
 
-      - name: Install Python test & lint tooling
-        run: pip install -r scripts/requirements-dev.txt
-
-      - name: Lint Python scripts and tests
-        run: ruff check scripts tests
-
-      - name: Run script unit tests
-        run: pytest tests
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
 
       - name: Verify cold boot invariants
-        shell: bash
-        run: |
-          if [ -f firmware/bootloader_v554_gpio16.bin ]; then
-            python3 scripts/verify_cold_boot_invariants.py
-          else
-            python3 scripts/verify_cold_boot_invariants.py --allow-missing-bootloader
-          fi
+        run: cargo xtask verify-invariants --allow-missing-bootloader
+
+      - name: Verify pure-Rust workspace invariants
+        run: cargo xtask verify-pure-rust --allow-phase1
