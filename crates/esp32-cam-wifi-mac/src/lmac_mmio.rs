@@ -22,6 +22,9 @@ const MAX_TX_DRAIN_POLLS: u32 = 200;
 /// Maximum poll iterations waiting for `RX_CTRL_BIT_RELOAD` to self-clear.
 const MAX_RX_RELOAD_POLLS: u32 = 10_000;
 
+/// Software-CCMP TX bypass bits (`tx_info[16] = 0xC0 << 17`) in `TX_PLCP1_REG[24:17]`.
+const TX_PLCP1_SW_CRYPTO_BYPASS_BITS: u32 = 0xC0u32 << 17;
+
 /// Singleton acquisition guard for [`HardwareWifiMmioBus::take`].
 static HW_BUS_TAKEN: AtomicBool = AtomicBool::new(false);
 
@@ -1415,12 +1418,13 @@ impl<B: WifiMmioBus> LmacHal<B> {
     pub fn submit_and_poll_tx(
         &mut self,
         desc_addr: u32,
-        mpdu_len: usize,
+        mpdu: &[u8],
         rate: WifiPhyRate,
         dur_us: u16,
         wait_ack: bool,
         max_polls: u32,
     ) -> Result<(), LmacError> {
+        let mpdu_len = mpdu.len();
         if mpdu_len == 0 || mpdu_len > 1600 {
             return Err(LmacError::InvalidPayloadLength);
         }
@@ -1447,7 +1451,17 @@ impl<B: WifiMmioBus> LmacHal<B> {
         // includes the 4-byte hardware-appended 802.11 FCS (MPDU length + 4).
         let psdu_len = (mpdu_len as u32).saturating_add(4);
         let is_ht_u32 = if rate.is_ht() { 1u32 } else { 0u32 };
+        // Vendor `ieee80211_ccmp_encrypt` sets `tx_info[16] = 0xC0` when FC[1]
+        // Protected (0x40) is set, and `mac_tx_set_plcp1` shifts `(u32)tx_info[16] << 17`
+        // into `TX_PLCP1_REG[24:17]` (`0x0180_0000`) so hardware skips TX encryption
+        // without toggling `HW_CRYPTO_DISABLE_START` (preserving RX HW decryption).
+        let sw_crypto_bypass = if mpdu.len() >= 2 && (mpdu[1] & 0x40) != 0 {
+            TX_PLCP1_SW_CRYPTO_BYPASS_BITS
+        } else {
+            0
+        };
         let plcp1 = ((is_ht_u32 << 9) << 16)
+            | sw_crypto_bypass
             | (u32::from(rate.hw_code() & 0x1F) << 12)
             | (psdu_len & 0xFFF)
             | regs::TX_PLCP1_BANDWIDTH_BIT;
@@ -1498,15 +1512,6 @@ impl<B: WifiMmioBus> LmacHal<B> {
         };
         let base = (desc_addr & 0x000F_FFFF) | mode | ack;
 
-        // Temporarily bypass STA HW crypto during TX (frames are encrypted in SW)
-        // and unconditionally restore `vif0_crypto_ctrl` on every return path.
-        let restore_crypto = self.vif0_crypto_ctrl != 0x0003_0000;
-        if restore_crypto {
-            self.bus
-                .write_reg(regs::HW_CRYPTO_DISABLE_START, 0x0003_0000);
-            self.bus.mem_barrier();
-        }
-
         // Write descriptor base address, barrier, then assert trigger bits
         self.bus.write_reg(regs::TX_PLCP0_TRIG_REG, base);
         self.bus.mem_barrier();
@@ -1515,15 +1520,7 @@ impl<B: WifiMmioBus> LmacHal<B> {
         self.bus.mem_barrier();
 
         // 8. Poll for completion, error, or loop exhaustion
-        let tx_res = self.poll_tx_completion(max_polls);
-
-        if restore_crypto {
-            self.bus
-                .write_reg(regs::HW_CRYPTO_DISABLE_START, self.vif0_crypto_ctrl);
-            self.bus.mem_barrier();
-        }
-
-        tx_res
+        self.poll_tx_completion(max_polls)
     }
 
     fn poll_tx_completion(&mut self, max_polls: u32) -> Result<(), LmacError> {
@@ -1716,7 +1713,14 @@ mod tests {
         mock.set_reg(regs::TX_PLCP2_REG, 0xABCD_000F);
         let mut hal = LmacHal::new(mock);
 
-        let res = hal.submit_and_poll_tx(0x3FFE_1000, 128, WifiPhyRate::Mcs7Lgi, 40, true, 100);
+        let res = hal.submit_and_poll_tx(
+            0x3FFE_1000,
+            &[0u8; 128],
+            WifiPhyRate::Mcs7Lgi,
+            40,
+            true,
+            100,
+        );
         assert_eq!(res, Ok(()));
 
         let psdu_len = 132u32;
@@ -1737,7 +1741,14 @@ mod tests {
         let mut hal = LmacHal::new(mock);
 
         // M-220: Provisional Mcs*Sgi rejected until short-GI bit confirmed.
-        let res = hal.submit_and_poll_tx(0x3FFE_1000, 128, WifiPhyRate::Mcs7Sgi, 40, true, 100);
+        let res = hal.submit_and_poll_tx(
+            0x3FFE_1000,
+            &[0u8; 128],
+            WifiPhyRate::Mcs7Sgi,
+            40,
+            true,
+            100,
+        );
         assert_eq!(res, Err(LmacError::UnsupportedRate));
         assert_eq!(hal.bus().write_count, 0);
     }
@@ -1835,13 +1846,12 @@ mod tests {
         mock.auto_tx_status = 0;
         let mut hal = LmacHal::new(mock);
 
-        let mpdu_len = 128;
-        let res =
-            hal.submit_and_poll_tx(0x3FFE_1000, mpdu_len, WifiPhyRate::Mcs7Lgi, 40, true, 100);
+        let mpdu = [0u8; 128];
+        let res = hal.submit_and_poll_tx(0x3FFE_1000, &mpdu, WifiPhyRate::Mcs7Lgi, 40, true, 100);
         assert_eq!(res, Ok(()));
 
         let bus = hal.bus();
-        let expected_psdu_len = (mpdu_len as u32).saturating_add(4);
+        let expected_psdu_len = (mpdu.len() as u32).saturating_add(4);
         assert_eq!(
             bus.reg(regs::TX_PLCP1_REG) & 0xFFF,
             expected_psdu_len & 0xFFF
@@ -1866,7 +1876,14 @@ mod tests {
         mock.auto_tx_status = 5;
         let mut hal = LmacHal::new(mock);
 
-        let res = hal.submit_and_poll_tx(0x3FFE_1000, 128, WifiPhyRate::Rate11mS, 40, true, 100);
+        let res = hal.submit_and_poll_tx(
+            0x3FFE_1000,
+            &[0u8; 128],
+            WifiPhyRate::Rate11mS,
+            40,
+            true,
+            100,
+        );
         assert_eq!(res, Err(LmacError::TxAckFailed(5)));
     }
 
@@ -1876,7 +1893,14 @@ mod tests {
         mock.auto_tx_err = 1;
         let mut hal = LmacHal::new(mock);
 
-        let res = hal.submit_and_poll_tx(0x3FFE_1000, 128, WifiPhyRate::Rate54m, 40, true, 100);
+        let res = hal.submit_and_poll_tx(
+            0x3FFE_1000,
+            &[0u8; 128],
+            WifiPhyRate::Rate54m,
+            40,
+            true,
+            100,
+        );
         assert_eq!(res, Err(LmacError::TxHardwareError));
         assert_eq!(
             hal.bus().reg(regs::TX_PLCP0_TRIG_REG) & regs::TX_PLCP0_TRIGGER_BITS,
@@ -1892,7 +1916,14 @@ mod tests {
         mock.auto_clear_tx_active_on_abort_reset = true;
         let mut hal = LmacHal::new(mock);
 
-        let res = hal.submit_and_poll_tx(0x3FFE_1000, 128, WifiPhyRate::Rate1mL, 40, false, 10);
+        let res = hal.submit_and_poll_tx(
+            0x3FFE_1000,
+            &[0u8; 128],
+            WifiPhyRate::Rate1mL,
+            40,
+            false,
+            10,
+        );
         assert_eq!(res, Err(LmacError::TxTimeout));
         assert_eq!(
             hal.bus().reg(regs::TX_PLCP0_TRIG_REG) & regs::TX_PLCP0_TRIGGER_BITS,
@@ -1909,8 +1940,14 @@ mod tests {
         let mut stuck = MockWifiMmioBus::new();
         stuck.set_reg(regs::MAC_CLK_RST_REG, regs::MAC_CLK_RST_BIT_TX_ACTIVE);
         let mut hal_stuck = LmacHal::new(stuck);
-        let res_stuck =
-            hal_stuck.submit_and_poll_tx(0x3FFE_1000, 128, WifiPhyRate::Rate1mL, 40, false, 10);
+        let res_stuck = hal_stuck.submit_and_poll_tx(
+            0x3FFE_1000,
+            &[0u8; 128],
+            WifiPhyRate::Rate1mL,
+            40,
+            false,
+            10,
+        );
         assert_eq!(res_stuck, Err(LmacError::TxDrainFailed));
     }
 
@@ -1921,7 +1958,8 @@ mod tests {
         mock.auto_tx_status = 0;
         let mut hal = LmacHal::new(mock);
 
-        let res = hal.submit_and_poll_tx(0x3FFE_1000, 64, WifiPhyRate::Rate1mL, 0, false, 100);
+        let res =
+            hal.submit_and_poll_tx(0x3FFE_1000, &[0u8; 64], WifiPhyRate::Rate1mL, 0, false, 100);
         assert_eq!(res, Ok(()));
 
         let plcp0 = hal.bus().last_tx_plcp0_triggered;
@@ -1940,7 +1978,14 @@ mod tests {
         mock.auto_tx_status = 0;
         let mut hal = LmacHal::new(mock);
 
-        let res = hal.submit_and_poll_tx(0x3FFE_1000, 64, WifiPhyRate::Rate1mL, 314, true, 100);
+        let res = hal.submit_and_poll_tx(
+            0x3FFE_1000,
+            &[0u8; 64],
+            WifiPhyRate::Rate1mL,
+            314,
+            true,
+            100,
+        );
         assert_eq!(res, Ok(()));
 
         let plcp0 = hal.bus().last_tx_plcp0_triggered;
@@ -1957,22 +2002,29 @@ mod tests {
         let mut hal = LmacHal::new(mock);
 
         assert_eq!(
-            hal.submit_and_poll_tx(0x3FFE_1000, 0, WifiPhyRate::Rate1mL, 0, false, 10),
+            hal.submit_and_poll_tx(0x3FFE_1000, &[], WifiPhyRate::Rate1mL, 0, false, 10),
             Err(LmacError::InvalidPayloadLength)
         );
         assert_eq!(
-            hal.submit_and_poll_tx(0x3FFE_1000, 1601, WifiPhyRate::Rate1mL, 0, false, 10),
+            hal.submit_and_poll_tx(
+                0x3FFE_1000,
+                &[0u8; 1601],
+                WifiPhyRate::Rate1mL,
+                0,
+                false,
+                10
+            ),
             Err(LmacError::InvalidPayloadLength)
         );
         // M-167: max_polls == 0 and > MAX_TX_POLLS rejected.
         assert_eq!(
-            hal.submit_and_poll_tx(0x3FFE_1000, 64, WifiPhyRate::Rate1mL, 0, false, 0),
+            hal.submit_and_poll_tx(0x3FFE_1000, &[0u8; 64], WifiPhyRate::Rate1mL, 0, false, 0),
             Err(LmacError::InvalidPollCount)
         );
         assert_eq!(
             hal.submit_and_poll_tx(
                 0x3FFE_1000,
-                64,
+                &[0u8; 64],
                 WifiPhyRate::Rate1mL,
                 0,
                 false,
@@ -1982,11 +2034,11 @@ mod tests {
         );
         // M-073: null and misaligned descriptor addresses rejected.
         assert_eq!(
-            hal.submit_and_poll_tx(0, 64, WifiPhyRate::Rate1mL, 0, false, 10),
+            hal.submit_and_poll_tx(0, &[0u8; 64], WifiPhyRate::Rate1mL, 0, false, 10),
             Err(LmacError::InvalidDmaAddress)
         );
         assert_eq!(
-            hal.submit_and_poll_tx(0x3FFE_1002, 64, WifiPhyRate::Rate1mL, 0, false, 10),
+            hal.submit_and_poll_tx(0x3FFE_1002, &[0u8; 64], WifiPhyRate::Rate1mL, 0, false, 10),
             Err(LmacError::InvalidDmaAddress)
         );
         assert_eq!(hal.bus().write_count, 0);
@@ -2011,7 +2063,14 @@ mod tests {
         mock.auto_tx_err = 1 << 16;
         let mut hal = LmacHal::new(mock);
 
-        let res = hal.submit_and_poll_tx(0x3FFE_1000, 128, WifiPhyRate::Rate54m, 40, true, 100);
+        let res = hal.submit_and_poll_tx(
+            0x3FFE_1000,
+            &[0u8; 128],
+            WifiPhyRate::Rate54m,
+            40,
+            true,
+            100,
+        );
         assert_eq!(res, Err(LmacError::TxHardwareError));
         assert_eq!(hal.bus().reg(regs::TX_ERR_CLEAR_REG) & (1 << 16), 1 << 16);
     }
@@ -2115,46 +2174,106 @@ mod tests {
     }
 
     #[test]
-    fn test_submit_and_poll_tx_bypasses_and_restores_hw_crypto_on_ok_and_err() {
+    fn test_submit_and_poll_tx_plcp1_sw_crypto_bypass_and_unchanged_crypto_ctrl() {
         let bssid = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
         let key = [0x55u8; 16];
 
-        // Case 1: Ok(()) path bypasses to 0x0003_0000 at trigger and restores 0x0003_0103.
+        let mut protected_mpdu = [0u8; 64];
+        protected_mpdu[0] = 0x08;
+        protected_mpdu[1] = 0x41; // ToDS | Protected (0x40)
+
+        let mut unprotected_mpdu = [0u8; 64];
+        unprotected_mpdu[0] = 0x08;
+        unprotected_mpdu[1] = 0x01; // ToDS only, Protected == 0
+
+        // Case 1: Protected == 1 sets TX_PLCP1_REG[24:17] = 0xC0 << 17 (0x0180_0000)
+        // and leaves HW_CRYPTO_DISABLE_START continuously at 0x0003_0103.
         let mut mock_ok = MockWifiMmioBus::new();
         mock_ok.auto_tx_done = true;
         mock_ok.auto_tx_status = 0;
         let mut hal_ok = LmacHal::new(mock_ok);
         hal_ok.install_sta_ccmp_key(4, 0, bssid, &key);
         assert_eq!(
-            hal_ok.submit_and_poll_tx(0x3FFE_1000, 64, WifiPhyRate::Rate6m, 40, true, 100),
+            hal_ok.submit_and_poll_tx(
+                0x3FFE_1000,
+                &protected_mpdu,
+                WifiPhyRate::Rate6m,
+                40,
+                true,
+                100
+            ),
             Ok(())
         );
-        assert_eq!(hal_ok.bus().crypto_ctrl_at_tx_trigger, 0x0003_0000);
+        assert_eq!(
+            hal_ok.bus().reg(regs::TX_PLCP1_REG) & 0x01FE_0000,
+            0x0180_0000
+        );
+        assert_eq!(hal_ok.bus().crypto_ctrl_at_tx_trigger, 0x0003_0103);
         assert_eq!(hal_ok.bus().reg(regs::HW_CRYPTO_DISABLE_START), 0x0003_0103);
 
-        // Case 2: TxAckFailed error path restores 0x0003_0103.
+        // Case 2: Protected == 0 (both normal and 1-byte MPDU) leaves TX_PLCP1_REG[24:17] == 0.
+        assert_eq!(
+            hal_ok.submit_and_poll_tx(
+                0x3FFE_1000,
+                &unprotected_mpdu,
+                WifiPhyRate::Rate6m,
+                40,
+                true,
+                100
+            ),
+            Ok(())
+        );
+        assert_eq!(hal_ok.bus().reg(regs::TX_PLCP1_REG) & 0x01FE_0000, 0);
+        assert_eq!(hal_ok.bus().crypto_ctrl_at_tx_trigger, 0x0003_0103);
+        assert_eq!(hal_ok.bus().reg(regs::HW_CRYPTO_DISABLE_START), 0x0003_0103);
+
+        assert_eq!(
+            hal_ok.submit_and_poll_tx(0x3FFE_1000, &[0x40], WifiPhyRate::Rate6m, 40, false, 100),
+            Ok(())
+        );
+        assert_eq!(hal_ok.bus().reg(regs::TX_PLCP1_REG) & 0x01FE_0000, 0);
+
+        // Case 3: TxAckFailed keeps HW_CRYPTO_DISABLE_START at 0x0003_0103.
         let mut mock_ack_err = MockWifiMmioBus::new();
         mock_ack_err.auto_tx_done = true;
         mock_ack_err.auto_tx_status = 3;
         let mut hal_ack_err = LmacHal::new(mock_ack_err);
         hal_ack_err.install_sta_ccmp_key(4, 0, bssid, &key);
         assert_eq!(
-            hal_ack_err.submit_and_poll_tx(0x3FFE_1000, 64, WifiPhyRate::Rate6m, 40, true, 100),
+            hal_ack_err.submit_and_poll_tx(
+                0x3FFE_1000,
+                &protected_mpdu,
+                WifiPhyRate::Rate6m,
+                40,
+                true,
+                100
+            ),
             Err(LmacError::TxAckFailed(3))
         );
-        assert_eq!(hal_ack_err.bus().crypto_ctrl_at_tx_trigger, 0x0003_0000);
+        assert_eq!(
+            hal_ack_err.bus().reg(regs::TX_PLCP1_REG) & 0x01FE_0000,
+            0x0180_0000
+        );
+        assert_eq!(hal_ack_err.bus().crypto_ctrl_at_tx_trigger, 0x0003_0103);
         assert_eq!(
             hal_ack_err.bus().reg(regs::HW_CRYPTO_DISABLE_START),
             0x0003_0103
         );
 
-        // Case 3: TxHardwareError path restores 0x0003_0103.
+        // Case 4: TxHardwareError keeps HW_CRYPTO_DISABLE_START at 0x0003_0103.
         let mut mock_hw_err = MockWifiMmioBus::new();
         mock_hw_err.auto_tx_err = 1;
         let mut hal_hw_err = LmacHal::new(mock_hw_err);
         hal_hw_err.install_sta_ccmp_key(4, 0, bssid, &key);
         assert_eq!(
-            hal_hw_err.submit_and_poll_tx(0x3FFE_1000, 64, WifiPhyRate::Rate6m, 40, true, 100),
+            hal_hw_err.submit_and_poll_tx(
+                0x3FFE_1000,
+                &protected_mpdu,
+                WifiPhyRate::Rate6m,
+                40,
+                true,
+                100
+            ),
             Err(LmacError::TxHardwareError)
         );
         assert_eq!(
@@ -2162,14 +2281,21 @@ mod tests {
             0x0003_0103
         );
 
-        // Case 4: TxTimeout path restores 0x0003_0103.
+        // Case 5: TxTimeout keeps HW_CRYPTO_DISABLE_START at 0x0003_0103.
         let mut mock_to = MockWifiMmioBus::new();
         mock_to.set_reg(regs::MAC_CLK_RST_REG, regs::MAC_CLK_RST_BIT_TX_ACTIVE);
         mock_to.auto_clear_tx_active_on_abort_reset = true;
         let mut hal_to = LmacHal::new(mock_to);
         hal_to.install_sta_ccmp_key(4, 0, bssid, &key);
         assert_eq!(
-            hal_to.submit_and_poll_tx(0x3FFE_1000, 64, WifiPhyRate::Rate6m, 40, false, 5),
+            hal_to.submit_and_poll_tx(
+                0x3FFE_1000,
+                &protected_mpdu,
+                WifiPhyRate::Rate6m,
+                40,
+                false,
+                5
+            ),
             Err(LmacError::TxTimeout)
         );
         assert_eq!(hal_to.bus().reg(regs::HW_CRYPTO_DISABLE_START), 0x0003_0103);

@@ -1969,8 +1969,11 @@ mod tests {
         let bssid_good = [0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0x02];
         let mut fsm = StaMacCore::new(sta_mac);
         let mut sink = MockSink::new();
-        let cfg = StaConnectConfig::from_slices(b"CorpNet", b"supersecret", None, -90)
-            .expect("valid cfg");
+        #[cfg(miri)]
+        let pass: &[u8] = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        #[cfg(not(miri))]
+        let pass: &[u8] = b"supersecret";
+        let cfg = StaConnectConfig::from_slices(b"CorpNet", pass, None, -90).expect("valid cfg");
         fsm.start_connect(cfg, 0, &mut sink).expect("scan start");
 
         let make_bcn = |bssid: [u8; 6], ie: &[u8]| -> ([u8; 128], usize) {
@@ -2326,8 +2329,14 @@ mod tests {
     fn test_precompute_pmk_avoids_recompute_on_start_connect() {
         let sta_mac = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
         let mut fsm = StaMacCore::new(sta_mac);
-        let cfg = StaConnectConfig::from_slices(b"WarmNet", b"supersecret", None, -90)
-            .expect("valid cfg");
+        #[cfg(miri)]
+        let (pass1, pass2): (&[u8], &[u8]) = (
+            b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            b"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+        );
+        #[cfg(not(miri))]
+        let (pass1, pass2): (&[u8], &[u8]) = (b"supersecret", b"othersecret");
+        let cfg = StaConnectConfig::from_slices(b"WarmNet", pass1, None, -90).expect("valid cfg");
         assert!(!fsm.pmk_cached);
 
         fsm.precompute_pmk(&cfg).expect("precompute_pmk");
@@ -2353,8 +2362,8 @@ mod tests {
         fsm.ensure_cached_pmk().expect("ensure_cached_pmk");
         assert_eq!(fsm.cached_pmk, cached_pmk);
 
-        let cfg2 = StaConnectConfig::from_slices(b"OtherNet", b"othersecret", None, -90)
-            .expect("valid cfg2");
+        let cfg2 =
+            StaConnectConfig::from_slices(b"OtherNet", pass2, None, -90).expect("valid cfg2");
         fsm.precompute_pmk(&cfg2).expect("precompute_pmk 2");
         assert!(fsm.pmk_cached);
         assert_ne!(fsm.cached_pmk, cached_pmk);

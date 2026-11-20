@@ -542,6 +542,9 @@ pub fn parse_addba_req(mpdu: &[u8]) -> Result<(u8, u16, u16, u16), FrameError> {
 /// Extended Supported Rates IE (Tag 50): 24, 36, 48, 54 Mbps.
 pub const EXT_SUPPORTED_RATES_IE: [u8; 6] = [0x32, 0x04, 0x30, 0x48, 0x60, 0x6C];
 
+/// WMM Information Element (Tag 221, OUI `00:50:F2`, Type 2, Subtype 0, Version 1, QoS Info 0).
+const WMM_INFO_IE: [u8; 9] = [0xDD, 0x07, 0x00, 0x50, 0xF2, 0x02, 0x00, 0x01, 0x00];
+
 /// Builds an 802.11 Probe Request management frame.
 pub fn build_probe_req(
     buf: &mut [u8],
@@ -643,6 +646,7 @@ pub fn build_assoc_req(
         .and_then(|v| v.checked_add(ssid.len()))
         .and_then(|v| v.checked_add(rates_ie_len))
         .and_then(|v| v.checked_add(rsn_ie.len()))
+        .and_then(|v| v.checked_add(WMM_INFO_IE.len()))
         .ok_or(FrameError::BufferTooSmall)?;
     if buf.len() < total_len {
         return Err(FrameError::BufferTooSmall);
@@ -684,6 +688,10 @@ pub fn build_assoc_req(
         buf[pos..pos + rsn_ie.len()].copy_from_slice(rsn_ie);
         pos += rsn_ie.len();
     }
+
+    // WMM Information Element
+    buf[pos..pos + WMM_INFO_IE.len()].copy_from_slice(&WMM_INFO_IE);
+    pos += WMM_INFO_IE.len();
 
     Ok(pos)
 }
@@ -789,16 +797,7 @@ pub fn eth_to_80211_data(
     let ethertype = &eth_frame[12..14];
     let eth_payload = &eth_frame[14..];
 
-    let mut mac_header = [0u8; 24];
-    // Frame Control: Type=2 (Data), Subtype=0, ToDS=1 -> 0x0108
-    mac_header[0] = 0x08;
-    mac_header[1] = if tx_key.is_some() { 0x41 } else { 0x01 };
-    mac_header[2] = 0x00;
-    mac_header[3] = 0x00;
-    mac_header[4..10].copy_from_slice(&bssid); // Addr1: RA (BSSID)
-    mac_header[10..16].copy_from_slice(sa); // Addr2: TA (STA MAC)
-    mac_header[16..22].copy_from_slice(da); // Addr3: DA
-    mac_header[22..24].copy_from_slice(&((seq & 0x0FFF) << 4).to_le_bytes());
+    let seq_ctrl = ((seq & 0x0FFF) << 4).to_le_bytes();
 
     if let Some((tk, key_id, pn)) = tx_key {
         if pn == 0 || pn > MAX_CCMP_PN {
@@ -807,6 +806,19 @@ pub fn eth_to_80211_data(
         if key_id > 3 {
             return Err(FrameError::CryptoError);
         }
+        // Encrypted post-PTK data frames use 26-byte WMM QoS Data header
+        // (Type=2, Subtype=8 QoS Data, ToDS=1, Protected=1 -> 0x4188).
+        let mut qos_header = [0u8; 26];
+        qos_header[0] = 0x88;
+        qos_header[1] = 0x41;
+        qos_header[2] = 0x00;
+        qos_header[3] = 0x00;
+        qos_header[4..10].copy_from_slice(&bssid); // Addr1: RA (BSSID)
+        qos_header[10..16].copy_from_slice(sa); // Addr2: TA (STA MAC)
+        qos_header[16..22].copy_from_slice(da); // Addr3: DA
+        qos_header[22..24].copy_from_slice(&seq_ctrl);
+        qos_header[24..26].copy_from_slice(&[0x00, 0x00]); // TID 0 (AC_BE)
+
         // Plaintext payload contains LLC/SNAP header (8 bytes) + eth_payload.
         let mut plain = [0u8; 1536];
         let plain_len = 8usize
@@ -820,11 +832,22 @@ pub fn eth_to_80211_data(
         plain[6..8].copy_from_slice(ethertype);
         plain[8..plain_len].copy_from_slice(eth_payload);
 
-        let res = ccmp_encrypt_mpdu(tk, key_id, pn, &mac_header, &plain[..plain_len], out_mpdu)
+        let res = ccmp_encrypt_mpdu(tk, key_id, pn, &qos_header, &plain[..plain_len], out_mpdu)
             .map_err(|_| FrameError::CryptoError);
         volatile_zeroize(&mut plain[..plain_len]);
         res
     } else {
+        let mut mac_header = [0u8; 24];
+        // Frame Control: Type=2 (Data), Subtype=0, ToDS=1 -> 0x0108
+        mac_header[0] = 0x08;
+        mac_header[1] = 0x01;
+        mac_header[2] = 0x00;
+        mac_header[3] = 0x00;
+        mac_header[4..10].copy_from_slice(&bssid); // Addr1: RA (BSSID)
+        mac_header[10..16].copy_from_slice(sa); // Addr2: TA (STA MAC)
+        mac_header[16..22].copy_from_slice(da); // Addr3: DA
+        mac_header[22..24].copy_from_slice(&seq_ctrl);
+
         let total_len = 32usize
             .checked_add(eth_payload.len())
             .ok_or(FrameError::BufferTooSmall)?;
@@ -1549,9 +1572,13 @@ mod tests {
         let len =
             build_assoc_req(&mut buf, bssid, sta, b"MySsid", &[], 3, 10).expect("valid assoc req");
         assert!(len > 30);
-        // header + caps/listen + SSID IE + Supported Rates + Ext Supported Rates
-        assert_eq!(len, 24 + 4 + (2 + 6) + 10 + 6);
-        assert_eq!(&buf[len - 6..len], &EXT_SUPPORTED_RATES_IE);
+        // header + caps/listen + SSID IE + Supported Rates + Ext Supported Rates + WMM Info IE
+        assert_eq!(len, 24 + 4 + (2 + 6) + 10 + 6 + WMM_INFO_IE.len());
+        assert_eq!(
+            &buf[len - WMM_INFO_IE.len() - 6..len - WMM_INFO_IE.len()],
+            &EXT_SUPPORTED_RATES_IE
+        );
+        assert_eq!(&buf[len - WMM_INFO_IE.len()..len], &WMM_INFO_IE);
     }
 
     #[test]
@@ -1564,18 +1591,19 @@ mod tests {
             build_assoc_req(&mut buf, bssid, sta, b"MySsid", &rsn, 3, 10).expect("valid assoc req");
 
         // IEs start at 28: SSID (8), Supported Rates (10), Extended
-        // Supported Rates (6), then RSN.
-        assert_eq!(len, 28 + 8 + 10 + 6 + rsn.len());
+        // Supported Rates (6), RSN, then WMM Info IE (9).
+        assert_eq!(len, 28 + 8 + 10 + 6 + rsn.len() + WMM_INFO_IE.len());
         assert_eq!(&buf[36..38], &[0x01, 0x08]);
         assert_eq!(&buf[46..52], &EXT_SUPPORTED_RATES_IE);
-        assert_eq!(&buf[52..len], &rsn);
+        assert_eq!(&buf[52..52 + rsn.len()], &rsn);
+        assert_eq!(&buf[52 + rsn.len()..len], &WMM_INFO_IE);
     }
 
     #[test]
     fn test_builders_reject_buffer_one_byte_short_of_ext_rates() {
         let bssid = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
         let sta = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
-        let mut buf = [0u8; 24 + 4 + 8 + 10 + 6 - 1];
+        let mut buf = [0u8; 24 + 4 + 8 + 10 + 6 + WMM_INFO_IE.len() - 1];
         assert_eq!(
             build_assoc_req(&mut buf, bssid, sta, b"MySsid", &[], 3, 10),
             Err(FrameError::BufferTooSmall)
@@ -1631,6 +1659,9 @@ mod tests {
             Some((&tk, 0, 100)),
         )
         .expect("eth_to_80211_data failed");
+        assert_eq!(to_ds_mpdu[0], 0x88);
+        assert_eq!(to_ds_mpdu[1], 0x41);
+        assert_eq!(&to_ds_mpdu[24..26], &[0x00, 0x00]);
 
         // Verify eth_to_80211_data (ToDS=1) with ccmp_decrypt_mpdu
         let mut to_ds_plain = [0u8; 256];
@@ -1754,6 +1785,96 @@ mod tests {
             }
             RxDataOutcome::Ethernet { .. } => panic!("expected Eapol outcome"),
         }
+    }
+
+    #[test]
+    fn test_eth_to_80211_qos_ccmp_roundtrip_to_rx_ext() {
+        let bssid = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let sta_mac = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC];
+        let peer_mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let tk = [0x66u8; 16];
+
+        let mut eth_tx = [0u8; 24];
+        eth_tx[0..6].copy_from_slice(&peer_mac);
+        eth_tx[6..12].copy_from_slice(&sta_mac);
+        eth_tx[12..14].copy_from_slice(&[0x08, 0x00]);
+        eth_tx[14..24].copy_from_slice(b"WMM_QOS_TX");
+
+        let mut to_ds_mpdu = [0u8; 256];
+        let to_ds_len = eth_to_80211_data(&mut to_ds_mpdu, &eth_tx, bssid, 7, Some((&tk, 0, 42)))
+            .expect("QoS CCMP TX should succeed");
+        // 26B QoS header + 8B CCMP IV + 18B LLC/payload + 8B MIC = 60B
+        assert_eq!(to_ds_len, 60);
+        assert_eq!(to_ds_mpdu[0], 0x88);
+        assert_eq!(to_ds_mpdu[1], 0x41);
+        assert_eq!(&to_ds_mpdu[24..26], &[0x00, 0x00]);
+
+        let mut plain = [0u8; 64];
+        let (pt_len, key_id, pn) =
+            ccmp_decrypt_mpdu(&tk, &to_ds_mpdu[..to_ds_len], &mut plain).expect("decrypt QoS TX");
+        assert_eq!((pt_len, key_id, pn), (18, 0, 42));
+
+        // Relay decrypted payload as FromDS=1 QoS Data (0x88, 0x42) into rx_80211_data_to_eth_ext.
+        let mut from_ds_hdr = [0u8; 26];
+        from_ds_hdr[0] = 0x88;
+        from_ds_hdr[1] = 0x42;
+        from_ds_hdr[4..10].copy_from_slice(&sta_mac);
+        from_ds_hdr[10..16].copy_from_slice(&bssid);
+        from_ds_hdr[16..22].copy_from_slice(&peer_mac);
+        from_ds_hdr[22..24].copy_from_slice(&(8u16 << 4).to_le_bytes());
+        from_ds_hdr[24..26].copy_from_slice(&[0x00, 0x00]);
+
+        let mut from_ds_mpdu = [0u8; 256];
+        let from_ds_len = ccmp_encrypt_mpdu(
+            &tk,
+            0,
+            43,
+            &from_ds_hdr,
+            &plain[..pt_len],
+            &mut from_ds_mpdu,
+        )
+        .expect("encrypt FromDS QoS RX");
+
+        let mut scratch = [0u8; 256];
+        let mut eth_rx = [0u8; 256];
+        let outcome = rx_80211_data_to_eth_ext(
+            &from_ds_mpdu[..from_ds_len],
+            &mut scratch,
+            &mut eth_rx,
+            Some(&tk),
+            None,
+            &bssid,
+            &sta_mac,
+            true,
+            false,
+        )
+        .expect("rx_80211_data_to_eth_ext QoS roundtrip");
+        assert_eq!(
+            outcome,
+            RxDataOutcome::Ethernet {
+                len: 24,
+                ccmp: Some(CcmpRxMeta {
+                    pn: 43,
+                    key_id: 0,
+                    qos_tid: Some(0),
+                }),
+            }
+        );
+        assert_eq!(&eth_rx[0..6], &sta_mac);
+        assert_eq!(&eth_rx[6..12], &peer_mac);
+        assert_eq!(&eth_rx[12..24], &eth_tx[12..24]);
+
+        // Unencrypted EAPOL path remains 24-byte 0x08/0x01.
+        let mut eapol_eth = [0u8; 24];
+        eapol_eth[0..6].copy_from_slice(&bssid);
+        eapol_eth[6..12].copy_from_slice(&sta_mac);
+        eapol_eth[12..14].copy_from_slice(&[0x88, 0x8E]);
+        eapol_eth[14..24].copy_from_slice(b"EAPOL_KEY!");
+        let eapol_len = eth_to_80211_data(&mut to_ds_mpdu, &eapol_eth, bssid, 9, None)
+            .expect("plaintext EAPOL");
+        assert_eq!(eapol_len, 42);
+        assert_eq!(to_ds_mpdu[0], 0x08);
+        assert_eq!(to_ds_mpdu[1], 0x01);
     }
 
     #[test]

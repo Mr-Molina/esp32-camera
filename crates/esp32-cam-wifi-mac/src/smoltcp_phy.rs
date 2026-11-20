@@ -156,7 +156,7 @@ impl<'a, B: WifiMmioBus> StaTxSink for DriverTxSink<'a, B> {
         let dur = estimate_tx_duration_us(mpdu.len(), rate);
         let res = self
             .lmac
-            .submit_and_poll_tx(desc_addr, mpdu.len(), rate, dur, wait_ack, 50_000);
+            .submit_and_poll_tx(desc_addr, mpdu, rate, dur, wait_ack, 50_000);
         // M-074: Only reclaim TX slot ownership when TX succeeded, was never
         // triggered, or was aborted and verified drained (`TX_ACTIVE == 0`).
         // Leave `in_flight = true` on `TxDrainFailed` so subsequent `tx_prepare`
@@ -225,7 +225,7 @@ impl<'a, B: WifiMmioBus> ApTxSink for ApDriverTxSink<'a, B> {
         let dur = estimate_tx_duration_us(mpdu.len(), rate);
         let res = self
             .lmac
-            .submit_and_poll_tx(desc_addr, mpdu.len(), rate, dur, wait_ack, 50_000);
+            .submit_and_poll_tx(desc_addr, mpdu, rate, dur, wait_ack, 50_000);
         // M-074: Only reclaim TX slot ownership when TX succeeded or drained
         // cleanly (`TX_ACTIVE == 0`). Leave `in_flight = true` on
         // `TxDrainFailed` so subsequent TX cannot overwrite live DMA memory.
@@ -1098,7 +1098,11 @@ mod tests {
         unsafe { Pin::new_unchecked(&mut driver) }
             .init_pinned(Some([0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc]))
             .expect("init");
-        let cfg = StaConnectConfig::from_slices(b"PadNet", b"password123", None, -90).expect("cfg");
+        #[cfg(miri)]
+        let pass: &[u8] = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        #[cfg(not(miri))]
+        let pass: &[u8] = b"password123";
+        let cfg = StaConnectConfig::from_slices(b"PadNet", pass, None, -90).expect("cfg");
         driver.connect(cfg, 10).expect("connect");
         assert_eq!(driver.state(), StaState::Scanning);
 
@@ -1171,8 +1175,11 @@ mod tests {
         unsafe { Pin::new_unchecked(&mut driver) }
             .init_pinned(Some([0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc]))
             .expect("init");
-        let cfg =
-            StaConnectConfig::from_slices(b"NoWedge", b"password123", None, -90).expect("cfg");
+        #[cfg(miri)]
+        let pass: &[u8] = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        #[cfg(not(miri))]
+        let pass: &[u8] = b"password123";
+        let cfg = StaConnectConfig::from_slices(b"NoWedge", pass, None, -90).expect("cfg");
         driver.connect(cfg, 10).expect("connect");
 
         // Slot 0: Malformed SW-owned descriptor (missing EOF — multi-descriptor
@@ -1900,8 +1907,11 @@ mod tests {
         let drv = unsafe { driver.as_mut().get_unchecked_mut() };
         assert_eq!(drv.take_last_sta_error(), None);
 
-        let cfg =
-            StaConnectConfig::from_slices(b"MissingAp", b"password123", None, -90).expect("cfg");
+        #[cfg(miri)]
+        let pass: &[u8] = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        #[cfg(not(miri))]
+        let pass: &[u8] = b"password123";
+        let cfg = StaConnectConfig::from_slices(b"MissingAp", pass, None, -90).expect("cfg");
         let mut now_ms = 1_000u64;
         drv.connect(cfg, now_ms).expect("connect");
 
@@ -1955,8 +1965,11 @@ mod tests {
         // SAFETY: `driver` remains pinned for the entire test lifetime.
         let drv = unsafe { driver.as_mut().get_unchecked_mut() };
 
-        let cfg =
-            StaConnectConfig::from_slices(b"Passthrough", b"password123", None, -90).expect("cfg");
+        #[cfg(miri)]
+        let pass: &[u8] = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        #[cfg(not(miri))]
+        let pass: &[u8] = b"password123";
+        let cfg = StaConnectConfig::from_slices(b"Passthrough", pass, None, -90).expect("cfg");
         let mut now_ms = 1_000u64;
         drv.connect(cfg, now_ms).expect("connect");
         assert_eq!(drv.state(), StaState::Scanning);
