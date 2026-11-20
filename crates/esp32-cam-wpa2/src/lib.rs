@@ -5,6 +5,10 @@
 //! WiFi driver.
 
 #![cfg_attr(not(test), no_std)]
+#![cfg_attr(
+    all(target_arch = "xtensa", feature = "c-supplicant-ffi"),
+    feature(asm_experimental_arch)
+)]
 
 #[deny(unsafe_code)]
 pub mod crypto;

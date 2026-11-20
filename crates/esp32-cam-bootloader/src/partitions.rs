@@ -37,6 +37,26 @@ pub const PART_SUBTYPE_OTA_MAX: u8 = 0x1F;
 /// OTA selection data subtype (`0x00`).
 pub const PART_SUBTYPE_DATA_OTA: u8 = 0x00;
 
+/// Total SPI flash capacity for ESP32-WROVER 4 MiB modules (`0x0040_0000`).
+pub const FLASH_SIZE_BYTES: u32 = 4 * 1024 * 1024;
+
+/// Minimum allowed flash offset for any partition entry (`0x9000`).
+///
+/// Protects the 2nd-stage bootloader (`0x1000`) and partition table (`0x8000`).
+pub const MIN_PARTITION_OFFSET: u32 = 0x9000;
+
+/// Required 64 KiB alignment for ESP32 MMU-mapped APP partitions (`0x10000`).
+pub const APP_PARTITION_ALIGN: u32 = 0x1_0000;
+
+/// Required 4 KiB sector alignment for `otadata` partitions (`0x1000`).
+pub const OTADATA_PARTITION_ALIGN: u32 = 0x1000;
+
+/// Minimum required size for dual-sector `otadata` partitions (`0x2000`).
+pub const OTADATA_MIN_SIZE: u32 = 0x2000;
+
+/// Maximum number of 32-byte entries in the partition table region.
+const MAX_PARTITION_ENTRIES: usize = PARTITION_TABLE_MAX_BYTES / 32;
+
 /// Errors encountered while reading and parsing partition tables.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -358,17 +378,21 @@ pub fn encode_md5_entry(entries_bytes: &[u8]) -> [u8; 32] {
 
 /// Reads and parses the flash partition table starting at `0x8000`.
 ///
-/// Verifies the `0x50AA` magic on each entry, validates the MD5 trailer
-/// if present, and extracts the layout without heap allocation.
+/// Verifies the `0x50AA` magic on each entry, enforces offset/size/alignment,
+/// flash-bounds, duplicate-subtype, overlap, and contiguous-OTA invariants,
+/// and requires a valid `0xEBEB` MD5 trailer with 14-byte `0xFF` padding.
 pub fn parse_partition_table<F: FlashIo>(flash: &mut F) -> Result<PartitionLayout, PartitionError> {
     let mut bounce = AlignedBounce64::new();
     let mut md5 = Md5Hasher::new();
     let mut layout = PartitionLayout::empty();
     let mut app_found = false;
-    let chunk_count = PARTITION_TABLE_MAX_BYTES / 32;
+    let mut md5_verified = false;
+    let mut spans = [(0u32, 0u32); MAX_PARTITION_ENTRIES];
+    let mut seen_types = [(0u8, 0u8); MAX_PARTITION_ENTRIES];
+    let mut span_count = 0usize;
 
     let mut i = 0;
-    while i < chunk_count {
+    while i < MAX_PARTITION_ENTRIES {
         let chunk_offset = (i * 32) as u32;
         let read_addr = PARTITION_TABLE_OFFSET
             .checked_add(chunk_offset)
@@ -377,12 +401,16 @@ pub fn parse_partition_table<F: FlashIo>(flash: &mut F) -> Result<PartitionLayou
         flash.read(read_addr, &mut bounce.bytes[..32])?;
         let entry = &bounce.bytes[..32];
 
-        // Check for MD5 marker (0xEBEB)
+        // Check for MD5 marker (0xEBEB) with 14-byte 0xFF padding
         if entry[0] == 0xEB && entry[1] == 0xEB {
+            if entry[2..16] != [0xFFu8; 14] {
+                return Err(PartitionError::InvalidTable);
+            }
             let actual = md5.finalize();
             if entry[16..32] != actual {
                 return Err(PartitionError::Md5Mismatch);
             }
+            md5_verified = true;
             break;
         }
 
@@ -402,6 +430,45 @@ pub fn parse_partition_table<F: FlashIo>(flash: &mut F) -> Result<PartitionLayou
         let subtype = entry[3];
         let offset = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
         let size = u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]]);
+
+        // Reject zero-sized, below-0x9000, overflowing, or out-of-flash spans
+        if size == 0 || offset < MIN_PARTITION_OFFSET {
+            return Err(PartitionError::InvalidTable);
+        }
+        let end = offset
+            .checked_add(size)
+            .ok_or(PartitionError::InvalidTable)?;
+        if end > FLASH_SIZE_BYTES {
+            return Err(PartitionError::InvalidTable);
+        }
+
+        // Enforce alignment and size invariants for APP and otadata entries
+        if ptype == PART_TYPE_APP && (offset & (APP_PARTITION_ALIGN - 1)) != 0 {
+            return Err(PartitionError::InvalidTable);
+        }
+        if ptype == PART_TYPE_DATA
+            && subtype == PART_SUBTYPE_DATA_OTA
+            && ((offset & (OTADATA_PARTITION_ALIGN - 1)) != 0 || size < OTADATA_MIN_SIZE)
+        {
+            return Err(PartitionError::InvalidTable);
+        }
+
+        // Reject duplicate (type, subtype) entries and overlapping flash spans
+        let mut prev = 0;
+        while prev < span_count {
+            if seen_types[prev] == (ptype, subtype) {
+                return Err(PartitionError::InvalidTable);
+            }
+            let (prev_start, prev_end) = spans[prev];
+            if offset < prev_end && prev_start < end {
+                return Err(PartitionError::InvalidTable);
+            }
+            prev += 1;
+        }
+        spans[span_count] = (offset, end);
+        seen_types[span_count] = (ptype, subtype);
+        span_count += 1;
+
         let span = PartitionSpan { offset, size };
 
         if ptype == PART_TYPE_DATA && subtype == PART_SUBTYPE_DATA_OTA {
@@ -428,6 +495,19 @@ pub fn parse_partition_table<F: FlashIo>(flash: &mut F) -> Result<PartitionLayou
 
     if !app_found {
         return Err(PartitionError::InvalidTable);
+    }
+
+    if !md5_verified {
+        return Err(PartitionError::Md5Mismatch);
+    }
+
+    // Require contiguous OTA slots 0..ota_count so modulo selection is sound
+    let mut slot = 0;
+    while slot < layout.ota_count as usize {
+        if layout.ota_slots[slot].is_none() {
+            return Err(PartitionError::InvalidTable);
+        }
+        slot += 1;
     }
 
     Ok(layout)
@@ -558,5 +638,137 @@ mod tests {
         let mut mock = MockFlash::<9>::new();
         let res = parse_partition_table(&mut mock);
         assert_eq!(res, Err(PartitionError::InvalidTable));
+    }
+
+    fn write_entries_with_md5(mock: &mut MockFlash<9>, entries: &[[u8; 32]]) {
+        let mut raw = [0xFFu8; 256];
+        let used = entries.len() * 32;
+        for (idx, entry) in entries.iter().enumerate() {
+            raw[idx * 32..(idx + 1) * 32].copy_from_slice(entry);
+        }
+        let trailer = encode_md5_entry(&raw[..used]);
+        raw[used..used + 32].copy_from_slice(&trailer);
+        mock.write_raw(PARTITION_TABLE_OFFSET, &raw[..used + 32])
+            .expect("flash write");
+    }
+
+    #[test]
+    fn missing_md5_trailer_is_rejected() {
+        let mut mock = MockFlash::<9>::new();
+        let e_ota0 = make_entry(PART_TYPE_APP, PART_SUBTYPE_OTA_MIN, 0x20000, 0x100000);
+        mock.write_raw(PARTITION_TABLE_OFFSET, &e_ota0)
+            .expect("flash write");
+        assert_eq!(
+            parse_partition_table(&mut mock),
+            Err(PartitionError::Md5Mismatch)
+        );
+    }
+
+    #[test]
+    fn md5_trailer_with_non_ff_padding_is_rejected() {
+        let mut mock = MockFlash::<9>::new();
+        let mut raw = [0xFFu8; 64];
+        let e_ota0 = make_entry(PART_TYPE_APP, PART_SUBTYPE_OTA_MIN, 0x20000, 0x100000);
+        raw[0..32].copy_from_slice(&e_ota0);
+        let mut trailer = encode_md5_entry(&raw[..32]);
+        trailer[5] = 0x00; // corrupt 14-byte 0xFF padding
+        raw[32..64].copy_from_slice(&trailer);
+        mock.write_raw(PARTITION_TABLE_OFFSET, &raw)
+            .expect("flash write");
+        assert_eq!(
+            parse_partition_table(&mut mock),
+            Err(PartitionError::InvalidTable)
+        );
+    }
+
+    #[test]
+    fn rejects_zero_size_overflow_and_out_of_flash() {
+        let mut mock = MockFlash::<9>::new();
+        let zero = make_entry(PART_TYPE_APP, PART_SUBTYPE_OTA_MIN, 0x20000, 0);
+        write_entries_with_md5(&mut mock, &[zero]);
+        assert_eq!(
+            parse_partition_table(&mut mock),
+            Err(PartitionError::InvalidTable)
+        );
+
+        let mut mock = MockFlash::<9>::new();
+        let wrap = make_entry(PART_TYPE_APP, PART_SUBTYPE_OTA_MIN, 0xFFFF_0000, 0x2_0000);
+        write_entries_with_md5(&mut mock, &[wrap]);
+        assert_eq!(
+            parse_partition_table(&mut mock),
+            Err(PartitionError::InvalidTable)
+        );
+
+        let mut mock = MockFlash::<9>::new();
+        let oob = make_entry(PART_TYPE_APP, PART_SUBTYPE_OTA_MIN, 0x380000, 0x100000);
+        write_entries_with_md5(&mut mock, &[oob]);
+        assert_eq!(
+            parse_partition_table(&mut mock),
+            Err(PartitionError::InvalidTable)
+        );
+    }
+
+    #[test]
+    fn rejects_offset_below_0x9000_and_unaligned_app_or_otadata() {
+        let mut mock = MockFlash::<9>::new();
+        let below = make_entry(PART_TYPE_DATA, PART_SUBTYPE_DATA_OTA, 0x1000, 0x2000);
+        let ota0 = make_entry(PART_TYPE_APP, PART_SUBTYPE_OTA_MIN, 0x20000, 0x100000);
+        write_entries_with_md5(&mut mock, &[below, ota0]);
+        assert_eq!(
+            parse_partition_table(&mut mock),
+            Err(PartitionError::InvalidTable)
+        );
+
+        let mut mock = MockFlash::<9>::new();
+        let unaligned_app = make_entry(PART_TYPE_APP, PART_SUBTYPE_OTA_MIN, 0x18000, 0x100000);
+        write_entries_with_md5(&mut mock, &[unaligned_app]);
+        assert_eq!(
+            parse_partition_table(&mut mock),
+            Err(PartitionError::InvalidTable)
+        );
+
+        let mut mock = MockFlash::<9>::new();
+        let unaligned_ota = make_entry(PART_TYPE_DATA, PART_SUBTYPE_DATA_OTA, 0x9800, 0x2000);
+        write_entries_with_md5(&mut mock, &[unaligned_ota, ota0]);
+        assert_eq!(
+            parse_partition_table(&mut mock),
+            Err(PartitionError::InvalidTable)
+        );
+
+        let mut mock = MockFlash::<9>::new();
+        let small_ota = make_entry(PART_TYPE_DATA, PART_SUBTYPE_DATA_OTA, 0x9000, 0x1000);
+        write_entries_with_md5(&mut mock, &[small_ota, ota0]);
+        assert_eq!(
+            parse_partition_table(&mut mock),
+            Err(PartitionError::InvalidTable)
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_subtypes_overlapping_spans_and_sparse_ota_slots() {
+        let mut mock = MockFlash::<9>::new();
+        let ota0_a = make_entry(PART_TYPE_APP, PART_SUBTYPE_OTA_MIN, 0x20000, 0x100000);
+        let ota0_b = make_entry(PART_TYPE_APP, PART_SUBTYPE_OTA_MIN, 0x120000, 0x100000);
+        write_entries_with_md5(&mut mock, &[ota0_a, ota0_b]);
+        assert_eq!(
+            parse_partition_table(&mut mock),
+            Err(PartitionError::InvalidTable)
+        );
+
+        let mut mock = MockFlash::<9>::new();
+        let ota1_overlap = make_entry(PART_TYPE_APP, PART_SUBTYPE_OTA_MIN + 1, 0x100000, 0x100000);
+        write_entries_with_md5(&mut mock, &[ota0_a, ota1_overlap]);
+        assert_eq!(
+            parse_partition_table(&mut mock),
+            Err(PartitionError::InvalidTable)
+        );
+
+        let mut mock = MockFlash::<9>::new();
+        let ota2_gap = make_entry(PART_TYPE_APP, PART_SUBTYPE_OTA_MIN + 2, 0x120000, 0x100000);
+        write_entries_with_md5(&mut mock, &[ota0_a, ota2_gap]);
+        assert_eq!(
+            parse_partition_table(&mut mock),
+            Err(PartitionError::InvalidTable)
+        );
     }
 }

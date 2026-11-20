@@ -8,7 +8,7 @@
 #![allow(unsafe_code)]
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 /// Maximum payload bytes carried by each chunk slot in the SPSC ring.
 pub const JPEG_SPSC_CHUNK_BYTES: usize = 1024;
@@ -45,10 +45,21 @@ impl JpegSpscSlot {
     };
 }
 
+/// RAII guard clearing the consumer active flag on scope exit or unwind.
+struct ConsumerActiveGuard<'a>(&'a AtomicBool);
+
+impl Drop for ConsumerActiveGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// Bounded lock-free SPSC ring buffer for inter-core JPEG streaming.
 pub struct Core1JpegSpsc<const SLOTS: usize> {
     head: AtomicUsize,
     tail: AtomicUsize,
+    consumer_active: AtomicBool,
     frames_pushed: AtomicU32,
     frames_dropped: AtomicU32,
     slots: [UnsafeCell<JpegSpscSlot>; SLOTS],
@@ -81,6 +92,7 @@ impl<const SLOTS: usize> Core1JpegSpsc<SLOTS> {
         Self {
             head: AtomicUsize::new(0),
             tail: AtomicUsize::new(0),
+            consumer_active: AtomicBool::new(false),
             frames_pushed: AtomicU32::new(0),
             frames_dropped: AtomicU32::new(0),
             slots: [const { UnsafeCell::new(JpegSpscSlot::ZERO) }; SLOTS],
@@ -123,7 +135,8 @@ impl<const SLOTS: usize> Core1JpegSpsc<SLOTS> {
         }
         let slot_ptr = self.slots[head].get();
         let chunk_len = chunk.len();
-        // SAFETY: Exclusive producer access guaranteed by head != tail.
+        // JUSTIFICATION: Producer writes exclusively to slot at `head`.
+        // SAFETY: `next_head != tail` guarantees consumer is not reading slot.
         unsafe {
             let slot = &mut *slot_ptr;
             slot.data[..chunk_len].copy_from_slice(chunk);
@@ -136,11 +149,13 @@ impl<const SLOTS: usize> Core1JpegSpsc<SLOTS> {
 
     /// Pops the next available chunk and passes its slice and flags to `f`.
     ///
-    /// Returns `Some(res)` if a chunk was consumed, or `None` if empty.
+    /// Returns `Some(res)` if a chunk was consumed, or `None` if empty or if
+    /// another consumer call is already active (non-reentrant guard).
     ///
     /// # Safety
     ///
-    /// Must only be called by the designated single consumer thread / core.
+    /// Must only be called by the designated single consumer thread / core,
+    /// and `f` must not invoke consumer methods re-entrantly.
     // JUSTIFICATION: Lock-free single-producer single-consumer ring queue.
     // SAFETY:
     // 1. Alignment & Non-null: `self.slots[tail]` is an inline array element,
@@ -149,19 +164,29 @@ impl<const SLOTS: usize> Core1JpegSpsc<SLOTS> {
     //    so the slice index never exceeds `SLOTS`.
     // 3. Provenance & Initialization: Slot data was committed by producer
     //    prior to `head` store with `Ordering::Release`.
-    // 4. Disjoint access & Aliasing: Consumer exclusively reads the slot at
-    //    index `tail` because producer cannot overwrite it until `tail` advances.
+    // 4. Disjoint access & Aliasing: `consumer_active` CAS blocks concurrent
+    //    or re-entrant consumer calls (`pop_with` / `reset_consumer`), and
+    //    producer cannot overwrite `tail` until `tail` advances.
     // 5. Atomic synchronization: Consumer checks `head` via `Ordering::Acquire`
     //    before reading slot, and stores `tail` with `Ordering::Release`.
-    // 6. Panic freedom & no_std safety: `len` is checked against chunk capacity
-    //    ensuring slice bounds are within `JPEG_SPSC_CHUNK_BYTES`.
+    // 6. Panic freedom & no_std safety: `len` is clamped to chunk capacity.
     pub unsafe fn pop_with<R>(&self, f: impl FnOnce(&[u8], u8) -> R) -> Option<R> {
+        if self
+            .consumer_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return None;
+        }
+        let _active_guard = ConsumerActiveGuard(&self.consumer_active);
+
         let tail = self.tail.load(Ordering::Relaxed);
         if tail == self.head.load(Ordering::Acquire) {
             return None;
         }
         let slot_ptr = self.slots[tail].get();
-        // SAFETY: Exclusive consumer access guaranteed while tail != head.
+        // JUSTIFICATION: Consumer borrows immutable view of slot at `tail`.
+        // SAFETY: `consumer_active` blocks re-entrancy and `tail != head`.
         let res = unsafe {
             let slot = &*slot_ptr;
             let len = usize::from(slot.len);
@@ -178,10 +203,31 @@ impl<const SLOTS: usize> Core1JpegSpsc<SLOTS> {
         Some(res)
     }
 
-    /// Resets the consumer index to match current head, discarding pending items.
+    /// Resets the consumer index to match current head, discarding pending
+    /// items.
+    ///
+    /// If a consumer call is already active on this ring (re-entrancy or
+    /// concurrent caller), this is a safe no-op to prevent `UnsafeCell`
+    /// aliasing UB or backward `tail` rewind (`M-017` / `C3-001`).
+    ///
+    /// # Safety
+    ///
+    /// Must only be called by the designated single consumer thread / core
+    /// while no `pop_with` closure is borrowing a slot.
     // JUSTIFICATION: Fast drain of obsolete JPEG chunks on stream abort.
-    // SAFETY: Consumer advances `tail` to current `head` via atomic operations.
-    pub fn reset_consumer(&self) {
+    // SAFETY:
+    // 1. Preconditions: Sole consumer core invokes reset outside `pop_with`.
+    // 2. Aliasing: `consumer_active` CAS prevents racing with `pop_with`.
+    // 3. Synchronization: `head` Acquire load paired with `tail` Release store.
+    pub unsafe fn reset_consumer(&self) {
+        if self
+            .consumer_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let _active_guard = ConsumerActiveGuard(&self.consumer_active);
         let head = self.head.load(Ordering::Acquire);
         self.tail.store(head, Ordering::Release);
     }
@@ -211,7 +257,7 @@ impl<const SLOTS: usize> Core1JpegSpsc<SLOTS> {
     /// Returns `true` if the ring has no pending chunks.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.tail.load(Ordering::Relaxed) == self.head.load(Ordering::Acquire)
+        self.tail.load(Ordering::Acquire) == self.head.load(Ordering::Acquire)
     }
 
     /// Returns the maximum chunk capacity of this ring (`SLOTS - 1`).
@@ -331,12 +377,50 @@ mod tests {
 
         // Test reset_consumer
         for _ in 0..3 {
+            // JUSTIFICATION: Single-threaded test producer push.
             // SAFETY: Single producer in test context.
             let _ = unsafe { ring.push_chunk(&[0x11; 16], 0) };
         }
         assert!(!ring.is_empty());
-        // Single consumer in test context.
-        ring.reset_consumer();
+        // JUSTIFICATION: Single-threaded test consumer reset.
+        // SAFETY: Single consumer outside `pop_with` in test context.
+        unsafe {
+            ring.reset_consumer();
+        }
+        assert!(ring.is_empty());
+    }
+
+    #[test]
+    fn test_spsc_reentrant_reset_and_pop_blocked_during_pop_with() {
+        let ring = Core1JpegSpsc::<8>::new();
+        for i in 1..=3u8 {
+            // JUSTIFICATION: Single-threaded test producer push.
+            // SAFETY: Single producer in test context.
+            assert!(unsafe { ring.push_chunk(&[i; 8], 0) });
+        }
+
+        // JUSTIFICATION: Verify re-entrant consumer calls cannot alias/rewind.
+        // SAFETY: Single consumer in test context; re-entrant guard blocks
+        // nested access cleanly without UB.
+        let first = unsafe {
+            ring.pop_with(|data, _| {
+                // Re-entrant reset_consumer must be a no-op.
+                ring.reset_consumer();
+                // Re-entrant pop_with must return None.
+                assert!(ring.pop_with(|_, _| 99u8).is_none());
+                data[0]
+            })
+        };
+        assert_eq!(first, Some(1));
+        assert!(!ring.is_empty());
+
+        // Remaining chunks 2 and 3 must still be intact in order.
+        for expected in [2u8, 3u8] {
+            // JUSTIFICATION: Single-threaded test consumer pop.
+            // SAFETY: Single consumer in test context.
+            let got = unsafe { ring.pop_with(|d, _| d[0]) };
+            assert_eq!(got, Some(expected));
+        }
         assert!(ring.is_empty());
     }
 }

@@ -6,13 +6,19 @@ use esp32_cam_types::{CameraError, SccbPhase};
 
 use crate::bus::{is_valid_sccb_addr, SccbBus};
 
-/// Maps an `embedded-hal` I2C error to [`CameraError`].
-fn map_i2c_error<E: embedded_hal::i2c::Error>(e: E, slv_addr: u8) -> CameraError {
+/// Maps an `embedded-hal` I2C error to [`CameraError`], tagging data-phase
+/// NACKs with `data_phase` so register-address writes report
+/// [`SccbPhase::RegAddr`].
+fn map_i2c_error_with_phase<E: embedded_hal::i2c::Error>(
+    e: E,
+    slv_addr: u8,
+    data_phase: SccbPhase,
+) -> CameraError {
     match embedded_hal::i2c::Error::kind(&e) {
         ErrorKind::NoAcknowledge(source) => {
             let phase = match source {
                 NoAcknowledgeSource::Address => SccbPhase::DeviceAddr,
-                NoAcknowledgeSource::Data => SccbPhase::Data,
+                NoAcknowledgeSource::Data => data_phase,
                 NoAcknowledgeSource::Unknown => SccbPhase::Unknown,
             };
             CameraError::SccbNack { slv_addr, phase }
@@ -22,11 +28,33 @@ fn map_i2c_error<E: embedded_hal::i2c::Error>(e: E, slv_addr: u8) -> CameraError
     }
 }
 
+/// Maps an `embedded-hal` I2C error to [`CameraError`].
+fn map_i2c_error<E: embedded_hal::i2c::Error>(e: E, slv_addr: u8) -> CameraError {
+    map_i2c_error_with_phase(e, slv_addr, SccbPhase::Data)
+}
+
+/// Returns true when an `embedded-hal` I2C error is a transient
+/// multi-master arbitration loss that is safe to retry for idempotent reads.
+fn is_arbitration_loss<E: embedded_hal::i2c::Error>(e: &E) -> bool {
+    matches!(
+        embedded_hal::i2c::Error::kind(e),
+        ErrorKind::ArbitrationLoss
+    )
+}
+
 /// `embedded-hal` 1.0 adapter implementing [`SccbBus`] over I2C and Delay.
 ///
 /// Follows the two-phase SCCB read protocol from `driver/sccb.c` (separate
 /// write of register address followed by STOP and subsequent read) and single
 /// scatter-gather `transaction` bursts for sequential register writes.
+///
+/// # Shared-Bus Locking Requirement
+/// OmniVision SCCB sensors forbid I2C Repeated-START between the register
+/// address write and data read, so [`SccbBus::read_reg8`] and
+/// [`SccbBus::read_reg16`] must issue two separate bus calls with an
+/// intervening STOP. Wrap `I2C` exclusively (or hold an external shared-bus
+/// lock across each `SccbBus` call) so another master/task cannot interleave
+/// between the two SCCB phases.
 #[derive(Debug)]
 pub struct EmbeddedHalSccb<I2C, D> {
     i2c: I2C,
@@ -67,14 +95,21 @@ where
         if !is_valid_sccb_addr(slv_addr) {
             return Err(CameraError::InvalidArg);
         }
-        let mut data = [0u8; 1];
-        self.i2c
-            .write(slv_addr, &[reg])
-            .map_err(|e| map_i2c_error(e, slv_addr))?;
-        self.i2c
-            .read(slv_addr, &mut data)
-            .map_err(|e| map_i2c_error(e, slv_addr))?;
-        Ok(data[0])
+        for attempt in 0..2u8 {
+            if let Err(e) = self.i2c.write(slv_addr, &[reg]) {
+                if attempt == 0 && is_arbitration_loss(&e) {
+                    continue;
+                }
+                return Err(map_i2c_error_with_phase(e, slv_addr, SccbPhase::RegAddr));
+            }
+            let mut data = [0u8; 1];
+            match self.i2c.read(slv_addr, &mut data) {
+                Ok(()) => return Ok(data[0]),
+                Err(e) if attempt == 0 && is_arbitration_loss(&e) => continue,
+                Err(e) => return Err(map_i2c_error_with_phase(e, slv_addr, SccbPhase::Data)),
+            }
+        }
+        Err(CameraError::I2cError)
     }
 
     fn write_reg8(&mut self, slv_addr: u8, reg: u8, data: u8) -> Result<(), CameraError> {
@@ -91,14 +126,21 @@ where
             return Err(CameraError::InvalidArg);
         }
         let reg_bytes = reg.to_be_bytes();
-        let mut data = [0u8; 1];
-        self.i2c
-            .write(slv_addr, &reg_bytes)
-            .map_err(|e| map_i2c_error(e, slv_addr))?;
-        self.i2c
-            .read(slv_addr, &mut data)
-            .map_err(|e| map_i2c_error(e, slv_addr))?;
-        Ok(data[0])
+        for attempt in 0..2u8 {
+            if let Err(e) = self.i2c.write(slv_addr, &reg_bytes) {
+                if attempt == 0 && is_arbitration_loss(&e) {
+                    continue;
+                }
+                return Err(map_i2c_error_with_phase(e, slv_addr, SccbPhase::RegAddr));
+            }
+            let mut data = [0u8; 1];
+            match self.i2c.read(slv_addr, &mut data) {
+                Ok(()) => return Ok(data[0]),
+                Err(e) if attempt == 0 && is_arbitration_loss(&e) => continue,
+                Err(e) => return Err(map_i2c_error_with_phase(e, slv_addr, SccbPhase::Data)),
+            }
+        }
+        Err(CameraError::I2cError)
     }
 
     fn write_reg16(&mut self, slv_addr: u8, reg: u16, data: u8) -> Result<(), CameraError> {
@@ -161,9 +203,17 @@ where
         if !is_valid_sccb_addr(slv_addr) {
             return Err(CameraError::InvalidArg);
         }
-        self.i2c
-            .write(slv_addr, &[])
-            .map_err(|e| map_i2c_error(e, slv_addr))
+        // Use a portable 1-byte read rather than a zero-length write, which
+        // embedded-hal 1.0 drivers are not required to support consistently.
+        let mut byte = [0u8; 1];
+        for attempt in 0..2u8 {
+            match self.i2c.read(slv_addr, &mut byte) {
+                Ok(()) => return Ok(()),
+                Err(e) if attempt == 0 && is_arbitration_loss(&e) => continue,
+                Err(e) => return Err(map_i2c_error(e, slv_addr)),
+            }
+        }
+        Err(CameraError::I2cError)
     }
 
     fn delay_ms(&mut self, ms: u32) {
@@ -187,8 +237,10 @@ mod tests {
 
     struct MockI2c {
         err: Option<ErrorKind>,
+        fail_once_err: Option<ErrorKind>,
         read_data: u8,
         tx_calls: usize,
+        read_calls: usize,
         written: [u8; 32],
         written_len: usize,
     }
@@ -197,8 +249,10 @@ mod tests {
         const fn new(read_data: u8) -> Self {
             Self {
                 err: None,
+                fail_once_err: None,
                 read_data,
                 tx_calls: 0,
+                read_calls: 0,
                 written: [0; 32],
                 written_len: 0,
             }
@@ -216,12 +270,16 @@ mod tests {
             operations: &mut [Operation<'_>],
         ) -> Result<(), Self::Error> {
             self.tx_calls += 1;
+            if let Some(err) = self.fail_once_err.take() {
+                return Err(MockI2cError(err));
+            }
             if let Some(err) = self.err {
                 return Err(MockI2cError(err));
             }
             for op in operations {
                 match op {
                     Operation::Read(buf) => {
+                        self.read_calls += 1;
                         for b in buf.iter_mut() {
                             *b = self.read_data;
                         }
@@ -351,5 +409,40 @@ mod tests {
         );
         adapter.i2c_mut().err = Some(ErrorKind::Bus);
         assert_eq!(adapter.read_reg8(0x30, 0x10), Err(CameraError::I2cError));
+    }
+
+    #[test]
+    fn test_m200_probe_read_phase_and_arbitration_retry() {
+        let mut adapter = EmbeddedHalSccb::new(MockI2c::new(0x5A), MockDelay);
+
+        // Portable probe uses a 1-byte read, not a zero-length write.
+        assert_eq!(adapter.probe(0x30), Ok(()));
+        assert_eq!(adapter.i2c().read_calls, 1);
+
+        // Register-address write NACK reports SccbPhase::RegAddr.
+        adapter.i2c_mut().err = Some(ErrorKind::NoAcknowledge(NoAcknowledgeSource::Data));
+        assert_eq!(
+            adapter.read_reg8(0x30, 0x10),
+            Err(CameraError::SccbNack {
+                slv_addr: 0x30,
+                phase: SccbPhase::RegAddr,
+            })
+        );
+        assert_eq!(
+            adapter.read_reg16(0x3C, 0x300A),
+            Err(CameraError::SccbNack {
+                slv_addr: 0x3C,
+                phase: SccbPhase::RegAddr,
+            })
+        );
+
+        // Transient ArbitrationLoss recovers on retry for read and probe.
+        adapter.i2c_mut().err = None;
+        adapter.i2c_mut().fail_once_err = Some(ErrorKind::ArbitrationLoss);
+        assert_eq!(adapter.probe(0x30), Ok(()));
+        adapter.i2c_mut().fail_once_err = Some(ErrorKind::ArbitrationLoss);
+        assert_eq!(adapter.read_reg8(0x30, 0x10), Ok(0x5A));
+        adapter.i2c_mut().fail_once_err = Some(ErrorKind::ArbitrationLoss);
+        assert_eq!(adapter.read_reg16(0x3C, 0x300A), Ok(0x5A));
     }
 }

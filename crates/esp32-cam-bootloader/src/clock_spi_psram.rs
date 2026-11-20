@@ -22,6 +22,16 @@ pub const SYSCON_PLL_TICK_CONF_REG: u32 = 0x3FF6_6008;
 /// UART0 clock divider register (`soc/uart_reg.h`).
 pub const UART0_CLKDIV_REG: u32 = 0x3FF4_0014;
 
+/// UART0 status register (`soc/uart_reg.h`).
+pub const UART0_STATUS_REG: u32 = 0x3FF4_001C;
+
+/// Mask covering `UART_TXFIFO_CNT` (`[23:16]`) and `UART_ST_UTX_OUT`
+/// (`[27:24]`) in `UART0_STATUS_REG`.
+pub const UART0_TX_BUSY_MASK: u32 = 0x0FFF_0000;
+
+/// Maximum poll iterations when draining UART0 TX before clock switches.
+const UART0_TX_DRAIN_MAX_POLLS: u32 = 100_000;
+
 /// SPI0 control register (`soc/spi_reg.h`).
 pub const SPI0_CTRL_REG: u32 = 0x3FF4_3008;
 
@@ -249,8 +259,91 @@ pub fn uart0_clkdiv_for_115200(apb_hz: u32) -> u32 {
     (int_part & 0x000F_FFFF) | ((frac_part & 0x0F) << 20)
 }
 
+/// Returns `true` if `addr` is a 4-byte-aligned register on the static ESP32
+/// Clock/SPI/UART0/IO_MUX/eFuse/GPIO16 MMIO allowlist.
+#[must_use]
+pub const fn is_allowed_clock_mmio_reg(addr: u32) -> bool {
+    if (addr & 3) != 0 {
+        return false;
+    }
+    matches!(
+        addr,
+        EFUSE_BLK0_RDATA0_REG
+            | EFUSE_BLK0_RDATA3_REG
+            | RTC_CNTL_OPTIONS0_REG
+            | RTC_CNTL_CLK_CONF_REG
+            | RTC_CNTL_REG
+            | SYSCON_XTAL_TICK_CONF_REG
+            | SYSCON_PLL_TICK_CONF_REG
+            | UART0_CLKDIV_REG
+            | UART0_STATUS_REG
+            | SPI0_CTRL_REG
+            | SPI0_CTRL2_REG
+            | SPI0_CLOCK_REG
+            | SPI0_USER_REG
+            | SPI0_USER1_REG
+            | SPI1_CMD_REG
+            | SPI1_CTRL_REG
+            | SPI1_CTRL2_REG
+            | SPI1_CLOCK_REG
+            | SPI1_USER_REG
+            | SPI1_USER1_REG
+            | SPI1_USER2_REG
+            | SPI1_MOSI_DLEN_REG
+            | SPI1_MISO_DLEN_REG
+            | SPI1_PIN_REG
+            | SPI1_W0_REG
+            | SPI1_EXT2_REG
+            | DPORT_CPU_PER_CONF_REG
+            | IO_MUX_GPIO6_REG
+            | IO_MUX_GPIO7_REG
+            | IO_MUX_GPIO8_REG
+            | IO_MUX_GPIO9_REG
+            | IO_MUX_GPIO10_REG
+            | IO_MUX_GPIO11_REG
+            | crate::gpio16::IO_MUX_GPIO16_REG
+            | crate::gpio16::RTC_CNTL_HOLD_FORCE_REG
+            | crate::gpio16::RTC_IO_DIG_PAD_HOLD_REG
+            | crate::gpio16::GPIO_OUT_W1TS_REG
+            | crate::gpio16::GPIO_FUNC16_OUT_SEL_CFG_REG
+            | crate::gpio16::GPIO_ENABLE_W1TS_REG
+    )
+}
+
+/// Polls `UART0_STATUS_REG` until the TX FIFO and transmitter FSM report idle.
+///
+/// Bounded to [`UART0_TX_DRAIN_MAX_POLLS`] iterations to avoid infinite hangs.
+pub fn drain_uart0_tx_mmio<M: ClockMmio>(mmio: &M) -> bool {
+    let mut i = 0;
+    while i < UART0_TX_DRAIN_MAX_POLLS {
+        if (mmio.read_u32(UART0_STATUS_REG) & UART0_TX_BUSY_MASK) == 0 {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Returns `true` if a byte-swapped 24-bit JEDEC RDID value is valid.
+#[must_use]
+pub const fn is_valid_rdid(rdid: u32) -> bool {
+    rdid != 0 && rdid != 0x00FF_FFFF
+}
+
+/// Extracts the 4-bit ESP32 chip package version from `EFUSE_BLK0_RDATA3_REG`.
+///
+/// Combines `EFUSE_RD_CHIP_VER_PKG` (`[11:9]`) with the ECO3 4th bit
+/// `EFUSE_RD_CHIP_VER_PKG_4BIT` (bit 2) folded into bit 3.
+#[must_use]
+pub const fn decode_efuse_pkg_ver(rdata3: u32) -> u32 {
+    let low3 = (rdata3 >> 9) & 0x7;
+    let bit3 = (rdata3 >> 2) & 0x1;
+    low3 | (bit3 << 3)
+}
+
 /// Configures system timer tick rates and sets UART0 baud divider for 115,200.
 pub fn configure_ticks<M: ClockMmio>(mmio: &mut M, xtal_mhz: u32, pll_mhz: u32) {
+    let _ = drain_uart0_tx_mmio(mmio);
     mmio.write_u32(SYSCON_XTAL_TICK_CONF_REG, xtal_mhz.saturating_sub(1));
     mmio.write_u32(SYSCON_PLL_TICK_CONF_REG, pll_mhz.saturating_sub(1));
     let apb_hz = xtal_mhz.saturating_mul(1_000_000);
@@ -260,6 +353,7 @@ pub fn configure_ticks<M: ClockMmio>(mmio: &mut M, xtal_mhz: u32, pll_mhz: u32) 
 
 /// Configures timer tick rates and UART0 divider from APB frequency.
 pub fn configure_ticks_apb<M: ClockMmio>(mmio: &mut M, xtal_mhz: u32, pll_mhz: u32, apb_mhz: u32) {
+    let _ = drain_uart0_tx_mmio(mmio);
     mmio.write_u32(SYSCON_XTAL_TICK_CONF_REG, xtal_mhz.saturating_sub(1));
     mmio.write_u32(SYSCON_PLL_TICK_CONF_REG, pll_mhz.saturating_sub(1));
     let apb_hz = apb_mhz.saturating_mul(1_000_000);
@@ -323,6 +417,8 @@ pub fn bbpll_set_dbias_1v25_mmio<M: ClockMmio>(mmio: &mut M) {
 
 /// Switches CPU clock to 240 MHz PLL and updates APB tick divider.
 pub fn switch_cpu_240m_pll_mmio<M: ClockMmio>(mmio: &mut M) {
+    let _ = drain_uart0_tx_mmio(mmio);
+
     let dport = mmio.read_u32(DPORT_CPU_PER_CONF_REG);
     let dport_next = (dport & !DPORT_CPUPERIOD_SEL_MASK) | DPORT_CPUPERIOD_240M;
     mmio.write_u32(DPORT_CPU_PER_CONF_REG, dport_next);
@@ -363,6 +459,56 @@ pub fn spi1_setup_rdid_mmio<M: ClockMmio>(mmio: &mut M) {
     mmio.write_u32(SPI1_USER2_REG, SPI_RDID_USER2_VAL);
     mmio.write_u32(SPI1_MOSI_DLEN_REG, 0);
     mmio.write_u32(SPI1_MISO_DLEN_REG, 23);
+}
+
+/// Executes a bounded SPI1 JEDEC RDID (`0x9F`) transfer, saving and restoring
+/// `SPI1_CTRL`, `SPI1_USER*`, `SPI1_MOSI_DLEN`, and `SPI1_MISO_DLEN`.
+///
+/// # Errors
+///
+/// Returns `Err(())` without mutating active SPI1 registers if `SPI_USR_BIT`
+/// fails to clear within `max_polls`, or after restoring registers if the
+/// decoded 24-bit JEDEC ID is invalid (`0` or `0x00FF_FFFF`).
+#[allow(clippy::result_unit_err)]
+pub fn spi1_read_rdid_mmio<M: ClockMmio>(mmio: &mut M, max_polls: u32) -> Result<u32, ()> {
+    let saved_ctrl = mmio.read_u32(SPI1_CTRL_REG);
+    let saved_user = mmio.read_u32(SPI1_USER_REG);
+    let saved_user1 = mmio.read_u32(SPI1_USER1_REG);
+    let saved_user2 = mmio.read_u32(SPI1_USER2_REG);
+    let saved_mosi_dlen = mmio.read_u32(SPI1_MOSI_DLEN_REG);
+    let saved_miso_dlen = mmio.read_u32(SPI1_MISO_DLEN_REG);
+
+    spi1_setup_rdid_mmio(mmio);
+    mmio.write_u32(SPI1_W0_REG, 0);
+    let cmd = mmio.read_u32(SPI1_CMD_REG) | SPI_USR_BIT;
+    mmio.write_u32(SPI1_CMD_REG, cmd);
+
+    let mut done = false;
+    let mut i = 0;
+    while i < max_polls {
+        if (mmio.read_u32(SPI1_CMD_REG) & SPI_USR_BIT) == 0 {
+            done = true;
+            break;
+        }
+        i += 1;
+    }
+
+    if !done {
+        return Err(());
+    }
+
+    let rdid = swap_rdid_24bit(mmio.read_u32(SPI1_W0_REG));
+    mmio.write_u32(SPI1_CTRL_REG, saved_ctrl);
+    mmio.write_u32(SPI1_USER_REG, saved_user);
+    mmio.write_u32(SPI1_USER1_REG, saved_user1);
+    mmio.write_u32(SPI1_USER2_REG, saved_user2);
+    mmio.write_u32(SPI1_MOSI_DLEN_REG, saved_mosi_dlen);
+    mmio.write_u32(SPI1_MISO_DLEN_REG, saved_miso_dlen);
+
+    if !is_valid_rdid(rdid) {
+        return Err(());
+    }
+    Ok(rdid)
 }
 
 #[cfg(target_arch = "xtensa")]
@@ -421,19 +567,25 @@ pub fn configure_bbpll_240m_apb_80m() {
 }
 
 #[cfg(target_arch = "xtensa")]
-/// Configures `SPI0` and `SPI1` for 40 MHz DIO SPI flash, attaches GPIO matrix
-/// if unconfigured, and synchronizes the ROM flash chip descriptor.
+/// Configures `SPI0` and `SPI1` for 40 MHz DIO SPI flash, parks GPIO16
+/// (PSRAM CS#) high to prevent bus contention, attaches GPIO matrix if
+/// unconfigured, and synchronizes the ROM flash chip descriptor.
 ///
 /// # Errors
 ///
-/// Returns `Err(())` if any Mask ROM SPI configuration or status check fails.
+/// Returns `Err(())` if any Mask ROM SPI configuration, RDID probe, or
+/// status check fails. PRO cache is flushed before returning on error paths
+/// once disabled.
 #[allow(clippy::result_unit_err)]
 pub fn attach_flash_4mb_dio() -> Result<(), ()> {
+    // Guarantee PSRAM CS# (GPIO16) is deselected high before touching SPI1.
+    crate::gpio16::init_gpio16_xtensa();
+
     // JUSTIFICATION: 2nd-stage bootloader runs in IRAM/DRAM and calibrates
     // SPI flash for 40 MHz DIO mode, GPIO matrix routing, and cache flush.
     // SAFETY: Symbol addresses match fixed ESP32 Mask ROM exports, PRO
-    // cache is disabled during reconfiguration and flushed before return,
-    // and MMIO accesses target valid SPI1/EFUSE peripheral registers.
+    // cache is disabled during reconfiguration and flushed before return on
+    // every exit path, and MMIO accesses target allowlisted registers.
     unsafe {
         let chip_ptr = core::ptr::addr_of_mut!(g_rom_flashchip);
         if esp_rom_spiflash_wait_idle(chip_ptr) != 0 {
@@ -441,39 +593,20 @@ pub fn attach_flash_4mb_dio() -> Result<(), ()> {
         }
 
         Cache_Read_Disable_rom(0);
-        let _ = esp_rom_spiflash_config_clk(2, 1);
+        if esp_rom_spiflash_config_clk(2, 1) != 0 {
+            Cache_Flush_rom(0);
+            return Err(());
+        }
 
         let mut mmio = XtensaClockMmio;
-        let saved_ctrl = mmio.read_u32(SPI1_CTRL_REG);
-        let saved_user = mmio.read_u32(SPI1_USER_REG);
-        let saved_user1 = mmio.read_u32(SPI1_USER1_REG);
-        let saved_user2 = mmio.read_u32(SPI1_USER2_REG);
-
-        spi1_setup_rdid_mmio(&mut mmio);
-        mmio.write_u32(SPI1_W0_REG, 0);
-        let cmd = mmio.read_u32(SPI1_CMD_REG) | SPI_USR_BIT;
-        mmio.write_u32(SPI1_CMD_REG, cmd);
-
-        for _ in 0..100_000 {
-            if (mmio.read_u32(SPI1_CMD_REG) & SPI_USR_BIT) == 0 {
-                break;
-            }
-        }
-
-        let rdid = swap_rdid_24bit(mmio.read_u32(SPI1_W0_REG));
-        mmio.write_u32(SPI1_CTRL_REG, saved_ctrl);
-        mmio.write_u32(SPI1_USER_REG, saved_user);
-        mmio.write_u32(SPI1_USER1_REG, saved_user1);
-        mmio.write_u32(SPI1_USER2_REG, saved_user2);
-
-        let mut device_id = (*chip_ptr).device_id;
-        if rdid != 0 && rdid != 0x00FF_FFFF {
-            device_id = rdid;
-            (*chip_ptr).device_id = device_id;
-        }
+        let Ok(device_id) = spi1_read_rdid_mmio(&mut mmio, 100_000) else {
+            Cache_Flush_rom(0);
+            return Err(());
+        };
+        (*chip_ptr).device_id = device_id;
 
         let spiconfig = ets_efuse_get_spiconfig();
-        let pkg_ver = (mmio.read_u32(EFUSE_BLK0_RDATA3_REG) >> 9) & 0x7;
+        let pkg_ver = decode_efuse_pkg_ver(mmio.read_u32(EFUSE_BLK0_RDATA3_REG));
         if spiconfig == 0 && !matches!(pkg_ver, 2 | 4 | 5 | 6) {
             gpio_matrix_out(11, 5, false, false);
             for (gpio, sig) in [(7, 1), (8, 2), (10, 4), (9, 3)] {
@@ -483,8 +616,14 @@ pub fn attach_flash_4mb_dio() -> Result<(), ()> {
             configure_flash_iomux_mmio(&mut mmio);
         }
 
-        let _ = esp_rom_spiflash_config_clk(2, 0);
-        let _ = esp_rom_spiflash_config_clk(2, 1);
+        if esp_rom_spiflash_config_clk(2, 0) != 0 {
+            Cache_Flush_rom(0);
+            return Err(());
+        }
+        if esp_rom_spiflash_config_clk(2, 1) != 0 {
+            Cache_Flush_rom(0);
+            return Err(());
+        }
 
         let dummy_ptr = core::ptr::addr_of_mut!(g_rom_spiflash_dummy_len_plus).cast::<u8>();
         core::ptr::write_volatile(dummy_ptr, ESP_ROM_SPIFLASH_DUMMY_LEN_PLUS_40M);
@@ -495,6 +634,7 @@ pub fn attach_flash_4mb_dio() -> Result<(), ()> {
         let param_ret =
             esp_rom_spiflash_config_param(device_id, 4 * 1024 * 1024, 64 * 1024, 4096, 256, 0xFFFF);
         if param_ret != 0 {
+            Cache_Flush_rom(0);
             return Err(());
         }
 
@@ -509,23 +649,36 @@ pub fn attach_flash_4mb_dio() -> Result<(), ()> {
 
 #[cfg(target_arch = "xtensa")]
 /// Real hardware MMIO accessor for Xtensa Clock and SPI registers.
+///
+/// Validates every address against [`is_allowed_clock_mmio_reg`] before
+/// dereferencing so safe callers cannot touch arbitrary or unaligned memory.
 pub struct XtensaClockMmio;
 
 #[cfg(target_arch = "xtensa")]
 impl ClockMmio for XtensaClockMmio {
     #[inline]
     fn read_u32(&self, addr: u32) -> u32 {
-        // JUSTIFICATION: Reading hardware MMIO registers on physical Xtensa
-        // SoC.
-        // SAFETY: Address must be a valid 4-byte aligned ESP32 MMIO register.
+        assert!(
+            is_allowed_clock_mmio_reg(addr),
+            "ClockMmio read_u32 address is not an allowlisted 4-byte-aligned register"
+        );
+        // JUSTIFICATION: Reading verified allowlisted ESP32 hardware MMIO
+        // registers on physical Xtensa SoC.
+        // SAFETY: `is_allowed_clock_mmio_reg(addr)` verified 4-byte alignment
+        // and membership in the static ESP32 peripheral register allowlist.
         unsafe { core::ptr::read_volatile(addr as *const u32) }
     }
 
     #[inline]
     fn write_u32(&mut self, addr: u32, val: u32) {
-        // JUSTIFICATION: Writing hardware MMIO registers on physical Xtensa
-        // SoC.
-        // SAFETY: Address must be a valid 4-byte aligned ESP32 MMIO register.
+        assert!(
+            is_allowed_clock_mmio_reg(addr),
+            "ClockMmio write_u32 address is not an allowlisted 4-byte-aligned register"
+        );
+        // JUSTIFICATION: Writing verified allowlisted ESP32 hardware MMIO
+        // registers on physical Xtensa SoC.
+        // SAFETY: `is_allowed_clock_mmio_reg(addr)` verified 4-byte alignment
+        // and membership in the static ESP32 peripheral register allowlist.
         unsafe { core::ptr::write_volatile(addr as *mut u32, val) }
     }
 }
@@ -759,5 +912,118 @@ mod tests {
         assert_eq!(mock.read_u32(SPI1_USER2_REG), SPI_RDID_USER2_VAL);
         assert_eq!(mock.read_u32(SPI1_MOSI_DLEN_REG), 0);
         assert_eq!(mock.read_u32(SPI1_MISO_DLEN_REG), 23);
+    }
+
+    #[test]
+    fn test_mmio_allowlist_and_eco3_pkg_ver() {
+        assert!(is_allowed_clock_mmio_reg(SPI1_CMD_REG));
+        assert!(is_allowed_clock_mmio_reg(UART0_STATUS_REG));
+        assert!(is_allowed_clock_mmio_reg(SPI1_MOSI_DLEN_REG));
+        assert!(is_allowed_clock_mmio_reg(EFUSE_BLK0_RDATA3_REG));
+
+        // Reject unaligned, NULL, RAM, and unallowlisted peripheral addresses
+        assert!(!is_allowed_clock_mmio_reg(0));
+        assert!(!is_allowed_clock_mmio_reg(SPI1_CMD_REG + 1));
+        assert!(!is_allowed_clock_mmio_reg(SPI1_CMD_REG + 2));
+        assert!(!is_allowed_clock_mmio_reg(0x3FFB_0000));
+        assert!(!is_allowed_clock_mmio_reg(0x4008_0000));
+        assert!(!is_allowed_clock_mmio_reg(0x3FF4_0000));
+
+        // 4-bit ECO3 pkg_ver folds bit 2 into bit 3
+        assert_eq!(decode_efuse_pkg_ver(0), 0);
+        assert_eq!(decode_efuse_pkg_ver(0b101 << 9), 5);
+        assert_eq!(decode_efuse_pkg_ver((0b010 << 9) | (1 << 2)), 0b1010);
+        assert_eq!(decode_efuse_pkg_ver((0b111 << 9) | (1 << 2)), 15);
+    }
+
+    struct RdidMockMmio {
+        inner: MockClockMmio,
+        clear_cmd_on_write: bool,
+        rdid_response: u32,
+        uart_busy_polls_left: core::cell::Cell<u32>,
+    }
+
+    impl RdidMockMmio {
+        fn new(clear_cmd_on_write: bool, rdid_response: u32) -> Self {
+            Self {
+                inner: MockClockMmio::new(),
+                clear_cmd_on_write,
+                rdid_response,
+                uart_busy_polls_left: core::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl ClockMmio for RdidMockMmio {
+        fn read_u32(&self, addr: u32) -> u32 {
+            if addr == UART0_STATUS_REG {
+                let left = self.uart_busy_polls_left.get();
+                if left > 0 {
+                    self.uart_busy_polls_left.set(left - 1);
+                    return 1 << 16; // TXFIFO_CNT = 1
+                }
+                return 0;
+            }
+            self.inner.read_u32(addr)
+        }
+
+        fn write_u32(&mut self, addr: u32, val: u32) {
+            if addr == SPI1_CMD_REG && (val & SPI_USR_BIT) != 0 && self.clear_cmd_on_write {
+                self.inner.write_u32(addr, val & !SPI_USR_BIT);
+                self.inner.seed(SPI1_W0_REG, self.rdid_response);
+            } else {
+                self.inner.write_u32(addr, val);
+            }
+        }
+    }
+
+    #[test]
+    fn test_spi1_rdid_restores_dlen_rejects_invalid_and_aborts_on_timeout() {
+        // 1. Valid RDID succeeds and restores CTRL/USER*/MOSI_DLEN/MISO_DLEN
+        let mut mock = RdidMockMmio::new(true, 0x0016_40EF);
+        mock.inner.seed(SPI1_CTRL_REG, 0xAAAA_0001);
+        mock.inner.seed(SPI1_USER_REG, 0xAAAA_0002);
+        mock.inner.seed(SPI1_USER1_REG, 0xAAAA_0003);
+        mock.inner.seed(SPI1_USER2_REG, 0xAAAA_0004);
+        mock.inner.seed(SPI1_MOSI_DLEN_REG, 0x0000_0055);
+        mock.inner.seed(SPI1_MISO_DLEN_REG, 0x0000_00AA);
+
+        let rdid = spi1_read_rdid_mmio(&mut mock, 16).expect("valid rdid");
+        assert_eq!(rdid, 0x00EF_4016);
+        assert_eq!(mock.inner.read_u32(SPI1_CTRL_REG), 0xAAAA_0001);
+        assert_eq!(mock.inner.read_u32(SPI1_USER_REG), 0xAAAA_0002);
+        assert_eq!(mock.inner.read_u32(SPI1_USER1_REG), 0xAAAA_0003);
+        assert_eq!(mock.inner.read_u32(SPI1_USER2_REG), 0xAAAA_0004);
+        assert_eq!(mock.inner.read_u32(SPI1_MOSI_DLEN_REG), 0x0000_0055);
+        assert_eq!(mock.inner.read_u32(SPI1_MISO_DLEN_REG), 0x0000_00AA);
+
+        // 2. Invalid RDID (0 and 0x00FF_FFFF) returns Err after restoring regs
+        for bad_raw in [0x0000_0000, 0x00FF_FFFF] {
+            let mut bad_mock = RdidMockMmio::new(true, bad_raw);
+            bad_mock.inner.seed(SPI1_MOSI_DLEN_REG, 0x0000_0077);
+            bad_mock.inner.seed(SPI1_MISO_DLEN_REG, 0x0000_0088);
+            assert_eq!(spi1_read_rdid_mmio(&mut bad_mock, 16), Err(()));
+            assert_eq!(bad_mock.inner.read_u32(SPI1_MOSI_DLEN_REG), 0x0000_0077);
+            assert_eq!(bad_mock.inner.read_u32(SPI1_MISO_DLEN_REG), 0x0000_0088);
+        }
+
+        // 3. Timeout returns Err without mutating registers after SPI_USR
+        let mut timeout_mock = RdidMockMmio::new(false, 0x0016_40EF);
+        timeout_mock.inner.seed(SPI1_CTRL_REG, 0x1234_5678);
+        assert_eq!(spi1_read_rdid_mmio(&mut timeout_mock, 8), Err(()));
+        // Last write must be SPI1_CMD_REG (no post-timeout register restores)
+        assert_eq!(
+            timeout_mock.inner.log[timeout_mock.inner.log_len - 1].0,
+            SPI1_CMD_REG
+        );
+    }
+
+    #[test]
+    fn test_switch_cpu_240m_drains_uart0_tx_before_clkdiv() {
+        let mut mock = RdidMockMmio::new(true, 0);
+        mock.uart_busy_polls_left.set(3);
+        switch_cpu_240m_pll_mmio(&mut mock);
+        assert_eq!(mock.uart_busy_polls_left.get(), 0);
+        assert_eq!(mock.inner.read_u32(UART0_CLKDIV_REG), 694 | (7 << 20));
     }
 }

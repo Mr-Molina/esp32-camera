@@ -28,6 +28,24 @@ pub const BOOTLOADER_IRAM_START: u32 = 0x4007_8000;
 /// End of bootloader-reserved IRAM (exclusive).
 pub const BOOTLOADER_IRAM_END: u32 = 0x4008_0000;
 
+/// Start of SRAM1 IRAM alias mapping bootloader DRAM (inclusive).
+pub const BOOTLOADER_DRAM_IRAM_ALIAS_START: u32 = 0x400A_8000;
+
+/// End of SRAM1 IRAM alias mapping bootloader DRAM (exclusive).
+pub const BOOTLOADER_DRAM_IRAM_ALIAS_END: u32 = 0x400B_0000;
+
+/// Lower bound of allowlisted application DRAM0 (inclusive).
+pub const SOC_APP_DRAM_LOW: u32 = 0x3FFA_E000;
+
+/// Upper bound of allowlisted application DRAM0 (exclusive).
+pub const SOC_APP_DRAM_HIGH: u32 = BOOTLOADER_DRAM_START;
+
+/// Lower bound of allowlisted application IRAM0 (inclusive).
+pub const SOC_APP_IRAM_LOW: u32 = BOOTLOADER_IRAM_END;
+
+/// Upper bound of allowlisted application IRAM0 (exclusive).
+pub const SOC_APP_IRAM_HIGH: u32 = 0x400A_0000;
+
 /// Lower bound of memory-mapped flash DROM virtual address space.
 pub const SOC_DROM_LOW: u32 = 0x3F40_0000;
 
@@ -39,6 +57,24 @@ pub const SOC_IROM_LOW: u32 = 0x400D_0000;
 
 /// Upper bound of memory-mapped flash IROM virtual address space.
 pub const SOC_IROM_HIGH: u32 = 0x4040_0000;
+
+/// Lower bound of RTC fast DRAM (inclusive).
+pub const SOC_RTC_DRAM_LOW: u32 = 0x3FF8_0000;
+
+/// Upper bound of RTC fast DRAM (exclusive).
+pub const SOC_RTC_DRAM_HIGH: u32 = 0x3FF8_2000;
+
+/// Lower bound of RTC fast IRAM (inclusive).
+pub const SOC_RTC_IRAM_LOW: u32 = 0x400C_0000;
+
+/// Upper bound of RTC fast IRAM (exclusive).
+pub const SOC_RTC_IRAM_HIGH: u32 = 0x400C_2000;
+
+/// Lower bound of RTC slow RAM (inclusive).
+pub const SOC_RTC_SLOW_LOW: u32 = 0x5000_0000;
+
+/// Upper bound of RTC slow RAM (exclusive).
+pub const SOC_RTC_SLOW_HIGH: u32 = 0x5000_2000;
 
 /// SHA-256 initial hash values (FIPS 180-4).
 const H0: [u32; 8] = [
@@ -294,27 +330,114 @@ pub enum SegmentKind {
 /// Metadata describing a validated segment within an application image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VerifiedSegment {
-    /// Offset within flash where segment payload begins.
-    pub flash_offset: u32,
-    /// Target load address in memory.
-    pub load_addr: u32,
-    /// Length of segment data in bytes.
-    pub data_len: u32,
-    /// Target memory classification.
-    pub kind: SegmentKind,
+    flash_offset: u32,
+    load_addr: u32,
+    data_len: u32,
+    kind: SegmentKind,
+}
+
+impl VerifiedSegment {
+    /// Returns the offset within flash where the segment payload begins.
+    #[inline]
+    #[must_use]
+    pub const fn flash_offset(&self) -> u32 {
+        self.flash_offset
+    }
+
+    /// Returns the target load address in memory.
+    #[inline]
+    #[must_use]
+    pub const fn load_addr(&self) -> u32 {
+        self.load_addr
+    }
+
+    /// Returns the length of segment data in bytes.
+    #[inline]
+    #[must_use]
+    pub const fn data_len(&self) -> u32 {
+        self.data_len
+    }
+
+    /// Returns the target memory classification.
+    #[inline]
+    #[must_use]
+    pub const fn kind(&self) -> SegmentKind {
+        self.kind
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn new_for_test(
+        flash_offset: u32,
+        load_addr: u32,
+        data_len: u32,
+        kind: SegmentKind,
+    ) -> Self {
+        Self {
+            flash_offset,
+            load_addr,
+            data_len,
+            kind,
+        }
+    }
 }
 
 /// Summary of an entire verified application image ready for booting.
+///
+/// Fields are private so callers cannot forge or mutate an already-verified
+/// image descriptor outside [`verify_app_image`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedImage {
-    /// Entry point address in memory where CPU begins execution.
-    pub entry_addr: u32,
-    /// Number of valid segments in the image.
-    pub segment_count: usize,
-    /// Verified segment descriptors.
-    pub segments: [Option<VerifiedSegment>; MAX_SEGMENTS],
-    /// Flash offset immediately following the entire image.
-    pub image_end_offset: u32,
+    entry_addr: u32,
+    segment_count: usize,
+    segments: [Option<VerifiedSegment>; MAX_SEGMENTS],
+    image_end_offset: u32,
+}
+
+impl VerifiedImage {
+    /// Returns the verified entry point address in executable memory.
+    #[inline]
+    #[must_use]
+    pub const fn entry_addr(&self) -> u32 {
+        self.entry_addr
+    }
+
+    /// Returns the number of valid segments in the image.
+    #[inline]
+    #[must_use]
+    pub const fn segment_count(&self) -> usize {
+        self.segment_count
+    }
+
+    /// Returns the verified segment descriptors.
+    #[inline]
+    #[must_use]
+    pub const fn segments(&self) -> &[Option<VerifiedSegment>; MAX_SEGMENTS] {
+        &self.segments
+    }
+
+    /// Returns the flash offset immediately following the entire image.
+    #[inline]
+    #[must_use]
+    pub const fn image_end_offset(&self) -> u32 {
+        self.image_end_offset
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn new_for_test(
+        entry_addr: u32,
+        segment_count: usize,
+        segments: [Option<VerifiedSegment>; MAX_SEGMENTS],
+        image_end_offset: u32,
+    ) -> Self {
+        Self {
+            entry_addr,
+            segment_count,
+            segments,
+            image_end_offset,
+        }
+    }
 }
 
 /// Errors encountered during application image verification.
@@ -329,20 +452,72 @@ pub enum ImageVerifyError {
     InvalidSegmentCount,
     /// Segment length is not 4-byte aligned.
     UnalignedSegmentLength,
-    /// Segment target address overlaps bootloader-reserved SRAM.
+    /// Segment load address is not 4-byte aligned or fails MMU page parity.
+    UnalignedLoadAddress,
+    /// Segment target address overlaps bootloader-reserved SRAM or its alias.
     BootloaderOverlap,
-    /// Image or segment exceeds partition boundary.
+    /// Two segments overlap in target RAM or 64 KiB MMU virtual page space.
+    SegmentOverlap,
+    /// Image or segment exceeds partition or allowlisted memory bounds.
     OutOfBounds,
     /// Segment XOR checksum mismatch.
     ChecksumMismatch,
+    /// Image header does not mandate appended SHA-256 (`header[23] != 1`).
+    MissingHash,
     /// Appended SHA-256 digest mismatch.
     HashMismatch,
+    /// Non-zero alignment padding or non-erased trailing unverified bytes.
+    TrailingBytes,
+    /// Entry address is zero or outside verified executable segments.
+    InvalidEntryAddress,
 }
 
 impl From<FlashError> for ImageVerifyError {
     fn from(err: FlashError) -> Self {
         Self::Flash(err)
     }
+}
+
+#[inline]
+const fn span_within(start: u32, end: u32, low: u32, high: u32) -> bool {
+    if start == end {
+        start >= low && start < high
+    } else {
+        start >= low && end <= high
+    }
+}
+
+#[inline]
+const fn span_overlaps(start: u32, end: u32, low: u32, high: u32) -> bool {
+    if start == end {
+        start >= low && start < high
+    } else {
+        start < high && end > low
+    }
+}
+
+/// Returns `true` if `[addr, addr + len)` lies strictly inside allowlisted
+/// ESP32 application DRAM0 or IRAM0, outside bootloader SRAM and MMIO.
+#[inline]
+#[must_use]
+pub const fn is_valid_app_ram_span(addr: u32, len: u32) -> bool {
+    let Some(end) = addr.checked_add(len) else {
+        return false;
+    };
+    span_within(addr, end, SOC_APP_DRAM_LOW, SOC_APP_DRAM_HIGH)
+        || span_within(addr, end, SOC_APP_IRAM_LOW, SOC_APP_IRAM_HIGH)
+}
+
+/// Returns `true` if `addr` is a non-zero address inside allowlisted
+/// executable ESP32 memory (application IRAM0 or flash-mapped IROM).
+#[inline]
+#[must_use]
+pub const fn is_valid_executable_addr(addr: u32) -> bool {
+    if addr == 0 {
+        return false;
+    }
+    (addr >= SOC_APP_IRAM_LOW && addr < SOC_APP_IRAM_HIGH)
+        || (addr >= SOC_IROM_LOW && addr < SOC_IROM_HIGH)
 }
 
 fn classify_and_check_overlap(
@@ -359,35 +534,134 @@ fn classify_and_check_overlap(
         return Ok(SegmentKind::RtcSkip);
     }
 
-    // Check DROM
-    if load_addr >= SOC_DROM_LOW && seg_end <= SOC_DROM_HIGH {
-        return Ok(SegmentKind::DromMap);
-    }
-    // Check IROM
-    if load_addr >= SOC_IROM_LOW && seg_end <= SOC_IROM_HIGH {
-        return Ok(SegmentKind::IromMap);
-    }
-    // Check RTC
-    if (load_addr >= 0x3FF8_0000 && seg_end <= 0x3FF8_2000)
-        || (load_addr >= 0x400C_0000 && seg_end <= 0x400C_2000)
-        || (load_addr >= 0x5000_0000 && seg_end <= 0x5000_2000)
-    {
-        return Ok(SegmentKind::RtcSkip);
+    if (load_addr & 3) != 0 {
+        return Err(ImageVerifyError::UnalignedLoadAddress);
     }
 
-    // Check Bootloader SRAM Overlap:
-    let overlaps_dram = load_addr < BOOTLOADER_DRAM_END && seg_end > BOOTLOADER_DRAM_START;
-    let overlaps_iram = load_addr < BOOTLOADER_IRAM_END && seg_end > BOOTLOADER_IRAM_START;
-    if overlaps_dram || overlaps_iram {
+    // Reject overlap with bootloader SRAM and its SRAM1 IRAM alias first so
+    // callers distinguish bootloader isolation faults from generic OOB.
+    if span_overlaps(
+        load_addr,
+        seg_end,
+        BOOTLOADER_DRAM_START,
+        BOOTLOADER_DRAM_END,
+    ) || span_overlaps(
+        load_addr,
+        seg_end,
+        BOOTLOADER_IRAM_START,
+        BOOTLOADER_IRAM_END,
+    ) || span_overlaps(
+        load_addr,
+        seg_end,
+        BOOTLOADER_DRAM_IRAM_ALIAS_START,
+        BOOTLOADER_DRAM_IRAM_ALIAS_END,
+    ) {
         return Err(ImageVerifyError::BootloaderOverlap);
     }
 
-    Ok(SegmentKind::RamLoad)
+    // Strict allowlist: DROM
+    if span_within(load_addr, seg_end, SOC_DROM_LOW, SOC_DROM_HIGH) {
+        return Ok(SegmentKind::DromMap);
+    }
+    // Strict allowlist: IROM
+    if span_within(load_addr, seg_end, SOC_IROM_LOW, SOC_IROM_HIGH) {
+        return Ok(SegmentKind::IromMap);
+    }
+    // Strict allowlist: RTC fast/slow RAM
+    if span_within(load_addr, seg_end, SOC_RTC_DRAM_LOW, SOC_RTC_DRAM_HIGH)
+        || span_within(load_addr, seg_end, SOC_RTC_IRAM_LOW, SOC_RTC_IRAM_HIGH)
+        || span_within(load_addr, seg_end, SOC_RTC_SLOW_LOW, SOC_RTC_SLOW_HIGH)
+    {
+        return Ok(SegmentKind::RtcSkip);
+    }
+    // Strict allowlist: application DRAM0 and IRAM0 SRAM
+    if is_valid_app_ram_span(load_addr, data_len) {
+        return Ok(SegmentKind::RamLoad);
+    }
+
+    Err(ImageVerifyError::OutOfBounds)
 }
 
-/// Verifies an ESP32 application image from flash, validating headers,
-/// checksum, optional SHA-256, and bootloader memory isolation.
-#[allow(clippy::manual_is_multiple_of)]
+#[inline]
+const fn mmu_page_vspan(load_addr: u32, data_len: u32) -> Option<(u64, u64)> {
+    const PAGE_SIZE: u64 = 0x1_0000;
+    const PAGE_MASK: u64 = PAGE_SIZE - 1;
+    let v_aligned = (load_addr as u64) & !PAGE_MASK;
+    if data_len == 0 {
+        return Some((v_aligned, v_aligned));
+    }
+    let off = (load_addr as u64) & PAGE_MASK;
+    let pages = (off + (data_len as u64) + PAGE_MASK) >> 16;
+    Some((v_aligned, v_aligned + pages * PAGE_SIZE))
+}
+
+fn check_segment_pairwise_overlap(
+    existing: &[Option<VerifiedSegment>],
+    candidate: &VerifiedSegment,
+) -> Result<(), ImageVerifyError> {
+    let cand_end = candidate
+        .load_addr
+        .checked_add(candidate.data_len)
+        .ok_or(ImageVerifyError::OutOfBounds)?;
+
+    for prev in existing.iter().flatten() {
+        match (prev.kind, candidate.kind) {
+            (SegmentKind::RamLoad, SegmentKind::RamLoad) => {
+                let prev_end = prev
+                    .load_addr
+                    .checked_add(prev.data_len)
+                    .ok_or(ImageVerifyError::OutOfBounds)?;
+                if span_overlaps(candidate.load_addr, cand_end, prev.load_addr, prev_end) {
+                    return Err(ImageVerifyError::SegmentOverlap);
+                }
+            }
+            (
+                SegmentKind::DromMap | SegmentKind::IromMap,
+                SegmentKind::DromMap | SegmentKind::IromMap,
+            ) => {
+                if let (Some((a_lo, a_hi)), Some((b_lo, b_hi))) = (
+                    mmu_page_vspan(prev.load_addr, prev.data_len),
+                    mmu_page_vspan(candidate.load_addr, candidate.data_len),
+                ) {
+                    if a_lo < b_hi && b_lo < a_hi {
+                        return Err(ImageVerifyError::SegmentOverlap);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn entry_in_verified_executable_segment(
+    entry_addr: u32,
+    segments: &[Option<VerifiedSegment>; MAX_SEGMENTS],
+) -> bool {
+    if !is_valid_executable_addr(entry_addr) {
+        return false;
+    }
+    for seg in segments.iter().flatten() {
+        let is_exec_seg = match seg.kind {
+            SegmentKind::IromMap => true,
+            SegmentKind::RamLoad => seg.load_addr >= SOC_APP_IRAM_LOW,
+            SegmentKind::DromMap | SegmentKind::RtcSkip => false,
+        };
+        if !is_exec_seg || seg.data_len == 0 {
+            continue;
+        }
+        if let Some(seg_end) = seg.load_addr.checked_add(seg.data_len) {
+            if entry_addr >= seg.load_addr && entry_addr < seg_end {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Verifies an ESP32 application image from flash, enforcing strict ESP32
+/// memory allowlists, mandatory SHA-256 verification, executable entry point
+/// bounds, inter-segment isolation, and clean trailing flash state.
 pub fn verify_app_image<F: FlashIo>(
     flash: &mut F,
     part_offset: u32,
@@ -410,8 +684,12 @@ pub fn verify_app_image<F: FlashIo>(
         return Err(ImageVerifyError::InvalidSegmentCount);
     }
 
+    // Mandatory SHA-256 verification: reject images without hash_appended == 1.
+    if header[23] != 1 {
+        return Err(ImageVerifyError::MissingHash);
+    }
+
     let entry_addr = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
-    let hash_appended = header[23] == 1;
 
     let mut sha256 = Sha256::new();
     sha256.update(header);
@@ -420,7 +698,7 @@ pub fn verify_app_image<F: FlashIo>(
     let mut segments: [Option<VerifiedSegment>; MAX_SEGMENTS] = [None; MAX_SEGMENTS];
     let mut rel_cursor: u32 = 24;
 
-    for slot in segments.iter_mut().take(segment_count) {
+    for seg_idx in 0..segment_count {
         let seg_hdr_end = rel_cursor
             .checked_add(8)
             .ok_or(ImageVerifyError::OutOfBounds)?;
@@ -448,7 +726,7 @@ pub fn verify_app_image<F: FlashIo>(
         ]);
         rel_cursor = seg_hdr_end;
 
-        if data_len % 4 != 0 {
+        if (data_len & 3) != 0 {
             return Err(ImageVerifyError::UnalignedSegmentLength);
         }
 
@@ -463,12 +741,22 @@ pub fn verify_app_image<F: FlashIo>(
         let flash_offset = part_offset
             .checked_add(rel_cursor)
             .ok_or(ImageVerifyError::OutOfBounds)?;
-        *slot = Some(VerifiedSegment {
+
+        // Enforce 64 KiB intra-page offset parity for MMU-mapped segments.
+        if matches!(kind, SegmentKind::DromMap | SegmentKind::IromMap)
+            && (load_addr & 0xFFFF) != (flash_offset & 0xFFFF)
+        {
+            return Err(ImageVerifyError::UnalignedLoadAddress);
+        }
+
+        let candidate = VerifiedSegment {
             flash_offset,
             load_addr,
             data_len,
             kind,
-        });
+        };
+        check_segment_pairwise_overlap(&segments[..seg_idx], &candidate)?;
+        segments[seg_idx] = Some(candidate);
 
         let mut remaining = data_len;
         while remaining > 0 {
@@ -489,8 +777,11 @@ pub fn verify_app_image<F: FlashIo>(
         }
     }
 
-    let target_end = (rel_cursor.saturating_add(16)) & !15;
-    let pad_len = target_end.saturating_sub(rel_cursor);
+    // Pad to the next 16-byte boundary (always 1..=16 bytes, no underflow).
+    let pad_len = 16 - (rel_cursor & 15);
+    let target_end = rel_cursor
+        .checked_add(pad_len)
+        .ok_or(ImageVerifyError::OutOfBounds)?;
     if target_end > part_size {
         return Err(ImageVerifyError::OutOfBounds);
     }
@@ -501,6 +792,12 @@ pub fn verify_app_image<F: FlashIo>(
     flash.read(pad_flash_addr, &mut bounce.bytes[..pad_len as usize])?;
     let pad_bytes = &bounce.bytes[..pad_len as usize];
 
+    for &pad_byte in &pad_bytes[..pad_len as usize - 1] {
+        if pad_byte != 0 {
+            return Err(ImageVerifyError::TrailingBytes);
+        }
+    }
+
     let actual_checksum = pad_bytes[pad_len as usize - 1];
     if actual_checksum != xor_checksum {
         return Err(ImageVerifyError::ChecksumMismatch);
@@ -509,23 +806,55 @@ pub fn verify_app_image<F: FlashIo>(
     sha256.update(pad_bytes);
     rel_cursor = target_end;
 
-    if hash_appended {
-        let hash_end = rel_cursor
-            .checked_add(32)
-            .ok_or(ImageVerifyError::OutOfBounds)?;
-        if hash_end > part_size {
-            return Err(ImageVerifyError::OutOfBounds);
+    // Mandatory 32-byte SHA-256 verification.
+    let hash_end = rel_cursor
+        .checked_add(32)
+        .ok_or(ImageVerifyError::OutOfBounds)?;
+    if hash_end > part_size {
+        return Err(ImageVerifyError::OutOfBounds);
+    }
+    let hash_flash_addr = part_offset
+        .checked_add(rel_cursor)
+        .ok_or(ImageVerifyError::OutOfBounds)?;
+    flash.read(hash_flash_addr, &mut bounce.bytes[..32])?;
+    let expected_hash = &bounce.bytes[..32];
+    let computed_hash = sha256.finalize();
+    if computed_hash != expected_hash {
+        return Err(ImageVerifyError::HashMismatch);
+    }
+    rel_cursor = hash_end;
+
+    // Reject non-erased trailing unverified bytes immediately following the
+    // SHA-256 trailer up to the next 4 KiB sector boundary (clamped to
+    // `part_size`).
+    if rel_cursor < part_size {
+        const SECTOR_BYTES: u32 = 4096;
+        let next_sector_boundary = rel_cursor
+            .checked_add(SECTOR_BYTES)
+            .map_or(part_size, |v| (v & !(SECTOR_BYTES - 1)).min(part_size));
+        let mut tail_cursor = rel_cursor;
+        while tail_cursor < next_sector_boundary {
+            let chunk_len = core::cmp::min(
+                (next_sector_boundary - tail_cursor) as usize,
+                bounce.bytes.len(),
+            );
+            let tail_addr = part_offset
+                .checked_add(tail_cursor)
+                .ok_or(ImageVerifyError::OutOfBounds)?;
+            flash.read(tail_addr, &mut bounce.bytes[..chunk_len])?;
+            for &b in &bounce.bytes[..chunk_len] {
+                if b != 0xFF {
+                    return Err(ImageVerifyError::TrailingBytes);
+                }
+            }
+            tail_cursor = tail_cursor
+                .checked_add(chunk_len as u32)
+                .ok_or(ImageVerifyError::OutOfBounds)?;
         }
-        let hash_flash_addr = part_offset
-            .checked_add(rel_cursor)
-            .ok_or(ImageVerifyError::OutOfBounds)?;
-        flash.read(hash_flash_addr, &mut bounce.bytes[..32])?;
-        let expected_hash = &bounce.bytes[..32];
-        let computed_hash = sha256.finalize();
-        if computed_hash != expected_hash {
-            return Err(ImageVerifyError::HashMismatch);
-        }
-        rel_cursor = hash_end;
+    }
+
+    if !entry_in_verified_executable_segment(entry_addr, &segments) {
+        return Err(ImageVerifyError::InvalidEntryAddress);
     }
 
     let image_end_offset = part_offset
@@ -628,34 +957,38 @@ mod tests {
             .expect("write_raw failed");
 
         let verified = verify_app_image(&mut flash, 0, 8192).expect("verification should succeed");
-        assert_eq!(verified.entry_addr, 0x4008_0000);
-        assert_eq!(verified.segment_count, 3);
-        assert_eq!(verified.image_end_offset, total_len as u32);
+        assert_eq!(verified.entry_addr(), 0x4008_0000);
+        assert_eq!(verified.segment_count(), 3);
+        assert_eq!(verified.image_end_offset(), total_len as u32);
 
-        let s0 = verified.segments[0].expect("seg 0 present");
-        assert_eq!(s0.kind, SegmentKind::DromMap);
-        assert_eq!(s0.load_addr, 0x3F40_0020);
-        assert_eq!(s0.data_len, 64);
-        assert_eq!(s0.flash_offset, 32);
+        let s0 = verified.segments()[0].expect("seg 0 present");
+        assert_eq!(s0.kind(), SegmentKind::DromMap);
+        assert_eq!(s0.load_addr(), 0x3F40_0020);
+        assert_eq!(s0.data_len(), 64);
+        assert_eq!(s0.flash_offset(), 32);
 
-        let s1 = verified.segments[1].expect("seg 1 present");
-        assert_eq!(s1.kind, SegmentKind::RamLoad);
-        assert_eq!(s1.load_addr, 0x4008_0000);
-        assert_eq!(s1.data_len, 64);
-        assert_eq!(s1.flash_offset, 104);
+        let s1 = verified.segments()[1].expect("seg 1 present");
+        assert_eq!(s1.kind(), SegmentKind::RamLoad);
+        assert_eq!(s1.load_addr(), 0x4008_0000);
+        assert_eq!(s1.data_len(), 64);
+        assert_eq!(s1.flash_offset(), 104);
 
-        let s2 = verified.segments[2].expect("seg 2 present");
-        assert_eq!(s2.kind, SegmentKind::RamLoad);
-        assert_eq!(s2.load_addr, 0x3FFB_0000);
-        assert_eq!(s2.data_len, 64);
-        assert_eq!(s2.flash_offset, 176);
+        let s2 = verified.segments()[2].expect("seg 2 present");
+        assert_eq!(s2.kind(), SegmentKind::RamLoad);
+        assert_eq!(s2.load_addr(), 0x3FFB_0000);
+        assert_eq!(s2.data_len(), 64);
+        assert_eq!(s2.flash_offset(), 176);
     }
 
     #[test]
     fn test_corrupted_payload_checksum_mismatch() {
         let drom_payload = [0x11u8; 64];
-        let (mut image_bytes, total_len) =
-            build_test_image(0x4008_0000, true, &[(0x3F40_0020, &drom_payload)]);
+        let iram_payload = [0x22u8; 64];
+        let (mut image_bytes, total_len) = build_test_image(
+            0x4008_0000,
+            true,
+            &[(0x3F40_0020, &drom_payload), (0x4008_0000, &iram_payload)],
+        );
 
         // Corrupt one payload byte
         image_bytes[35] ^= 0xFF;
@@ -672,8 +1005,12 @@ mod tests {
     #[test]
     fn test_corrupted_hash_mismatch() {
         let drom_payload = [0x11u8; 64];
-        let (mut image_bytes, total_len) =
-            build_test_image(0x4008_0000, true, &[(0x3F40_0020, &drom_payload)]);
+        let iram_payload = [0x22u8; 64];
+        let (mut image_bytes, total_len) = build_test_image(
+            0x4008_0000,
+            true,
+            &[(0x3F40_0020, &drom_payload), (0x4008_0000, &iram_payload)],
+        );
 
         // Corrupt the last byte of the SHA-256 hash
         image_bytes[total_len - 1] ^= 0xFF;
@@ -692,7 +1029,7 @@ mod tests {
         let payload = [0xAAu8; 64];
 
         // Case 1: Overlaps Bootloader IRAM (0x4007_8000..0x4008_0000)
-        let (image1, len1) = build_test_image(0x4008_0000, false, &[(0x4007_8100, &payload)]);
+        let (image1, len1) = build_test_image(0x4008_0000, true, &[(0x4007_8100, &payload)]);
         let mut flash1 = MockFlash::<2>::new();
         flash1
             .write_raw(0, &image1[..len1])
@@ -701,24 +1038,41 @@ mod tests {
         assert_eq!(err1, ImageVerifyError::BootloaderOverlap);
 
         // Case 2: Overlaps Bootloader DRAM (0x3FFF_0000..0x3FFF_8000)
-        let (image2, len2) = build_test_image(0x4008_0000, false, &[(0x3FFF_0100, &payload)]);
+        let (image2, len2) = build_test_image(0x4008_0000, true, &[(0x3FFF_0100, &payload)]);
         let mut flash2 = MockFlash::<2>::new();
         flash2
             .write_raw(0, &image2[..len2])
             .expect("write_raw failed");
         let err2 = verify_app_image(&mut flash2, 0, 8192).expect_err("should reject DRAM overlap");
         assert_eq!(err2, ImageVerifyError::BootloaderOverlap);
+
+        // Case 3: Overlaps SRAM1 IRAM alias of bootloader DRAM
+        // (0x400A_8000..0x400B_0000)
+        let (image3, len3) = build_test_image(0x4008_0000, true, &[(0x400A_8100, &payload)]);
+        let mut flash3 = MockFlash::<2>::new();
+        flash3
+            .write_raw(0, &image3[..len3])
+            .expect("write_raw failed");
+        let err3 = verify_app_image(&mut flash3, 0, 8192).expect_err("should reject alias overlap");
+        assert_eq!(err3, ImageVerifyError::BootloaderOverlap);
     }
 
     #[test]
     fn test_padding_segment_returns_rtc_skip() {
         let pad_payload = [0x00u8; 64];
         let drom_payload = [0x11u8; 64];
+        let iram_payload = [0x22u8; 64];
 
+        // seg0 ends at offset 24+8+64 = 96; seg1 header is 8 bytes -> payload
+        // at flash offset 104 (0x68), matching 0x3F40_0068 page offset.
         let (image_bytes, total_len) = build_test_image(
             0x4008_0000,
             true,
-            &[(0, &pad_payload), (0x3F40_0020, &drom_payload)],
+            &[
+                (0, &pad_payload),
+                (0x3F40_0068, &drom_payload),
+                (0x4008_0000, &iram_payload),
+            ],
         );
 
         let mut flash = MockFlash::<2>::new();
@@ -727,18 +1081,169 @@ mod tests {
             .expect("write_raw failed");
 
         let verified = verify_app_image(&mut flash, 0, 8192).expect("verification should succeed");
-        assert_eq!(verified.segment_count, 2);
+        assert_eq!(verified.segment_count(), 3);
 
-        let s0 = verified.segments[0].expect("seg 0 present");
-        assert_eq!(s0.kind, SegmentKind::RtcSkip);
-        assert_eq!(s0.load_addr, 0);
-        assert_eq!(s0.data_len, 64);
-        assert_eq!(s0.flash_offset, 32);
+        let s0 = verified.segments()[0].expect("seg 0 present");
+        assert_eq!(s0.kind(), SegmentKind::RtcSkip);
+        assert_eq!(s0.load_addr(), 0);
+        assert_eq!(s0.data_len(), 64);
+        assert_eq!(s0.flash_offset(), 32);
 
-        let s1 = verified.segments[1].expect("seg 1 present");
-        assert_eq!(s1.kind, SegmentKind::DromMap);
-        assert_eq!(s1.load_addr, 0x3F40_0020);
-        assert_eq!(s1.data_len, 64);
-        assert_eq!(s1.flash_offset, 104);
+        let s1 = verified.segments()[1].expect("seg 1 present");
+        assert_eq!(s1.kind(), SegmentKind::DromMap);
+        assert_eq!(s1.load_addr(), 0x3F40_0068);
+        assert_eq!(s1.data_len(), 64);
+        assert_eq!(s1.flash_offset(), 104);
+    }
+
+    #[test]
+    fn test_rejects_mmio_rom_unmapped_and_unaligned_segments() {
+        let payload = [0x5Au8; 64];
+
+        // MMIO peripheral register space (DPORT 0x3FF0_0000)
+        let (img_mmio, len_mmio) = build_test_image(0x4008_0000, true, &[(0x3FF0_0040, &payload)]);
+        let mut flash = MockFlash::<2>::new();
+        flash.write_raw(0, &img_mmio[..len_mmio]).expect("write");
+        assert_eq!(
+            verify_app_image(&mut flash, 0, 8192),
+            Err(ImageVerifyError::OutOfBounds)
+        );
+
+        // Mask ROM space (0x4000_0000)
+        let (img_rom, len_rom) = build_test_image(0x4008_0000, true, &[(0x4000_0100, &payload)]);
+        let mut flash_rom = MockFlash::<2>::new();
+        flash_rom.write_raw(0, &img_rom[..len_rom]).expect("write");
+        assert_eq!(
+            verify_app_image(&mut flash_rom, 0, 8192),
+            Err(ImageVerifyError::OutOfBounds)
+        );
+
+        // ROM static stack/BSS space (0x3FFF_8000..0x4000_0000)
+        let (img_stack, len_stack) =
+            build_test_image(0x4008_0000, true, &[(0x3FFF_8100, &payload)]);
+        let mut flash_stack = MockFlash::<2>::new();
+        flash_stack
+            .write_raw(0, &img_stack[..len_stack])
+            .expect("write");
+        assert_eq!(
+            verify_app_image(&mut flash_stack, 0, 8192),
+            Err(ImageVerifyError::OutOfBounds)
+        );
+
+        // Unaligned RAM load address
+        let (img_unaligned, len_u) =
+            build_test_image(0x4008_0000, true, &[(0x4008_0002, &payload)]);
+        let mut flash_u = MockFlash::<2>::new();
+        flash_u
+            .write_raw(0, &img_unaligned[..len_u])
+            .expect("write");
+        assert_eq!(
+            verify_app_image(&mut flash_u, 0, 8192),
+            Err(ImageVerifyError::UnalignedLoadAddress)
+        );
+    }
+
+    #[test]
+    fn test_rejects_missing_sha256_and_trailing_unverified_bytes() {
+        let iram_payload = [0x22u8; 64];
+
+        // Case 1: header[23] == 0 (missing mandatory SHA-256)
+        let (img_no_hash, len_nh) =
+            build_test_image(0x4008_0000, false, &[(0x4008_0000, &iram_payload)]);
+        let mut flash_nh = MockFlash::<2>::new();
+        flash_nh
+            .write_raw(0, &img_no_hash[..len_nh])
+            .expect("write");
+        assert_eq!(
+            verify_app_image(&mut flash_nh, 0, 8192),
+            Err(ImageVerifyError::MissingHash)
+        );
+
+        // Case 2: header[23] == 2 (non-boolean downgrade value)
+        let (mut img_bad_flag, len_bf) =
+            build_test_image(0x4008_0000, true, &[(0x4008_0000, &iram_payload)]);
+        img_bad_flag[23] = 2;
+        let mut flash_bf = MockFlash::<2>::new();
+        flash_bf
+            .write_raw(0, &img_bad_flag[..len_bf])
+            .expect("write");
+        assert_eq!(
+            verify_app_image(&mut flash_bf, 0, 8192),
+            Err(ImageVerifyError::MissingHash)
+        );
+
+        // Case 3: trailing non-0xFF byte appended after valid SHA-256 trailer
+        let (img_valid, len_v) =
+            build_test_image(0x4008_0000, true, &[(0x4008_0000, &iram_payload)]);
+        let mut flash_tail = MockFlash::<2>::new();
+        flash_tail.write_raw(0, &img_valid[..len_v]).expect("write");
+        flash_tail
+            .write_raw(len_v as u32, &[0xAA])
+            .expect("write trailing byte");
+        assert_eq!(
+            verify_app_image(&mut flash_tail, 0, 8192),
+            Err(ImageVerifyError::TrailingBytes)
+        );
+    }
+
+    #[test]
+    fn test_rejects_invalid_entry_addr_and_overlapping_segments() {
+        let dram_payload = [0x33u8; 64];
+        let iram_payload = [0x22u8; 64];
+
+        // Case 1: entry_addr == 0
+        let (img_zero, len_z) = build_test_image(0, true, &[(0x4008_0000, &iram_payload)]);
+        let mut flash_z = MockFlash::<2>::new();
+        flash_z.write_raw(0, &img_zero[..len_z]).expect("write");
+        assert_eq!(
+            verify_app_image(&mut flash_z, 0, 8192),
+            Err(ImageVerifyError::InvalidEntryAddress)
+        );
+
+        // Case 2: entry_addr in DRAM (non-executable)
+        let (img_dram, len_d) =
+            build_test_image(0x3FFB_0000, true, &[(0x3FFB_0000, &dram_payload)]);
+        let mut flash_d = MockFlash::<2>::new();
+        flash_d.write_raw(0, &img_dram[..len_d]).expect("write");
+        assert_eq!(
+            verify_app_image(&mut flash_d, 0, 8192),
+            Err(ImageVerifyError::InvalidEntryAddress)
+        );
+
+        // Case 3: entry_addr in IRAM range but outside loaded segment
+        let (img_outside, len_o) =
+            build_test_image(0x4008_1000, true, &[(0x4008_0000, &iram_payload)]);
+        let mut flash_o = MockFlash::<2>::new();
+        flash_o.write_raw(0, &img_outside[..len_o]).expect("write");
+        assert_eq!(
+            verify_app_image(&mut flash_o, 0, 8192),
+            Err(ImageVerifyError::InvalidEntryAddress)
+        );
+
+        // Case 4: pairwise overlapping RamLoad segments
+        let (img_ov, len_ov) = build_test_image(
+            0x4008_0000,
+            true,
+            &[(0x4008_0000, &iram_payload), (0x4008_0020, &iram_payload)],
+        );
+        let mut flash_ov = MockFlash::<2>::new();
+        flash_ov.write_raw(0, &img_ov[..len_ov]).expect("write");
+        assert_eq!(
+            verify_app_image(&mut flash_ov, 0, 8192),
+            Err(ImageVerifyError::SegmentOverlap)
+        );
+
+        // Case 5: DROM segment violating 64 KiB intra-page parity
+        let (img_par, len_par) = build_test_image(
+            0x4008_0000,
+            true,
+            &[(0x3F40_0040, &dram_payload), (0x4008_0000, &iram_payload)],
+        );
+        let mut flash_par = MockFlash::<2>::new();
+        flash_par.write_raw(0, &img_par[..len_par]).expect("write");
+        assert_eq!(
+            verify_app_image(&mut flash_par, 0, 8192),
+            Err(ImageVerifyError::UnalignedLoadAddress)
+        );
     }
 }

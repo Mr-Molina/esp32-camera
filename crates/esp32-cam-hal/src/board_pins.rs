@@ -1,6 +1,6 @@
-//! Compile-time board pinout profiles
-//! (authoritative board schematic / hardware pinout tables) and GPIO conflict / range
-//! validation (`FW-001`, `DMA-102`).
+//! Compile-time board pinout profiles (authoritative board schematic /
+//! hardware pinout tables) and GPIO conflict / range validation (`FW-001`,
+//! `DMA-102`).
 
 #![forbid(unsafe_code)]
 
@@ -588,7 +588,8 @@ mod tests {
         assert_eq!(Esp32S3GoouuuPins.validate_pins(), Ok(()));
         assert_eq!(Esp32S3XiaoPins.validate_pins(), Ok(()));
 
-        // Verify exact pin numbers against authoritative board schematic / hardware pinout tables
+        // Verify exact pin numbers against authoritative board schematic
+        // and hardware pinout tables
         assert_eq!(WroverKitPins::XCLK, 21);
         assert_eq!(WroverKitPins::D0, 4);
         assert_eq!(WroverKitPins::PWDN, None);

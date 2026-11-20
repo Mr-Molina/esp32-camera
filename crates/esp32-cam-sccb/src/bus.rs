@@ -217,20 +217,32 @@ pub trait SccbBus {
 
     /// Writes multiple 8-bit register address/value pairs in sequence,
     /// coalescing contiguous ascending addresses into [`Self::write_reg8_seq`].
+    ///
+    /// # Preconditions
+    /// Callers must only use this helper on sensors that support sequential
+    /// auto-incrementing register bursts and whose contiguous runs contain no
+    /// write-strobe side effects. Register `0xFF` (`BANK_SEL`) is never
+    /// coalesced into a sequential burst.
     fn write_reg8_bulk(&mut self, addr: u8, pairs: &[(u8, u8)]) -> Result<(), CameraError> {
+        const BANK_SEL_REG8: u8 = 0xFF;
         if !is_valid_sccb_addr(addr) {
             return Err(CameraError::InvalidArg);
         }
         let mut idx = 0;
         while idx < pairs.len() {
             let (start_reg, first_val) = pairs[idx];
+            if start_reg == BANK_SEL_REG8 {
+                self.write_reg8(addr, start_reg, first_val)?;
+                idx += 1;
+                continue;
+            }
             let mut buf = [0u8; MAX_BULK_COALESCE_BYTES];
             buf[0] = first_val;
             let mut run_len = 1usize;
             while idx + run_len < pairs.len() && run_len < MAX_BULK_COALESCE_BYTES {
                 let prev_reg = pairs[idx + run_len - 1].0;
                 let (cand_reg, cand_val) = pairs[idx + run_len];
-                if prev_reg.checked_add(1) == Some(cand_reg) {
+                if cand_reg != BANK_SEL_REG8 && prev_reg.checked_add(1) == Some(cand_reg) {
                     buf[run_len] = cand_val;
                     run_len += 1;
                 } else {
@@ -248,21 +260,34 @@ pub trait SccbBus {
     }
 
     /// Writes multiple 16-bit register address/value pairs in sequence,
-    /// coalescing contiguous ascending addresses into [`Self::write_reg16_seq`].
+    /// coalescing contiguous ascending addresses into
+    /// [`Self::write_reg16_seq`].
+    ///
+    /// # Preconditions
+    /// Callers must only use this helper on sensors that support sequential
+    /// auto-incrementing register bursts and whose contiguous runs contain no
+    /// write-strobe side effects. Bank-select register `0x00FF` is never
+    /// coalesced into a sequential burst.
     fn write_reg16_bulk(&mut self, addr: u8, pairs: &[(u16, u8)]) -> Result<(), CameraError> {
+        const BANK_SEL_REG16: u16 = 0x00FF;
         if !is_valid_sccb_addr(addr) {
             return Err(CameraError::InvalidArg);
         }
         let mut idx = 0;
         while idx < pairs.len() {
             let (start_reg, first_val) = pairs[idx];
+            if start_reg == BANK_SEL_REG16 {
+                self.write_reg16(addr, start_reg, first_val)?;
+                idx += 1;
+                continue;
+            }
             let mut buf = [0u8; MAX_BULK_COALESCE_BYTES];
             buf[0] = first_val;
             let mut run_len = 1usize;
             while idx + run_len < pairs.len() && run_len < MAX_BULK_COALESCE_BYTES {
                 let prev_reg = pairs[idx + run_len - 1].0;
                 let (cand_reg, cand_val) = pairs[idx + run_len];
-                if prev_reg.checked_add(1) == Some(cand_reg) {
+                if cand_reg != BANK_SEL_REG16 && prev_reg.checked_add(1) == Some(cand_reg) {
                     buf[run_len] = cand_val;
                     run_len += 1;
                 } else {
@@ -298,6 +323,10 @@ pub trait SccbBus {
 /// `0x10 | group_id` (group end) followed by `0xA0 | group_id` (group launch)
 /// so multi-register exposure/gain/timing pairs latch atomically at frame end.
 ///
+/// If `f(bus)` returns `Err`, a best-effort group-end write (`0x10 | group_id`)
+/// is emitted without launching (`0xA0 | group_id`) so subsequent unrelated
+/// writes are not captured by an abandoned hardware group hold.
+///
 /// # Errors
 /// Returns [`CameraError::InvalidArg`] if `slv_addr` is outside `0x08..=0x77`
 /// or `group_id > 3`, or propagates any [`CameraError`] from `bus` or `f`.
@@ -315,7 +344,13 @@ where
         return Err(CameraError::InvalidArg);
     }
     bus.write_reg16(slv_addr, OV_GROUP_HOLD_REG, group_id)?;
-    let out = f(bus)?;
+    let out = match f(bus) {
+        Ok(val) => val,
+        Err(err) => {
+            let _ = bus.write_reg16(slv_addr, OV_GROUP_HOLD_REG, 0x10 | group_id);
+            return Err(err);
+        }
+    };
     bus.write_reg16(slv_addr, OV_GROUP_HOLD_REG, 0x10 | group_id)?;
     bus.write_reg16(slv_addr, OV_GROUP_HOLD_REG, 0xA0 | group_id)?;
     Ok(out)
@@ -597,5 +632,44 @@ mod tests {
         );
         assert_eq!(bus.reads, 0);
         assert_eq!(bus.writes, 0);
+    }
+
+    #[test]
+    fn test_m122_ov_group_hold_error_emits_group_end_without_launch() {
+        let mut bus = SpyBus::new(0);
+        let res: Result<(), CameraError> = with_ov_group_hold(&mut bus, 0x3C, 2, |b| {
+            b.write_reg16(0x3C, 0x3500, 0xAA)?;
+            Err(CameraError::SccbError)
+        });
+        assert_eq!(res, Err(CameraError::SccbError));
+        assert_eq!(
+            &bus.log16[..bus.log16_len],
+            &[
+                (OV_GROUP_HOLD_REG, 0x02),
+                (0x3500, 0xAA),
+                (OV_GROUP_HOLD_REG, 0x12),
+            ],
+            "closure Err must emit Group End (0x10|id) and never launch (0xA0|id)"
+        );
+    }
+
+    #[test]
+    fn test_m234_bulk_does_not_coalesce_bank_select() {
+        let mut bus = SpyBus::new(0);
+        let pairs8 = [(0xFE, 0x11), (0xFF, 0x01)];
+        assert_eq!(bus.write_reg8_bulk(0x30, &pairs8), Ok(()));
+        assert_eq!(bus.writes, 2);
+        assert_eq!(
+            bus.seq8_calls, 0,
+            "0xFF BANK_SEL must not be coalesced into write_reg8_seq"
+        );
+
+        let pairs16 = [(0x00FE, 0x11), (0x00FF, 0x01)];
+        assert_eq!(bus.write_reg16_bulk(0x30, &pairs16), Ok(()));
+        assert_eq!(bus.writes, 4);
+        assert_eq!(
+            bus.seq16_calls, 0,
+            "0x00FF BANK_SEL must not be coalesced into write_reg16_seq"
+        );
     }
 }

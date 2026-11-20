@@ -2,6 +2,8 @@
 //!
 //! Compliant with FIPS-197, RFC 3602, RFC 4493, RFC 3394, and NIST SP 800-38D.
 
+use super::hash::{ct_eq, zeroize_bytes, zeroize_u32s};
+
 /// Error type for AES operations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AesError;
@@ -47,11 +49,7 @@ const INV_SBOX: [u8; 256] = [
 const RCON: [u8; 10] = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36];
 
 fn gmul2(x: u8) -> u8 {
-    if (x & 0x80) != 0 {
-        (x << 1) ^ 0x1b
-    } else {
-        x << 1
-    }
+    (x << 1) ^ (0u8.wrapping_sub(x >> 7) & 0x1b)
 }
 
 fn gmul(b: u8, x: u8) -> u8 {
@@ -72,6 +70,12 @@ fn gmul(b: u8, x: u8) -> u8 {
 /// AES-128 expanded key schedule.
 pub struct Aes128Key {
     round_keys: [u32; 44],
+}
+
+impl Drop for Aes128Key {
+    fn drop(&mut self) {
+        zeroize_u32s(&mut self.round_keys);
+    }
 }
 
 impl Aes128Key {
@@ -103,6 +107,7 @@ impl Aes128Key {
     /// Encrypts a single 16-byte block.
     pub fn encrypt_block(&self, block: &[u8; 16], out: &mut [u8; 16]) {
         let mut s = *block;
+        let mut new_s = [0u8; 16];
         for c in 0..4 {
             let kw = self.round_keys[c].to_be_bytes();
             for r in 0..4 {
@@ -117,7 +122,6 @@ impl Aes128Key {
                 s[0], s[5], s[10], s[15], s[4], s[9], s[14], s[3], s[8], s[13], s[2], s[7], s[12],
                 s[1], s[6], s[11],
             ];
-            let mut new_s = [0u8; 16];
             for c in 0..4 {
                 let (a, b, cv, d) = (s[4 * c], s[4 * c + 1], s[4 * c + 2], s[4 * c + 3]);
                 new_s[4 * c] = gmul(2, a) ^ gmul(3, b) ^ cv ^ d;
@@ -147,11 +151,14 @@ impl Aes128Key {
             }
         }
         *out = s;
+        zeroize_bytes(&mut s);
+        zeroize_bytes(&mut new_s);
     }
 
     /// Decrypts a single 16-byte block.
     pub fn decrypt_block(&self, block: &[u8; 16], out: &mut [u8; 16]) {
         let mut s = *block;
+        let mut new_s = [0u8; 16];
         for c in 0..4 {
             let kw = self.round_keys[40 + c].to_be_bytes();
             for r in 0..4 {
@@ -172,7 +179,6 @@ impl Aes128Key {
                     s[r + 4 * c] ^= kw[r];
                 }
             }
-            let mut new_s = [0u8; 16];
             for c in 0..4 {
                 let (a, b, cv, d) = (s[4 * c], s[4 * c + 1], s[4 * c + 2], s[4 * c + 3]);
                 new_s[4 * c] = gmul(14, a) ^ gmul(11, b) ^ gmul(13, cv) ^ gmul(9, d);
@@ -196,39 +202,51 @@ impl Aes128Key {
             }
         }
         *out = s;
+        zeroize_bytes(&mut s);
+        zeroize_bytes(&mut new_s);
     }
 }
 
 /// In-place AES-128 CBC mode encryption.
+///
+/// # Errors
+///
+/// Returns [`AesError`] if `data.len()` is not a multiple of 16 bytes.
 pub fn aes_128_cbc_encrypt(key: &[u8; 16], iv: &[u8; 16], data: &mut [u8]) -> Result<(), AesError> {
     if !data.len().is_multiple_of(16) {
         return Err(AesError);
     }
     let cipher = Aes128Key::new(key);
     let mut cur = *iv;
+    let mut block = [0u8; 16];
     for chunk in data.as_chunks_mut::<16>().0 {
         for (c, &iv_b) in chunk.iter_mut().zip(cur.iter()) {
             *c ^= iv_b;
         }
-        let mut block = [0u8; 16];
         block.copy_from_slice(chunk);
         cipher.encrypt_block(&block, &mut cur);
         chunk.copy_from_slice(&cur);
     }
+    zeroize_bytes(&mut cur);
+    zeroize_bytes(&mut block);
     Ok(())
 }
 
 /// In-place AES-128 CBC mode decryption.
+///
+/// # Errors
+///
+/// Returns [`AesError`] if `data.len()` is not a multiple of 16 bytes.
 pub fn aes_128_cbc_decrypt(key: &[u8; 16], iv: &[u8; 16], data: &mut [u8]) -> Result<(), AesError> {
     if !data.len().is_multiple_of(16) {
         return Err(AesError);
     }
     let cipher = Aes128Key::new(key);
     let mut cur = *iv;
+    let mut block = [0u8; 16];
+    let mut out = [0u8; 16];
     for chunk in data.as_chunks_mut::<16>().0 {
-        let mut block = [0u8; 16];
         block.copy_from_slice(chunk);
-        let mut out = [0u8; 16];
         cipher.decrypt_block(&block, &mut out);
         for (o, &iv_b) in out.iter_mut().zip(cur.iter()) {
             *o ^= iv_b;
@@ -236,6 +254,9 @@ pub fn aes_128_cbc_decrypt(key: &[u8; 16], iv: &[u8; 16], data: &mut [u8]) -> Re
         cur = block;
         chunk.copy_from_slice(&out);
     }
+    zeroize_bytes(&mut cur);
+    zeroize_bytes(&mut block);
+    zeroize_bytes(&mut out);
     Ok(())
 }
 
@@ -246,9 +267,7 @@ fn shl1(b: &[u8; 16]) -> [u8; 16] {
         out[i] = (b[i] << 1) | carry;
         carry = (b[i] >> 7) & 1;
     }
-    if carry != 0 {
-        out[15] ^= 0x87;
-    }
+    out[15] ^= 0u8.wrapping_sub(carry) & 0x87;
     out
 }
 
@@ -257,35 +276,30 @@ pub fn omac1_aes_128_vector(key: &[u8; 16], slices: &[&[u8]]) -> [u8; 16] {
     let cipher = Aes128Key::new(key);
     let mut l = [0u8; 16];
     cipher.encrypt_block(&[0u8; 16], &mut l);
-    let k1 = shl1(&l);
-    let k2 = shl1(&k1);
-    let total_len: usize = slices.iter().map(|s| s.len()).sum();
-    let full_blocks_before_last = if total_len == 0 {
-        0
-    } else {
-        (total_len - 1) / 16
-    };
+    let mut k1 = shl1(&l);
+    let mut k2 = shl1(&k1);
     let mut x = [0u8; 16];
     let mut buf = [0u8; 16];
-    let mut buf_len = 0;
-    let mut processed = 0;
+    let mut enc_out = [0u8; 16];
+    let mut buf_len = 0usize;
+    let mut has_data = false;
+
     for slice in slices {
         for &byte in *slice {
-            buf[buf_len] = byte;
-            buf_len += 1;
-            if buf_len == 16 && processed < full_blocks_before_last {
+            if buf_len == 16 {
                 for j in 0..16 {
                     x[j] ^= buf[j];
                 }
-                let mut out = [0u8; 16];
-                cipher.encrypt_block(&x, &mut out);
-                x = out;
+                cipher.encrypt_block(&x, &mut enc_out);
+                x = enc_out;
                 buf_len = 0;
-                processed += 1;
             }
+            buf[buf_len] = byte;
+            buf_len += 1;
+            has_data = true;
         }
     }
-    if total_len > 0 && total_len.is_multiple_of(16) {
+    if has_data && buf_len == 16 {
         for j in 0..16 {
             buf[j] ^= k1[j];
         }
@@ -301,6 +315,12 @@ pub fn omac1_aes_128_vector(key: &[u8; 16], slices: &[&[u8]]) -> [u8; 16] {
     }
     let mut out = [0u8; 16];
     cipher.encrypt_block(&x, &mut out);
+    zeroize_bytes(&mut l);
+    zeroize_bytes(&mut k1);
+    zeroize_bytes(&mut k2);
+    zeroize_bytes(&mut x);
+    zeroize_bytes(&mut buf);
+    zeroize_bytes(&mut enc_out);
     out
 }
 
@@ -310,8 +330,16 @@ pub fn omac1_aes_128(key: &[u8; 16], data: &[u8]) -> [u8; 16] {
 }
 
 /// RFC 3394 AES Key Wrap algorithm supporting n >= 1 64-bit blocks.
+///
+/// # Errors
+///
+/// Returns [`AesError`] if `plain` is empty, not a multiple of 8 bytes, or
+/// `cipher_out.len() != plain.len() + 8`.
 pub fn aes_wrap(kek: &[u8; 16], plain: &[u8], cipher_out: &mut [u8]) -> Result<(), AesError> {
-    if !plain.len().is_multiple_of(8) || plain.is_empty() || cipher_out.len() != plain.len() + 8 {
+    if !plain.len().is_multiple_of(8)
+        || plain.is_empty()
+        || plain.len().checked_add(8) != Some(cipher_out.len())
+    {
         return Err(AesError);
     }
     let n = plain.len() / 8;
@@ -319,12 +347,12 @@ pub fn aes_wrap(kek: &[u8; 16], plain: &[u8], cipher_out: &mut [u8]) -> Result<(
     cipher_out[..8].copy_from_slice(&[0xa6; 8]);
     cipher_out[8..].copy_from_slice(plain);
     let mut block = [0u8; 16];
+    let mut enc = [0u8; 16];
     for j in 0..6 {
         for i in 1..=n {
             let t = (n * j + i) as u64;
             block[..8].copy_from_slice(&cipher_out[..8]);
             block[8..].copy_from_slice(&cipher_out[i * 8..(i + 1) * 8]);
-            let mut enc = [0u8; 16];
             cipher.encrypt_block(&block, &mut enc);
             let a = u64::from_be_bytes([
                 enc[0], enc[1], enc[2], enc[3], enc[4], enc[5], enc[6], enc[7],
@@ -333,10 +361,17 @@ pub fn aes_wrap(kek: &[u8; 16], plain: &[u8], cipher_out: &mut [u8]) -> Result<(
             cipher_out[i * 8..(i + 1) * 8].copy_from_slice(&enc[8..16]);
         }
     }
+    zeroize_bytes(&mut block);
+    zeroize_bytes(&mut enc);
     Ok(())
 }
 
 /// RFC 3394 AES Key Unwrap algorithm supporting n >= 1 64-bit blocks.
+///
+/// # Errors
+///
+/// Returns [`AesError`] if `cipher` length is invalid or the integrity check
+/// value fails verification.
 pub fn aes_unwrap(kek: &[u8; 16], cipher: &[u8], plain_out: &mut [u8]) -> Result<(), AesError> {
     if !cipher.len().is_multiple_of(8) || cipher.len() < 16 || plain_out.len() != cipher.len() - 8 {
         return Err(AesError);
@@ -347,24 +382,24 @@ pub fn aes_unwrap(kek: &[u8; 16], cipher: &[u8], plain_out: &mut [u8]) -> Result
     a.copy_from_slice(&cipher[..8]);
     plain_out.copy_from_slice(&cipher[8..]);
     let mut block = [0u8; 16];
+    let mut dec = [0u8; 16];
     for j in (0..6).rev() {
         for i in (1..=n).rev() {
             let t = (n * j + i) as u64;
             let a_val = u64::from_be_bytes(a) ^ t;
             block[..8].copy_from_slice(&a_val.to_be_bytes());
             block[8..].copy_from_slice(&plain_out[(i - 1) * 8..i * 8]);
-            let mut dec = [0u8; 16];
             key_sched.decrypt_block(&block, &mut dec);
             a.copy_from_slice(&dec[..8]);
             plain_out[(i - 1) * 8..i * 8].copy_from_slice(&dec[8..16]);
         }
     }
-    let mut diff = 0u8;
-    for &b in &a {
-        diff |= b ^ 0xa6;
-    }
-    if diff != 0 {
-        plain_out.fill(0);
+    let valid = ct_eq(&a, &[0xa6; 8]);
+    zeroize_bytes(&mut a);
+    zeroize_bytes(&mut block);
+    zeroize_bytes(&mut dec);
+    if !valid {
+        zeroize_bytes(plain_out);
         return Err(AesError);
     }
     Ok(())
@@ -375,25 +410,27 @@ fn gf128_mul(x: &[u8; 16], y: &[u8; 16]) -> [u8; 16] {
     let mut v = *y;
     for &xb in x {
         for bit in (0..8).rev() {
-            if ((xb >> bit) & 1) != 0 {
-                for i in 0..16 {
-                    z[i] ^= v[i];
-                }
+            let mask = 0u8.wrapping_sub((xb >> bit) & 1);
+            for i in 0..16 {
+                z[i] ^= v[i] & mask;
             }
-            let carry = (v[15] & 1) != 0;
+            let r_mask = 0u8.wrapping_sub(v[15] & 1) & 0xe1;
             for i in (1..16).rev() {
                 v[i] = (v[i] >> 1) | (v[i - 1] << 7);
             }
-            v[0] >>= 1;
-            if carry {
-                v[0] ^= 0xe1;
-            }
+            v[0] = (v[0] >> 1) ^ r_mask;
         }
     }
+    zeroize_bytes(&mut v);
     z
 }
 
 /// NIST SP 800-38D AES-GMAC tag calculation.
+///
+/// # Errors
+///
+/// Returns [`AesError`] if `iv` is empty or `iv`/`aad` bit lengths overflow
+/// `u64`.
 pub fn aes_gmac(
     key: &[u8; 16],
     iv: &[u8],
@@ -403,6 +440,8 @@ pub fn aes_gmac(
     if iv.is_empty() {
         return Err(AesError);
     }
+    let iv_bits = (iv.len() as u64).checked_mul(8).ok_or(AesError)?;
+    let aad_bits = (aad.len() as u64).checked_mul(8).ok_or(AesError)?;
     let cipher = Aes128Key::new(key);
     let mut h = [0u8; 16];
     cipher.encrypt_block(&[0u8; 16], &mut h);
@@ -425,12 +464,14 @@ pub fn aes_gmac(
             iv_pos += take;
         }
         let mut iv_len_blk = [0u8; 16];
-        let iv_bits = (iv.len() as u64).wrapping_mul(8);
         iv_len_blk[8..16].copy_from_slice(&iv_bits.to_be_bytes());
         for i in 0..16 {
             iv_len_blk[i] ^= j0_y[i];
         }
         j0 = gf128_mul(&iv_len_blk, &h);
+        zeroize_bytes(&mut j0_y);
+        zeroize_bytes(&mut chunk);
+        zeroize_bytes(&mut iv_len_blk);
     }
     let mut y = [0u8; 16];
     let mut pos = 0;
@@ -446,7 +487,6 @@ pub fn aes_gmac(
         pos += take;
     }
     let mut len_blk = [0u8; 16];
-    let aad_bits = (aad.len() as u64).wrapping_mul(8);
     len_blk[..8].copy_from_slice(&aad_bits.to_be_bytes());
     for i in 0..16 {
         len_blk[i] ^= y[i];
@@ -457,6 +497,12 @@ pub fn aes_gmac(
     for i in 0..16 {
         tag_out[i] = y[i] ^ ej0[i];
     }
+    zeroize_bytes(&mut h);
+    zeroize_bytes(&mut j0);
+    zeroize_bytes(&mut y);
+    zeroize_bytes(&mut chunk);
+    zeroize_bytes(&mut len_blk);
+    zeroize_bytes(&mut ej0);
     Ok(())
 }
 
@@ -590,5 +636,27 @@ mod tests {
                 0x56, 0x03
             ]
         );
+    }
+
+    #[test]
+    fn test_aes_unwrap_tamper_zeroizes_output_and_cmac_multislice() {
+        let kek = [0x11u8; 16];
+        let pt = [0x22u8; 16];
+        let mut ct = [0u8; 24];
+        aes_wrap(&kek, &pt, &mut ct).expect("wrap");
+        ct[0] ^= 0x01;
+        let mut out = [0xAAu8; 16];
+        assert_eq!(aes_unwrap(&kek, &ct, &mut out), Err(AesError));
+        assert_eq!(out, [0u8; 16]);
+
+        // Verify lazy-streaming CMAC matches single-slice across boundaries.
+        let key = [0x2bu8; 16];
+        let msg33 = [0x5au8; 33];
+        for len in [0usize, 1, 15, 16, 17, 32, 33] {
+            let single = omac1_aes_128(&key, &msg33[..len]);
+            let split = len / 2;
+            let vectored = omac1_aes_128_vector(&key, &[&msg33[..split], &msg33[split..len]]);
+            assert_eq!(single, vectored, "CMAC mismatch at len={len}");
+        }
     }
 }

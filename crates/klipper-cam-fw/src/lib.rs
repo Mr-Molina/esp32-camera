@@ -2,12 +2,15 @@
 //!
 //! # Modules
 //!
-//! - [`config`]: Hardware pinout, camera sensor, network, and security configuration.
-//! - [`http`]: Non-blocking HTTP control server and multipart MJPEG stream server.
-//! - [`ota`]: Flash partition layout, constant-time token verification, and rollback state machine.
-//! - [`runtime`]: Bare-metal multi-core execution environment and cooperative scheduling.
-//! - [`spsc_ring`]: Lock-free single-producer single-consumer ring buffer for inter-core JPEG transfer.
-//! - [`telemetry`]: Performance counters, stream diagnostics, and system telemetry.
+//! - [`captive_net`]: Pure-Rust SoftAP DHCPv4 server and captive-portal DNS.
+//! - [`config`]: Hardware pinout, camera sensor, network, and security config.
+//! - [`http`]: Non-blocking HTTP control and multipart MJPEG stream servers.
+//! - [`ota`]: Flash partition layout, constant-time token check, and rollback.
+//! - [`prov_store`]: Brownout-safe dual-sector flash provisioning store.
+//! - [`prov_uart`]: Setup-Mode-only UART0 provisioning CLI fallback.
+//! - [`runtime`]: Bare-metal multi-core execution and cooperative scheduling.
+//! - [`spsc_ring`]: Lock-free SPSC ring buffer for inter-core JPEG transfer.
+//! - [`telemetry`]: Performance counters, stream diagnostics, and telemetry.
 
 #![no_std]
 #![deny(unsafe_code)]
@@ -17,10 +20,15 @@
 extern crate alloc;
 
 pub mod ap_select;
+pub mod captive_net;
 pub mod config;
 pub mod frame_buffer;
 pub mod http;
 pub mod ota;
+#[allow(unsafe_code)]
+pub mod prov_store;
+#[allow(unsafe_code)]
+pub mod prov_uart;
 pub mod runtime;
 pub mod spsc_ring;
 #[allow(unsafe_code)]
@@ -33,13 +41,20 @@ pub use ap_select::{
     ROAM_WEAK_DURATION_MS, SCAN_ACTIVE_MAX_MS, SCAN_ACTIVE_MIN_MS, SCAN_PASSES,
 };
 
+pub use captive_net::{
+    handle_captive_dns_query, DhcpServer, AP_IP, AP_SUBNET_MASK, CAPTIVE_PORTAL_URI,
+    DHCP_CLIENT_PORT, DHCP_LEASE_SECS, DHCP_POOL_SIZE, DHCP_POOL_START_HOST, DHCP_SERVER_PORT,
+    DNS_PORT, DNS_TTL_SECS,
+};
+
 pub use config::{
-    active_ota_token, active_wifi_pass, active_wifi_ssid, BoardVariant, CameraPinout, Ipv4Addr,
-    KlipperCamConfig, NetworkConfig, StaticIpConfig, TakePictureConfig, AITHINKER_FLASH_LED_GPIO,
-    AITHINKER_PINOUT, DEFAULT_CONTROL_PORT, DEFAULT_FB_COUNT, DEFAULT_JPEG_QUALITY,
-    DEFAULT_OTA_TOKEN, DEFAULT_STREAM_PACING_MS, DEFAULT_STREAM_PORT, DEFAULT_WIFI_RECONNECT_MS,
-    DEFAULT_XCLK_FREQ_HZ, ESP32S3_GOOUUU_PINOUT, ESP32S3_WROOM_PINOUT, ESP32S3_XIAO_PINOUT,
-    HTTP_PORT, JPEG_QUALITY, OTA_TOKEN, STREAM_PORT, WROVER_KIT_PINOUT,
+    active_ota_token, active_wifi_pass, active_wifi_ssid, BoardVariant, CameraPinout, ConfigError,
+    IpMode, Ipv4Addr, KlipperCamConfig, NetworkConfig, NvsConfigOverrides, StaticIpConfig,
+    TakePictureConfig, WifiAuthMode, AITHINKER_FLASH_LED_GPIO, AITHINKER_PINOUT,
+    DEFAULT_CONTROL_PORT, DEFAULT_FB_COUNT, DEFAULT_JPEG_QUALITY, DEFAULT_OTA_TOKEN,
+    DEFAULT_STREAM_PACING_MS, DEFAULT_STREAM_PORT, DEFAULT_WIFI_RECONNECT_MS, DEFAULT_XCLK_FREQ_HZ,
+    ESP32S3_GOOUUU_PINOUT, ESP32S3_WROOM_PINOUT, ESP32S3_XIAO_PINOUT, HTTP_PORT, JPEG_QUALITY,
+    MIN_OTA_TOKEN_LEN, OTA_TOKEN, STREAM_PORT, WROVER_KIT_PINOUT,
 };
 pub use esp32_cam_conversions::{
     self, decode_jpeg_to_rgb565, decode_jpeg_to_rgb888, encode_grayscale_to_jpeg,
@@ -77,13 +92,19 @@ pub use ota::{
     crc32_ieee, find_partition_by_label, validate_ota_image_header, verify_ota_token,
     verify_partition_table_integrity, AlignedFlashChunk, AlignedOtaBuf, Core1ParkControl,
     Core1PauseGuard, EspImageHeader, GuardedFlashStorage, MockNorFlash, NoOpFlashStorage,
-    OtaDataManager, OtaDataSelect, OtaError, OtaFlashStorage, OtaImgState, OtaSlot, PartitionEntry,
-    PartitionSubType, PartitionType, ESP_IMAGE_HEADER_LEN, ESP_IMAGE_HEADER_MAGIC,
-    ESP_IMAGE_MAX_SEGMENTS, ESP_IMAGE_MIN_SEGMENTS, FLASH_SECTOR_SIZE, NVS_OFFSET, NVS_SIZE,
-    OTADATA_OFFSET, OTADATA_SECTOR_0_OFFSET, OTADATA_SECTOR_1_OFFSET, OTADATA_SIZE, OTA_0_OFFSET,
-    OTA_0_SIZE, OTA_1_OFFSET, OTA_1_SIZE, OTA_CHUNK_SIZE, OTA_PARTITION_MAX_SIZE, PARTITION_TABLE,
-    PHY_INIT_OFFSET, PHY_INIT_SIZE,
+    OtaDataManager, OtaDataSector, OtaDataSelect, OtaError, OtaFlashStorage, OtaImgState, OtaSlot,
+    OtaWriteSession, PartitionEntry, PartitionSubType, PartitionType, ESP_IMAGE_HEADER_LEN,
+    ESP_IMAGE_HEADER_MAGIC, ESP_IMAGE_MAX_SEGMENTS, ESP_IMAGE_MIN_SEGMENTS, FLASH_SECTOR_SIZE,
+    NVS_OFFSET, NVS_SIZE, OTADATA_OFFSET, OTADATA_SECTOR_0_OFFSET, OTADATA_SECTOR_1_OFFSET,
+    OTADATA_SIZE, OTA_0_OFFSET, OTA_0_SIZE, OTA_1_OFFSET, OTA_1_SIZE, OTA_CHUNK_SIZE,
+    OTA_PARTITION_MAX_SIZE, PARTITION_TABLE, PHY_INIT_OFFSET, PHY_INIT_SIZE,
 };
+pub use prov_store::{
+    ProvStore, ProvStoreError, ProvisionedConfig, FLAG_PROVISIONED, FLAG_STATIC_IP,
+    MAX_OTA_TOKEN_LEN, MAX_PASS_LEN, MAX_SSID_LEN, MAX_STATIC_PREFIX_LEN, MIN_STATIC_PREFIX_LEN,
+    PROV_MAGIC, PROV_RECORD_LEN, PROV_SECTOR_A_OFFSET, PROV_SECTOR_B_OFFSET, PROV_VERSION,
+};
+pub use prov_uart::{UartProvAction, UartProvSession, UartReply};
 pub use runtime::{
     FirmwareRuntime, SensorHalAdapter, TakePictureRunner, WifiLifecycleState, WifiStaState,
 };

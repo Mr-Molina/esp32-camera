@@ -3,6 +3,7 @@
 #![no_std]
 #![cfg_attr(target_arch = "xtensa", feature(asm_experimental_arch))]
 
+pub mod ap_fsm;
 pub mod dma_ring;
 pub mod frames_80211;
 pub mod lmac_mmio;
@@ -11,6 +12,13 @@ pub mod rate_ctrl;
 pub mod regs;
 pub mod smoltcp_phy;
 pub mod sta_fsm;
+
+pub use crate::ap_fsm::ApConfig;
+pub use crate::ap_fsm::ApError;
+pub use crate::ap_fsm::ApMacCore;
+pub use crate::ap_fsm::ApStats;
+pub use crate::ap_fsm::ApTxSink;
+pub use crate::ap_fsm::MAX_AP_CLIENTS;
 
 pub use crate::dma_ring::DmaRingError;
 pub use crate::dma_ring::WifiRxCtrl;

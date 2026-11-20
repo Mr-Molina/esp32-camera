@@ -206,43 +206,51 @@ impl<'a> FirmwareRuntime<'a> {
 
     /// Handles `IP_EVENT_STA_GOT_IP`:
     /// 1. Records assigned station IPv4 address.
-    /// 2. Cancels OTA rollback (`esp_ota_mark_app_valid_cancel_rollback`,
-    ///    `APP-003` / `FW-002`).
-    /// 3. Starts the Port 80 and Port 81 HTTP servers if not already running.
+    /// 2. Starts the Port 80 and Port 81 HTTP servers if not already running.
+    ///
+    /// Note (`M-039` / `C1-019`): Because this convenience helper uses
+    /// [`NoOpFlashStorage`], it intentionally does **not** set
+    /// `rollback_cancelled = true`, preventing a non-persistent call from
+    /// masking a real flash rollback cancellation later.
     pub fn on_wifi_got_ip(&mut self, ip: Ipv4Addr) -> Result<(), OtaError> {
         let mut noop = NoOpFlashStorage;
         self.on_wifi_got_ip_with_flash(ip, &mut noop)
     }
 
-    /// Handles `IP_EVENT_STA_GOT_IP` and persists rollback cancellation to SPI
-    /// NOR `flash`:
-    /// 1. Records assigned station IPv4 address.
-    /// 2. Cancels OTA rollback in `otadata` and syncs the updated sector to
-    ///    `flash`.
-    /// 3. Starts the Port 80 and Port 81 HTTP servers if not already running.
+    /// Handles `IP_EVENT_STA_GOT_IP` and optionally persists rollback
+    /// cancellation to SPI NOR `flash` (`M-039`):
+    /// 1. Always records assigned station IPv4 address, updates the server's
+    ///    runtime active IP allowlist (`M-047`), and enables HTTP servers so a
+    ///    transient flash I/O error never blocks webserver bring-up.
+    /// 2. Only cancels OTA rollback in `otadata` when `self.first_http_served`
+    ///    is already `true` and `flash.has_persistent_otadata()` is `true`,
+    ///    delegating to [`Self::try_cancel_rollback_with_flash`] so a broken
+    ///    HTTP server can never prematurely confirm a new slot on `GOT_IP`
+    ///    alone (`M-039` / `FW-NET-02`).
     pub fn on_wifi_got_ip_with_flash<F: OtaFlashStorage>(
         &mut self,
         ip: Ipv4Addr,
         flash: &mut F,
     ) -> Result<(), OtaError> {
         self.ip_confirmed = true;
-        if !self.rollback_cancelled {
-            let _ = self.server.on_wifi_got_ip_with_flash(flash)?;
-            self.rollback_cancelled = true;
-        }
         self.wifi_state = WifiStaState::ConnectedGotIp { ip };
         self.webservers_started = true;
+        self.server.set_active_ip(ip);
+        if self.first_http_served && !self.rollback_cancelled && flash.has_persistent_otadata() {
+            let _ = self.try_cancel_rollback_with_flash(flash)?;
+        }
         Ok(())
     }
 
     /// Records a confirmed station IPv4 address (DHCP `Configured` or static IP
-    /// with verified ARP/peer reachability) and enables HTTP servers without
-    /// cancelling OTA rollback until the first HTTP request is served
-    /// (`FW-NET-02`).
+    /// with verified ARP/peer reachability), updates the server's active IP
+    /// allowlist (`M-047`), and enables HTTP servers without cancelling OTA
+    /// rollback until the first HTTP request is served (`FW-NET-02`).
     pub fn on_wifi_ip_confirmed(&mut self, ip: Ipv4Addr) {
         self.ip_confirmed = true;
         self.wifi_state = WifiStaState::ConnectedGotIp { ip };
         self.webservers_started = true;
+        self.server.set_active_ip(ip);
     }
 
     /// Marks that at least one HTTP response has been served (`FW-NET-02`).
@@ -250,9 +258,22 @@ impl<'a> FirmwareRuntime<'a> {
         self.first_http_served = true;
     }
 
+    /// Marks `first_http_served` only when a `2xx` HTTP response has been
+    /// served (`M-039` / `C1-019`).
+    pub fn on_http_request_served_status(&mut self, status_code: u16) {
+        if (200..=299).contains(&status_code) {
+            self.first_http_served = true;
+        }
+    }
+
     /// Cancels OTA rollback in `flash` once both `ip_confirmed` and
-    /// `first_http_served` are true (`FW-NET-02`). Leaves `rollback_cancelled`
-    /// `false` on error so the caller can log and retry.
+    /// `first_http_served` are true (`FW-NET-02`).
+    ///
+    /// Resynchronizes `otadata` from persistent `flash` before checking
+    /// pending-rollback state, rejects non-persistent (`NoOpFlashStorage`)
+    /// backends, refuses to cancel when a newly committed OTA is pending
+    /// reboot (`M-004`), and leaves `rollback_cancelled` `false` on error so
+    /// the caller can log and retry (`M-039` / `C1-019`).
     pub fn try_cancel_rollback_with_flash<F: OtaFlashStorage>(
         &mut self,
         flash: &mut F,
@@ -260,6 +281,15 @@ impl<'a> FirmwareRuntime<'a> {
         if !self.ip_confirmed || !self.first_http_served || self.rollback_cancelled {
             return Ok(false);
         }
+        if !flash.has_persistent_otadata() {
+            return Err(OtaError::FlashWriteError);
+        }
+        if self.server.ota_manager.pending_reboot_slot().is_some() {
+            return Err(OtaError::RollbackStateInvalid);
+        }
+        self.server
+            .ota_manager
+            .resync_from_flash_for_rollback(flash)?;
         if !self.server.ota_manager.has_pending_rollback() {
             self.rollback_cancelled = true;
             return Ok(false);
@@ -354,10 +384,10 @@ mod tests {
         assert!(rt.on_wifi_got_ip(ip).is_ok());
         assert_eq!(rt.wifi_state, WifiStaState::ConnectedGotIp { ip });
         assert!(rt.webservers_started);
-        assert!(rt.rollback_cancelled);
+        // NoOpFlashStorage must not falsely latch rollback_cancelled = true (M-039).
+        assert!(!rt.rollback_cancelled);
 
-        // Subsequent DHCP renewal does not re-write flash or fail when
-        // already cancelled
+        // Subsequent DHCP renewal updates IP cleanly.
         let ip_renewed = Ipv4Addr::new(172, 22, 1, 53);
         assert!(rt.on_wifi_got_ip(ip_renewed).is_ok());
         assert_eq!(
@@ -518,9 +548,9 @@ mod tests {
         runtime.on_wifi_sta_start();
         runtime
             .on_wifi_got_ip(Ipv4Addr::new(172, 22, 1, 52))
-            .expect("Wi-Fi IP acquisition cancels rollback and starts webservers");
+            .expect("Wi-Fi IP acquisition starts webservers");
         assert!(runtime.webservers_started);
-        assert!(runtime.rollback_cancelled);
+        assert!(!runtime.rollback_cancelled);
 
         // 6. Port 80 GET /snapshot serves the exact HAL-captured JPEG frame.
         let mut resp_buf = [0u8; 4096];
@@ -587,8 +617,8 @@ mod tests {
         assert!(status_json.contains("\"stream_active\":false"));
         assert!(status_json.contains("\"active_partition\":\"ota_0\""));
 
-        // 8. Port 80 POST /update authenticated OTA upload.
-        let ota_payload = crate::ota::make_valid_esp_image(false);
+        // 8. Port 80 POST /update authenticated OTA upload (with mandatory SHA-256).
+        let ota_payload = crate::ota::make_valid_esp_image(true);
         let mut ota_req = [0u8; 512];
         let req_len = {
             let mut w = SliceWriter::new(&mut ota_req);
@@ -610,5 +640,83 @@ mod tests {
         assert_eq!(runtime.server.last_ota_bytes_written(), ota_payload.len());
 
         let _ = streaming_hal.deinit().expect("deinit HAL camera driver");
+    }
+
+    #[test]
+    fn test_m039_m004_runtime_rollback_lifecycle_and_premature_cancel_blocked() {
+        use crate::ota::{MockNorFlash, OtaDataSelect, OtaImgState};
+
+        // 1. M-039: on_wifi_got_ip_with_flash BEFORE first HTTP 2xx must NOT
+        // cancel rollback in flash, while still bringing up webservers & IP.
+        let mut flash: MockNorFlash<8192> = MockNorFlash::new();
+        flash.otadata_s0[..32]
+            .copy_from_slice(&OtaDataSelect::new(1, OtaImgState::Valid).to_bytes());
+        flash.otadata_s1[..32]
+            .copy_from_slice(&OtaDataSelect::new(2, OtaImgState::PendingVerify).to_bytes());
+
+        let mut rt = FirmwareRuntime::new_default();
+        rt.server.ota_manager = OtaDataManager::load_from_flash(&mut flash).expect("load");
+        let ip = Ipv4Addr::new(172, 22, 1, 52);
+        let writes_before = flash.write_count;
+        assert_eq!(rt.on_wifi_got_ip_with_flash(ip, &mut flash), Ok(()));
+        assert!(rt.webservers_started);
+        assert_eq!(rt.wifi_state, WifiStaState::ConnectedGotIp { ip });
+        assert_eq!(rt.server.active_ip(), Some(ip));
+        assert!(!rt.rollback_cancelled);
+        assert_eq!(
+            flash.write_count, writes_before,
+            "flash must not be written before HTTP 2xx"
+        );
+
+        // 2. Non-2xx HTTP status must not set first_http_served; 2xx does.
+        rt.on_http_request_served_status(500);
+        assert!(!rt.first_http_served);
+        rt.on_http_request_served_status(200);
+        assert!(rt.first_http_served);
+
+        // Transient flash write failure after 2xx leaves rollback_cancelled = false.
+        flash.fail_writes = true;
+        assert!(rt.on_wifi_got_ip_with_flash(ip, &mut flash).is_err());
+        assert!(!rt.rollback_cancelled);
+
+        // 3. NoOpFlashStorage is rejected by try_cancel_rollback_with_flash.
+        assert_eq!(
+            rt.try_cancel_rollback_with_flash(&mut NoOpFlashStorage),
+            Err(OtaError::FlashWriteError)
+        );
+        assert!(!rt.rollback_cancelled);
+
+        // 4. Stale RAM state is resynced from flash before cancelling rollback.
+        rt.server.ota_manager.sector_1 = OtaDataSelect::new(2, OtaImgState::Valid);
+        flash.fail_writes = false;
+        assert_eq!(rt.try_cancel_rollback_with_flash(&mut flash), Ok(true));
+        assert!(rt.rollback_cancelled);
+
+        // 5. M-004: Committing an OTA to Ota0 while running Ota1 must NOT allow
+        // try_cancel_rollback_with_flash to prematurely mark unbooted Ota0 Valid.
+        let mut flash_ota: MockNorFlash<8192> = MockNorFlash::new_booted_ota0();
+        let mut rt_ota = FirmwareRuntime::new_default();
+        rt_ota.server.ota_manager =
+            OtaDataManager::load_from_flash(&mut flash_ota).expect("load ota0");
+        rt_ota.on_wifi_ip_confirmed(ip);
+        let img = crate::ota::make_valid_esp_image(true);
+        let slot = rt_ota
+            .server
+            .ota_manager
+            .write_ota_image_to_flash(&mut flash_ota, &img)
+            .expect("commit Ota1 while running Ota0");
+        assert_eq!(slot, OtaSlot::Ota1);
+        rt_ota.on_http_request_served_status(200);
+        assert_eq!(
+            rt_ota.try_cancel_rollback_with_flash(&mut flash_ota),
+            Err(OtaError::RollbackStateInvalid)
+        );
+        assert!(!rt_ota.rollback_cancelled);
+        let mut raw_s1 = [0u8; 32];
+        raw_s1.copy_from_slice(&flash_ota.otadata_s1[..32]);
+        assert_eq!(
+            OtaDataSelect::from_bytes(&raw_s1).state(),
+            OtaImgState::PendingVerify
+        );
     }
 }

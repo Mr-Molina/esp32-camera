@@ -152,29 +152,80 @@ impl<'a> PingPongFrameBuffer<'a> {
     }
 }
 
+/// Move-only reader pin token issued by [`TripleFrameBuffer`].
+///
+/// While a [`PinnedFrameSlot`] is live, [`TripleFrameBuffer`] refuses to
+/// recycle that slot into `write_idx` or swap it out during promotion,
+/// guaranteeing sound zero-`unsafe` scoped borrows via
+/// [`TripleFrameBuffer::slot_bytes`] (`M-018` / `C3-002`).
+#[derive(Debug, PartialEq, Eq)]
+pub struct PinnedFrameSlot {
+    slot_idx: usize,
+    len: usize,
+    seq: u64,
+}
+
+impl PinnedFrameSlot {
+    /// Returns the pinned slot index (`0..=2`).
+    #[inline]
+    #[must_use]
+    pub const fn slot_index(&self) -> u8 {
+        self.slot_idx as u8
+    }
+
+    /// Returns the valid JPEG payload length in bytes for this pinned frame.
+    #[inline]
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns `true` if the pinned frame has zero bytes.
+    #[inline]
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Returns the frame sequence number recorded when this slot was written.
+    #[inline]
+    #[must_use]
+    pub const fn frame_seq(&self) -> u64 {
+        self.seq
+    }
+}
+
 /// Zero-`unsafe` `#![no_std]` triple-buffered JPEG frame manager.
 ///
 /// Backs three PSRAM/DRAM slots (`read_idx`, `ready_idx`, `write_idx`) for
 /// race-free concurrent HTTP streaming (active read slot), HTTP snapshots
-/// (ready slot), and background DMA frame capture (write slot).
+/// (ready slot), and background DMA frame capture (write slot), with per-slot
+/// sequence tracking (`M-169`) and reader pinning refcounts (`M-018`).
 pub struct TripleFrameBuffer<'a> {
     slots: [&'a mut [u8]; 3],
     lens: [usize; 3],
+    seqs: [u64; 3],
+    pin_counts: [u32; 3],
     read_idx: usize,
     ready_idx: usize,
     write_idx: usize,
     has_new_ready: bool,
-    frame_seq: u64,
+    latest_seq: u64,
 }
 
 impl<'a> PartialEq for TripleFrameBuffer<'a> {
     fn eq(&self, other: &Self) -> bool {
         self.lens == other.lens
+            && self.seqs == other.seqs
+            && self.pin_counts == other.pin_counts
             && self.read_idx == other.read_idx
             && self.ready_idx == other.ready_idx
             && self.write_idx == other.write_idx
             && self.has_new_ready == other.has_new_ready
-            && self.frame_seq == other.frame_seq
+            && self.latest_seq == other.latest_seq
+            && self.slots[0][..self.lens[0]] == other.slots[0][..other.lens[0]]
+            && self.slots[1][..self.lens[1]] == other.slots[1][..other.lens[1]]
+            && self.slots[2][..self.lens[2]] == other.slots[2][..other.lens[2]]
     }
 }
 
@@ -184,23 +235,27 @@ impl<'a> core::fmt::Debug for TripleFrameBuffer<'a> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("TripleFrameBuffer")
             .field("lens", &self.lens)
+            .field("seqs", &self.seqs)
+            .field("pin_counts", &self.pin_counts)
             .field("read_idx", &self.read_idx)
             .field("ready_idx", &self.ready_idx)
             .field("write_idx", &self.write_idx)
             .field("has_new_ready", &self.has_new_ready)
-            .field("frame_seq", &self.frame_seq)
+            .field("latest_seq", &self.latest_seq)
             .finish()
     }
 }
 
 impl<'a> TripleFrameBuffer<'a> {
-    /// Initializes a triple-buffered [`TripleFrameBuffer`] backed by three slots.
+    /// Initializes a triple-buffered [`TripleFrameBuffer`] backed by three
+    /// equal-length slots.
     ///
     /// Copies `initial_frame` into `slot_a` and `slot_b`.
     ///
     /// # Errors
     ///
-    /// Returns [`CameraError::InvalidArg`] if `initial_frame` is empty.
+    /// Returns [`CameraError::InvalidArg`] if `initial_frame` is empty or the
+    /// three slots do not have identical capacities (`M-169`).
     /// Returns [`CameraError::BufferTooSmall`] if any slot is smaller
     /// than `initial_frame`.
     pub fn new(
@@ -216,16 +271,21 @@ impl<'a> TripleFrameBuffer<'a> {
         if slot_a.len() < init_len || slot_b.len() < init_len || slot_c.len() < init_len {
             return Err(CameraError::BufferTooSmall);
         }
+        if slot_a.len() != slot_b.len() || slot_b.len() != slot_c.len() {
+            return Err(CameraError::InvalidArg);
+        }
         slot_a[..init_len].copy_from_slice(initial_frame);
         slot_b[..init_len].copy_from_slice(initial_frame);
         Ok(Self {
             slots: [slot_a, slot_b, slot_c],
             lens: [init_len, init_len, 0],
+            seqs: [1, 1, 0],
+            pin_counts: [0, 0, 0],
             read_idx: 0,
             ready_idx: 1,
             write_idx: 2,
             has_new_ready: false,
-            frame_seq: 1,
+            latest_seq: 1,
         })
     }
 
@@ -259,16 +319,92 @@ impl<'a> TripleFrameBuffer<'a> {
         self.write_idx as u8
     }
 
-    /// Returns the monotonically increasing sequence number of the active frame.
+    /// Returns the sequence number of the active front-buffer frame (`M-169`).
     #[must_use]
     pub const fn frame_seq(&self) -> u64 {
-        self.frame_seq
+        self.seqs[self.read_idx]
+    }
+
+    /// Returns the sequence number of the active front-buffer frame (`M-169`).
+    #[must_use]
+    pub const fn active_frame_seq(&self) -> u64 {
+        self.seqs[self.read_idx]
+    }
+
+    /// Returns the monotonically increasing sequence number of the latest
+    /// committed frame (`M-169`).
+    #[must_use]
+    pub const fn latest_frame_seq(&self) -> u64 {
+        self.latest_seq
     }
 
     /// Returns `true` if a newer committed frame is waiting in the ready slot.
     #[must_use]
     pub const fn has_new_ready(&self) -> bool {
         self.has_new_ready
+    }
+
+    /// Returns the active reader pin refcount for `slot_idx` (`0..=2`).
+    #[must_use]
+    pub const fn pin_count(&self, slot_idx: usize) -> u32 {
+        if slot_idx < 3 {
+            self.pin_counts[slot_idx]
+        } else {
+            0
+        }
+    }
+
+    /// Returns `true` if `slot_idx` currently has one or more pinned readers.
+    #[must_use]
+    pub const fn is_slot_pinned(&self, slot_idx: usize) -> bool {
+        self.pin_count(slot_idx) > 0
+    }
+
+    /// Pins the currently active read slot, returning a move-only
+    /// [`PinnedFrameSlot`] token that protects the slot from promotion or
+    /// write recycling until [`Self::unpin_slot`] is called (`M-018`).
+    #[must_use]
+    pub fn pin_active_slot(&mut self) -> PinnedFrameSlot {
+        let idx = self.read_idx;
+        self.pin_counts[idx] = self.pin_counts[idx].saturating_add(1);
+        PinnedFrameSlot {
+            slot_idx: idx,
+            len: self.lens[idx],
+            seq: self.seqs[idx],
+        }
+    }
+
+    /// Pins the latest committed snapshot slot (`ready_idx` if a newer frame is
+    /// ready, else `read_idx`), protecting it from recycling until
+    /// [`Self::unpin_slot`] is called (`M-018`).
+    #[must_use]
+    pub fn pin_latest_snapshot_slot(&mut self) -> PinnedFrameSlot {
+        let idx = if self.has_new_ready {
+            self.ready_idx
+        } else {
+            self.read_idx
+        };
+        self.pin_counts[idx] = self.pin_counts[idx].saturating_add(1);
+        PinnedFrameSlot {
+            slot_idx: idx,
+            len: self.lens[idx],
+            seq: self.seqs[idx],
+        }
+    }
+
+    /// Releases a previously acquired [`PinnedFrameSlot`] reader pin (`M-018`).
+    pub fn unpin_slot(&mut self, token: PinnedFrameSlot) {
+        if token.slot_idx < 3 {
+            self.pin_counts[token.slot_idx] = self.pin_counts[token.slot_idx].saturating_sub(1);
+        }
+    }
+
+    /// Returns a scoped immutable slice for a live [`PinnedFrameSlot`] token.
+    #[must_use]
+    pub fn slot_bytes(&self, token: &PinnedFrameSlot) -> &[u8] {
+        let slot = &self.slots[token.slot_idx];
+        let clamped = token.len.min(slot.len());
+        &slot[..clamped]
     }
 
     /// Returns the latest committed frame for instantaneous snapshot delivery.
@@ -292,29 +428,38 @@ impl<'a> TripleFrameBuffer<'a> {
     /// Commits `new_len` bytes written into the staging/write slot.
     ///
     /// Swaps the write and ready slots, sets `has_new_ready = true`, and
-    /// increments `frame_seq`.
+    /// increments `latest_seq`. Refuses to recycle `ready_idx` into `write_idx`
+    /// while `ready_idx` is pinned by an active reader (`M-018`).
     ///
     /// # Errors
     ///
     /// Returns [`CameraError::InvalidArg`] if `new_len == 0` or exceeds
     /// the slot capacity.
+    /// Returns [`CameraError::InvalidState`] if `ready_idx` or `write_idx` is
+    /// currently pinned.
     pub fn commit_write_slot(&mut self, new_len: usize) -> Result<u64, CameraError> {
         if new_len == 0 || new_len > self.slots[self.write_idx].len() {
             return Err(CameraError::InvalidArg);
         }
+        if self.pin_counts[self.ready_idx] != 0 || self.pin_counts[self.write_idx] != 0 {
+            return Err(CameraError::InvalidState);
+        }
+        let next_seq = self.latest_seq.wrapping_add(1);
         self.lens[self.write_idx] = new_len;
+        self.seqs[self.write_idx] = next_seq;
+        self.latest_seq = next_seq;
         core::mem::swap(&mut self.write_idx, &mut self.ready_idx);
         self.has_new_ready = true;
-        self.frame_seq = self.frame_seq.wrapping_add(1);
-        Ok(self.frame_seq)
+        Ok(next_seq)
     }
 
     /// Promotes the ready slot to become the new active read slot.
     ///
     /// Returns `true` if a new ready frame was promoted, or `false` if no new
-    /// ready frame was available.
+    /// ready frame was available or if the current active read slot is pinned
+    /// by a reader (`M-018`).
     pub fn promote_ready_to_active(&mut self) -> bool {
-        if self.has_new_ready {
+        if self.has_new_ready && self.pin_counts[self.read_idx] == 0 {
             core::mem::swap(&mut self.read_idx, &mut self.ready_idx);
             self.has_new_ready = false;
             true
@@ -491,7 +636,9 @@ mod tests {
                 .commit_write_slot(chunk_data.len())
                 .expect("commit write slot");
             assert_eq!(seq, i);
-            assert_eq!(tfb.frame_seq(), i);
+            assert_eq!(tfb.latest_frame_seq(), i);
+            assert_eq!(tfb.active_frame_seq(), 1);
+            assert_eq!(tfb.frame_seq(), 1);
             assert!(tfb.has_new_ready());
 
             // Active frame remains pinned to initial frame at index 0
@@ -513,6 +660,7 @@ mod tests {
 
         // Active frame is still initial frame
         assert_eq!(tfb.active_frame(), &init_frame);
+        assert_eq!(tfb.frame_seq(), 1);
 
         // Promote ready to active
         let promoted = tfb.promote_ready_to_active();
@@ -520,10 +668,63 @@ mod tests {
         assert!(!tfb.has_new_ready());
         // Active frame is now the last committed chunk (value 6)
         assert_eq!(tfb.active_frame(), &[6u8; 16]);
+        assert_eq!(tfb.frame_seq(), 6);
+        assert_eq!(tfb.active_frame_seq(), 6);
 
         // Second promote returns false when has_new_ready is false
         let second_promoted = tfb.promote_ready_to_active();
         assert!(!second_promoted);
+    }
+
+    #[test]
+    fn test_triple_frame_buffer_pinning_blocks_recycling_and_promotion() {
+        let mut slot_a = [0u8; 64];
+        let mut slot_b = [0u8; 64];
+        let mut slot_c = [0u8; 64];
+        let init_frame = [0xFF, 0xD8, 0x01, 0xFF, 0xD9];
+
+        let mut tfb = TripleFrameBuffer::new(&mut slot_a, &mut slot_b, &mut slot_c, &init_frame)
+            .expect("initialize TripleFrameBuffer");
+
+        // Pin active slot (slot 0) as a streaming reader.
+        let active_pin = tfb.pin_active_slot();
+        assert_eq!(active_pin.slot_index(), 0);
+        assert_eq!(active_pin.frame_seq(), 1);
+        assert_eq!(tfb.slot_bytes(&active_pin), &init_frame);
+        assert!(tfb.is_slot_pinned(0));
+
+        // Writes into write_idx / ready_idx still succeed while read_idx is pinned.
+        let frame2 = [0xAA; 12];
+        tfb.write_slot_mut()[..frame2.len()].copy_from_slice(&frame2);
+        assert_eq!(tfb.commit_write_slot(frame2.len()), Ok(2));
+
+        // Promotion is blocked while read_idx is pinned.
+        assert!(!tfb.promote_ready_to_active());
+        assert_eq!(tfb.slot_bytes(&active_pin), &init_frame);
+
+        // Pin latest snapshot slot (ready_idx) -> blocks commit recycling ready_idx.
+        let snap_pin = tfb.pin_latest_snapshot_slot();
+        assert_eq!(snap_pin.frame_seq(), 2);
+        assert_eq!(tfb.slot_bytes(&snap_pin), &frame2);
+        let frame3 = [0xBB; 10];
+        tfb.write_slot_mut()[..frame3.len()].copy_from_slice(&frame3);
+        assert_eq!(
+            tfb.commit_write_slot(frame3.len()),
+            Err(CameraError::InvalidState)
+        );
+        assert_eq!(tfb.slot_bytes(&snap_pin), &frame2);
+
+        // Unpin snapshot slot -> commit now succeeds.
+        tfb.unpin_slot(snap_pin);
+        assert_eq!(tfb.commit_write_slot(frame3.len()), Ok(3));
+        assert_eq!(tfb.latest_snapshot_frame(), &frame3);
+
+        // Unpin active slot -> promotion now succeeds.
+        tfb.unpin_slot(active_pin);
+        assert!(!tfb.is_slot_pinned(0));
+        assert!(tfb.promote_ready_to_active());
+        assert_eq!(tfb.active_frame(), &frame3);
+        assert_eq!(tfb.active_frame_seq(), 3);
     }
 
     #[test]
@@ -545,6 +746,25 @@ mod tests {
             TripleFrameBuffer::new(&mut tiny, &mut slot_b, &mut slot_c, &init),
             Err(CameraError::BufferTooSmall)
         );
+
+        // Uneven slot capacities rejected (M-169)
+        let mut wider = [0u8; 24];
+        assert_eq!(
+            TripleFrameBuffer::new(&mut slot_a, &mut wider, &mut slot_c, &init),
+            Err(CameraError::InvalidArg)
+        );
+
+        // PartialEq compares slot contents, not only indices/lengths (M-169)
+        let mut a1 = [0u8; 16];
+        let mut b1 = [0u8; 16];
+        let mut c1 = [0u8; 16];
+        let mut a2 = [0u8; 16];
+        let mut b2 = [0u8; 16];
+        let mut c2 = [0u8; 16];
+        let init_alt = [0xFF, 0xD8, 0xBB, 0xFF, 0xD9];
+        let tfb1 = TripleFrameBuffer::new(&mut a1, &mut b1, &mut c1, &init).expect("tfb1");
+        let tfb2 = TripleFrameBuffer::new(&mut a2, &mut b2, &mut c2, &init_alt).expect("tfb2");
+        assert_ne!(tfb1, tfb2);
 
         let mut tfb = TripleFrameBuffer::new(&mut slot_a, &mut slot_b, &mut slot_c, &init)
             .expect("valid init");

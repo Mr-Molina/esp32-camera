@@ -8,6 +8,8 @@
 use core::hint;
 #[cfg(target_arch = "xtensa")]
 use core::ptr;
+#[cfg(any(target_arch = "xtensa", test))]
+use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Temperature sensor output register (`sens_reg.h:344`).
 ///
@@ -176,6 +178,163 @@ pub fn temprature_sens_read_ops<R: RegOps>(regs: &mut R) -> u8 {
     ((raw & SENS_TSENS_OUT_MASK) >> SENS_TSENS_OUT_SHIFT) as u8
 }
 
+/// Returns `true` iff `addr` is 4-byte aligned and belongs to the verified
+/// ESP32 COEX/TSENS MMIO register allowlist for reads.
+#[must_use]
+#[allow(non_upper_case_globals)]
+pub const fn is_valid_mmio_read_addr(addr: u32) -> bool {
+    if (addr & 3) != 0 {
+        return false;
+    }
+    matches!(
+        addr,
+        SENS_SAR_SLAVE_ADDR3_REG
+            | SENS_SAR_TSENS_CTRL_REG
+            | COEX_SLC_0x3FF5C080_REG
+            | COEX_MAC_0x600310D0_REG
+            | COEX_MAC_0x60031300_REG
+            | COEX_BT_PRIO0_0x60033D30_REG
+            | COEX_BT_PRIO1_0x60033D38_REG
+            | COEX_BT_PRIO2_0x60033D40_REG
+            | COEX_FE_0x600041C4_REG
+            | BB_COEX_0x3FF5D040_REG
+    )
+}
+
+/// Returns `true` iff `addr` is 4-byte aligned and belongs to the verified
+/// writable ESP32 COEX/TSENS MMIO register allowlist.
+#[must_use]
+#[allow(non_upper_case_globals)]
+pub const fn is_valid_mmio_write_addr(addr: u32) -> bool {
+    if (addr & 3) != 0 {
+        return false;
+    }
+    matches!(
+        addr,
+        SENS_SAR_TSENS_CTRL_REG
+            | COEX_SLC_0x3FF5C080_REG
+            | COEX_MAC_0x600310D0_REG
+            | COEX_MAC_0x60031300_REG
+            | COEX_BT_PRIO0_0x60033D30_REG
+            | COEX_BT_PRIO1_0x60033D38_REG
+            | COEX_BT_PRIO2_0x60033D40_REG
+            | COEX_FE_0x600041C4_REG
+            | BB_COEX_0x3FF5D040_REG
+    )
+}
+
+/// Lightweight `#![no_std]` atomic spinlock serializing dual-core and same-core
+/// ISR access to COEX MMIO RMW sequences and the TSENS FSM.
+///
+/// On Xtensa, acquiring the lock masks local interrupts (`rsil 15`) before
+/// spinning so a same-core ISR or higher-priority task cannot preempt the lock
+/// holder and deadlock on re-entry; dropping [`SpinLockGuard`] releases the
+/// lock and restores the saved `PS` interrupt level (`wsr.ps` + `rsync`).
+#[cfg(any(target_arch = "xtensa", test))]
+struct AtomicSpinLock {
+    locked: AtomicBool,
+}
+
+#[cfg(any(target_arch = "xtensa", test))]
+struct SpinLockGuard<'a> {
+    lock: &'a AtomicSpinLock,
+    #[cfg(target_arch = "xtensa")]
+    saved_ps: u32,
+}
+
+#[cfg(any(target_arch = "xtensa", test))]
+impl AtomicSpinLock {
+    const fn new() -> Self {
+        Self {
+            locked: AtomicBool::new(false),
+        }
+    }
+
+    fn lock(&self) -> SpinLockGuard<'_> {
+        #[cfg(target_arch = "xtensa")]
+        let saved_ps: u32 = {
+            let ps: u32;
+            // JUSTIFICATION: Masks local Xtensa interrupts to level 15 before
+            // acquiring the spinlock to prevent single-core ISR/preemption
+            // deadlock on `COEX_LOCK` or `TSENS_LOCK` (`M-103`).
+            // SAFETY:
+            // 1. Alignment & Non-null: Register-only `rsil` instruction.
+            // 2. Memory layout: Architectural Xtensa LX6 status register op.
+            // 3. Provenance: Valid privileged instruction on bare-metal ESP32.
+            // 4. Aliasing: Touches no Rust memory.
+            // 5. Volatile semantics: `asm!` without `nomem` prevents reordering
+            //    critical-section accesses before interrupt masking.
+            // 6. Panic safety: Cannot unwind; `SpinLockGuard::drop` restores PS.
+            unsafe {
+                core::arch::asm!("rsil {0}, 15", out(reg) ps, options(nostack));
+            }
+            ps
+        };
+        while self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            while self.locked.load(Ordering::Relaxed) {
+                hint::spin_loop();
+            }
+        }
+        SpinLockGuard {
+            lock: self,
+            #[cfg(target_arch = "xtensa")]
+            saved_ps,
+        }
+    }
+
+    #[cfg(all(test, not(target_arch = "xtensa")))]
+    fn try_lock(&self) -> Option<SpinLockGuard<'_>> {
+        self.locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| SpinLockGuard { lock: self })
+    }
+}
+
+#[cfg(any(target_arch = "xtensa", test))]
+impl Drop for SpinLockGuard<'_> {
+    fn drop(&mut self) {
+        self.lock.locked.store(false, Ordering::Release);
+        #[cfg(target_arch = "xtensa")]
+        {
+            let ps = self.saved_ps;
+            // JUSTIFICATION: Restores the saved Xtensa `PS` interrupt level
+            // after leaving the spinlock critical section (`M-103`).
+            // SAFETY:
+            // 1. Alignment & Non-null: Register-only instruction; no memory
+            //    operand.
+            // 2. Memory layout: Architectural Xtensa `wsr.ps` + `rsync`.
+            // 3. Provenance: `ps` was captured by `rsil 15` in `lock()`.
+            // 4. Aliasing: Touches no Rust memory; restores local core `PS`.
+            // 5. Volatile semantics: `asm!` without `nomem` orders the
+            //    `Release` store before re-enabling interrupts.
+            // 6. Panic safety: Cannot unwind.
+            unsafe {
+                core::arch::asm!(
+                    "wsr.ps {0}",
+                    "rsync",
+                    in(reg) ps,
+                    options(nostack),
+                );
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "xtensa")]
+static COEX_LOCK: AtomicSpinLock = AtomicSpinLock::new();
+
+#[cfg(target_arch = "xtensa")]
+static TSENS_LOCK: AtomicSpinLock = AtomicSpinLock::new();
+
+// JUSTIFICATION: Declares ESP32 ROM `ets_delay_us` and ESP-IDF DPORT register
+// read helper linked on Xtensa targets for TSENS timing and safe DPORT reads.
+// SAFETY: Both symbols use the standard C ABI, take plain `u32` value
+// arguments, and never unwind across FFI.
 #[cfg(target_arch = "xtensa")]
 extern "C" {
     fn ets_delay_us(us: u32);
@@ -189,36 +348,52 @@ struct HwRegOps;
 impl RegOps for HwRegOps {
     #[inline]
     fn read_u32(&self, addr: u32) -> u32 {
+        if !is_valid_mmio_read_addr(addr) {
+            return 0;
+        }
         // JUSTIFICATION: `esp_dport_access_reg_read` is the ESP-IDF DPORT/RTC
         // FFI read primitive required on ESP32 Xtensa silicon.
         // SAFETY:
-        // 1. Address validity: `addr` is a verified 32-bit ESP32 MMIO address.
+        // 1. Address validity: `is_valid_mmio_read_addr` verified 4-byte
+        //    alignment and membership in the COEX/TSENS MMIO allowlist.
         // 2. ABI & unwind: `extern "C"` helper is leaf-like and never unwinds.
         unsafe { esp_dport_access_reg_read(addr) }
     }
 
     #[inline]
     fn write_u32(&mut self, addr: u32, val: u32) {
-        // JUSTIFICATION: Direct MMIO write preceded by Xtensa `memw` matches
-        // `librtc.a:bt_bb.o` and `rtc_analog.o` ordering guarantees.
+        if !is_valid_mmio_write_addr(addr) {
+            return;
+        }
+        // JUSTIFICATION: Direct MMIO write bracketed by Xtensa `memw` barriers
+        // preserves pre- and post-write ordering against subsequent MMIO reads
+        // and `ets_delay_us` waits.
         // SAFETY:
-        // 1. Alignment & address: `addr` is a 4-byte aligned ESP32 MMIO word.
-        // 2. Volatile & barrier: `memw` + `write_volatile` prevents elision.
-        // 3. Exclusive access: Caller owns COEX/TSENS MMIO synchronization.
+        // 1. Alignment & address: `is_valid_mmio_write_addr` verified 4-byte
+        //    alignment and membership in the writable COEX/TSENS allowlist.
+        // 2. Volatile & barriers: leading and trailing `memw` + `write_volatile`
+        //    prevent compiler elision and posted-write skew.
+        // 3. Exclusive access: `COEX_LOCK`/`TSENS_LOCK` serialize RMW callers.
         unsafe {
             core::arch::asm!("memw", options(nostack, preserves_flags));
             ptr::write_volatile(addr as *mut u32, val);
+            core::arch::asm!("memw", options(nostack, preserves_flags));
         }
     }
 
     #[inline]
     fn delay_us(&mut self, us: u32) {
-        // JUSTIFICATION: ROM `ets_delay_us` FFI provides the exact microsecond
-        // busy-wait required by the temperature sensor FSM timing.
+        // JUSTIFICATION: Flushes posted RTC/APB register writes via `memw` and
+        // a DPORT read-back barrier before ROM `ets_delay_us` busy-waits for
+        // the temperature sensor FSM settling interval.
         // SAFETY:
-        // 1. Value argument: `us` is a plain `u32` with no pointer aliasing.
-        // 2. ABI & unwind: ROM busy-wait helper never panics or unwinds.
+        // 1. Read-back target: `SENS_SAR_TSENS_CTRL_REG` is a verified 4-byte
+        //    aligned side-effect-free control register.
+        // 2. Value argument: `us` is a plain `u32` with no pointer aliasing.
+        // 3. ABI & unwind: ROM busy-wait helper never panics or unwinds.
         unsafe {
+            core::arch::asm!("memw", options(nostack, preserves_flags));
+            let _ = esp_dport_access_reg_read(SENS_SAR_TSENS_CTRL_REG);
             ets_delay_us(us);
         }
     }
@@ -227,16 +402,17 @@ impl RegOps for HwRegOps {
 /// C ABI compatibility shim for `librtc.a:bt_bb.o:coex_bt_high_prio`.
 ///
 /// # Safety
-/// Caller must ensure ESP32 DPORT/MAC/BB clocks are enabled and no concurrent
-/// task mutates the coexistence priority registers during execution.
+/// Caller must ensure ESP32 DPORT/MAC/BB clocks are enabled. Dual-core RMW
+/// serialization is enforced internally by `COEX_LOCK`.
 // JUSTIFICATION: C radio blobs (`libnet80211.a:ieee80211_ioctl.o`) resolve
 // the unmangled `coex_bt_high_prio` symbol across the C ABI boundary.
-// SAFETY: Delegates immediately to `coex_bt_high_prio_ops` using `HwRegOps`
-// under the caller's `# Safety` hardware-clock and exclusivity preconditions.
+// SAFETY: Acquires `COEX_LOCK` and delegates to `coex_bt_high_prio_ops` using
+// `HwRegOps` under the caller's `# Safety` hardware-clock precondition.
 #[cfg(target_arch = "xtensa")]
 #[no_mangle]
 #[link_section = ".text.coex_bt_high_prio"]
 pub unsafe extern "C" fn coex_bt_high_prio() {
+    let _guard = COEX_LOCK.lock();
     let mut hw = HwRegOps;
     coex_bt_high_prio_ops(&mut hw);
 }
@@ -244,16 +420,18 @@ pub unsafe extern "C" fn coex_bt_high_prio() {
 /// C ABI compatibility shim for `librtc.a:rtc_analog.o:temprature_sens_read`.
 ///
 /// # Safety
-/// Caller must ensure ESP32 RTC/SAR/DPORT clocks are active and no concurrent
-/// task mutates `SENS_SAR_TSENS_CTRL_REG` during sensor conversion.
+/// Caller must ensure ESP32 RTC/SAR/DPORT clocks are active. Dual-core and
+/// same-core ISR TSENS FSM serialization is enforced internally by `TSENS_LOCK`
+/// (masking local interrupts via `rsil 15` and restoring `PS` on drop).
 // JUSTIFICATION: C PHY calibration blobs (`libphy.a:phy_chip_v7_cal.o`)
 // resolve the unmangled `temprature_sens_read` symbol across the C ABI.
-// SAFETY: Delegates immediately to `temprature_sens_read_ops` using `HwRegOps`
-// under the caller's `# Safety` hardware-clock and exclusivity preconditions.
+// SAFETY: Acquires `TSENS_LOCK` and delegates to `temprature_sens_read_ops`
+// using `HwRegOps` under the caller's `# Safety` hardware-clock precondition.
 #[cfg(target_arch = "xtensa")]
 #[no_mangle]
 #[link_section = ".text.temprature_sens_read"]
 pub unsafe extern "C" fn temprature_sens_read() -> u8 {
+    let _guard = TSENS_LOCK.lock();
     let mut hw = HwRegOps;
     temprature_sens_read_ops(&mut hw)
 }
@@ -265,11 +443,19 @@ pub unsafe extern "C" fn temprature_sens_read() -> u8 {
 pub fn link_touch() -> usize {
     #[cfg(target_arch = "xtensa")]
     {
-        let coex =
-            hint::black_box(coex_bt_high_prio as unsafe extern "C" fn() as *const () as usize);
-        let tsens = hint::black_box(
-            temprature_sens_read as unsafe extern "C" fn() -> u8 as *const () as usize,
-        );
+        // JUSTIFICATION: Takes the address of `coex_bt_high_prio` to retain
+        // its symbol across `--gc-sections` without invoking it.
+        // SAFETY: Function pointer cast to `*const ()` and `usize` performs no
+        // call or memory access.
+        let coex_fn: unsafe extern "C" fn() = coex_bt_high_prio;
+        let coex = hint::black_box(coex_fn as *const () as usize);
+
+        // JUSTIFICATION: Takes the address of `temprature_sens_read` to retain
+        // its symbol across `--gc-sections` without invoking it.
+        // SAFETY: Function pointer cast to `*const ()` and `usize` performs no
+        // call or memory access.
+        let tsens_fn: unsafe extern "C" fn() -> u8 = temprature_sens_read;
+        let tsens = hint::black_box(tsens_fn as *const () as usize);
         coex ^ tsens
     }
     #[cfg(not(target_arch = "xtensa"))]
@@ -506,5 +692,68 @@ mod tests {
     #[test]
     fn link_touch_returns_zero_on_host() {
         assert_eq!(link_touch(), 0, "host link_touch must return 0");
+    }
+
+    #[test]
+    fn hw_reg_ops_address_validation_allows_only_aligned_coex_tsens_regs() {
+        // Every RMW step in `COEX_BT_HIGH_PRIO_STEPS` must be read+write valid.
+        for step in COEX_BT_HIGH_PRIO_STEPS {
+            assert!(
+                is_valid_mmio_read_addr(step.addr),
+                "COEX step 0x{:08X} must be valid for read",
+                step.addr
+            );
+            assert!(
+                is_valid_mmio_write_addr(step.addr),
+                "COEX step 0x{:08X} must be valid for write",
+                step.addr
+            );
+        }
+
+        // TSENS control register is read+write; output register is read-only.
+        assert!(is_valid_mmio_read_addr(SENS_SAR_TSENS_CTRL_REG));
+        assert!(is_valid_mmio_write_addr(SENS_SAR_TSENS_CTRL_REG));
+        assert!(is_valid_mmio_read_addr(SENS_SAR_SLAVE_ADDR3_REG));
+        assert!(!is_valid_mmio_write_addr(SENS_SAR_SLAVE_ADDR3_REG));
+
+        // Unaligned offsets and non-allowlisted addresses must be rejected.
+        let rejected = [
+            0x0000_0000,
+            SENS_SAR_TSENS_CTRL_REG + 1,
+            SENS_SAR_TSENS_CTRL_REG + 2,
+            SENS_SAR_TSENS_CTRL_REG + 3,
+            COEX_SLC_0x3FF5C080_REG + 2,
+            0x3FFB_0000, // DRAM
+            0x4008_0000, // IRAM
+            0x3FF4_8848, // adjacent unverified SENS register
+            0xFFFF_FFFC,
+            u32::MAX,
+        ];
+        for bad in rejected {
+            assert!(
+                !is_valid_mmio_read_addr(bad),
+                "unexpected read allow for 0x{bad:08X}"
+            );
+            assert!(
+                !is_valid_mmio_write_addr(bad),
+                "unexpected write allow for 0x{bad:08X}"
+            );
+        }
+    }
+
+    #[test]
+    fn atomic_spinlock_enforces_exclusivity_and_releases_on_drop() {
+        let lock = AtomicSpinLock::new();
+        {
+            let _guard = lock.lock();
+            assert!(
+                lock.try_lock().is_none(),
+                "second acquisition must fail while lock is held"
+            );
+        }
+        assert!(
+            lock.try_lock().is_some(),
+            "lock must be re-acquirable after guard drops"
+        );
     }
 }

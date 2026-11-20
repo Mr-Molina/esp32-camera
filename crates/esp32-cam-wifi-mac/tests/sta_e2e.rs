@@ -1,8 +1,10 @@
 //! End-to-end integration tests for `esp32-cam-wifi-mac`.
 
+use core::pin::Pin;
 use esp32_cam_wifi_mac::frames_80211::parse_80211_header;
 use esp32_cam_wifi_mac::frames_80211::FrameType;
 use esp32_cam_wifi_mac::phy_bridge::host_mock_reset;
+use esp32_cam_wifi_mac::phy_bridge::host_mock_set_phy_enabled;
 use esp32_cam_wifi_mac::phy_bridge::host_mock_snapshot;
 use esp32_cam_wifi_mac::Esp32StaWifiDriver;
 use esp32_cam_wifi_mac::MockWifiMmioBus;
@@ -231,13 +233,25 @@ fn wrap_fromds_ccmp(
 }
 
 fn read_tx_mpdu(driver: &Esp32StaWifiDriver<MockWifiMmioBus>) -> &[u8] {
-    let len = driver.tx_slot().desc().payload_len() as usize;
-    &driver.tx_slot().buffer_slice()[..len]
+    let frame_len = driver.tx_slot().desc().payload_len() as usize;
+    assert!(frame_len >= 4, "TX DMA frame must include 4-byte FCS");
+    let mpdu_len = frame_len - 4;
+    assert_eq!(
+        &driver.tx_slot().buffer_slice()[mpdu_len..frame_len],
+        &[0u8; 4]
+    );
+    &driver.tx_slot().buffer_slice()[..mpdu_len]
 }
+
+static HOST_MOCK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
 fn e2e_ap_sta_wpa2_ccmp_and_smoltcp_lifecycle() {
+    let _guard = HOST_MOCK_TEST_LOCK
+        .lock()
+        .expect("host mock lock not poisoned");
     host_mock_reset();
+    host_mock_set_phy_enabled(true);
     let (pmk, cred) = test_pmk_and_cred();
 
     let mut rsn_ie = [0u8; 32];
@@ -259,7 +273,11 @@ fn e2e_ap_sta_wpa2_ccmp_and_smoltcp_lifecycle() {
     bus.auto_tx_status = 0;
 
     let mut driver = Esp32StaWifiDriver::new(bus);
-    let mac = driver.init(Some(STA_MAC)).expect("driver init should pass");
+    // JUSTIFICATION: Stack-pinned local driver never moved after init.
+    // SAFETY: `driver` stays at a fixed stack address for the test lifetime.
+    let mac = unsafe { Pin::new_unchecked(&mut driver) }
+        .init_pinned(Some(STA_MAC))
+        .expect("driver init should pass");
     assert_eq!(mac, STA_MAC);
 
     let cfg = StaConnectConfig::from_slices(SSID, cred, None, -90)
@@ -456,4 +474,123 @@ fn e2e_ap_sta_wpa2_ccmp_and_smoltcp_lifecycle() {
     driver.poll(now + 15).expect("poll deauth");
     assert!(!driver.is_connected());
     assert_eq!(driver.state(), StaState::Disconnected);
+    assert_eq!(driver.bssid(), None);
+}
+
+#[test]
+fn e2e_rejects_pre_key_plaintext_data_and_post_key_plaintext_eapol() {
+    let _guard = HOST_MOCK_TEST_LOCK
+        .lock()
+        .expect("host mock lock not poisoned");
+    host_mock_reset();
+    host_mock_set_phy_enabled(true);
+    let (pmk, cred) = test_pmk_and_cred();
+
+    let mut rsn_ie = [0u8; 32];
+    let rsn_len = gen_wpa_ie(
+        WPA_PROTO_RSN,
+        WPA_CIPHER_CCMP,
+        WPA_CIPHER_CCMP,
+        WPA_KEY_MGMT_PSK,
+        0,
+        0,
+        &mut rsn_ie,
+    )
+    .expect("RSN IE");
+    let ap_rsn = &rsn_ie[..rsn_len];
+
+    let mut bus = MockWifiMmioBus::new();
+    bus.auto_init_3d24 = true;
+    bus.auto_tx_done = true;
+    bus.auto_tx_status = 0;
+
+    let mut driver = Esp32StaWifiDriver::new(bus);
+    // JUSTIFICATION: Stack-pinned local driver never moved after init.
+    // SAFETY: `driver` stays at a fixed stack address for the test lifetime.
+    unsafe { Pin::new_unchecked(&mut driver) }
+        .init_pinned(Some(STA_MAC))
+        .expect("init");
+    let cfg = StaConnectConfig::from_slices(SSID, cred, None, -90).expect("cfg");
+    let mut now = 1_000u64;
+    driver.connect(cfg, now).expect("connect");
+
+    let (best_bcn, best_len) = build_beacon_vec(AP_BEST_BSSID, SSID, 1, ap_rsn);
+    driver
+        .push_mock_rx_mpdu(&best_bcn[..best_len], -55)
+        .expect("beacon");
+    for _ in 0..14 {
+        now += 95;
+        driver.poll(now).expect("scan poll");
+        if driver.state() == StaState::AuthWait {
+            break;
+        }
+    }
+    assert_eq!(driver.state(), StaState::AuthWait);
+    driver
+        .push_mock_rx_mpdu(&build_auth_resp(AP_BEST_BSSID, STA_MAC), -55)
+        .expect("auth");
+    driver
+        .push_mock_rx_mpdu(&build_assoc_resp(AP_BEST_BSSID, STA_MAC, 1), -55)
+        .expect("assoc");
+    assert_eq!(driver.state(), StaState::FourWayWait);
+
+    // Pre-key plaintext Ethernet IP injection during FourWayWait MUST be rejected.
+    let mut plain_ip = [0u8; 40];
+    plain_ip[0] = 0x08;
+    plain_ip[1] = 0x02;
+    plain_ip[4..10].copy_from_slice(&STA_MAC);
+    plain_ip[10..16].copy_from_slice(&AP_BEST_BSSID);
+    plain_ip[16..22].copy_from_slice(&AP_BEST_BSSID);
+    plain_ip[24..32].copy_from_slice(&[0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00, 0x08, 0x00]);
+    plain_ip[32..40].copy_from_slice(b"INJECTED");
+    assert_eq!(
+        driver.push_mock_rx_mpdu(&plain_ip, -55),
+        Err(esp32_cam_wifi_mac::DriverError::Sta(
+            esp32_cam_wifi_mac::StaError::Frame(
+                esp32_cam_wifi_mac::frames_80211::FrameError::UnencryptedPayloadRejected
+            )
+        ))
+    );
+    assert_eq!(driver.rx_queue_len(), 0);
+
+    // Complete 4-way handshake.
+    let anonce = [0xB2u8; 32];
+    let (m1, m1_len) = build_eapol_m1(&anonce, 1);
+    let (m1_mpdu, m1_mpdu_len) = wrap_fromds_eapol(AP_BEST_BSSID, STA_MAC, 10, &m1[..m1_len]);
+    driver
+        .push_mock_rx_mpdu(&m1_mpdu[..m1_mpdu_len], -53)
+        .expect("M1");
+    let m2_eapol = &read_tx_mpdu(&driver)[32..];
+    let mut snonce = [0u8; 32];
+    snonce.copy_from_slice(&m2_eapol[17..49]);
+    let ptk = wpa_pmk_to_ptk(
+        &pmk,
+        b"Pairwise key expansion",
+        &STA_MAC,
+        &AP_BEST_BSSID,
+        &snonce,
+        &anonce,
+        false,
+    );
+    let gtk = [0x88u8; 16];
+    let (m3, m3_len) = build_eapol_m3(&anonce, 2, ap_rsn, &gtk, 1, &ptk);
+    let (m3_mpdu, m3_mpdu_len) = wrap_fromds_eapol(AP_BEST_BSSID, STA_MAC, 11, &m3[..m3_len]);
+    driver
+        .push_mock_rx_mpdu(&m3_mpdu[..m3_mpdu_len], -52)
+        .expect("M3");
+    assert_eq!(driver.state(), StaState::Connected);
+
+    // Post-key plaintext EAPOL injection MUST be rejected (CVE-2020-26140).
+    let (spoof_m1, spoof_len) = build_eapol_m1(&[0xCCu8; 32], 99);
+    let (spoof_mpdu, spoof_mpdu_len) =
+        wrap_fromds_eapol(AP_BEST_BSSID, STA_MAC, 12, &spoof_m1[..spoof_len]);
+    assert_eq!(
+        driver.push_mock_rx_mpdu(&spoof_mpdu[..spoof_mpdu_len], -52),
+        Err(esp32_cam_wifi_mac::DriverError::Sta(
+            esp32_cam_wifi_mac::StaError::Frame(
+                esp32_cam_wifi_mac::frames_80211::FrameError::UnencryptedPayloadRejected
+            )
+        ))
+    );
+    assert_eq!(driver.state(), StaState::Connected);
 }

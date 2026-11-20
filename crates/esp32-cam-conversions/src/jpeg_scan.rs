@@ -111,6 +111,10 @@ fn extract_jpeg_payload_with_dir(buf: &[u8], search_forward: bool) -> Option<&[u
 /// 2. A valid EOI marker exists after the SOI marker.
 /// 3. The SOI marker occurs strictly before EOI (`soi_offset + 2 <= eoi_end`).
 ///
+/// Callers MUST pass a slice bounded to the active DMA-written frame length
+/// rather than the full backing buffer capacity so stale trailing DMA/PSRAM
+/// bytes beyond the current frame cannot be matched by backward EOI scanning.
+///
 /// Safely handles truncated or malformed buffers without panic or arithmetic
 /// underflow. Returns `Some(&buf[soi_offset..eoi_end])` on success, or `None`
 /// if markers are missing, inverted, or out of bounds.
@@ -147,8 +151,10 @@ pub fn validate_jpeg_frame(buf: &[u8]) -> Option<(u16, u16)> {
 /// - Every segment following `SOI` must begin with a `0xFF` marker prefix
 ///   (optional `0xFF` fill bytes are skipped; non-`0xFF` inter-segment junk
 ///   and `0x00`/`0x01` markers before `SOS` are rejected).
-/// - `SOF0`..`SOF2` must carry `nf` in `1..=4`, exact segment length
-///   `seg_len == 8 + 3 * nf` (`>= 11`), and non-zero `width` and `height`.
+/// - `SOF0`..`SOF2` must carry 8-bit sample precision (`precision == 8`),
+///   `nf` in `1..=4`, exact segment length `seg_len == 8 + 3 * nf` (`>= 11`),
+///   non-zero `width` and `height`, unique component IDs, sampling factors
+///   `h_samp`/`v_samp` in `1..=4`, and quantization table selector `< 4`.
 #[must_use]
 pub fn parse_jpeg_dimensions(buf: &[u8]) -> Option<(u16, u16)> {
     // Minimum valid SOI (2) + SOF marker (2) + SOF body for Nf=1 (11) = 15.
@@ -191,6 +197,10 @@ pub fn parse_jpeg_dimensions(buf: &[u8]) -> Option<(u16, u16)> {
                 if seg_len < 11 || i.checked_add(seg_len)? > buf.len() {
                     return None;
                 }
+                let precision = buf[i + 2];
+                if precision != 8 {
+                    return None;
+                }
                 let nf = buf[i + 7] as usize;
                 if !(1..=4).contains(&nf) || seg_len != 8 + 3 * nf {
                     return None;
@@ -199,6 +209,26 @@ pub fn parse_jpeg_dimensions(buf: &[u8]) -> Option<(u16, u16)> {
                 let width = u16::from_be_bytes([buf[i + 5], buf[i + 6]]);
                 if width == 0 || height == 0 {
                     return None;
+                }
+                let mut seen_ids = [0u8; 4];
+                for (comp_idx, slot) in seen_ids.iter_mut().take(nf).enumerate() {
+                    let base = i + 8 + comp_idx * 3;
+                    let cid = buf[base];
+                    let samp = buf[base + 1];
+                    let q_idx = buf[base + 2];
+                    let h_samp = samp >> 4;
+                    let v_samp = samp & 0x0F;
+                    if !(1..=4).contains(&h_samp) || !(1..=4).contains(&v_samp) || q_idx >= 4 {
+                        return None;
+                    }
+                    *slot = cid;
+                }
+                for a in 0..nf {
+                    for b in (a + 1)..nf {
+                        if seen_ids[a] == seen_ids[b] {
+                            return None;
+                        }
+                    }
                 }
                 return Some((width, height));
             }
@@ -587,5 +617,43 @@ mod tests {
         let extracted = extract_jpeg_payload(&framed);
         assert_eq!(extracted, Some(&valid_stream[..]));
         assert_eq!(validate_jpeg_frame(&framed), Some((320, 240)));
+    }
+
+    #[test]
+    fn test_m124_parse_jpeg_dimensions_precision_and_component_checks() {
+        // Non-8-bit sample precision (12-bit) must be rejected.
+        let bad_precision = [
+            0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x0B, 0x0C, 0x00, 0xF0, 0x01, 0x40, 0x01, 0x01, 0x11,
+            0x00, 0xFF, 0xD9,
+        ];
+        assert_eq!(parse_jpeg_dimensions(&bad_precision), None);
+
+        // Zero horizontal/vertical sampling factor must be rejected.
+        let bad_samp_zero = [
+            0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0xF0, 0x01, 0x40, 0x01, 0x01, 0x01,
+            0x00, 0xFF, 0xD9,
+        ];
+        assert_eq!(parse_jpeg_dimensions(&bad_samp_zero), None);
+
+        // Out-of-range sampling factor (> 4) must be rejected.
+        let bad_samp_high = [
+            0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0xF0, 0x01, 0x40, 0x01, 0x01, 0x51,
+            0x00, 0xFF, 0xD9,
+        ];
+        assert_eq!(parse_jpeg_dimensions(&bad_samp_high), None);
+
+        // Quantization selector >= 4 must be rejected.
+        let bad_qidx = [
+            0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0xF0, 0x01, 0x40, 0x01, 0x01, 0x11,
+            0x04, 0xFF, 0xD9,
+        ];
+        assert_eq!(parse_jpeg_dimensions(&bad_qidx), None);
+
+        // Duplicate component IDs in SOF0 must be rejected.
+        let dup_comp_id = [
+            0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x11, 0x08, 0x00, 0xF0, 0x01, 0x40, 0x03, 0x01, 0x22,
+            0x00, 0x01, 0x11, 0x01, 0x03, 0x11, 0x01, 0xFF, 0xD9,
+        ];
+        assert_eq!(parse_jpeg_dimensions(&dup_comp_id), None);
     }
 }

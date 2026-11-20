@@ -21,14 +21,15 @@
 //!   last chunk plus a margin.
 
 use core::ops::ControlFlow;
+use core::ptr;
 
 use esp32_cam_types::CameraError;
 
 use crate::dma_filter::DmaFilterKind;
 use crate::dma_ring::{Lldesc, LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE};
 use crate::esp32_i2s::{
-    append_unpacked_jpeg_chunk, find_jpeg_eoi, I2S_INLINK_ADDR_MASK, I2S_IN_DSCR_EMPTY_INT_RAW,
-    I2S_IN_DSCR_ERR_INT_RAW, I2S_IN_SUC_EOF_INT_BIT, JPEG_DMA_NODE_SIZE,
+    append_unpacked_jpeg_chunk, find_jpeg_eoi, find_jpeg_soi, DmaFenceOrder, I2S_INLINK_ADDR_MASK,
+    I2S_IN_DSCR_EMPTY_INT_RAW, I2S_IN_DSCR_ERR_INT_RAW, I2S_IN_SUC_EOF_INT_BIT, JPEG_DMA_NODE_SIZE,
     JPEG_UNPACKED_HALF_BUFFER_SIZE,
 };
 
@@ -97,9 +98,17 @@ impl CaptureHooks for NoCaptureHooks {
 pub enum DrainGate {
     /// Also require the half's last descriptor to be written back with
     /// `owner == 0`. Relies on the DMA writing back descriptors (LL Open
-    /// question 1).
+    /// question 1), and enables [`HalfDrain::observe`] to detect `>= half_cnt`
+    /// single-poll ring laps via the guard half immediately behind `half_idx`.
     OwnerWriteback,
     /// Trust the `in_eof_des_addr` position alone.
+    ///
+    /// # Limitation (`M-113`)
+    ///
+    /// Because `I2S_IN_EOF_DES_ADDR_REG` wraps modulo `half_cnt`, single-poll
+    /// ring laps of `>= half_cnt` halves are unobservable without descriptor
+    /// owner writeback. Prefer [`Self::OwnerWriteback`] whenever hardware
+    /// writeback is available.
     EofPosition,
 }
 
@@ -122,9 +131,10 @@ pub struct HalfDrain {
 impl HalfDrain {
     /// Creates a drain for `half_cnt` half-buffers of `2 * node_size` DMA bytes.
     ///
-    /// Returns [`CameraError::InvalidArg`] unless `half_cnt >= 2` and
-    /// `node_size` is non-zero, a multiple of 4 and at most
-    /// [`LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE`].
+    /// Returns [`CameraError::InvalidArg`] unless `half_cnt >= 2`, `node_size`
+    /// is non-zero, a multiple of 4 and at most
+    /// [`LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE`], and `2 * half_cnt * node_size`
+    /// (plus descriptor counts) do not overflow `usize` / `isize::MAX`.
     pub fn new(
         half_cnt: usize,
         node_size: usize,
@@ -136,6 +146,18 @@ impl HalfDrain {
             || node_size > LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE
             || !node_size.is_multiple_of(4)
         {
+            return Err(CameraError::InvalidArg);
+        }
+        let Some(half_bytes) = node_size.checked_mul(2) else {
+            return Err(CameraError::InvalidArg);
+        };
+        let Some(total_buf) = half_cnt.checked_mul(half_bytes) else {
+            return Err(CameraError::InvalidArg);
+        };
+        let Some(total_desc) = half_cnt.checked_mul(2) else {
+            return Err(CameraError::InvalidArg);
+        };
+        if total_buf > isize::MAX as usize || total_desc > isize::MAX as usize {
             return Err(CameraError::InvalidArg);
         }
         Ok(Self {
@@ -197,15 +219,20 @@ impl HalfDrain {
         self.halves_drained
     }
 
-    fn check_ring(&self, descriptors: &[Lldesc], dma_buf: &[u8]) -> Result<(), CameraError> {
+    fn check_ring_lens(&self, desc_len: usize, buf_len: usize) -> Result<(), CameraError> {
+        let need_desc = self.half_cnt.checked_mul(2).ok_or(CameraError::Overflow)?;
         let need_buf = self
             .half_cnt
             .checked_mul(self.half_bytes())
             .ok_or(CameraError::Overflow)?;
-        if descriptors.len() < 2 * self.half_cnt || dma_buf.len() < need_buf {
+        if desc_len < need_desc || buf_len < need_buf {
             return Err(CameraError::InvalidArg);
         }
         Ok(())
+    }
+
+    fn check_ring(&self, descriptors: &[Lldesc], dma_buf: &[u8]) -> Result<(), CameraError> {
+        self.check_ring_lens(descriptors.len(), dma_buf.len())
     }
 
     /// Maps an `in_eof_des_addr` value to the half it completes. Only the
@@ -230,11 +257,16 @@ impl HalfDrain {
     ///   read, so an EOF landing in between is never lost: it re-raises the
     ///   bit and the address already covers it.
     /// - The completed-half count advances by the EOF position delta, modulo
-    ///   the ring. More than `half_cnt - 1` pending halves means the DMA is
-    ///   overwriting the oldest unconsumed half: [`CameraError::Overflow`].
-    ///   (A lap of exactly `half_cnt` halves between two observations leaves
-    ///   the position unchanged and cannot be told apart from a re-raised
-    ///   bit; the owner gate and the poll rate cover that case.)
+    ///   the ring. Under [`DrainGate::OwnerWriteback`], `observe` also
+    ///   unconditionally checks the guard half immediately behind `half_idx`
+    ///   (`(half_idx + half_cnt - 1) % half_cnt`): because that half is always
+    ///   re-armed (`owner == true`) on ring build/reset/consume and is the last
+    ///   half DMA reaches before lapping `half_idx`, finding `owner == false`
+    ///   proves `>= half_cnt` unconsumed halves completed (catching both
+    ///   `delta == 0` and `delta in 1..half_cnt` single-poll laps with zero
+    ///   false positives) and fails with [`CameraError::Overflow`] (`M-113`).
+    ///   More than `half_cnt - 1` pending halves also fails with
+    ///   [`CameraError::Overflow`].
     ///
     /// Returns the number of halves newly reported complete.
     pub fn observe<S: DmaStatus>(
@@ -242,7 +274,8 @@ impl HalfDrain {
         descriptors: &[Lldesc],
         status: &mut S,
     ) -> Result<usize, CameraError> {
-        if descriptors.len() < 2 * self.half_cnt {
+        let need_desc = self.half_cnt.checked_mul(2).ok_or(CameraError::Overflow)?;
+        if descriptors.len() < need_desc {
             return Err(CameraError::InvalidArg);
         }
         let raw = status.int_raw();
@@ -269,17 +302,123 @@ impl HalfDrain {
         let h = self
             .half_of_eof_addr(descriptors, addr)
             .ok_or(CameraError::DmaRingCorrupted)?;
-        let delta = (h + self.half_cnt - self.last_eof_half) % self.half_cnt;
+        let delta = if h >= self.last_eof_half {
+            h - self.last_eof_half
+        } else {
+            self.half_cnt - self.last_eof_half + h
+        };
+        if self.gate == DrainGate::OwnerWriteback {
+            let guard = if self.half_idx == 0 {
+                self.half_cnt - 1
+            } else {
+                self.half_idx - 1
+            };
+            if !descriptors[2 * guard + 1].owner() {
+                self.last_eof_half = h;
+                self.pending = self.half_cnt;
+                return Err(CameraError::Overflow);
+            }
+        }
         self.last_eof_half = h;
-        self.pending += delta;
+        self.pending = self.pending.saturating_add(delta);
         if self.pending > self.half_cnt - 1 {
             return Err(CameraError::Overflow);
         }
         Ok(delta)
     }
 
+    /// Filters `half_bytes` bytes read via volatile loads from `half_ptr` into
+    /// `scratch` without creating a Rust slice reference over active DMA SRAM.
+    ///
+    /// # Safety
+    ///
+    /// `half_ptr` must be valid for volatile reads of `half_bytes` contiguous
+    /// bytes inside the DMA ring allocation.
+    // JUSTIFICATION: Reads active DMA SRAM via volatile loads into a 32-byte
+    // stack chunk to avoid materialising `&[u8]` over DMA-accessible memory.
+    // SAFETY:
+    // 1. Alignment & Non-null: `u8` requires 1-byte alignment; `half_ptr` is
+    //    non-null by caller contract.
+    // 2. Memory layout: `half_bytes` contiguous bytes in a single DMA buffer.
+    // 3. Provenance & Lifetime: Derived from the live DMA ring root pointer.
+    // 4. Aliasing: Volatile raw loads do not assert Rust reference exclusivity.
+    // 5. Volatile semantics: `read_volatile` prevents elision/reordering.
+    // 6. Panic safety: Volatile byte reads cannot unwind.
+    unsafe fn filter_half_volatile(
+        &self,
+        half_ptr: *const u8,
+        half_bytes: usize,
+        scratch: &mut [u8],
+    ) -> usize {
+        let mut tmp = [0u8; 32];
+        let mut off = 0usize;
+        let mut out_written = 0usize;
+        while off < half_bytes && out_written < scratch.len() {
+            let chunk_len = (half_bytes - off).min(tmp.len());
+            let mut i = 0usize;
+            while i < chunk_len {
+                // JUSTIFICATION: Volatile load of one DMA ring byte without
+                // forming a Rust slice over DMA memory.
+                // SAFETY:
+                // 1. Alignment & Non-null: `u8` has alignment 1; `half_ptr` is
+                //    non-null by caller contract.
+                // 2. Memory layout: `off + i < half_bytes`, inside the half.
+                // 3. Provenance & Lifetime: Derived from the live ring root.
+                // 4. Aliasing: Raw volatile read does not create `&[u8]`.
+                // 5. Volatile semantics: Prevents compiler elision/tearing.
+                // 6. Panic safety: Volatile read cannot unwind.
+                tmp[i] = unsafe { ptr::read_volatile(half_ptr.add(off + i)) };
+                i += 1;
+            }
+            let n = self
+                .filter
+                .apply(&mut scratch[out_written..], &tmp[..chunk_len]);
+            out_written += n;
+            off += chunk_len;
+            if n == 0 {
+                break;
+            }
+        }
+        out_written
+    }
+
+    /// Poisons `half_bytes` bytes at `half_ptr` via volatile writes without
+    /// creating `&mut [u8]` over active DMA SRAM.
+    ///
+    /// # Safety
+    ///
+    /// `half_ptr` must be valid for volatile writes of `half_bytes` contiguous
+    /// bytes of a CPU-owned half inside the DMA ring allocation.
+    // JUSTIFICATION: Writes poison bytes to a CPU-owned DMA half via raw
+    // volatile stores without creating a full-ring `&mut [u8]`.
+    // SAFETY:
+    // 1. Alignment & Non-null: `u8` has alignment 1; `half_ptr` is non-null.
+    // 2. Memory layout: `half_bytes` bytes inside the single DMA buffer.
+    // 3. Provenance & Lifetime: Derived from the writable DMA ring root.
+    // 4. Aliasing: Only the CPU-owned half is written prior to re-arming.
+    // 5. Volatile semantics: `write_volatile` ensures stores are emitted
+    //    before the subsequent DMA fence and descriptor re-arm.
+    // 6. Panic safety: Volatile byte stores cannot unwind.
+    unsafe fn poison_half_volatile(half_ptr: *mut u8, half_bytes: usize) {
+        let mut i = 0usize;
+        while i < half_bytes {
+            // JUSTIFICATION: Volatile store of one poison byte into CPU-owned
+            // DMA half memory.
+            // SAFETY:
+            // 1. Alignment & Non-null: `u8` has alignment 1; `half_ptr` is
+            //    non-null.
+            // 2. Memory layout: `i < half_bytes`, within the half slice.
+            // 3. Provenance & Lifetime: Derived from the writable ring root.
+            // 4. Aliasing: Half is CPU-owned before descriptor re-arm.
+            // 5. Volatile semantics: Ensures store is not elided before fence.
+            // 6. Panic safety: Volatile store cannot unwind.
+            unsafe { ptr::write_volatile(half_ptr.add(i), DMA_POISON_BYTE) };
+            i += 1;
+        }
+    }
+
     /// Filters the current half into `scratch`, poisons it (LL-06) and
-    /// re-arms both of its descriptors with one packed volatile store each.
+    /// re-arms both of its descriptors (tail `2 * h + 1` before head `2 * h`).
     fn consume_half<S: DmaStatus>(
         &mut self,
         descriptors: &mut [Lldesc],
@@ -296,11 +435,69 @@ impl HalfDrain {
         // The poison must reach SRAM before the DMA may write the half again.
         status.barrier();
         let flags = Lldesc::pack_flags(self.node_size as u16, 0, 0, false, false, true);
-        descriptors[2 * h].store_flags(flags);
+        // Re-arm tail descriptor before head so DMA never enters `2 * h` with
+        // an un-armed `2 * h + 1` on preemption.
         descriptors[2 * h + 1].store_flags(flags);
+        descriptors[2 * h].store_flags(flags);
         self.half_idx = (h + 1) % self.half_cnt;
         self.halves_drained = self.halves_drained.wrapping_add(1);
         n
+    }
+
+    /// Raw-pointer counterpart to [`Self::consume_half`] for active DMA rings
+    /// ([`crate::RunningCapture`]), avoiding `&mut [Lldesc]` / `&mut [u8]`.
+    ///
+    /// # Safety
+    ///
+    /// `dma_buf` must point to at least `buf_len >= half_cnt * half_bytes`
+    /// writable bytes belonging to the armed DMA ring.
+    // JUSTIFICATION: Consumes a completed half from an armed DMA ring via raw
+    // volatile accesses so no `&mut [u8]` aliases active DMA halves.
+    // SAFETY:
+    // 1. Alignment & Non-null: `dma_buf` is `NonNull<u8>` (1-byte aligned).
+    // 2. Memory layout: `off + half_bytes <= buf_len` verified by caller.
+    // 3. Provenance & Lifetime: `dma_buf` is the live armed ring root pointer.
+    // 4. Aliasing: Only the CPU-owned half `h` is read and poisoned; descriptor
+    //    headers are updated via `AtomicU32::store` on `&Lldesc`.
+    // 5. Volatile semantics: Volatile reads/writes paired with `status.barrier`.
+    // 6. Panic safety: Cannot unwind.
+    unsafe fn consume_half_raw<S: DmaStatus>(
+        &mut self,
+        descriptors: &[Lldesc],
+        dma_buf: ptr::NonNull<u8>,
+        buf_len: usize,
+        status: &mut S,
+        scratch: &mut [u8],
+    ) -> Result<usize, CameraError> {
+        let h = self.half_idx;
+        let half_bytes = self.half_bytes();
+        let off = h.checked_mul(half_bytes).ok_or(CameraError::Overflow)?;
+        let end = off.checked_add(half_bytes).ok_or(CameraError::Overflow)?;
+        if end > buf_len {
+            return Err(CameraError::InvalidArg);
+        }
+        // JUSTIFICATION: Offset into the validated DMA buffer for half `h`.
+        // SAFETY:
+        // 1. Alignment & Non-null: `dma_buf` is non-null (`u8` align 1).
+        // 2. Memory layout: `off + half_bytes <= buf_len <= isize::MAX`.
+        // 3. Provenance & Lifetime: Derived from the live armed ring root.
+        // 4. Aliasing: Volatile raw reads/writes on half `h` only.
+        // 5. Volatile semantics: Enforced inside volatile helpers.
+        // 6. Panic safety: Pointer arithmetic and volatile ops cannot unwind.
+        let n = unsafe {
+            let half_ptr = dma_buf.as_ptr().add(off);
+            let n = self.filter_half_volatile(half_ptr.cast_const(), half_bytes, scratch);
+            Self::poison_half_volatile(half_ptr, half_bytes);
+            n
+        };
+        status.barrier();
+        let flags = Lldesc::pack_flags(self.node_size as u16, 0, 0, false, false, true);
+        // Re-arm tail descriptor before head so DMA never hits an un-armed tail.
+        descriptors[2 * h + 1].store_flags(flags);
+        descriptors[2 * h].store_flags(flags);
+        self.half_idx = (h + 1) % self.half_cnt;
+        self.halves_drained = self.halves_drained.wrapping_add(1);
+        Ok(n)
     }
 
     /// Consumes every half that is complete, oldest first (FW-CORE-02,
@@ -351,6 +548,70 @@ impl HalfDrain {
         Ok(drained)
     }
 
+    /// Raw-pointer counterpart to [`Self::drain_ready_halves`] used by
+    /// [`crate::RunningCapture`] while DMA is active.
+    ///
+    /// # Safety
+    ///
+    /// `dma_buf` must point to at least `buf_len` writable bytes of the armed
+    /// DMA ring matching `descriptors`, remaining valid for this call.
+    // JUSTIFICATION: Drains completed halves from an armed DMA ring without
+    // creating `&mut [Lldesc]` or `&mut [u8]` over active DMA memory.
+    // SAFETY:
+    // 1. Alignment & Non-null: `dma_buf` is `NonNull<u8>` (1-byte aligned).
+    // 2. Memory layout: `check_ring_lens` verifies descriptor/buffer sizes.
+    // 3. Provenance & Lifetime: `dma_buf` is the armed ring root for this call.
+    // 4. Aliasing: `descriptors` is shared `&[Lldesc]` (atomic headers) and
+    //    `dma_buf` is accessed solely via volatile loads/stores on CPU halves.
+    // 5. Volatile semantics: Enforced via `consume_half_raw` and `status.barrier`.
+    // 6. Panic safety: Bounds checked before volatile ops; `sink` runs after
+    //    state updates.
+    pub(crate) unsafe fn drain_ready_halves_raw<S, F>(
+        &mut self,
+        descriptors: &[Lldesc],
+        dma_buf: ptr::NonNull<u8>,
+        buf_len: usize,
+        status: &mut S,
+        scratch: &mut [u8],
+        mut sink: F,
+    ) -> Result<usize, CameraError>
+    where
+        S: DmaStatus,
+        F: FnMut(&[u8]) -> ControlFlow<()>,
+    {
+        self.check_ring_lens(descriptors.len(), buf_len)?;
+        self.observe(descriptors, status)?;
+
+        let limit = self.half_cnt.min(MAX_DRAIN_HALVES);
+        let mut drained = 0usize;
+        while drained < limit && self.pending > 0 {
+            if self.gate == DrainGate::OwnerWriteback && descriptors[2 * self.half_idx + 1].owner()
+            {
+                break;
+            }
+            // JUSTIFICATION: Consumes one verified CPU-owned half via raw ptrs.
+            // SAFETY:
+            // 1. Alignment & Non-null: `dma_buf` is non-null by caller contract.
+            // 2. Memory layout: `check_ring_lens` verified `buf_len` covers all
+            //    `half_cnt` halves.
+            // 3. Provenance & Lifetime: Derived from the armed ring root.
+            // 4. Aliasing: Half `half_idx` is reported complete by `observe`.
+            // 5. Volatile semantics: Volatile loads/stores + `status.barrier`.
+            // 6. Panic safety: `consume_half_raw` returns `Result` and cannot
+            //    unwind.
+            let n = unsafe {
+                let d = descriptors;
+                self.consume_half_raw(d, dma_buf, buf_len, status, scratch)?
+            };
+            self.pending -= 1;
+            drained += 1;
+            if sink(&scratch[..n]).is_break() {
+                break;
+            }
+        }
+        Ok(drained)
+    }
+
     /// Consumes the current half unconditionally (LL-05): filters it into
     /// `scratch`, poisons it and re-arms it.
     ///
@@ -382,13 +643,63 @@ impl HalfDrain {
         scratch: &mut [u8],
     ) -> Result<usize, CameraError> {
         let half_bytes = self.half_bytes();
-        let off = self.half_idx * half_bytes;
+        let off = self
+            .half_idx
+            .checked_mul(half_bytes)
+            .ok_or(CameraError::Overflow)?;
+        let end = off.checked_add(half_bytes).ok_or(CameraError::Overflow)?;
         // LL-03: read only what the DMA wrote before this point.
-        crate::esp32_i2s::dma_fence(core::sync::atomic::Ordering::Acquire);
-        let half = dma_buf
-            .get(off..off + half_bytes)
-            .ok_or(CameraError::InvalidArg)?;
+        crate::esp32_i2s::dma_fence(DmaFenceOrder::Acquire);
+        let half = dma_buf.get(off..end).ok_or(CameraError::InvalidArg)?;
         Ok(self.filter.apply(scratch, half))
+    }
+
+    /// Raw-pointer counterpart to [`Self::peek_current_half`] for active DMA
+    /// rings ([`crate::RunningCapture`]), reading via volatile loads.
+    ///
+    /// # Safety
+    ///
+    /// `dma_buf` must point to at least `buf_len` readable bytes of the armed
+    /// DMA ring, valid for the duration of this call.
+    // JUSTIFICATION: Peeks the active DMA half via volatile loads without
+    // creating `&[u8]` over concurrently written DMA memory.
+    // SAFETY:
+    // 1. Alignment & Non-null: `dma_buf` is `NonNull<u8>` (1-byte aligned).
+    // 2. Memory layout: `off + half_bytes <= buf_len` is checked before reads.
+    // 3. Provenance & Lifetime: `dma_buf` is the live armed ring root pointer.
+    // 4. Aliasing: Volatile loads do not create Rust references over DMA SRAM.
+    // 5. Volatile semantics: Preceded by `dma_fence(Acquire)` and uses
+    //    `ptr::read_volatile`.
+    // 6. Panic safety: Bounds checked; volatile reads cannot unwind.
+    pub(crate) unsafe fn peek_current_half_raw(
+        &self,
+        dma_buf: ptr::NonNull<u8>,
+        buf_len: usize,
+        scratch: &mut [u8],
+    ) -> Result<usize, CameraError> {
+        let half_bytes = self.half_bytes();
+        let off = self
+            .half_idx
+            .checked_mul(half_bytes)
+            .ok_or(CameraError::Overflow)?;
+        let end = off.checked_add(half_bytes).ok_or(CameraError::Overflow)?;
+        if end > buf_len {
+            return Err(CameraError::InvalidArg);
+        }
+        crate::esp32_i2s::dma_fence(DmaFenceOrder::Acquire);
+        // JUSTIFICATION: Volatile read of current half for idle EOI peek.
+        // SAFETY:
+        // 1. Alignment & Non-null: `dma_buf` is non-null (`u8` align 1).
+        // 2. Memory layout: `off + half_bytes <= buf_len <= isize::MAX`.
+        // 3. Provenance & Lifetime: Derived from the live armed ring root.
+        // 4. Aliasing: Volatile raw loads only; no `&[u8]` materialized.
+        // 5. Volatile semantics: Preceded by `Acquire` fence.
+        // 6. Panic safety: Cannot unwind.
+        let n = unsafe {
+            let half_ptr = dma_buf.as_ptr().add(off).cast_const();
+            self.filter_half_volatile(half_ptr, half_bytes, scratch)
+        };
+        Ok(n)
     }
 }
 
@@ -558,6 +869,106 @@ impl PolledJpegCapture {
         }
     }
 
+    fn peek_has_soi_then_eoi(prev_tail: &[u8; 2], prev_tail_len: usize, peeked: &[u8]) -> bool {
+        if prev_tail_len == 2
+            && prev_tail[0] == 0xFF
+            && prev_tail[1] == 0xD8
+            && peeked.first() == Some(&0xFF)
+        {
+            return find_jpeg_eoi(peeked).is_some();
+        }
+        if (1..=2).contains(&prev_tail_len)
+            && prev_tail[prev_tail_len - 1] == 0xFF
+            && peeked.len() >= 2
+            && peeked[0] == 0xD8
+            && peeked[1] == 0xFF
+        {
+            return find_jpeg_eoi(&peeked[1..]).is_some();
+        }
+        if let Some(soi_off) = find_jpeg_soi(peeked) {
+            return find_jpeg_eoi(&peeked[soi_off + 2..]).is_some();
+        }
+        false
+    }
+
+    fn peek_indicates_frame_end(&self, jpeg_out: &[u8], peeked: &[u8]) -> bool {
+        if self.soi_found {
+            let boundary_eoi = self.written > 0
+                && jpeg_out.get(self.written - 1) == Some(&0xFF)
+                && peeked.first() == Some(&0xD9);
+            boundary_eoi || find_jpeg_eoi(peeked).is_some()
+        } else {
+            Self::peek_has_soi_then_eoi(&self.prev_tail, self.prev_tail_len, peeked)
+        }
+    }
+
+    /// Raw-pointer counterpart to [`Self::drain_into`] for active DMA rings.
+    ///
+    /// # Safety
+    ///
+    /// `dma_buf` must point to at least `buf_len` writable bytes of the armed
+    /// DMA ring matching `descriptors`, valid for this call.
+    // JUSTIFICATION: Drains active DMA halves via volatile raw-pointer reads
+    // to avoid `&mut [Lldesc]` / `&mut [u8]` aliasing UB.
+    // SAFETY:
+    // 1. Alignment & Non-null: `dma_buf` is `NonNull<u8>` (1-byte aligned).
+    // 2. Memory layout: Checked inside `drain_ready_halves_raw`.
+    // 3. Provenance & Lifetime: Forwarded from `RunningCapture` for this call.
+    // 4. Aliasing: Uses `&[Lldesc]` and volatile accesses on CPU halves only.
+    // 5. Volatile semantics: Enforced by `HalfDrain::drain_ready_halves_raw`.
+    // 6. Panic safety: Cannot unwind.
+    unsafe fn drain_into_raw<S: DmaStatus>(
+        &mut self,
+        descriptors: &[Lldesc],
+        dma_buf: ptr::NonNull<u8>,
+        buf_len: usize,
+        status: &mut S,
+        jpeg_out: &mut [u8],
+    ) -> Result<(usize, Option<usize>), CameraError> {
+        let Self {
+            drain,
+            chunk,
+            written,
+            soi_found,
+            prev_tail,
+            prev_tail_len,
+            ..
+        } = self;
+        let mut outcome: Result<Option<usize>, CameraError> = Ok(None);
+        // JUSTIFICATION: Delegates to raw-pointer half drain on the armed ring.
+        // SAFETY:
+        // 1. Alignment & Non-null: `dma_buf` is non-null by caller contract.
+        // 2. Memory layout: `buf_len` is validated by `drain_ready_halves_raw`.
+        // 3. Provenance & Lifetime: Derived from the armed ring root pointer.
+        // 4. Aliasing: No `&mut [u8]` or `&mut [Lldesc]` is materialized.
+        // 5. Volatile semantics: Enforced by `drain_ready_halves_raw`.
+        // 6. Panic safety: Closure updates local state only and cannot unwind.
+        let n = unsafe {
+            drain.drain_ready_halves_raw(
+                descriptors,
+                dma_buf,
+                buf_len,
+                status,
+                chunk.as_mut_slice(),
+                |c| match append_unpacked_jpeg_chunk(
+                    c,
+                    jpeg_out,
+                    written,
+                    soi_found,
+                    prev_tail,
+                    prev_tail_len,
+                ) {
+                    Ok(None) => ControlFlow::Continue(()),
+                    done => {
+                        outcome = done;
+                        ControlFlow::Break(())
+                    }
+                },
+            )?
+        };
+        Ok((n, outcome?))
+    }
+
     /// Runs one poll step: drains completed halves into `jpeg_out`, then
     /// checks for the end of the frame.
     ///
@@ -566,8 +977,8 @@ impl PolledJpegCapture {
     ///   seen and four consecutive samples read inactive (LL-05 debounce).
     /// - Every [`Self::IDLE_HOOK_POLLS`] polls without progress,
     ///   [`CaptureHooks::idle`] is called. Every [`Self::IDLE_PEEK_POLLS`]
-    ///   such polls the current half is peeked; an EOI there ends the frame
-    ///   early.
+    ///   such polls the current half is peeked; an EOI there (after SOI) ends
+    ///   the frame early.
     ///
     /// On [`CaptureStep::FrameEnded`] the caller stops the DMA and calls
     /// [`Self::finish`]; on [`CaptureStep::Complete`] or
@@ -627,11 +1038,110 @@ impl PolledJpegCapture {
                 Ok(n) => n,
                 Err(e) => return CaptureStep::Failed(e),
             };
-            let peeked = &self.chunk[..n];
-            let boundary_eoi = self.written > 0
-                && jpeg_out.get(self.written - 1) == Some(&0xFF)
-                && peeked.first() == Some(&0xD9);
-            if boundary_eoi || find_jpeg_eoi(peeked).is_some() {
+            if self.peek_indicates_frame_end(jpeg_out, &self.chunk[..n]) {
+                self.diag.frame_end_us = Some(hooks.now_us());
+                return CaptureStep::FrameEnded;
+            }
+        }
+        CaptureStep::Pending
+    }
+
+    /// Raw-pointer counterpart to [`Self::poll`] for active DMA captures
+    /// ([`crate::RunningCapture::poll`]).
+    ///
+    /// # Safety
+    ///
+    /// `dma_buf` must point to at least `buf_len` writable bytes of the armed
+    /// DMA ring matching `descriptors`, valid for this call.
+    // JUSTIFICATION: Polls an active DMA ring via volatile raw accesses so no
+    // `&mut [Lldesc]` or `&mut [u8]` aliases hardware DMA writes.
+    // SAFETY:
+    // 1. Alignment & Non-null: `dma_buf` is `NonNull<u8>` (1-byte aligned).
+    // 2. Memory layout: Checked in `drain_into_raw` / `peek_current_half_raw`.
+    // 3. Provenance & Lifetime: Forwarded from `RunningCapture` for this call.
+    // 4. Aliasing: Only shared `&[Lldesc]` and volatile byte ops are used.
+    // 5. Volatile semantics: Enforced by raw drain and peek helpers.
+    // 6. Panic safety: No unsafe operation can unwind.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn poll_raw<S, H, V>(
+        &mut self,
+        descriptors: &[Lldesc],
+        dma_buf: ptr::NonNull<u8>,
+        buf_len: usize,
+        status: &mut S,
+        jpeg_out: &mut [u8],
+        vsync_active: &mut V,
+        hooks: &mut H,
+    ) -> CaptureStep
+    where
+        S: DmaStatus,
+        H: CaptureHooks,
+        V: FnMut() -> bool,
+    {
+        if vsync_active() {
+            self.seen_active_video = true;
+        }
+
+        // JUSTIFICATION: Drains ready halves using raw volatile accesses.
+        // SAFETY:
+        // 1. Alignment & Non-null: `dma_buf` is non-null by caller contract.
+        // 2. Memory layout: Checked inside `drain_into_raw`.
+        // 3. Provenance & Lifetime: Derived from the armed ring root pointer.
+        // 4. Aliasing: No `&mut [Lldesc]` or `&mut [u8]` is created.
+        // 5. Volatile semantics: Enforced by `drain_into_raw`.
+        // 6. Panic safety: Returns `Result` and cannot unwind.
+        let drained = unsafe {
+            let d = descriptors;
+            self.drain_into_raw(d, dma_buf, buf_len, status, jpeg_out)
+        };
+        match drained {
+            Err(e) => return CaptureStep::Failed(e),
+            Ok((_, Some(len))) => {
+                self.note_progress(hooks);
+                return CaptureStep::Complete(len);
+            }
+            Ok((n, None)) if n > 0 => {
+                self.note_progress(hooks);
+                return CaptureStep::Pending;
+            }
+            Ok(_) => {}
+        }
+
+        self.idle_polls = self.idle_polls.wrapping_add(1);
+        if self.idle_polls.is_multiple_of(Self::IDLE_HOOK_POLLS) {
+            hooks.idle();
+        }
+
+        let vsync_ended = self.seen_active_video
+            && !vsync_active()
+            && !vsync_active()
+            && !vsync_active()
+            && !vsync_active();
+        if vsync_ended {
+            self.diag.frame_end_us = Some(hooks.now_us());
+            return CaptureStep::FrameEnded;
+        }
+
+        if self.idle_polls >= Self::IDLE_PEEK_POLLS {
+            self.idle_polls = 0;
+            self.diag.idle_peeks = self.diag.idle_peeks.wrapping_add(1);
+            // JUSTIFICATION: Peeks active DMA half via volatile byte loads.
+            // SAFETY:
+            // 1. Alignment & Non-null: `dma_buf` is non-null by caller contract.
+            // 2. Memory layout: Checked inside `peek_current_half_raw`.
+            // 3. Provenance & Lifetime: Derived from the armed ring root.
+            // 4. Aliasing: Volatile loads only; no `&[u8]` created.
+            // 5. Volatile semantics: Preceded by `Acquire` fence.
+            // 6. Panic safety: Returns `Result` and cannot unwind.
+            let peek_res = unsafe {
+                self.drain
+                    .peek_current_half_raw(dma_buf, buf_len, &mut self.chunk)
+            };
+            let n = match peek_res {
+                Ok(n) => n,
+                Err(e) => return CaptureStep::Failed(e),
+            };
+            if self.peek_indicates_frame_end(jpeg_out, &self.chunk[..n]) {
                 self.diag.frame_end_us = Some(hooks.now_us());
                 return CaptureStep::FrameEnded;
             }
@@ -641,10 +1151,11 @@ impl PolledJpegCapture {
 
     /// Completes a frame after [`CaptureStep::FrameEnded`] and a DMA stop.
     ///
-    /// Halves the EOF position reported complete but the owner gate held back
-    /// are consumed first, then the current, partially written half is
-    /// consumed unconditionally (LL-05). Returns the `SOI..=EOI` length, or
-    /// [`CameraError::CorruptedFrame`] when no EOI follows the SOI.
+    /// Observes any final EOF latched during VSYNC debounce or DMA stop
+    /// latency first, consumes pending completed halves, and then consumes the
+    /// current, partially written half unconditionally (LL-05). Returns the
+    /// `SOI..=EOI` length, or [`CameraError::CorruptedFrame`] when no EOI
+    /// follows the SOI.
     pub fn finish<S: DmaStatus>(
         &mut self,
         descriptors: &mut [Lldesc],
@@ -661,6 +1172,8 @@ impl PolledJpegCapture {
             prev_tail_len,
             ..
         } = self;
+        // Observe any final halves completed after the last poll before stop.
+        drain.observe(descriptors, status)?;
         loop {
             let more = drain.pending() > 0;
             let n = drain.drain_tail_half(descriptors, dma_buf, status, chunk.as_mut_slice())?;
@@ -1402,5 +1915,197 @@ mod tests {
             &mut h.hooks,
         );
         assert_eq!(step, CaptureStep::Failed(CameraError::BufferTooSmall));
+    }
+
+    /// M-112 (C4-011): a half completing after the last `poll()` (during VSYNC
+    /// debounce or DMA stop latency) must be observed by `finish()` so the
+    /// following tail half containing EOI is not abandoned.
+    #[test]
+    fn finish_observes_final_completed_halves_before_tail() {
+        let mut h = Harness::new();
+        let mut cap = Harness::capture();
+        let f = jpeg(2 * CHUNK + 200, true, 0x42);
+
+        // Start active video and consume half 0 normally.
+        h.ring.dma_write(0, 0, &f[..CHUNK]);
+        h.ring.dma_complete(0, &mut h.dma, true);
+        assert_eq!(h.poll(&mut cap, true), CaptureStep::Pending);
+
+        // VSYNC ends while half 1 has NOT yet raised EOF during `poll()`.
+        assert_eq!(h.poll(&mut cap, false), CaptureStep::FrameEnded);
+
+        // Half 1 completes during VSYNC debounce / DMA stop latency, and the
+        // tail 200 bytes (containing EOI) land in half 2.
+        h.ring.dma_write(1, 0, &f[CHUNK..2 * CHUNK]);
+        h.ring.dma_complete(1, &mut h.dma, true);
+        h.ring.dma_write(2, 0, &f[2 * CHUNK..2 * CHUNK + 200]);
+
+        assert_eq!(h.finish(&mut cap), Ok(2 * CHUNK + 200));
+        assert_eq!(&h.out[..4], &[0xFF, 0xD8, 0xFF, 0xE0]);
+        assert_eq!(&h.out[2 * CHUNK + 198..2 * CHUNK + 200], &[0xFF, 0xD9]);
+    }
+
+    /// M-113 (C4-012): single-poll full-ring lap (`>= half_cnt`) from
+    /// `pending == 0` under `OwnerWriteback` must fail with `Overflow`.
+    #[test]
+    fn observe_detects_single_poll_full_ring_lap_under_owner_writeback() {
+        // 2-half ring: DMA completes halves 0 and 1 before first poll.
+        type Ring2 = Ring<4, { 2 * HALF }>;
+        let mut ring2 = Ring2::new();
+        let mut drain2 =
+            HalfDrain::new(2, NODE, DmaFilterKind::Jpeg, DrainGate::OwnerWriteback).expect("d2");
+        let mut dma = MockDma::default();
+        ring2.dma_complete(0, &mut dma, true);
+        ring2.dma_complete(1, &mut dma, true);
+        assert_eq!(
+            drain2.observe(&ring2.desc, &mut dma),
+            Err(CameraError::Overflow)
+        );
+
+        // 8-half ring: DMA completes all 8 halves (0..=7) in one poll interval.
+        let mut ring8 = Ring8::new();
+        let mut drain8 = drain8(DrainGate::OwnerWriteback);
+        let mut dma8 = MockDma::default();
+        for h in 0..HALVES {
+            ring8.dma_complete(h, &mut dma8, true);
+        }
+        assert_eq!(
+            drain8.observe(&ring8.desc, &mut dma8),
+            Err(CameraError::Overflow)
+        );
+    }
+
+    /// M-113: single-poll laps with `delta in 1..half_cnt` (5-half lap on a
+    /// 4-half ring and 9-half lap on an 8-half ring) must return `Overflow`,
+    /// while normal `1..=3`-half advances pass with zero false positives.
+    #[test]
+    fn observe_detects_single_poll_over_lap_and_allows_normal_advances() {
+        type Ring4 = Ring<8, { 4 * HALF }>;
+
+        // Normal 1-, 2-, and 3-half advances on a 4-half ring must succeed.
+        for advance in 1..=3 {
+            let mut ring4 = Ring4::new();
+            let mut drain4 =
+                HalfDrain::new(4, NODE, DmaFilterKind::Jpeg, DrainGate::OwnerWriteback)
+                    .expect("d4");
+            let mut dma = MockDma::default();
+            for h in 0..advance {
+                ring4.dma_complete(h, &mut dma, true);
+            }
+            assert_eq!(
+                drain4.observe(&ring4.desc, &mut dma),
+                Ok(advance),
+                "normal {advance}-half advance on 4-half ring must pass"
+            );
+        }
+
+        // 5-half single-poll lap on a 4-half ring (`0 -> 1 -> 2 -> 3 -> 0`,
+        // `delta == 1`) must return `Overflow`.
+        let mut ring4 = Ring4::new();
+        let mut drain4 =
+            HalfDrain::new(4, NODE, DmaFilterKind::Jpeg, DrainGate::OwnerWriteback).expect("d4");
+        let mut dma4 = MockDma::default();
+        for h in [0usize, 1, 2, 3, 0] {
+            ring4.dma_complete(h, &mut dma4, true);
+        }
+        assert_eq!(
+            drain4.observe(&ring4.desc, &mut dma4),
+            Err(CameraError::Overflow)
+        );
+
+        // 9-half single-poll lap on an 8-half ring (`0..=7, 0`, `delta == 1`)
+        // must return `Overflow`, both from `half_idx == 0` and non-zero
+        // `half_idx` after consuming halves.
+        let mut ring8 = Ring8::new();
+        let mut drain8_zero = drain8(DrainGate::OwnerWriteback);
+        let mut dma8 = MockDma::default();
+        for step in 0..9 {
+            ring8.dma_complete(step % HALVES, &mut dma8, true);
+        }
+        assert_eq!(
+            drain8_zero.observe(&ring8.desc, &mut dma8),
+            Err(CameraError::Overflow)
+        );
+
+        let mut ring8_mid = Ring8::new();
+        let mut drain8_mid = drain8(DrainGate::OwnerWriteback);
+        let mut dma8_mid = MockDma::default();
+        for h in 0..3 {
+            ring8_mid.dma_complete(h, &mut dma8_mid, true);
+        }
+        let (r, _, n) = drain_collect(&mut drain8_mid, &mut ring8_mid, &mut dma8_mid);
+        assert_eq!((r, n), (Ok(3), 3));
+        assert_eq!(drain8_mid.half_idx(), 3);
+        // Normal 3-half advance across wrap from `half_idx == 3` (`3, 4, 5`).
+        for h in 3..6 {
+            ring8_mid.dma_complete(h, &mut dma8_mid, true);
+        }
+        let (r, _, n) = drain_collect(&mut drain8_mid, &mut ring8_mid, &mut dma8_mid);
+        assert_eq!((r, n), (Ok(3), 3));
+        assert_eq!(drain8_mid.half_idx(), 6);
+        // Now DMA laps 9 halves (`6, 7, 0, 1, 2, 3, 4, 5, 6`, `delta == 1`).
+        for step in 0..9 {
+            ring8_mid.dma_complete((6 + step) % HALVES, &mut dma8_mid, true);
+        }
+        assert_eq!(
+            drain8_mid.observe(&ring8_mid.desc, &mut dma8_mid),
+            Err(CameraError::Overflow)
+        );
+    }
+
+    /// M-114 (C4-013): `HalfDrain::new` rejects overflowing `half_cnt`, and
+    /// repeated `observe` calls after `Overflow` saturate instead of wrapping.
+    #[test]
+    fn new_rejects_overflowing_half_cnt_and_observe_saturates() {
+        let j = DmaFilterKind::Jpeg;
+        let g = DrainGate::OwnerWriteback;
+        assert_eq!(
+            HalfDrain::new(usize::MAX / 2 + 1, NODE, j, g),
+            Err(CameraError::InvalidArg)
+        );
+        assert_eq!(
+            HalfDrain::new(usize::MAX, 4, j, g),
+            Err(CameraError::InvalidArg)
+        );
+
+        let mut ring = Ring8::new();
+        let mut drain = drain8(DrainGate::OwnerWriteback);
+        let mut dma = MockDma::default();
+        ring.dma_complete(6, &mut dma, false);
+        assert_eq!(drain.observe(&ring.desc, &mut dma), Ok(7));
+        for _ in 0..4 {
+            ring.dma_complete(7, &mut dma, false);
+            assert_eq!(
+                drain.observe(&ring.desc, &mut dma),
+                Err(CameraError::Overflow)
+            );
+        }
+    }
+
+    /// C4-037: idle peek must not prematurely emit `FrameEnded` on stray
+    /// pre-SOI `FF D9`, while still ending when SOI precedes EOI in the peek.
+    #[test]
+    fn idle_peek_ignores_pre_soi_eoi_and_detects_post_soi_eoi() {
+        let mut h = Harness::new();
+        let mut cap = Harness::capture();
+        // Write stray `FF D9` with no SOI yet in half 0.
+        h.ring.dma_write(0, 0, &[0x11, 0xFF, 0xD9, 0x22]);
+        for _ in 0..PolledJpegCapture::IDLE_PEEK_POLLS {
+            assert_eq!(h.poll(&mut cap, true), CaptureStep::Pending);
+        }
+        assert_eq!(cap.diag().idle_peeks, 1);
+
+        // Now write a valid SOI..EOI inside half 0: next idle peek ends frame.
+        h.ring
+            .dma_write(0, 4, &[0xFF, 0xD8, 0xFF, 0xE0, 0xAA, 0xFF, 0xD9]);
+        let mut step = CaptureStep::Pending;
+        for _ in 0..PolledJpegCapture::IDLE_PEEK_POLLS {
+            step = h.poll(&mut cap, true);
+            if step != CaptureStep::Pending {
+                break;
+            }
+        }
+        assert_eq!(step, CaptureStep::FrameEnded);
+        assert_eq!(h.finish(&mut cap), Ok(7));
     }
 }

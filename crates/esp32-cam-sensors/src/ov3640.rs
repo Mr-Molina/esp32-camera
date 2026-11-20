@@ -17,9 +17,9 @@
 //! Until a register map from an OV3640 reference is ported and checked on
 //! hardware, the setters that depend on those blocks refuse with
 //! [`CameraError::NotSupported`] rather than write another sensor's map into
-//! a real part: [`CameraSensor::set_framesize`], [`CameraSensor::set_pixformat`],
-//! [`CameraSensor::set_quality`], [`CameraSensor::set_res_raw`] and
-//! [`CameraSensor::set_pll`].
+//! a real part: [`CameraSensor::set_framesize`],
+//! [`CameraSensor::set_pixformat`], [`CameraSensor::set_quality`],
+//! [`CameraSensor::set_res_raw`] and [`CameraSensor::set_pll`].
 //!
 //! The remaining methods, including [`CameraSensor::reset`], still write the
 //! unverified default table, so this driver has **not** been validated against

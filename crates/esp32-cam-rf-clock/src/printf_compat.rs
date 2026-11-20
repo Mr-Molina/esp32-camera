@@ -15,8 +15,10 @@ pub static ESP_RADIO_TAG: [u8; 10] = *b"ESP_RADIO\0";
 /// `__esp_radio_printf` on Xtensa targets.
 ///
 /// # Safety
-/// `tag` (if non-null) and `fmt` must be valid, NUL-terminated C strings, and
-/// `va` must be a valid [`XtensaVaList`] matching `fmt` specifiers.
+/// `tag` (if non-null) and `fmt` must be valid, NUL-terminated C strings not
+/// mutated concurrently, and `va` (if non-null) must be properly aligned for
+/// [`XtensaVaList`], valid for mutable access, non-aliasing with `tag`/`fmt`/
+/// `%s` strings, and match `fmt` specifiers.
 // JUSTIFICATION: C radio blobs invoke `syslog` and `*_printf` trampolines
 // that forward raw C strings and Xtensa Call8 varargs into Rust.
 // SAFETY: `buf` is an 80-byte stack array; `format_syslog_line` guarantees NUL
@@ -31,6 +33,10 @@ pub unsafe extern "C" fn rust_syslog(tag: *const u8, fmt: *const u8, va: *mut Xt
 
     #[cfg(target_arch = "xtensa")]
     if len > 0 && !tag.is_null() {
+        // JUSTIFICATION: Declares the ESP-IDF radio logging callback linked from
+        // `esp-wifi-sys-esp32` on Xtensa targets.
+        // SAFETY: `__esp_radio_printf` follows the C ABI `(tag, msg)` signature
+        // taking two NUL-terminated C strings and never unwinds.
         extern "C" {
             fn __esp_radio_printf(tag: *const core::ffi::c_char, msg: *const core::ffi::c_char);
         }
@@ -51,8 +57,11 @@ pub unsafe extern "C" fn rust_syslog(tag: *const u8, fmt: *const u8, va: *mut Xt
 /// trampolines (`vsnprintf`, `snprintf`, `sprintf`).
 ///
 /// # Safety
-/// `buf` must be writable for `size` bytes when non-null and `size > 0`, `fmt`
-/// must be NUL-terminated, and `va` must match `fmt` specifiers.
+/// `buf` must be writable for `size` bytes (or formatted length + NUL when
+/// called from `sprintf`) when non-null and `size > 0`, must not overlap `fmt`,
+/// `va`, or any `%s` string argument; `fmt` must be NUL-terminated; and `va`
+/// (when non-null) must be properly aligned for [`XtensaVaList`], valid for
+/// mutable access, and match `fmt` specifiers.
 // JUSTIFICATION: Xtensa assembly trampolines call an unmangled `extern "C"`
 // symbol without relying on Rust symbol mangling.
 // SAFETY: Forwards directly to `rust_vsnprintf` under the caller's `# Safety`
@@ -70,6 +79,13 @@ pub unsafe extern "C" fn rust_vsnprintf_abi(
     unsafe { rust_vsnprintf(buf, size, fmt, va) }
 }
 
+// JUSTIFICATION: Pure-Rust `#![no_std]` cannot express Xtensa Call8 C variadic
+// prologues (`...`) or pass-by-value 12-byte `va_list` structs in stable Rust;
+// these 11 trampolines materialize `XtensaVaList` on stack and invoke
+// `rust_vsnprintf_abi` / `rust_syslog`.
+// SAFETY: Each trampoline follows the Xtensa Call8 windowed ABI
+// (`entry`/`retw.n`), preserves stack alignment, and forwards `sprintf`'s `-1`
+// (`usize::MAX`) size to `rust_vsnprintf`, which clamps `cap` to `isize::MAX`.
 #[cfg(target_arch = "xtensa")]
 global_asm!(
     // 1. vsnprintf(a2=buf, a3=count, a4=fmt, a5..a7=va)
@@ -385,49 +401,62 @@ global_asm!(
 #[must_use]
 #[inline(never)]
 pub fn link_touch() -> usize {
-    let syslog_addr = hint::black_box(
-        rust_syslog as unsafe extern "C" fn(*const u8, *const u8, *mut XtensaVaList) as *const ()
-            as usize,
-    );
-    let vsnprintf_addr = hint::black_box(
-        rust_vsnprintf_abi
-            as unsafe extern "C" fn(*mut u8, usize, *const u8, *mut XtensaVaList) -> i32
-            as *const () as usize,
-    );
+    // JUSTIFICATION: Takes the address of `rust_syslog` to retain its symbol
+    // across `--gc-sections` without invoking it.
+    // SAFETY: Function pointer cast to `*const ()` and `usize` performs no
+    // call or memory access.
+    let syslog_fn: unsafe extern "C" fn(*const u8, *const u8, *mut XtensaVaList) = rust_syslog;
+    let syslog_addr = hint::black_box(syslog_fn as *const () as usize);
+
+    // JUSTIFICATION: Takes the address of `rust_vsnprintf_abi` to retain its
+    // symbol across `--gc-sections` without invoking it.
+    // SAFETY: Function pointer cast to `*const ()` and `usize` performs no
+    // call or memory access.
+    let vsnprintf_fn: unsafe extern "C" fn(*mut u8, usize, *const u8, *mut XtensaVaList) -> i32 =
+        rust_vsnprintf_abi;
+    let vsnprintf_addr = hint::black_box(vsnprintf_fn as *const () as usize);
+
     let tag_addr = hint::black_box(&raw const ESP_RADIO_TAG as usize);
     let base = syslog_addr ^ vsnprintf_addr ^ tag_addr;
 
     #[cfg(target_arch = "xtensa")]
     {
+        // JUSTIFICATION: Declares opaque linker symbols for the 11 Xtensa
+        // `global_asm!` trampolines so `link_touch` anchors them without
+        // declaring mismatched 0-arg `fn()` signatures.
+        // SAFETY: Symbols are defined by `global_asm!` in this module and are
+        // only taken by address via `&raw const`, never dereferenced or called.
         extern "C" {
-            fn vsnprintf();
-            fn snprintf();
-            fn sprintf();
-            fn syslog();
-            fn rtc_printf();
-            fn coexist_printf();
-            fn net80211_printf();
-            fn phy_printf();
-            fn pp_printf();
-            fn __esp_radio_log_write();
-            fn __esp_radio_log_writev();
+            static vsnprintf: u8;
+            static snprintf: u8;
+            static sprintf: u8;
+            static syslog: u8;
+            static rtc_printf: u8;
+            static coexist_printf: u8;
+            static net80211_printf: u8;
+            static phy_printf: u8;
+            static pp_printf: u8;
+            static __esp_radio_log_write: u8;
+            static __esp_radio_log_writev: u8;
         }
-        let mut acc = base;
-        let syms: [unsafe extern "C" fn(); 11] = [
-            vsnprintf,
-            snprintf,
-            sprintf,
-            syslog,
-            rtc_printf,
-            coexist_printf,
-            net80211_printf,
-            phy_printf,
-            pp_printf,
-            __esp_radio_log_write,
-            __esp_radio_log_writev,
+        // Form raw symbol addresses to keep all 11 Xtensa assembly trampolines
+        // reachable for the linker without reading text memory.
+        let syms: [*const u8; 11] = [
+            &raw const vsnprintf,
+            &raw const snprintf,
+            &raw const sprintf,
+            &raw const syslog,
+            &raw const rtc_printf,
+            &raw const coexist_printf,
+            &raw const net80211_printf,
+            &raw const phy_printf,
+            &raw const pp_printf,
+            &raw const __esp_radio_log_write,
+            &raw const __esp_radio_log_writev,
         ];
+        let mut acc = base;
         for sym in syms {
-            acc ^= hint::black_box(sym as *const () as usize);
+            acc ^= hint::black_box(sym as usize);
         }
         acc
     }

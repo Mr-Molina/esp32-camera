@@ -14,6 +14,10 @@ use esp32_cam_types::{CameraFbLocation, CameraGrabMode, FrameSize, PixelFormat};
 /// builds without a real token fail in `build.rs` (`BUILD-07`).
 pub const DEFAULT_OTA_TOKEN: &str = "klipper-cam-ota-2026";
 
+/// Minimum required length in bytes for a valid production OTA authentication
+/// token (`M-031` / `C1-010`).
+pub const MIN_OTA_TOKEN_LEN: usize = 16;
+
 /// Default Wi-Fi SSID when `WIFI_SSID` is not set at compile time.
 pub const DEFAULT_WIFI_SSID: &str = "iot";
 
@@ -68,25 +72,66 @@ pub const STREAM_PORT: u16 = DEFAULT_STREAM_PORT;
 /// Active JPEG compression quality (`12` by default, range `1..=63`).
 pub const JPEG_QUALITY: u8 = DEFAULT_JPEG_QUALITY;
 
+/// Environment variables checked by [`active_ota_token`] in exact precedence
+/// order (`M-027`, kept 1:1 with `build.rs::OTA_TOKEN_VARS`).
+pub const OTA_TOKEN_VARS: [&str; 4] = [
+    "CAM_OTA_TOKEN",
+    "OTA_TOKEN",
+    "WIFI_OTA_TOKEN",
+    "ESP32_CAM_OTA_TOKEN",
+];
+
 /// Returns the active OTA token resolved at compile time via `option_env!`.
 ///
-/// Checked in priority order:
+/// Checked in priority order (1:1 with `build.rs::OTA_TOKEN_VARS`):
 /// 1. `CAM_OTA_TOKEN`
 /// 2. `OTA_TOKEN`
 /// 3. `WIFI_OTA_TOKEN`
-/// 4. [`DEFAULT_OTA_TOKEN`] fallback if unset or empty.
+/// 4. `ESP32_CAM_OTA_TOKEN`
+/// 5. Under `provisioning-ap`, returns `""` (never [`DEFAULT_OTA_TOKEN`]);
+///    otherwise falls back to [`DEFAULT_OTA_TOKEN`] if unset or empty.
 #[inline]
 pub const fn active_ota_token() -> &'static str {
+    let fallback = if cfg!(feature = "provisioning-ap") {
+        ""
+    } else {
+        DEFAULT_OTA_TOKEN
+    };
     match option_env!("CAM_OTA_TOKEN") {
         Some(token) if !token.is_empty() => token,
         _ => match option_env!("OTA_TOKEN") {
             Some(token) if !token.is_empty() => token,
             _ => match COMPILE_TIME_OTA_TOKEN {
                 Some(token) if !token.is_empty() => token,
-                _ => DEFAULT_OTA_TOKEN,
+                _ => match option_env!("ESP32_CAM_OTA_TOKEN") {
+                    Some(token) if !token.is_empty() => token,
+                    _ => fallback,
+                },
             },
         },
     }
+}
+
+/// Returns `true` if `token` is a valid production OTA authentication token
+/// (`M-027` / `M-031` / `C1-010`):
+/// - at least [`MIN_OTA_TOKEN_LEN`] (`16`) bytes
+/// - every byte is graphic ASCII (`0x21..=0x7E`, rejecting all whitespace,
+///   control characters, and non-ASCII bytes)
+/// - not equal to [`DEFAULT_OTA_TOKEN`]
+#[inline]
+pub const fn is_valid_ota_token(token: &[u8]) -> bool {
+    if token.len() < MIN_OTA_TOKEN_LEN {
+        return false;
+    }
+    let mut i = 0;
+    while i < token.len() {
+        let b = token[i];
+        if b < 0x21 || b > 0x7E {
+            return false;
+        }
+        i += 1;
+    }
+    !const_bytes_eq(token, DEFAULT_OTA_TOKEN.as_bytes())
 }
 
 /// Active OTA authentication token resolved at compile time.
@@ -135,10 +180,11 @@ impl fmt::Display for ConfigError {
         match self {
             Self::InvalidConfig => f.write_str(
                 "invalid configuration (SSID 1..=32 bytes, WIFI_PASS empty or 8..=63 bytes, \
-                 non-empty OTA token, distinct non-zero ports)",
+                 non-default OTA token >= 16 bytes, quality 1..=63, distinct non-zero ports)",
             ),
             Self::OpenWifiNotAllowed => f.write_str(
-                "WIFI_PASS is empty; build with the `allow-open-wifi` feature to join an Open network",
+                "WIFI_PASS is empty; build with the `allow-open-wifi` feature \
+                 to join an Open network",
             ),
             Self::InvalidPassphraseLength(len) => {
                 write!(f, "WIFI_PASS is {} bytes; WPA2-PSK needs 8..=63", len)
@@ -174,7 +220,28 @@ const _: () = assert!(
     "WIFI_PASS must be empty or 8..=63 bytes"
 );
 const _: () = assert!(JPEG_QUALITY >= 1 && JPEG_QUALITY <= 63);
+#[cfg(not(feature = "provisioning-ap"))]
 const _: () = assert!(!OTA_TOKEN.is_empty());
+
+/// Returns `true` when `WIFI_SSID` was explicitly set to a non-empty value at
+/// compile time (as opposed to falling back to [`DEFAULT_WIFI_SSID`]).
+#[inline]
+pub const fn has_explicit_build_wifi_ssid() -> bool {
+    match COMPILE_TIME_WIFI_SSID {
+        Some(ssid) => !ssid.is_empty(),
+        None => false,
+    }
+}
+
+/// Returns `true` when `WIFI_PASS` was explicitly set to a valid WPA2-PSK
+/// passphrase (`8..=63` bytes) at compile time.
+#[inline]
+pub const fn has_explicit_build_wifi_pass() -> bool {
+    match COMPILE_TIME_WIFI_PASS {
+        Some(pass) => pass.len() >= 8 && pass.len() <= 63,
+        None => false,
+    }
+}
 
 /// Returns the active Wi-Fi SSID resolved at compile time via
 /// `option_env!("WIFI_SSID")`, falling back to [`DEFAULT_WIFI_SSID`] if unset
@@ -511,9 +578,39 @@ impl Default for StaticIpConfig {
     }
 }
 
+/// IPv4 address assignment mode for the Wi-Fi station interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IpMode {
+    /// Obtain IPv4 address, netmask, gateway, and DNS via DHCPv4.
+    Dhcp,
+    /// Use a fixed static IPv4 configuration (DHCPv4 disabled).
+    Static(StaticIpConfig),
+}
+
+impl IpMode {
+    /// Returns `true` if this IP mode is structurally valid.
+    #[inline]
+    pub const fn is_valid(&self) -> bool {
+        match self {
+            Self::Dhcp => true,
+            Self::Static(cfg) => cfg.is_valid(),
+        }
+    }
+}
+
+impl Default for IpMode {
+    #[inline]
+    fn default() -> Self {
+        Self::Static(StaticIpConfig::KLIPPER_DEFAULT)
+    }
+}
+
 /// Wi-Fi and IPv4 network configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NetworkConfig {
+    /// IPv4 address assignment mode (static by default for backward
+    /// compatibility).
+    pub ip_mode: IpMode,
     /// Static IPv4 settings (`172.22.1.52/24`, GW `172.22.1.1`).
     pub static_ip: StaticIpConfig,
     /// 2.4 GHz Wi-Fi SSID.
@@ -527,6 +624,7 @@ pub struct NetworkConfig {
 impl NetworkConfig {
     /// Default network configuration and `172.22.1.52/24` static profile ready.
     pub const DEFAULT: Self = Self {
+        ip_mode: IpMode::Static(StaticIpConfig::KLIPPER_DEFAULT),
         static_ip: StaticIpConfig::KLIPPER_DEFAULT,
         wifi_ssid: active_wifi_ssid(),
         wifi_password: active_wifi_pass(),
@@ -652,7 +750,59 @@ impl KlipperCamConfig {
         &self.network.static_ip
     }
 
+    /// Returns the configured IPv4 assignment mode (`Dhcp` or `Static`).
+    #[inline]
+    pub const fn ip_mode(&self) -> IpMode {
+        self.network.ip_mode
+    }
+
+    /// Returns `true` if this configuration holds usable Wi-Fi station
+    /// credentials (`wifi_ssid` in `1..=32` bytes and either a `8..=63`-byte
+    /// WPA2-PSK passphrase or an empty passphrase with `allow-open-wifi`).
+    ///
+    /// Under `provisioning-ap`, the built-in [`DEFAULT_WIFI_SSID`] fallback
+    /// (`"iot"`) paired with an empty passphrase never satisfies this check
+    /// unless `WIFI_SSID` was explicitly provided at build time.
+    #[inline]
+    pub const fn has_sta_credentials(&self) -> bool {
+        let ssid = self.network.wifi_ssid.as_bytes();
+        let pass = self.network.wifi_password.as_bytes();
+
+        if ssid.is_empty() || ssid.len() > 32 {
+            return false;
+        }
+        if cfg!(feature = "provisioning-ap")
+            && !has_explicit_build_wifi_ssid()
+            && pass.is_empty()
+            && const_bytes_eq(ssid, DEFAULT_WIFI_SSID.as_bytes())
+        {
+            return false;
+        }
+        if pass.is_empty() {
+            ALLOW_OPEN_WIFI
+        } else {
+            pass.len() >= 8 && pass.len() <= 63
+        }
+    }
+
+    /// Returns `true` if the configured OTA authentication token satisfies
+    /// [`is_valid_ota_token`] (at least [`MIN_OTA_TOKEN_LEN`] graphic ASCII
+    /// bytes and not equal to [`DEFAULT_OTA_TOKEN`]).
+    #[inline]
+    pub const fn has_valid_ota_token(&self) -> bool {
+        is_valid_ota_token(self.ota_token.as_bytes())
+    }
+
     /// Returns `true` if this configuration is structurally and semantically valid.
+    ///
+    /// Enforces (`M-031` / `C1-010`):
+    /// - `wifi_ssid` length in `1..=32` bytes
+    /// - `wifi_password` empty or `8..=63` bytes
+    /// - `ota_token` at least [`MIN_OTA_TOKEN_LEN`] (`16`) bytes and not equal to
+    ///   [`DEFAULT_OTA_TOKEN`]
+    /// - `quality` in `1..=63`
+    /// - valid `ip_mode` / `static_ip` and distinct non-zero `control_port` /
+    ///   `stream_port`
     pub const fn is_valid(&self) -> bool {
         let ssid = self.network.wifi_ssid.as_bytes();
         let pass = self.network.wifi_password.as_bytes();
@@ -664,11 +814,16 @@ impl KlipperCamConfig {
         if !pass.is_empty() && (pass.len() < 8 || pass.len() > 63) {
             return false;
         }
-        if token.is_empty() {
+        if !is_valid_ota_token(token) {
             return false;
         }
-        if !self.network.static_ip.is_valid() {
+        if self.quality < 1 || self.quality > 63 {
             return false;
+        }
+        if let IpMode::Static(static_cfg) = self.network.ip_mode {
+            if !static_cfg.is_valid() || !self.network.static_ip.is_valid() {
+                return false;
+            }
         }
         if self.control_port == 0 || self.stream_port == 0 || self.control_port == self.stream_port
         {
@@ -688,22 +843,41 @@ impl KlipperCamConfig {
     }
 
     /// Resolves `KlipperCamConfig` from compile-time build environment variables.
+    ///
+    /// Under the `provisioning-ap` feature, an unset `WIFI_SSID` resolves to
+    /// `""` instead of [`DEFAULT_WIFI_SSID`] so a freshly flashed device never
+    /// mistakes the built-in fallback for provisioned station credentials.
     pub const fn from_build_env() -> Self {
         let mut cfg = Self::WROVER_KIT_HD;
         cfg.ota_token = active_ota_token();
+        if cfg!(feature = "provisioning-ap") && !has_explicit_build_wifi_ssid() {
+            cfg.network.wifi_ssid = "";
+        }
         cfg
     }
 
-    /// Applies optional configuration overrides loaded from NVS (`LOGIC-172`).
+    /// Applies optional configuration overrides loaded from NVS (`LOGIC-172` /
+    /// `M-031`), validating every overridden field and rejecting weak/default
+    /// tokens, invalid passphrases, out-of-range quality, or invalid static IP.
     #[inline]
-    pub fn with_nvs_overrides(mut self, overrides: NvsConfigOverrides<'static>) -> Self {
+    pub fn with_nvs_overrides(
+        mut self,
+        overrides: NvsConfigOverrides<'static>,
+    ) -> Result<Self, ConfigError> {
         if let Some(ssid) = overrides.wifi_ssid {
+            if ssid.is_empty() || ssid.len() > 32 {
+                return Err(ConfigError::InvalidConfig);
+            }
             self.network.wifi_ssid = ssid;
         }
         if let Some(pass) = overrides.wifi_password {
+            let _ = wifi_auth_mode(pass, ALLOW_OPEN_WIFI)?;
             self.network.wifi_password = pass;
         }
         if let Some(token) = overrides.ota_token {
+            if !is_valid_ota_token(token.as_bytes()) {
+                return Err(ConfigError::InvalidConfig);
+            }
             self.ota_token = token;
         }
         if let Some(vflip) = overrides.vflip {
@@ -713,21 +887,64 @@ impl KlipperCamConfig {
             self.hmirror = hmirror;
         }
         if let Some(quality) = overrides.quality {
+            if !(1..=63).contains(&quality) {
+                return Err(ConfigError::InvalidConfig);
+            }
             self.quality = quality;
         }
         if let Some(frame_size) = overrides.frame_size {
             self.frame_size = frame_size;
         }
         if let Some(static_ip) = overrides.static_ip {
+            if !static_ip.is_valid() {
+                return Err(ConfigError::InvalidConfig);
+            }
             self.network.static_ip = static_ip;
+            self.network.ip_mode = IpMode::Static(static_ip);
         }
-        self
+        if let Some(ip_mode) = overrides.ip_mode {
+            match ip_mode {
+                IpMode::Dhcp => {
+                    self.network.ip_mode = IpMode::Dhcp;
+                }
+                IpMode::Static(static_ip) => {
+                    if !static_ip.is_valid() {
+                        return Err(ConfigError::InvalidConfig);
+                    }
+                    self.network.static_ip = static_ip;
+                    self.network.ip_mode = IpMode::Static(static_ip);
+                }
+            }
+        }
+        if !self.is_valid() {
+            return Err(ConfigError::InvalidConfig);
+        }
+        Ok(self)
     }
+}
+
+/// Const-compatible byte-slice equality helper for `is_valid`.
+#[inline]
+const fn const_bytes_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 /// Optional configuration overrides retrieved from non-volatile storage
 /// (`LOGIC-172`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// Implements a manual [`fmt::Debug`] that redacts `wifi_password` and
+/// `ota_token` (`M-134` / `C1-036`).
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub struct NvsConfigOverrides<'a> {
     /// Optional Wi-Fi SSID override.
     pub wifi_ssid: Option<&'a str>,
@@ -745,6 +962,24 @@ pub struct NvsConfigOverrides<'a> {
     pub frame_size: Option<FrameSize>,
     /// Optional static IP configuration override.
     pub static_ip: Option<StaticIpConfig>,
+    /// Optional IPv4 assignment mode override (`Dhcp` or `Static`).
+    pub ip_mode: Option<IpMode>,
+}
+
+impl fmt::Debug for NvsConfigOverrides<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NvsConfigOverrides")
+            .field("wifi_ssid", &self.wifi_ssid)
+            .field("wifi_password", &self.wifi_password.map(|_| "[REDACTED]"))
+            .field("ota_token", &self.ota_token.map(|_| "[REDACTED]"))
+            .field("vflip", &self.vflip)
+            .field("hmirror", &self.hmirror)
+            .field("quality", &self.quality)
+            .field("frame_size", &self.frame_size)
+            .field("static_ip", &self.static_ip)
+            .field("ip_mode", &self.ip_mode)
+            .finish()
+    }
 }
 
 impl Default for KlipperCamConfig {
@@ -853,9 +1088,18 @@ mod tests {
         assert_eq!(Ipv4Addr::parse_ascii("172.22.1"), None);
         assert_eq!(Ipv4Addr::parse_ascii(""), None);
 
-        let cfg = KlipperCamConfig::default();
-        assert!(cfg.is_valid());
+        let mut cfg = KlipperCamConfig::default();
+        assert!(
+            !cfg.is_valid(),
+            "factory default OTA token must fail is_valid()"
+        );
+        #[cfg(not(feature = "provisioning-ap"))]
         assert!(cfg.is_default_ota_token());
+        #[cfg(feature = "provisioning-ap")]
+        assert!(!cfg.has_valid_ota_token());
+        cfg.ota_token = "private-test-ota-token-2026";
+        assert!(cfg.is_valid());
+        assert!(!cfg.is_default_ota_token());
         assert_eq!(cfg.http_port(), 80);
         assert_eq!(cfg.static_ip().prefix_len, 24);
 
@@ -876,13 +1120,23 @@ mod tests {
             frame_size: Some(FrameSize::Vga),
             ..Default::default()
         };
-        let overridden = cfg.with_nvs_overrides(overrides);
+        let overridden = cfg
+            .with_nvs_overrides(overrides)
+            .expect("valid NVS overrides");
         assert!(overridden.vflip);
         assert!(overridden.hmirror);
         assert_eq!(overridden.quality, 20);
         assert_eq!(overridden.frame_size, FrameSize::Vga);
 
-        let env_cfg = KlipperCamConfig::from_build_env();
+        let mut env_cfg = KlipperCamConfig::from_build_env();
+        if env_cfg.is_default_ota_token() || !env_cfg.has_valid_ota_token() {
+            assert!(!env_cfg.is_valid());
+            env_cfg.ota_token = "private-build-env-ota-token";
+        }
+        #[cfg(feature = "provisioning-ap")]
+        if env_cfg.network.wifi_ssid.is_empty() {
+            env_cfg.network.wifi_ssid = "test-build-env-ssid";
+        }
         assert!(env_cfg.is_valid());
     }
 
@@ -900,14 +1154,20 @@ mod tests {
     #[test]
     fn test_ota_token_resolution() {
         let token = active_ota_token();
+        #[cfg(not(feature = "provisioning-ap"))]
         assert!(!token.is_empty());
+        #[cfg(feature = "provisioning-ap")]
+        assert_ne!(token, DEFAULT_OTA_TOKEN);
     }
 
     #[test]
     fn test_compile_time_invariants_and_constants() {
         assert_ne!(HTTP_PORT, STREAM_PORT);
         assert!((1..=63).contains(&JPEG_QUALITY));
+        #[cfg(not(feature = "provisioning-ap"))]
         assert!(!OTA_TOKEN.is_empty());
+        #[cfg(feature = "provisioning-ap")]
+        assert_ne!(OTA_TOKEN, DEFAULT_OTA_TOKEN);
     }
 
     // ---- WP-09 / FW-NET-03 + FW-NET-04: fail-closed boot configuration ----
@@ -955,6 +1215,7 @@ mod tests {
     #[test]
     fn test_wp09_boot_wifi_auth_checks_is_valid_first() {
         let mut cfg = KlipperCamConfig::WROVER_KIT_HD;
+        cfg.ota_token = "private-boot-auth-ota-token";
         cfg.network.wifi_password = "correct-horse";
         assert_eq!(cfg.boot_wifi_auth(false), Ok(WifiAuthMode::WpaWpa2Personal));
 
@@ -1013,5 +1274,358 @@ mod tests {
         assert!(cfg.is_default_ota_token());
         cfg.ota_token = "a-real-secret";
         assert!(!cfg.is_default_ota_token());
+    }
+
+    #[test]
+    fn test_m031_is_valid_and_nvs_overrides_reject_weak_and_invalid() {
+        let mut cfg = KlipperCamConfig::WROVER_KIT_HD;
+        cfg.ota_token = DEFAULT_OTA_TOKEN;
+        assert!(!cfg.is_valid(), "DEFAULT_OTA_TOKEN must be rejected");
+
+        cfg.ota_token = "too-short-15chr";
+        assert!(!cfg.is_valid(), "tokens < 16 bytes must be rejected");
+
+        // M-031: whitespace and non-graphic ASCII tokens must be rejected.
+        for bad in [
+            "                ",
+            " klipper-cam-ota-2026",
+            "valid-16-byte-tk ",
+            "valid 16 byte tk",
+            "\tvalid-16-byte-tk",
+            "valid-16-byte-t\x7F",
+        ] {
+            assert!(!is_valid_ota_token(bad.as_bytes()), "bad token: {bad:?}");
+            cfg.ota_token = bad;
+            assert!(!cfg.is_valid(), "is_valid must reject {bad:?}");
+        }
+
+        cfg.ota_token = "valid-16-byte-tk";
+        assert!(cfg.is_valid());
+
+        // M-031: NVS overrides must also reject whitespace/non-graphic tokens.
+        for bad in [
+            "                ",
+            " klipper-cam-ota-2026",
+            "valid 16 byte tk",
+        ] {
+            assert_eq!(
+                cfg.with_nvs_overrides(NvsConfigOverrides {
+                    ota_token: Some(bad),
+                    ..Default::default()
+                }),
+                Err(ConfigError::InvalidConfig),
+                "with_nvs_overrides must reject {bad:?}"
+            );
+        }
+
+        let mut q0 = cfg;
+        q0.quality = 0;
+        assert!(!q0.is_valid(), "quality 0 must be rejected");
+        let mut q64 = cfg;
+        q64.quality = 64;
+        assert!(!q64.is_valid(), "quality 64 must be rejected");
+        let mut q1 = cfg;
+        q1.quality = 1;
+        assert!(q1.is_valid());
+        let mut q63 = cfg;
+        q63.quality = 63;
+        assert!(q63.is_valid());
+
+        assert_eq!(
+            cfg.with_nvs_overrides(NvsConfigOverrides {
+                ota_token: Some(DEFAULT_OTA_TOKEN),
+                ..Default::default()
+            }),
+            Err(ConfigError::InvalidConfig)
+        );
+        assert_eq!(
+            cfg.with_nvs_overrides(NvsConfigOverrides {
+                ota_token: Some("short-token"),
+                ..Default::default()
+            }),
+            Err(ConfigError::InvalidConfig)
+        );
+        assert_eq!(
+            cfg.with_nvs_overrides(NvsConfigOverrides {
+                quality: Some(0),
+                ..Default::default()
+            }),
+            Err(ConfigError::InvalidConfig)
+        );
+        assert_eq!(
+            cfg.with_nvs_overrides(NvsConfigOverrides {
+                quality: Some(64),
+                ..Default::default()
+            }),
+            Err(ConfigError::InvalidConfig)
+        );
+        assert_eq!(
+            cfg.with_nvs_overrides(NvsConfigOverrides {
+                wifi_ssid: Some(""),
+                ..Default::default()
+            }),
+            Err(ConfigError::InvalidConfig)
+        );
+        assert_eq!(
+            cfg.with_nvs_overrides(NvsConfigOverrides {
+                wifi_password: Some("short"),
+                ..Default::default()
+            }),
+            Err(ConfigError::InvalidPassphraseLength(5))
+        );
+        if !ALLOW_OPEN_WIFI {
+            assert_eq!(
+                cfg.with_nvs_overrides(NvsConfigOverrides {
+                    wifi_password: Some(""),
+                    ..Default::default()
+                }),
+                Err(ConfigError::OpenWifiNotAllowed)
+            );
+        }
+        let mut bad_ip = StaticIpConfig::KLIPPER_DEFAULT;
+        bad_ip.ip = bad_ip.gateway;
+        assert_eq!(
+            cfg.with_nvs_overrides(NvsConfigOverrides {
+                static_ip: Some(bad_ip),
+                ..Default::default()
+            }),
+            Err(ConfigError::InvalidConfig)
+        );
+    }
+
+    #[test]
+    fn test_m134_nvs_config_overrides_redacts_secrets_in_debug() {
+        extern crate alloc;
+        use alloc::format;
+        let overrides = NvsConfigOverrides {
+            wifi_ssid: Some("printer-net"),
+            wifi_password: Some("super-secret-wifi-pass"),
+            ota_token: Some("super-secret-ota-token-value"),
+            quality: Some(15),
+            ..Default::default()
+        };
+        let rendered = format!("{:?}", overrides);
+        assert!(rendered.contains("printer-net"));
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(!rendered.contains("super-secret-wifi-pass"));
+        assert!(!rendered.contains("super-secret-ota-token-value"));
+    }
+
+    // ---- SoftAP Provisioning: IpMode, credentials, Review Focus #1 ----
+
+    #[test]
+    fn test_ip_mode_default_and_validity() {
+        assert_eq!(
+            IpMode::default(),
+            IpMode::Static(StaticIpConfig::KLIPPER_DEFAULT)
+        );
+        assert_eq!(
+            NetworkConfig::DEFAULT.ip_mode,
+            IpMode::Static(StaticIpConfig::KLIPPER_DEFAULT)
+        );
+        assert_eq!(
+            KlipperCamConfig::WROVER_KIT_HD.ip_mode(),
+            IpMode::Static(StaticIpConfig::KLIPPER_DEFAULT)
+        );
+        assert!(IpMode::Dhcp.is_valid());
+        assert!(IpMode::Static(StaticIpConfig::KLIPPER_DEFAULT).is_valid());
+
+        let mut bad_same = StaticIpConfig::KLIPPER_DEFAULT;
+        bad_same.ip = bad_same.gateway;
+        assert!(!IpMode::Static(bad_same).is_valid());
+
+        let mut bad_prefix = StaticIpConfig::KLIPPER_DEFAULT;
+        bad_prefix.prefix_len = 0;
+        assert!(!IpMode::Static(bad_prefix).is_valid());
+
+        let mut bad_subnet = StaticIpConfig::KLIPPER_DEFAULT;
+        bad_subnet.gateway = Ipv4Addr::new(10, 0, 0, 1);
+        assert!(!IpMode::Static(bad_subnet).is_valid());
+    }
+
+    #[test]
+    fn test_review_focus_1_fresh_build_env_and_default_leakage() {
+        assert_eq!(
+            has_explicit_build_wifi_ssid(),
+            COMPILE_TIME_WIFI_SSID.is_some_and(|s| !s.is_empty())
+        );
+        assert_eq!(
+            has_explicit_build_wifi_pass(),
+            COMPILE_TIME_WIFI_PASS.is_some_and(|p| (8..=63).contains(&p.len()))
+        );
+
+        let env_cfg = KlipperCamConfig::from_build_env();
+        if cfg!(feature = "provisioning-ap") {
+            let any_ota_env = option_env!("CAM_OTA_TOKEN").is_some_and(|s| !s.is_empty())
+                || option_env!("OTA_TOKEN").is_some_and(|s| !s.is_empty())
+                || COMPILE_TIME_OTA_TOKEN.is_some_and(|s| !s.is_empty())
+                || option_env!("ESP32_CAM_OTA_TOKEN").is_some_and(|s| !s.is_empty());
+            if !any_ota_env {
+                assert_eq!(
+                    active_ota_token(),
+                    "",
+                    "unset OTA env under provisioning-ap must return empty string"
+                );
+                assert_eq!(env_cfg.ota_token, "");
+                assert!(!env_cfg.has_valid_ota_token());
+            }
+            if !has_explicit_build_wifi_ssid() {
+                assert_eq!(
+                    env_cfg.network.wifi_ssid, "",
+                    "unset WIFI_SSID under provisioning-ap must not leak DEFAULT_WIFI_SSID"
+                );
+                assert!(!env_cfg.has_sta_credentials());
+            }
+        }
+
+        // Built-in DEFAULT_WIFI_SSID ("iot") + empty pass + DEFAULT_OTA_TOKEN
+        // must never satisfy has_valid_ota_token() and must never satisfy
+        // has_sta_credentials() under provisioning-ap (or without open-wifi).
+        let mut fallback_cfg = KlipperCamConfig::WROVER_KIT_HD;
+        fallback_cfg.network.wifi_ssid = DEFAULT_WIFI_SSID;
+        fallback_cfg.network.wifi_password = DEFAULT_WIFI_PASS;
+        fallback_cfg.ota_token = DEFAULT_OTA_TOKEN;
+        assert!(!fallback_cfg.has_valid_ota_token());
+        if cfg!(feature = "provisioning-ap") && !has_explicit_build_wifi_ssid() {
+            assert!(
+                !fallback_cfg.has_sta_credentials(),
+                "built-in DEFAULT_WIFI_SSID + empty pass must fail has_sta_credentials()"
+            );
+        } else if !ALLOW_OPEN_WIFI {
+            assert!(!fallback_cfg.has_sta_credentials());
+        }
+    }
+
+    #[test]
+    fn test_has_sta_credentials_and_has_valid_ota_token_matrix() {
+        let mut cfg = KlipperCamConfig::WROVER_KIT_HD;
+
+        // Empty or > 32 B SSID fails.
+        cfg.network.wifi_ssid = "";
+        cfg.network.wifi_password = "valid-passphrase";
+        assert!(!cfg.has_sta_credentials());
+
+        cfg.network.wifi_ssid = "123456789012345678901234567890123";
+        assert!(!cfg.has_sta_credentials());
+
+        // 32 B SSID + 8 B passphrase succeeds.
+        cfg.network.wifi_ssid = "12345678901234567890123456789012";
+        cfg.network.wifi_password = "12345678";
+        assert!(cfg.has_sta_credentials());
+
+        // 7 B and 64 B passphrases fail; 63 B succeeds.
+        cfg.network.wifi_password = "1234567";
+        assert!(!cfg.has_sta_credentials());
+
+        cfg.network.wifi_password =
+            "1234567890123456789012345678901234567890123456789012345678901234";
+        assert!(!cfg.has_sta_credentials());
+
+        cfg.network.wifi_password =
+            "123456789012345678901234567890123456789012345678901234567890123";
+        assert!(cfg.has_sta_credentials());
+
+        // Real WPA2 network genuinely named DEFAULT_WIFI_SSID ("iot") succeeds.
+        cfg.network.wifi_ssid = DEFAULT_WIFI_SSID;
+        cfg.network.wifi_password = "real-iot-passphrase";
+        assert!(cfg.has_sta_credentials());
+
+        // OTA token validity checks.
+        cfg.ota_token = "";
+        assert!(!cfg.has_valid_ota_token());
+        cfg.ota_token = DEFAULT_OTA_TOKEN;
+        assert!(!cfg.has_valid_ota_token());
+        cfg.ota_token = "short-15-bytes!";
+        assert!(!cfg.has_valid_ota_token());
+        cfg.ota_token = "valid-16-byte-tk";
+        assert!(cfg.has_valid_ota_token());
+    }
+
+    #[test]
+    fn test_with_nvs_overrides_ip_mode_dhcp_and_static() {
+        extern crate alloc;
+        use alloc::format;
+
+        let base = KlipperCamConfig::from_build_env();
+        let dhcp_overrides = NvsConfigOverrides {
+            wifi_ssid: Some("KlipperShop"),
+            wifi_password: Some("wpa2-shop-secret"),
+            ota_token: Some("private-shop-ota-token-2026"),
+            ip_mode: Some(IpMode::Dhcp),
+            ..Default::default()
+        };
+        let rendered = format!("{dhcp_overrides:?}");
+        assert!(rendered.contains("Dhcp"));
+        assert!(!rendered.contains("wpa2-shop-secret"));
+        assert!(!rendered.contains("private-shop-ota-token-2026"));
+
+        let dhcp_cfg = base
+            .with_nvs_overrides(dhcp_overrides)
+            .expect("DHCP provisioned overrides must succeed");
+        assert!(dhcp_cfg.has_sta_credentials());
+        assert!(dhcp_cfg.has_valid_ota_token());
+        assert!(dhcp_cfg.is_valid());
+        assert_eq!(dhcp_cfg.network.ip_mode, IpMode::Dhcp);
+        assert_eq!(dhcp_cfg.ip_mode(), IpMode::Dhcp);
+
+        // Switching to Static via ip_mode keeps static_ip synchronized.
+        let custom_static = StaticIpConfig {
+            ip: Ipv4Addr::new(192, 168, 50, 52),
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            gateway: Ipv4Addr::new(192, 168, 50, 1),
+            dns: Ipv4Addr::new(192, 168, 50, 1),
+            prefix_len: 24,
+        };
+        let static_cfg = dhcp_cfg
+            .with_nvs_overrides(NvsConfigOverrides {
+                ip_mode: Some(IpMode::Static(custom_static)),
+                ..Default::default()
+            })
+            .expect("Static IpMode override must succeed");
+        assert_eq!(static_cfg.network.ip_mode, IpMode::Static(custom_static));
+        assert_eq!(*static_cfg.static_ip(), custom_static);
+        assert!(static_cfg.is_valid());
+
+        // Setting static_ip directly also keeps ip_mode synchronized.
+        let legacy = StaticIpConfig::LEGACY_FALLBACK;
+        let synced_cfg = dhcp_cfg
+            .with_nvs_overrides(NvsConfigOverrides {
+                static_ip: Some(legacy),
+                ..Default::default()
+            })
+            .expect("static_ip override must succeed");
+        assert_eq!(synced_cfg.network.ip_mode, IpMode::Static(legacy));
+        assert_eq!(*synced_cfg.static_ip(), legacy);
+
+        // Invalid StaticIpConfig inside IpMode::Static is rejected.
+        let mut bad_ip = custom_static;
+        bad_ip.ip = bad_ip.gateway;
+        assert_eq!(
+            dhcp_cfg.with_nvs_overrides(NvsConfigOverrides {
+                ip_mode: Some(IpMode::Static(bad_ip)),
+                ..Default::default()
+            }),
+            Err(ConfigError::InvalidConfig)
+        );
+
+        let mut bad_prefix = custom_static;
+        bad_prefix.prefix_len = 33;
+        assert_eq!(
+            dhcp_cfg.with_nvs_overrides(NvsConfigOverrides {
+                ip_mode: Some(IpMode::Static(bad_prefix)),
+                ..Default::default()
+            }),
+            Err(ConfigError::InvalidConfig)
+        );
+
+        let mut bad_gw = custom_static;
+        bad_gw.gateway = Ipv4Addr::new(10, 0, 0, 1);
+        assert_eq!(
+            dhcp_cfg.with_nvs_overrides(NvsConfigOverrides {
+                ip_mode: Some(IpMode::Static(bad_gw)),
+                ..Default::default()
+            }),
+            Err(ConfigError::InvalidConfig)
+        );
     }
 }

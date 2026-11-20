@@ -1,4 +1,5 @@
-//! Toolchain and environment bootstrap subcommand for cloud and container sessions.
+//! Toolchain and environment bootstrap subcommand for cloud and container
+//! sessions.
 //!
 //! Replaces the retired `scripts/cloud-setup.sh` in pure Rust, ensuring the
 //! developer plugins that `.claude/settings.json` enables for local sessions

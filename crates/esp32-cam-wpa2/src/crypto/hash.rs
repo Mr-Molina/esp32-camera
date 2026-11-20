@@ -1,7 +1,42 @@
 //! Cryptographic hash and HMAC implementations (SHA-1, SHA-256, MD5).
 //!
 //! FIPS 180-4 and RFC 1321 compliant streaming implementations in pure Rust
-//! with zero external dependencies and zero unsafe code.
+//! with zero external dependencies.
+
+use core::hint::black_box;
+use core::sync::atomic::{compiler_fence, Ordering};
+
+/// Volatiles-zeros a byte slice to prevent dead-store elimination of secrets.
+// Rationale: `lib.rs` sets `#[deny(unsafe_code)]` on `crypto`, and volatile
+// writes are required to guarantee secret scrubbing cannot be elided by LLVM.
+#[allow(unsafe_code)]
+#[inline]
+pub(crate) fn zeroize_bytes(buf: &mut [u8]) {
+    for byte in buf.iter_mut() {
+        // JUSTIFICATION: Volatile write prevents DSE on secret key material.
+        // SAFETY: `byte` is a valid, aligned, uniquely borrowed `&mut u8`.
+        unsafe {
+            core::ptr::write_volatile(byte, 0);
+        }
+    }
+    compiler_fence(Ordering::SeqCst);
+}
+
+/// Volatiles-zeros a `u32` slice to prevent dead-store elimination of secrets.
+// Rationale: `lib.rs` sets `#[deny(unsafe_code)]` on `crypto`, and volatile
+// writes are required to guarantee secret scrubbing cannot be elided by LLVM.
+#[allow(unsafe_code)]
+#[inline]
+pub(crate) fn zeroize_u32s(buf: &mut [u32]) {
+    for word in buf.iter_mut() {
+        // JUSTIFICATION: Volatile write prevents DSE on secret state words.
+        // SAFETY: `word` is a valid, aligned, uniquely borrowed `&mut u32`.
+        unsafe {
+            core::ptr::write_volatile(word, 0);
+        }
+    }
+    compiler_fence(Ordering::SeqCst);
+}
 
 /// Compares two slices for equality in constant time.
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
@@ -10,15 +45,24 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     }
     let mut diff = 0u8;
     for (&x, &y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
+        diff = black_box(diff | (x ^ y));
     }
-    diff == 0
+    let masked = black_box(diff);
+    (u16::from(masked).wrapping_sub(1) >> 15) == 1
 }
 
 struct HashBuf {
     buf: [u8; 64],
     len: usize,
     total_len: u64,
+}
+
+impl Drop for HashBuf {
+    fn drop(&mut self) {
+        zeroize_bytes(&mut self.buf);
+        self.len = 0;
+        self.total_len = 0;
+    }
 }
 
 impl HashBuf {
@@ -46,12 +90,13 @@ impl HashBuf {
                 return;
             }
         }
+        let mut block = [0u8; 64];
         while offset + 64 <= data.len() {
-            let mut block = [0u8; 64];
             block.copy_from_slice(&data[offset..offset + 64]);
             compress(&block);
             offset += 64;
         }
+        zeroize_bytes(&mut block);
         if offset < data.len() {
             let rem = &data[offset..];
             self.buf[..rem.len()].copy_from_slice(rem);
@@ -112,6 +157,7 @@ fn sha1_compress(state: &mut [u32; 5], block: &[u8; 64]) {
     for (s, v) in state.iter_mut().zip([a, b, c, d, e].iter()) {
         *s = s.wrapping_add(*v);
     }
+    zeroize_u32s(&mut w);
 }
 
 /// Computes SHA-1 hash across multiple slice fragments.
@@ -126,6 +172,7 @@ pub fn sha1_vector(slices: &[&[u8]]) -> [u8; 20] {
     for (i, &w) in s.iter().enumerate() {
         out[i * 4..(i + 1) * 4].copy_from_slice(&w.to_be_bytes());
     }
+    zeroize_u32s(&mut s);
     out
 }
 
@@ -183,6 +230,7 @@ fn sha256_compress(state: &mut [u32; 8], block: &[u8; 64]) {
     for (s, v) in state.iter_mut().zip([a, b, c, d, e, f, g, h].iter()) {
         *s = s.wrapping_add(*v);
     }
+    zeroize_u32s(&mut w);
 }
 
 /// Computes SHA-256 hash across multiple slice fragments.
@@ -200,6 +248,7 @@ pub fn sha256_vector(slices: &[&[u8]]) -> [u8; 32] {
     for (i, &w) in s.iter().enumerate() {
         out[i * 4..(i + 1) * 4].copy_from_slice(&w.to_be_bytes());
     }
+    zeroize_u32s(&mut s);
     out
 }
 
@@ -251,6 +300,7 @@ fn md5_compress(state: &mut [u32; 4], block: &[u8; 64]) {
     for (s, v) in state.iter_mut().zip([a, b, c, d].iter()) {
         *s = s.wrapping_add(*v);
     }
+    zeroize_u32s(&mut x);
 }
 
 /// Computes MD5 hash across multiple slice fragments.
@@ -265,6 +315,7 @@ pub fn md5_vector(slices: &[&[u8]]) -> [u8; 16] {
     for (i, &w) in s.iter().enumerate() {
         out[i * 4..(i + 1) * 4].copy_from_slice(&w.to_le_bytes());
     }
+    zeroize_u32s(&mut s);
     out
 }
 
@@ -277,7 +328,9 @@ pub fn md5(data: &[u8]) -> [u8; 16] {
 fn hmac_pad<const D: usize, F: Fn(&[u8]) -> [u8; D]>(key: &[u8], hf: F) -> ([u8; 64], [u8; 64]) {
     let mut k = [0u8; 64];
     if key.len() > 64 {
-        k[..D].copy_from_slice(&hf(key));
+        let mut digest = hf(key);
+        k[..D].copy_from_slice(&digest);
+        zeroize_bytes(&mut digest);
     } else {
         k[..key.len()].copy_from_slice(key);
     }
@@ -286,12 +339,13 @@ fn hmac_pad<const D: usize, F: Fn(&[u8]) -> [u8; D]>(key: &[u8], hf: F) -> ([u8;
         ip[i] = k[i] ^ 0x36;
         op[i] = k[i] ^ 0x5c;
     }
+    zeroize_bytes(&mut k);
     (ip, op)
 }
 
 /// Computes HMAC-SHA1 over multiple slice fragments.
 pub fn hmac_sha1_vector(key: &[u8], slices: &[&[u8]]) -> [u8; 20] {
-    let (ip, op) = hmac_pad(key, sha1);
+    let (mut ip, mut op) = hmac_pad(key, sha1);
     let mut s = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0];
     let mut b = HashBuf::new();
     b.update(&ip, |bk| sha1_compress(&mut s, bk));
@@ -312,12 +366,17 @@ pub fn hmac_sha1_vector(key: &[u8], slices: &[&[u8]]) -> [u8; 20] {
     for (i, &w) in s_out.iter().enumerate() {
         out[i * 4..(i + 1) * 4].copy_from_slice(&w.to_be_bytes());
     }
+    zeroize_bytes(&mut ip);
+    zeroize_bytes(&mut op);
+    zeroize_bytes(&mut in_d);
+    zeroize_u32s(&mut s);
+    zeroize_u32s(&mut s_out);
     out
 }
 
 /// Computes HMAC-SHA256 over multiple slice fragments.
 pub fn hmac_sha256_vector(key: &[u8], slices: &[&[u8]]) -> [u8; 32] {
-    let (ip, op) = hmac_pad(key, sha256);
+    let (mut ip, mut op) = hmac_pad(key, sha256);
     let mut s = [
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
         0x5be0cd19,
@@ -344,12 +403,17 @@ pub fn hmac_sha256_vector(key: &[u8], slices: &[&[u8]]) -> [u8; 32] {
     for (i, &w) in s_out.iter().enumerate() {
         out[i * 4..(i + 1) * 4].copy_from_slice(&w.to_be_bytes());
     }
+    zeroize_bytes(&mut ip);
+    zeroize_bytes(&mut op);
+    zeroize_bytes(&mut in_d);
+    zeroize_u32s(&mut s);
+    zeroize_u32s(&mut s_out);
     out
 }
 
 /// Computes HMAC-MD5 over multiple slice fragments.
 pub fn hmac_md5_vector(key: &[u8], slices: &[&[u8]]) -> [u8; 16] {
-    let (ip, op) = hmac_pad(key, md5);
+    let (mut ip, mut op) = hmac_pad(key, md5);
     let mut s = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476];
     let mut b = HashBuf::new();
     b.update(&ip, |bk| md5_compress(&mut s, bk));
@@ -370,6 +434,11 @@ pub fn hmac_md5_vector(key: &[u8], slices: &[&[u8]]) -> [u8; 16] {
     for (i, &w) in s_out.iter().enumerate() {
         out[i * 4..(i + 1) * 4].copy_from_slice(&w.to_le_bytes());
     }
+    zeroize_bytes(&mut ip);
+    zeroize_bytes(&mut op);
+    zeroize_bytes(&mut in_d);
+    zeroize_u32s(&mut s);
+    zeroize_u32s(&mut s_out);
     out
 }
 
@@ -379,9 +448,17 @@ mod tests {
 
     #[test]
     fn test_ct_eq() {
+        assert!(ct_eq(b"", b""));
         assert!(ct_eq(b"hello", b"hello"));
         assert!(!ct_eq(b"hello", b"hellp"));
+        assert!(!ct_eq(b"aello", b"hello"));
         assert!(!ct_eq(b"hello", b"hell"));
+        let mut bytes = [0xAAu8; 16];
+        zeroize_bytes(&mut bytes);
+        assert_eq!(bytes, [0u8; 16]);
+        let mut words = [0xDEAD_BEEFu32; 4];
+        zeroize_u32s(&mut words);
+        assert_eq!(words, [0u32; 4]);
     }
 
     #[test]

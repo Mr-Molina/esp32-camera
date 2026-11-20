@@ -258,17 +258,40 @@ pub fn find_partition_by_label(label: &str) -> Option<&'static PartitionEntry> {
     None
 }
 
-/// Verifies that all entries in [`PARTITION_TABLE`] are 4KB-aligned,
-/// strictly ordered, non-overlapping, and fit within the 4MB SPI flash
-/// (`0x400000`).
+/// Minimum safe flash offset after the ESP32 bootloader (`0x1000`) and
+/// partition table (`0x8000..0x9000`) (`M-135` / `C1-037`).
+pub const PARTITION_MIN_OFFSET: u32 = 0x0000_9000;
+
+/// Mandatory 64KB MMU alignment for ESP32 application (`ota_0` / `ota_1`)
+/// partitions (`M-135` / `C1-037`).
+pub const APP_PARTITION_ALIGN: u32 = 0x0001_0000;
+
+/// Verifies that all entries in [`PARTITION_TABLE`] are 4KB-aligned, above
+/// the bootloader/partition-table region (`>= 0x9000`), 64KB-aligned for
+/// application partitions, have non-empty unique labels, are strictly ordered,
+/// non-overlapping, and fit within the 4MB SPI flash (`0x400000`).
 pub const fn verify_partition_table_integrity() -> bool {
     let mut i = 0;
     while i < PARTITION_TABLE.len() {
         let entry = PARTITION_TABLE[i];
+        if entry.label.is_empty() {
+            return false;
+        }
+        if entry.offset < PARTITION_MIN_OFFSET {
+            return false;
+        }
         if (entry.offset & 0xFFF) != 0 || (entry.size & 0xFFF) != 0 || entry.size == 0 {
             return false;
         }
-        let end = entry.offset.saturating_add(entry.size);
+        if matches!(entry.part_type, PartitionType::App)
+            && (entry.offset & (APP_PARTITION_ALIGN - 1)) != 0
+        {
+            return false;
+        }
+        let end = match entry.offset.checked_add(entry.size) {
+            Some(e) => e,
+            None => return false,
+        };
         if end > FLASH_TOTAL_SIZE {
             return false;
         }
@@ -278,35 +301,63 @@ pub const fn verify_partition_table_integrity() -> bool {
                 return false;
             }
         }
+        let mut j = i + 1;
+        while j < PARTITION_TABLE.len() {
+            if const_str_eq(entry.label, PARTITION_TABLE[j].label) {
+                return false;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Const-compatible string equality helper for partition table checks.
+const fn const_str_eq(a: &str, b: &str) -> bool {
+    let ab = a.as_bytes();
+    let bb = b.as_bytes();
+    if ab.len() != bb.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < ab.len() {
+        if ab[i] != bb[i] {
+            return false;
+        }
         i += 1;
     }
     true
 }
 
 /// Constant-time OTA authentication token comparator (`FW-010` / `APP-002` /
-/// `SEC-170`).
+/// `SEC-170` / `M-030`).
 ///
-/// Uses a bitwise XOR accumulator across all bytes of `expected` without
-/// branching early on byte mismatches or length mismatches, preventing
-/// timing side-channel recovery of `X-OTA-Token` over Wi-Fi.
-///
-/// Uses branchless byte selection inside the comparison loop (`SEC-170`).
+/// Uses `#[inline(never)]` and `core::hint::black_box` optimization barriers
+/// across `max(provided.len(), expected.len())` with branchless byte masking
+/// to prevent LLVM short-circuiting or `memcmp` lowering.
 /// Rejects empty `provided` or empty `expected` tokens unconditionally.
-#[inline]
-pub const fn verify_ota_token(provided: &[u8], expected: &[u8]) -> bool {
+#[inline(never)]
+pub fn verify_ota_token(provided: &[u8], expected: &[u8]) -> bool {
     if expected.is_empty() || provided.is_empty() {
         return false;
     }
-    let mut diff: usize = provided.len() ^ expected.len();
+    let mut diff: usize = core::hint::black_box(provided.len() ^ expected.len());
+    let max_len = if provided.len() > expected.len() {
+        provided.len()
+    } else {
+        expected.len()
+    };
     let mut i: usize = 0;
-    while i < expected.len() {
-        let mask = ((i < provided.len()) as usize).wrapping_neg();
-        let safe_idx = i & mask;
-        let p_byte = provided[safe_idx] & (mask as u8);
-        diff |= (p_byte ^ expected[i]) as usize;
+    while i < max_len {
+        let p_mask = ((i < provided.len()) as usize).wrapping_neg();
+        let e_mask = ((i < expected.len()) as usize).wrapping_neg();
+        let p_byte = core::hint::black_box(provided[i & p_mask]) & (p_mask as u8);
+        let e_byte = core::hint::black_box(expected[i & e_mask]) & (e_mask as u8);
+        diff = core::hint::black_box(diff | ((p_byte ^ e_byte) as usize));
         i += 1;
     }
-    diff == 0
+    core::hint::black_box(diff) == 0
 }
 
 /// 16-entry nibble lookup table for IEEE 802.3 CRC-32 (polynomial
@@ -408,7 +459,8 @@ pub struct OtaDataSelect {
     pub seq_label: [u8; 20],
     /// Raw [`OtaImgState`] value.
     pub ota_state: u32,
-    /// IEEE 802.3 CRC-32 of `ota_seq` in little-endian byte order.
+    /// ESP-IDF `bootloader_common_ota_select_crc` (`crc32_esp_ota`) over
+    /// `ota_seq` in little-endian byte order (`M-136` / `C1-038`).
     pub crc: u32,
 }
 
@@ -428,10 +480,35 @@ impl OtaDataSelect {
         }
     }
 
+    /// Creates a new [`OtaDataSelect`] with validated `ota_seq`
+    /// (`1..=u32::MAX - 1`), `state`, and valid ESP-IDF `otadata` CRC-32,
+    /// returning `None` if `ota_seq` is `0` or `u32::MAX` (`M-136`).
+    #[inline]
+    pub const fn try_new(ota_seq: u32, state: OtaImgState) -> Option<Self> {
+        if ota_seq == 0 || ota_seq == u32::MAX {
+            return None;
+        }
+        let crc = crc32_esp_ota(&ota_seq.to_le_bytes());
+        Some(Self {
+            ota_seq,
+            seq_label: [0xFF; 20],
+            ota_state: state as u32,
+            crc,
+        })
+    }
+
     /// Creates a new [`OtaDataSelect`] with `ota_seq`, `state`, and
     /// valid ESP-IDF `otadata` CRC-32.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `ota_seq` is `0` or `u32::MAX` (`M-136` / `C1-038`).
     #[inline]
     pub const fn new(ota_seq: u32, state: OtaImgState) -> Self {
+        assert!(
+            ota_seq != 0 && ota_seq != u32::MAX,
+            "ota_seq must be in 1..u32::MAX"
+        );
         let crc = crc32_esp_ota(&ota_seq.to_le_bytes());
         Self {
             ota_seq,
@@ -503,7 +580,9 @@ impl OtaDataSelect {
         }
     }
 
-    /// Serializes this record into a 32-byte little-endian array.
+    /// Serializes this record verbatim into a 32-byte little-endian array
+    /// (`M-032` / `C1-011`: preserves `New` vs `PendingVerify` without silent
+    /// rewriting).
     pub const fn to_bytes(&self) -> [u8; 32] {
         let mut out = [0xFFu8; 32];
         let seq_b = self.ota_seq.to_le_bytes();
@@ -518,12 +597,7 @@ impl OtaDataSelect {
             i += 1;
         }
 
-        let flash_state = if self.ota_state == OtaImgState::PendingVerify as u32 {
-            OtaImgState::New as u32
-        } else {
-            self.ota_state
-        };
-        let st_b = flash_state.to_le_bytes();
+        let st_b = self.ota_state.to_le_bytes();
         out[24] = st_b[0];
         out[25] = st_b[1];
         out[26] = st_b[2];
@@ -537,7 +611,9 @@ impl OtaDataSelect {
         out
     }
 
-    /// Deserializes a 32-byte little-endian array into an [`OtaDataSelect`].
+    /// Deserializes a 32-byte little-endian array verbatim into an
+    /// [`OtaDataSelect`] (`M-032` / `C1-011`: preserves `New` vs
+    /// `PendingVerify` without silent rewriting).
     pub const fn from_bytes(bytes: &[u8; 32]) -> Self {
         let ota_seq = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         let mut seq_label = [0u8; 20];
@@ -546,12 +622,7 @@ impl OtaDataSelect {
             seq_label[i] = bytes[4 + i];
             i += 1;
         }
-        let raw_state = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]);
-        let ota_state = if ota_seq != u32::MAX && raw_state == OtaImgState::New as u32 {
-            OtaImgState::PendingVerify as u32
-        } else {
-            raw_state
-        };
+        let ota_state = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]);
         let crc = u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]);
         Self {
             ota_seq,
@@ -606,35 +677,78 @@ pub trait Core1ParkControl {
     fn resume_core1(&self) -> bool;
 }
 
-/// RAII guard that pauses Core 1 on creation and resumes it on drop
-/// (`FW-CORE-01`).
+/// RAII guard that pauses Core 1 on creation and resumes it on explicit
+/// [`Self::resume`] or drop (`FW-CORE-01` / `M-019` / `C1-014`).
+///
+/// Must not be nested on the same `Core1ParkControl` instance; prefer
+/// [`Self::with_core1_paused`] or explicit [`Self::resume`] so resume
+/// failures are propagated as `Err(OtaError::FlashWriteError)`.
+#[must_use = "Core1PauseGuard resumes Core 1 immediately if dropped"]
 pub struct Core1PauseGuard<'a, P: Core1ParkControl> {
     controller: &'a P,
+    resumed: bool,
 }
 
 impl<'a, P: Core1ParkControl> Core1PauseGuard<'a, P> {
     /// Pauses Core 1, returning [`OtaError::FlashWriteError`] if parking times
-    /// out.
+    /// out (`M-019`). Rollback of any partial depth increment is the
+    /// responsibility of [`Core1ParkControl::pause_core1`], so a failed nested
+    /// pause never unparks an outer guard.
     pub fn new(controller: &'a P) -> Result<Self, OtaError> {
         if controller.pause_core1() {
-            Ok(Self { controller })
+            Ok(Self {
+                controller,
+                resumed: false,
+            })
         } else {
             Err(OtaError::FlashWriteError)
+        }
+    }
+
+    /// Explicitly resumes Core 1 and propagates any resume timeout as
+    /// [`OtaError::FlashWriteError`] (`M-019`).
+    pub fn resume(mut self) -> Result<(), OtaError> {
+        self.resumed = true;
+        if self.controller.resume_core1() {
+            Ok(())
+        } else {
+            Err(OtaError::FlashWriteError)
+        }
+    }
+
+    /// Executes `f` while Core 1 is parked, resuming Core 1 afterward and
+    /// propagating both operation errors and resume failures (`M-019`).
+    pub fn with_core1_paused<R>(
+        controller: &'a P,
+        f: impl FnOnce() -> Result<R, OtaError>,
+    ) -> Result<R, OtaError> {
+        let guard = Self::new(controller)?;
+        let op_res = f();
+        let resume_res = guard.resume();
+        match (op_res, resume_res) {
+            (Ok(val), Ok(())) => Ok(val),
+            (Err(err), _) => Err(err),
+            (Ok(_), Err(err)) => Err(err),
         }
     }
 }
 
 impl<P: Core1ParkControl> Drop for Core1PauseGuard<'_, P> {
     fn drop(&mut self) {
-        let _ = self.controller.resume_core1();
+        if !self.resumed {
+            let _ = self.controller.resume_core1();
+        }
     }
 }
 
 /// [`OtaFlashStorage`] wrapper that acquires a [`Core1PauseGuard`] on every
 /// `read_aligned`, `erase_range`, and `write_aligned` call (`FW-CORE-01`).
+///
+/// Inner `flash` and `park` fields are encapsulated (`M-034` / `C1-013`) so
+/// callers cannot bypass Core 1 parking during active flash operations.
 pub struct GuardedFlashStorage<F, P: Core1ParkControl> {
-    pub flash: F,
-    pub park: P,
+    flash: F,
+    park: P,
 }
 
 impl<F, P: Core1ParkControl> GuardedFlashStorage<F, P> {
@@ -642,22 +756,40 @@ impl<F, P: Core1ParkControl> GuardedFlashStorage<F, P> {
     pub const fn new(flash: F, park: P) -> Self {
         Self { flash, park }
     }
+
+    /// Returns a shared reference to the parking controller metadata.
+    #[must_use]
+    pub const fn park(&self) -> &P {
+        &self.park
+    }
+
+    /// Consumes the guard wrapper and returns the underlying `(flash, park)`.
+    #[must_use]
+    pub fn into_inner(self) -> (F, P) {
+        (self.flash, self.park)
+    }
 }
 
 impl<F: OtaFlashStorage, P: Core1ParkControl> OtaFlashStorage for GuardedFlashStorage<F, P> {
     fn read_aligned(&mut self, offset: u32, buf: &mut [u8]) -> Result<(), OtaError> {
-        let _guard = Core1PauseGuard::new(&self.park)?;
-        self.flash.read_aligned(offset, buf)
+        let guard = Core1PauseGuard::new(&self.park)?;
+        let res = self.flash.read_aligned(offset, buf);
+        let resume_res = guard.resume();
+        res.and(resume_res)
     }
 
     fn erase_range(&mut self, from: u32, to: u32) -> Result<(), OtaError> {
-        let _guard = Core1PauseGuard::new(&self.park)?;
-        self.flash.erase_range(from, to)
+        let guard = Core1PauseGuard::new(&self.park)?;
+        let res = self.flash.erase_range(from, to);
+        let resume_res = guard.resume();
+        res.and(resume_res)
     }
 
     fn write_aligned(&mut self, offset: u32, data: &[u8]) -> Result<(), OtaError> {
-        let _guard = Core1PauseGuard::new(&self.park)?;
-        self.flash.write_aligned(offset, data)
+        let guard = Core1PauseGuard::new(&self.park)?;
+        let res = self.flash.write_aligned(offset, data);
+        let resume_res = guard.resume();
+        res.and(resume_res)
     }
 
     fn has_persistent_otadata(&self) -> bool {
@@ -786,8 +918,9 @@ impl<const APP_WINDOW: usize> MockNorFlash<APP_WINDOW> {
     }
 
     fn region_mut(&mut self, offset: u32, len: usize) -> Result<&mut [u8], OtaError> {
+        let len_u32 = u32::try_from(len).map_err(|_| OtaError::FlashWriteError)?;
         let end = offset
-            .checked_add(len as u32)
+            .checked_add(len_u32)
             .ok_or(OtaError::FlashWriteError)?;
         if offset >= OTADATA_SECTOR_0_OFFSET && end <= OTADATA_SECTOR_0_OFFSET + FLASH_SECTOR_SIZE {
             let start = (offset - OTADATA_SECTOR_0_OFFSET) as usize;
@@ -856,30 +989,263 @@ impl<const APP_WINDOW: usize> OtaFlashStorage for MockNorFlash<APP_WINDOW> {
     }
 }
 
-/// Returns `true` if `seq_a` is newer than `seq_b`, handling sequence
-/// wraparound near `u32::MAX` with strict weak ordering (`LOGIC-170`).
+/// Returns `true` if `seq_a` is newer than `seq_b` under ESP-IDF bootloader
+/// unsigned sequence ordering over valid sequences `1..=u32::MAX - 1`
+/// (`M-033` / `C1-012`).
+///
+/// Forms a strict weak ordering:
+/// - Any valid sequence (`1..=u32::MAX - 1`) is greater than an invalid
+///   sequence (`0` or `u32::MAX`).
+/// - Between two valid sequences, plain unsigned `seq_a > seq_b` is used,
+///   matching ESP-IDF `bootloader_common_get_active_otadata`.
+/// - Two invalid sequences are incomparable (`false`).
 #[inline]
 pub const fn is_seq_greater(seq_a: u32, seq_b: u32) -> bool {
-    if seq_a == seq_b {
-        return false;
+    let a_valid = seq_a != 0 && seq_a != u32::MAX;
+    let b_valid = seq_b != 0 && seq_b != u32::MAX;
+    match (a_valid, b_valid) {
+        (true, true) => seq_a > seq_b,
+        (true, false) => true,
+        (false, _) => false,
     }
-    if seq_a >= u32::MAX - 10 && seq_b <= 10 {
-        false
-    } else if seq_b >= u32::MAX - 10 && seq_a <= 10 {
-        true
-    } else {
-        seq_a > seq_b
+}
+
+/// Typed `otadata` flash sector selector (`0x17000` vs `0x18000`,
+/// `M-137` / `C1-039`).
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OtaDataSector {
+    /// First 4KB `otadata` sector at `0x17000`.
+    Sector0 = 0,
+    /// Second 4KB `otadata` sector at `0x18000`.
+    Sector1 = 1,
+}
+
+impl OtaDataSector {
+    /// Returns the SPI flash byte offset of this `otadata` sector.
+    #[inline]
+    pub const fn offset(self) -> u32 {
+        match self {
+            Self::Sector0 => OTADATA_SECTOR_0_OFFSET,
+            Self::Sector1 => OTADATA_SECTOR_1_OFFSET,
+        }
+    }
+
+    /// Returns the numeric sector index (`0` or `1`).
+    #[inline]
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// Returns the opposite `otadata` sector.
+    #[inline]
+    pub const fn opposite(self) -> Self {
+        match self {
+            Self::Sector0 => Self::Sector1,
+            Self::Sector1 => Self::Sector0,
+        }
+    }
+
+    /// Converts a raw numeric sector index (`0` or `1`) to an [`OtaDataSector`].
+    #[inline]
+    pub const fn from_index(index: usize) -> Option<Self> {
+        match index {
+            0 => Some(Self::Sector0),
+            1 => Some(Self::Sector1),
+            _ => None,
+        }
+    }
+}
+
+/// Stateful streaming OTA write session enforcing partition bounds, header
+/// validation, sequential writes, running SHA-256, and full flash readback
+/// integrity verification before `otadata` commit (`M-035` / `C1-015`).
+pub struct OtaWriteSession {
+    target_slot: OtaSlot,
+    expected_len: usize,
+    bytes_written: usize,
+    partition_offset: u32,
+    partition_size: u32,
+    header_buf: [u8; ESP_IMAGE_HEADER_LEN],
+    header_len: usize,
+    header_validated: bool,
+    hasher: Sha256,
+}
+
+impl OtaWriteSession {
+    /// Returns the passive target [`OtaSlot`] being written.
+    #[inline]
+    pub const fn target_slot(&self) -> OtaSlot {
+        self.target_slot
+    }
+
+    /// Returns the expected total firmware image length in bytes.
+    #[inline]
+    pub const fn expected_len(&self) -> usize {
+        self.expected_len
+    }
+
+    /// Returns the number of firmware payload bytes written so far.
+    #[inline]
+    pub const fn bytes_written(&self) -> usize {
+        self.bytes_written
+    }
+
+    /// Writes the next sequential chunk of firmware bytes into the erased
+    /// passive partition, padding any final non-4-byte-aligned tail with `0xFF`.
+    pub fn write_chunk<F: OtaFlashStorage>(
+        &mut self,
+        flash: &mut F,
+        chunk: &[u8],
+    ) -> Result<(), OtaError> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        let next_written =
+            self.bytes_written
+                .checked_add(chunk.len())
+                .ok_or(OtaError::ImageTooLarge {
+                    image_size: usize::MAX,
+                    partition_size: self.partition_size as usize,
+                })?;
+        if next_written > self.expected_len {
+            return Err(OtaError::ImageTooLarge {
+                image_size: next_written,
+                partition_size: self.expected_len,
+            });
+        }
+        // Only the final chunk may have a length not divisible by 4.
+        if (chunk.len() & 3) != 0 && next_written != self.expected_len {
+            return Err(OtaError::FlashWriteError);
+        }
+
+        if !self.header_validated {
+            let need = ESP_IMAGE_HEADER_LEN - self.header_len;
+            let take = chunk.len().min(need);
+            self.header_buf[self.header_len..self.header_len + take]
+                .copy_from_slice(&chunk[..take]);
+            self.header_len += take;
+            if self.header_len == ESP_IMAGE_HEADER_LEN {
+                validate_ota_image_header(
+                    &self.header_buf,
+                    self.expected_len,
+                    self.partition_size as usize,
+                )?;
+                self.header_validated = true;
+            }
+        }
+
+        let mut buf = AlignedFlashChunk::default();
+        let mut off = 0usize;
+        while off < chunk.len() {
+            let step = (chunk.len() - off).min(OTA_CHUNK_SIZE);
+            buf.0[..step].copy_from_slice(&chunk[off..off + step]);
+            let aligned_step = (step + 3) & !3;
+            let mut pad = step;
+            while pad < aligned_step {
+                buf.0[pad] = 0xFF;
+                pad += 1;
+            }
+            let rel_off =
+                u32::try_from(self.bytes_written).map_err(|_| OtaError::FlashWriteError)?;
+            let write_end = rel_off
+                .checked_add(aligned_step as u32)
+                .ok_or(OtaError::FlashWriteError)?;
+            if write_end > self.partition_size {
+                return Err(OtaError::ImageTooLarge {
+                    image_size: write_end as usize,
+                    partition_size: self.partition_size as usize,
+                });
+            }
+            let flash_addr = self
+                .partition_offset
+                .checked_add(rel_off)
+                .ok_or(OtaError::FlashWriteError)?;
+            flash.write_aligned(flash_addr, &buf.0[..aligned_step])?;
+            self.hasher.update(&chunk[off..off + step]);
+            self.bytes_written += step;
+            off += step;
+        }
+        Ok(())
+    }
+
+    /// Finalizes the streaming OTA session: requires exact byte count,
+    /// validates full image header/segments/XOR checksum/SHA-256 via flash
+    /// readback (`FW-NET-18`), and commits `otadata` (`M-035`).
+    pub fn finish<F: OtaFlashStorage>(
+        self,
+        mgr: &mut OtaDataManager,
+        flash: &mut F,
+    ) -> Result<OtaDataSelect, OtaError> {
+        if self.bytes_written != self.expected_len {
+            return Err(OtaError::IncompletePayload {
+                received: self.bytes_written,
+                expected: self.expected_len,
+            });
+        }
+        if !self.header_validated {
+            return Err(OtaError::ImageTooSmall);
+        }
+        if self.target_slot != mgr.select_inactive_slot()
+            || mgr.pending_reboot_slot().is_some()
+            || mgr.has_pending_rollback()
+        {
+            return Err(OtaError::RollbackStateInvalid);
+        }
+        let written_digest = self.hasher.finalize();
+        if flash.supports_readback() {
+            let mut chunk = AlignedFlashChunk::default();
+            let readback = OtaDataManager::readback_verify_image(
+                flash,
+                self.partition_offset,
+                self.expected_len,
+                &mut chunk,
+            )?;
+            if readback != written_digest {
+                return Err(OtaError::ReadbackMismatch);
+            }
+        }
+        mgr.commit_update(flash, self.target_slot)
     }
 }
 
 /// Dual-sector `otadata` state machine (`0x17000` and `0x18000`).
+///
+/// Tracks immutable hardware `running_slot` and a `pending_reboot_slot` latch
+/// (`M-004` / `C1-004`) so next-boot `otadata` commits never flip the target
+/// OTA partition onto the live XIP-executing slot before reboot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OtaDataManager {
     pub sector_0: OtaDataSelect,
     pub sector_1: OtaDataSelect,
+    running_slot: OtaSlot,
+    pending_reboot_slot: Option<OtaSlot>,
 }
 
 impl OtaDataManager {
+    /// Computes the winning bootable [`OtaSlot`] from two raw sectors.
+    #[inline]
+    const fn compute_active_slot(sector_0: &OtaDataSelect, sector_1: &OtaDataSelect) -> OtaSlot {
+        let s0_ok = sector_0.is_bootable();
+        let s1_ok = sector_1.is_bootable();
+        let winning_seq = match (s0_ok, s1_ok) {
+            (true, true) => {
+                if is_seq_greater(sector_0.ota_seq, sector_1.ota_seq) {
+                    sector_0.ota_seq
+                } else {
+                    sector_1.ota_seq
+                }
+            }
+            (true, false) => sector_0.ota_seq,
+            (false, true) => sector_1.ota_seq,
+            (false, false) => return OtaSlot::Ota0,
+        };
+        match OtaSlot::from_seq(winning_seq) {
+            Some(slot) => slot,
+            None => OtaSlot::Ota0,
+        }
+    }
+
     /// Creates an [`OtaDataManager`] booted into `ota_0` (`ota_seq = 1`, `Valid`).
     #[inline]
     pub const fn new() -> Self {
@@ -892,35 +1258,55 @@ impl OtaDataManager {
         Self {
             sector_0: OtaDataSelect::new(1, OtaImgState::Valid),
             sector_1: OtaDataSelect::erased(),
+            running_slot: OtaSlot::Ota0,
+            pending_reboot_slot: None,
         }
     }
 
-    /// Creates an [`OtaDataManager`] from two raw `otadata` sector entries.
+    /// Creates an [`OtaDataManager`] from two raw `otadata` sector entries,
+    /// latching `running_slot` from the winning bootable sector.
     #[inline]
     pub const fn from_sectors(sector_0: OtaDataSelect, sector_1: OtaDataSelect) -> Self {
-        Self { sector_0, sector_1 }
-    }
-
-    /// Overrides active slot configuration according to hardware MMU mapping.
-    pub fn set_running_slot_from_mmu(&mut self, slot: OtaSlot) {
-        match slot {
-            OtaSlot::Ota0 => {
-                self.sector_0 = OtaDataSelect::new(1, OtaImgState::Valid);
-                self.sector_1 = OtaDataSelect::erased();
-            }
-            OtaSlot::Ota1 => {
-                self.sector_0 = OtaDataSelect::new(1, OtaImgState::Valid);
-                self.sector_1 = OtaDataSelect::new(2, OtaImgState::Valid);
-            }
+        let running_slot = Self::compute_active_slot(&sector_0, &sector_1);
+        Self {
+            sector_0,
+            sector_1,
+            running_slot,
+            pending_reboot_slot: None,
         }
     }
 
-    /// Reads both `otadata` sectors (`0x17000` and `0x18000`) from `flash`
-    /// using 4-byte-aligned [`AlignedOtaBuf`] buffers.
+    /// Returns the immutable hardware partition slot currently executing code
+    /// (`M-004` / `C1-004`).
+    #[inline]
+    pub const fn running_slot(&self) -> OtaSlot {
+        self.running_slot
+    }
+
+    /// Returns the newly committed target slot awaiting a device reboot, if any
+    /// (`M-004` / `C1-004`).
+    #[inline]
+    pub const fn pending_reboot_slot(&self) -> Option<OtaSlot> {
+        self.pending_reboot_slot
+    }
+
+    /// Records the currently executing hardware MMU slot without fabricating
+    /// or overwriting `otadata` sector state (`M-039` / `C1-019`).
+    #[inline]
+    pub fn set_running_slot_from_mmu(&mut self, slot: OtaSlot) {
+        self.running_slot = slot;
+    }
+
+    /// Reads both `otadata` sectors (`0x17000` and `0x18000`) from persistent
+    /// `flash` using 4-byte-aligned [`AlignedOtaBuf`] buffers.
     ///
-    /// If neither sector in flash contains a valid CRC-32 (e.g. blank factory
-    /// flash), initializes to [`Self::new_booted_ota0`].
+    /// Rejects non-persistent backends (`!flash.has_persistent_otadata()`,
+    /// `M-137`). If neither sector in flash contains a valid CRC-32 (e.g.
+    /// blank factory flash), initializes to [`Self::new_booted_ota0`].
     pub fn load_from_flash<F: OtaFlashStorage>(flash: &mut F) -> Result<Self, OtaError> {
+        if !flash.has_persistent_otadata() {
+            return Err(OtaError::FlashWriteError);
+        }
         let mut buf0 = AlignedOtaBuf::default();
         let mut buf1 = AlignedOtaBuf::default();
         flash.read_aligned(OTADATA_SECTOR_0_OFFSET, &mut buf0.0)?;
@@ -934,35 +1320,82 @@ impl OtaDataManager {
         }
     }
 
-    /// Returns the index of the inactive/older otadata flash sector (`0` for
-    /// `0x17000`, `1` for `0x18000`).
+    /// Returns the typed inactive/older `otadata` flash sector, preferring
+    /// non-bootable (erased, aborted, invalid, or corrupt) sectors first so
+    /// post-rollback OTAs never overwrite the sole valid fallback sector
+    /// (`M-003` / `C1-003`).
     #[inline]
-    pub const fn select_inactive_otadata_sector(&self) -> usize {
-        let s0_valid = self.sector_0.is_crc_valid();
-        let s1_valid = self.sector_1.is_crc_valid();
-        match (s0_valid, s1_valid) {
+    pub const fn select_inactive_sector(&self) -> OtaDataSector {
+        let s0_boot = self.sector_0.is_bootable();
+        let s1_boot = self.sector_1.is_bootable();
+        match (s0_boot, s1_boot) {
             (true, true) => {
                 if is_seq_greater(self.sector_0.ota_seq, self.sector_1.ota_seq) {
-                    1
+                    OtaDataSector::Sector1
                 } else {
-                    0
+                    OtaDataSector::Sector0
                 }
             }
-            (true, false) => 1,
-            (false, true) => 0,
-            (false, false) => 0,
+            (true, false) => OtaDataSector::Sector1,
+            (false, true) => OtaDataSector::Sector0,
+            (false, false) => OtaDataSector::Sector0,
         }
     }
 
-    /// Returns the index of the active otadata flash sector (`0` for `0x17000`,
-    /// `1` for `0x18000`).
+    /// Returns the index of the inactive/older `otadata` flash sector (`0` for
+    /// `0x17000`, `1` for `0x18000`) (`M-003` / `C1-003`).
+    #[inline]
+    pub const fn select_inactive_otadata_sector(&self) -> usize {
+        self.select_inactive_sector().index()
+    }
+
+    /// Returns the index of the active `otadata` flash sector (`0` for
+    /// `0x17000`, `1` for `0x18000`).
     #[inline]
     pub const fn active_otadata_sector(&self) -> usize {
-        if self.select_inactive_otadata_sector() == 0 {
-            1
-        } else {
-            0
+        self.select_inactive_sector().opposite().index()
+    }
+
+    /// Programs `entry` into `sector` in two stages (`0..28` before the final
+    /// 4-byte `crc` commit word at `28..32`, `M-136` / `C1-038`) and performs
+    /// 32-byte readback verification when `flash.supports_readback()` is true
+    /// (`M-137` / `C1-039`).
+    fn write_entry_to_sector_with_verify<F: OtaFlashStorage>(
+        flash: &mut F,
+        sector: OtaDataSector,
+        entry: &OtaDataSelect,
+    ) -> Result<(), OtaError> {
+        let sector_offset = sector.offset();
+        let expected = AlignedOtaBuf(entry.to_bytes());
+        flash.erase_range(sector_offset, sector_offset + FLASH_SECTOR_SIZE)?;
+        // Stage 1: write ota_seq, seq_label, and ota_state before CRC so a
+        // power loss leaves crc == 0xFFFF_FFFF (detectable torn write).
+        flash.write_aligned(sector_offset, &expected.0[..28])?;
+        // Stage 2: commit the 4-byte CRC word last.
+        flash.write_aligned(sector_offset + 28, &expected.0[28..32])?;
+        if flash.supports_readback() {
+            let mut verify = AlignedOtaBuf::default();
+            flash.read_aligned(sector_offset, &mut verify.0)?;
+            if verify.0 != expected.0 {
+                return Err(OtaError::ReadbackMismatch);
+            }
         }
+        Ok(())
+    }
+
+    /// Erases the 4KB `otadata` `sector` and writes its 32-byte
+    /// [`OtaDataSelect`] entry to `flash` with two-stage commit and readback
+    /// verification (`M-136` / `M-137`).
+    pub fn sync_sector_entry_to_flash<F: OtaFlashStorage>(
+        &self,
+        flash: &mut F,
+        sector: OtaDataSector,
+    ) -> Result<(), OtaError> {
+        let entry = match sector {
+            OtaDataSector::Sector0 => &self.sector_0,
+            OtaDataSector::Sector1 => &self.sector_1,
+        };
+        Self::write_entry_to_sector_with_verify(flash, sector, entry)
     }
 
     /// Erases the 4KB `otadata` sector (`sector_index`: `0` for `0x17000`,
@@ -973,31 +1406,44 @@ impl OtaDataManager {
         flash: &mut F,
         sector_index: usize,
     ) -> Result<(), OtaError> {
-        let (sector_offset, entry) = match sector_index {
-            0 => (OTADATA_SECTOR_0_OFFSET, &self.sector_0),
-            1 => (OTADATA_SECTOR_1_OFFSET, &self.sector_1),
-            _ => return Err(OtaError::NoPassivePartition),
-        };
-        flash.erase_range(sector_offset, sector_offset + FLASH_SECTOR_SIZE)?;
-        let aligned = AlignedOtaBuf(entry.to_bytes());
-        flash.write_aligned(sector_offset, &aligned.0)
+        let sector = OtaDataSector::from_index(sector_index).ok_or(OtaError::InvalidOtaDataCrc)?;
+        self.sync_sector_entry_to_flash(flash, sector)
     }
 
-    /// Erases the 4KB `otadata` sector corresponding to `slot`
-    /// (`0x17000` for `Ota0`, `0x18000` for `Ota1`) and writes its 32-byte
-    /// [`OtaDataSelect`] entry to `flash`.
+    /// Syncs the `otadata` sector corresponding to `slot` to `flash`
+    /// (`M-137` / `C1-039`: routes to the sector actually holding `slot`
+    /// rather than assuming `Ota0 => sector_0` / `Ota1 => sector_1`).
     pub fn sync_slot_to_flash<F: OtaFlashStorage>(
         &self,
         flash: &mut F,
         slot: OtaSlot,
     ) -> Result<(), OtaError> {
-        let (sector_offset, entry) = match slot {
-            OtaSlot::Ota0 => (OTADATA_SECTOR_0_OFFSET, &self.sector_0),
-            OtaSlot::Ota1 => (OTADATA_SECTOR_1_OFFSET, &self.sector_1),
+        let s0_match = self.sector_0.is_bootable() && self.sector_0.slot() == Some(slot);
+        let s1_match = self.sector_1.is_bootable() && self.sector_1.slot() == Some(slot);
+        let sector = match (s0_match, s1_match) {
+            (true, true) => {
+                if is_seq_greater(self.sector_0.ota_seq, self.sector_1.ota_seq) {
+                    OtaDataSector::Sector0
+                } else {
+                    OtaDataSector::Sector1
+                }
+            }
+            (true, false) => OtaDataSector::Sector0,
+            (false, true) => OtaDataSector::Sector1,
+            (false, false) => {
+                if self.sector_0.is_crc_valid() && self.sector_0.slot() == Some(slot) {
+                    OtaDataSector::Sector0
+                } else if self.sector_1.is_crc_valid() && self.sector_1.slot() == Some(slot) {
+                    OtaDataSector::Sector1
+                } else {
+                    match slot {
+                        OtaSlot::Ota0 => OtaDataSector::Sector0,
+                        OtaSlot::Ota1 => OtaDataSector::Sector1,
+                    }
+                }
+            }
         };
-        flash.erase_range(sector_offset, sector_offset + FLASH_SECTOR_SIZE)?;
-        let aligned = AlignedOtaBuf(entry.to_bytes());
-        flash.write_aligned(sector_offset, &aligned.0)
+        self.sync_sector_entry_to_flash(flash, sector)
     }
 
     /// Alias for [`Self::sync_slot_to_flash`].
@@ -1010,42 +1456,120 @@ impl OtaDataManager {
         self.sync_slot_to_flash(flash, slot)
     }
 
-    /// Marks the currently active OTA slot as [`OtaImgState::Valid`]
-    /// (`EMB-003`) and, if the state transitioned from `PendingVerify`/`New`,
-    /// persists the updated `otadata` sector to `flash`.
+    /// Marks the currently running OTA slot as [`OtaImgState::Valid`]
+    /// (`EMB-003`) and, if the state transitioned from `PendingVerify`/`New`/
+    /// `Undefined`, persists the updated `otadata` sector to `flash`.
+    ///
+    /// Hardened against:
+    /// - Premature validation of an unbooted committed slot (`M-004`)
+    /// - RAM/flash desync on write failure (`M-036`)
+    /// - Zero-bootable-sector power-loss bricking during active-sector erase
+    ///   (`M-037` / `C1-017`)
     pub fn cancel_rollback_in_flash<F: OtaFlashStorage>(
         &mut self,
         flash: &mut F,
     ) -> Result<bool, OtaError> {
+        if self.pending_reboot_slot.is_some() {
+            return Err(OtaError::RollbackStateInvalid);
+        }
         let mut staged = *self;
         let s0_ok = staged.sector_0.is_bootable();
         let s1_ok = staged.sector_1.is_bootable();
-        let (active_sec, changed) = match (s0_ok, s1_ok) {
+        let (active_sec, other_bootable) = match (s0_ok, s1_ok) {
             (true, true) => {
                 if is_seq_greater(staged.sector_0.ota_seq, staged.sector_1.ota_seq) {
-                    (0usize, staged.sector_0.mark_app_valid_cancel_rollback()?)
+                    (OtaDataSector::Sector0, true)
                 } else {
-                    (1usize, staged.sector_1.mark_app_valid_cancel_rollback()?)
+                    (OtaDataSector::Sector1, true)
                 }
             }
-            (true, false) => (0usize, staged.sector_0.mark_app_valid_cancel_rollback()?),
-            (false, true) => (1usize, staged.sector_1.mark_app_valid_cancel_rollback()?),
+            (true, false) => (OtaDataSector::Sector0, false),
+            (false, true) => (OtaDataSector::Sector1, false),
             (false, false) => return Err(OtaError::InvalidOtaDataCrc),
         };
+        let target_entry = match active_sec {
+            OtaDataSector::Sector0 => &mut staged.sector_0,
+            OtaDataSector::Sector1 => &mut staged.sector_1,
+        };
+        if target_entry.slot() != Some(self.running_slot) {
+            return Err(OtaError::RollbackStateInvalid);
+        }
+        let orig_entry = *target_entry;
+        let prev_state = orig_entry.state();
+        let changed = target_entry.mark_app_valid_cancel_rollback()?;
         if changed {
-            staged.sync_otadata_sector_to_flash(flash, active_sec)?;
+            let updated_entry = *target_entry;
+            if flash.has_persistent_otadata() {
+                if prev_state == OtaImgState::Undefined {
+                    // NOR 0xFFFF_FFFF -> 0x0000_0002 is strictly 1->0 bits;
+                    // program in place with zero erase window.
+                    let state_bytes = (OtaImgState::Valid as u32).to_le_bytes();
+                    flash.write_aligned(active_sec.offset() + 24, &state_bytes)?;
+                    if flash.supports_readback() {
+                        let mut verify = AlignedOtaBuf::default();
+                        flash.read_aligned(active_sec.offset(), &mut verify.0)?;
+                        if verify.0 != updated_entry.to_bytes() {
+                            return Err(OtaError::ReadbackMismatch);
+                        }
+                    }
+                } else if !other_bootable {
+                    let backup_sec = active_sec.opposite();
+                    if updated_entry.ota_seq <= u32::MAX - 3 {
+                        // M-037: Atomically write `(ota_seq + 2, Valid)` (same
+                        // slot parity, strictly higher seq) into `backup_sec`
+                        // without erasing the sole bootable `active_sec`.
+                        let next_seq = updated_entry.ota_seq + 2;
+                        let advanced = OtaDataSelect::try_new(next_seq, OtaImgState::Valid)
+                            .ok_or(OtaError::SequenceOverflow)?;
+                        Self::write_entry_to_sector_with_verify(flash, backup_sec, &advanced)?;
+                        match active_sec {
+                            OtaDataSector::Sector0 => {
+                                staged.sector_0 = orig_entry;
+                                staged.sector_1 = advanced;
+                            }
+                            OtaDataSector::Sector1 => {
+                                staged.sector_1 = orig_entry;
+                                staged.sector_0 = advanced;
+                            }
+                        }
+                    } else {
+                        // Sequence near u32::MAX: stage backup copy before
+                        // rewriting active sector; equal `(ota_seq, Valid)`
+                        // recovery is permitted in `resync_from_flash_for_ota`.
+                        Self::write_entry_to_sector_with_verify(flash, backup_sec, &updated_entry)?;
+                        Self::write_entry_to_sector_with_verify(flash, active_sec, &updated_entry)?;
+                        flash.erase_range(
+                            backup_sec.offset(),
+                            backup_sec.offset() + FLASH_SECTOR_SIZE,
+                        )?;
+                    }
+                } else {
+                    // Opposite sector is a valid bootable fallback; safe to
+                    // erase and two-stage rewrite the active sector.
+                    Self::write_entry_to_sector_with_verify(flash, active_sec, &updated_entry)?;
+                }
+            }
             *self = staged;
         }
         Ok(changed)
     }
 
-    /// Prepares the inactive partition for receiving OTA chunks by
-    /// erasing its range.
+    /// Prepares the inactive partition for receiving OTA chunks by resyncing
+    /// `otadata` from flash, rejecting unconfirmed/pending-reboot states
+    /// (`M-004` / `M-005`), validating `image_size`, and erasing the 4KB-aligned
+    /// target range (`M-035`).
     pub fn begin_ota<F: OtaFlashStorage>(
-        &self,
+        &mut self,
         flash: &mut F,
         image_size: usize,
     ) -> Result<OtaSlot, OtaError> {
+        if self.pending_reboot_slot.is_some() {
+            return Err(OtaError::RollbackStateInvalid);
+        }
+        self.resync_from_flash_for_ota(flash)?;
+        if self.has_pending_rollback() {
+            return Err(OtaError::RollbackStateInvalid);
+        }
         let target_slot = self.select_inactive_slot();
         let partition = target_slot.partition();
         let max_size = if (partition.size as usize) < OTA_PARTITION_MAX_SIZE {
@@ -1056,18 +1580,65 @@ impl OtaDataManager {
         if image_size == 0 {
             return Err(OtaError::MissingContentLength);
         }
+        if image_size < ESP_IMAGE_HEADER_LEN {
+            return Err(OtaError::ImageTooSmall);
+        }
         if image_size > max_size {
             return Err(OtaError::ImageTooLarge {
                 image_size,
                 partition_size: max_size,
             });
         }
-        let erase_len = ((image_size as u32) + 0xFFF) & !0xFFF;
-        flash.erase_range(partition.offset, partition.offset.saturating_add(erase_len))?;
+        let image_u32 = u32::try_from(image_size).map_err(|_| OtaError::ImageTooLarge {
+            image_size,
+            partition_size: max_size,
+        })?;
+        let erase_len = image_u32
+            .checked_add(0xFFF)
+            .ok_or(OtaError::ImageTooLarge {
+                image_size,
+                partition_size: max_size,
+            })?
+            & !0xFFF;
+        if erase_len > partition.size {
+            return Err(OtaError::ImageTooLarge {
+                image_size,
+                partition_size: max_size,
+            });
+        }
+        let erase_end = partition
+            .offset
+            .checked_add(erase_len)
+            .ok_or(OtaError::FlashWriteError)?;
+        flash.erase_range(partition.offset, erase_end)?;
         Ok(target_slot)
     }
 
-    /// Writes an aligned chunk of OTA firmware into flash at the given byte offset.
+    /// Starts a stateful [`OtaWriteSession`] that tracks byte count, header
+    /// validation, running SHA-256, and flash readback before commit (`M-035`).
+    pub fn begin_ota_session<F: OtaFlashStorage>(
+        &mut self,
+        flash: &mut F,
+        image_size: usize,
+    ) -> Result<OtaWriteSession, OtaError> {
+        let target_slot = self.begin_ota(flash, image_size)?;
+        let partition = target_slot.partition();
+        Ok(OtaWriteSession {
+            target_slot,
+            expected_len: image_size,
+            bytes_written: 0,
+            partition_offset: partition.offset,
+            partition_size: partition.size,
+            header_buf: [0u8; ESP_IMAGE_HEADER_LEN],
+            header_len: 0,
+            header_validated: false,
+            hasher: Sha256::new(),
+        })
+    }
+
+    /// Writes a 4-byte-aligned chunk of OTA firmware into the inactive flash
+    /// partition after checking slot safety, alignment, and partition bounds
+    /// (`M-035` / `C1-015`).
     pub fn write_chunk<F: OtaFlashStorage>(
         &self,
         flash: &mut F,
@@ -1075,59 +1646,248 @@ impl OtaDataManager {
         offset: u32,
         chunk: &[u8],
     ) -> Result<(), OtaError> {
+        if slot != self.select_inactive_slot()
+            || self.pending_reboot_slot.is_some()
+            || self.has_pending_rollback()
+        {
+            return Err(OtaError::RollbackStateInvalid);
+        }
+        if (offset & 3) != 0 || (chunk.len() & 3) != 0 {
+            return Err(OtaError::FlashWriteError);
+        }
         let partition = slot.partition();
-        flash.write_aligned(partition.offset.saturating_add(offset), chunk)
+        let chunk_len = u32::try_from(chunk.len()).map_err(|_| OtaError::ImageTooLarge {
+            image_size: chunk.len(),
+            partition_size: partition.size as usize,
+        })?;
+        let end_rel = offset
+            .checked_add(chunk_len)
+            .ok_or(OtaError::ImageTooLarge {
+                image_size: usize::MAX,
+                partition_size: partition.size as usize,
+            })?;
+        if end_rel > partition.size {
+            return Err(OtaError::ImageTooLarge {
+                image_size: end_rel as usize,
+                partition_size: partition.size as usize,
+            });
+        }
+        let flash_addr = partition
+            .offset
+            .checked_add(offset)
+            .ok_or(OtaError::FlashWriteError)?;
+        flash.write_aligned(flash_addr, chunk)
     }
 
-    /// Finalizes an OTA update after all chunks are written, updating `otadata`.
+    /// Finalizes an OTA update after all chunks are written, walking the
+    /// flashed ESP32 segment headers and executing full
+    /// [`Self::readback_verify_image`] (header, segments, 8-bit XOR checksum,
+    /// and mandatory appended SHA-256) before committing `otadata` (`M-035`).
     pub fn finish_ota<F: OtaFlashStorage>(
         &mut self,
         flash: &mut F,
         slot: OtaSlot,
     ) -> Result<OtaDataSelect, OtaError> {
+        if slot != self.select_inactive_slot()
+            || self.pending_reboot_slot.is_some()
+            || self.has_pending_rollback()
+        {
+            return Err(OtaError::RollbackStateInvalid);
+        }
+        if !flash.supports_readback() {
+            return Err(OtaError::FlashWriteError);
+        }
+        let partition = slot.partition();
+        let max_size = if (partition.size as usize) < OTA_PARTITION_MAX_SIZE {
+            partition.size as usize
+        } else {
+            OTA_PARTITION_MAX_SIZE
+        };
+        let base = partition.offset;
+
+        let mut hdr_buf = AlignedOtaBuf::default();
+        flash.read_aligned(base, &mut hdr_buf.0)?;
+        let header = validate_ota_image_header(
+            &hdr_buf.0[..ESP_IMAGE_HEADER_LEN],
+            ESP_IMAGE_HEADER_LEN,
+            max_size,
+        )?;
+
+        let mut chunk = AlignedFlashChunk::default();
+        let mut offset = ESP_IMAGE_HEADER_LEN;
+        let mut seg_idx = 0u8;
+        let mut seg_hdr = [0u8; 8];
+        while seg_idx < header.segment_count {
+            if offset.checked_add(8).ok_or(OtaError::ImageTooSmall)? > max_size {
+                return Err(OtaError::ImageTooSmall);
+            }
+            Self::read_exact_unaligned(flash, base, offset, &mut seg_hdr, &mut chunk)?;
+            let data_len =
+                u32::from_le_bytes([seg_hdr[4], seg_hdr[5], seg_hdr[6], seg_hdr[7]]) as usize;
+            offset = offset
+                .checked_add(8)
+                .and_then(|o| o.checked_add(data_len))
+                .ok_or(OtaError::ImageTooSmall)?;
+            if offset > max_size {
+                return Err(OtaError::ImageTooLarge {
+                    image_size: offset,
+                    partition_size: max_size,
+                });
+            }
+            seg_idx += 1;
+        }
+
+        let aligned_end = (offset.checked_add(16).ok_or(OtaError::ImageTooSmall)?) & !15;
+        let total_len = aligned_end
+            .checked_add(ESP_IMAGE_DIGEST_LEN)
+            .ok_or(OtaError::ImageTooSmall)?;
+        if total_len > max_size {
+            return Err(OtaError::ImageTooLarge {
+                image_size: total_len,
+                partition_size: max_size,
+            });
+        }
+        Self::readback_verify_image(flash, base, total_len, &mut chunk)?;
         self.commit_update(flash, slot)
     }
 
-    /// Commits an update to the older/inactive `otadata` sector in flash.
+    /// Commits an update to the older/inactive `otadata` sector in flash,
+    /// deferring RAM mutation until flash writes + readback succeed (`M-036`)
+    /// and persisting factory-blank `sector_0` first if needed (`M-037`).
     pub fn commit_update<F: OtaFlashStorage>(
         &mut self,
         flash: &mut F,
         target_slot: OtaSlot,
     ) -> Result<OtaDataSelect, OtaError> {
-        let inactive_sector = self.select_inactive_otadata_sector();
-        let entry = self.set_boot_slot(target_slot)?;
-        self.sync_otadata_sector_to_flash(flash, inactive_sector)?;
+        if self.pending_reboot_slot.is_some()
+            || self.has_pending_rollback()
+            || target_slot == self.running_slot
+        {
+            return Err(OtaError::RollbackStateInvalid);
+        }
+        let mut staged = *self;
+        let inactive_sector = staged.select_inactive_sector();
+
+        // M-037 / C1-017: On factory-blank flash where `sector_0 = (1, Valid)`
+        // was synthesized only in RAM, persist `sector_0` before writing the
+        // first `Ota1` update into `sector_1` so rollback always has a valid
+        // on-flash fallback record.
+        if flash.has_persistent_otadata()
+            && inactive_sector == OtaDataSector::Sector1
+            && staged.sector_0.is_bootable()
+        {
+            let mut raw0 = AlignedOtaBuf::default();
+            let mut raw1 = AlignedOtaBuf::default();
+            flash.read_aligned(OTADATA_SECTOR_0_OFFSET, &mut raw0.0)?;
+            flash.read_aligned(OTADATA_SECTOR_1_OFFSET, &mut raw1.0)?;
+            if raw0.0 == [0xFF; 32] && raw1.0 == [0xFF; 32] {
+                staged.sync_sector_entry_to_flash(flash, OtaDataSector::Sector0)?;
+            }
+        }
+
+        let entry = staged.set_boot_slot(target_slot)?;
+        staged.sync_sector_entry_to_flash(flash, inactive_sector)?;
+        *self = staged;
         Ok(entry)
     }
 
-    /// Rolls back the active slot to the previous bootable partition if available.
+    /// Rolls back an unconfirmed (`PendingVerify` / `New` / `Undefined`)
+    /// running slot to the previous bootable partition, deferring RAM mutation
+    /// until flash write + readback succeed (`M-036`).
     pub fn rollback<F: OtaFlashStorage>(&mut self, flash: &mut F) -> Result<OtaSlot, OtaError> {
-        let s0_ok = self.sector_0.is_bootable();
-        let s1_ok = self.sector_1.is_bootable();
+        if !self.has_pending_rollback() || self.pending_reboot_slot.is_some() {
+            return Err(OtaError::RollbackStateInvalid);
+        }
+        let mut staged = *self;
+        let s0_ok = staged.sector_0.is_bootable();
+        let s1_ok = staged.sector_1.is_bootable();
         match (s0_ok, s1_ok) {
             (true, true) => {
-                if is_seq_greater(self.sector_0.ota_seq, self.sector_1.ota_seq) {
-                    self.sector_0.ota_state = OtaImgState::Aborted as u32;
-                    self.sector_0.crc = self.sector_0.calculate_crc();
-                    self.sync_otadata_sector_to_flash(flash, 0)?;
+                let active_sec = if is_seq_greater(staged.sector_0.ota_seq, staged.sector_1.ota_seq)
+                {
+                    staged.sector_0.ota_state = OtaImgState::Aborted as u32;
+                    staged.sector_0.crc = staged.sector_0.calculate_crc();
+                    OtaDataSector::Sector0
                 } else {
-                    self.sector_1.ota_state = OtaImgState::Aborted as u32;
-                    self.sector_1.crc = self.sector_1.calculate_crc();
-                    self.sync_otadata_sector_to_flash(flash, 1)?;
-                }
+                    staged.sector_1.ota_state = OtaImgState::Aborted as u32;
+                    staged.sector_1.crc = staged.sector_1.calculate_crc();
+                    OtaDataSector::Sector1
+                };
+                staged.sync_sector_entry_to_flash(flash, active_sec)?;
+                *self = staged;
                 Ok(self.active_slot())
             }
             _ => Err(OtaError::RollbackStateInvalid),
         }
     }
 
-    /// Resynchronizes this manager's memory state against real flash before an
-    /// OTA partition write begins (`FW-NET-12`).
-    pub fn resync_from_flash_for_ota<F: OtaFlashStorage>(
+    /// Resynchronizes this manager's memory state against real flash before a
+    /// rollback cancellation check (`M-039` / `C1-019`).
+    pub fn resync_from_flash_for_rollback<F: OtaFlashStorage>(
         &mut self,
         flash: &mut F,
     ) -> Result<(), OtaError> {
         if !flash.has_persistent_otadata() {
+            return Err(OtaError::FlashWriteError);
+        }
+        if self.pending_reboot_slot.is_some() {
+            return Err(OtaError::RollbackStateInvalid);
+        }
+        let mut buf0 = AlignedOtaBuf::default();
+        let mut buf1 = AlignedOtaBuf::default();
+        flash.read_aligned(OTADATA_SECTOR_0_OFFSET, &mut buf0.0)?;
+        flash.read_aligned(OTADATA_SECTOR_1_OFFSET, &mut buf1.0)?;
+
+        let s0_erased = buf0.0 == [0xFF; 32];
+        let s1_erased = buf1.0 == [0xFF; 32];
+        if s0_erased && s1_erased {
+            if self.running_slot != OtaSlot::Ota0 {
+                return Err(OtaError::RollbackStateInvalid);
+            }
+            self.sector_0 = OtaDataSelect::new(1, OtaImgState::Valid);
+            self.sector_1 = OtaDataSelect::erased();
+            return Ok(());
+        }
+
+        let s0 = OtaDataSelect::from_bytes(&buf0.0);
+        let s1 = OtaDataSelect::from_bytes(&buf1.0);
+        if !s0.is_bootable() && !s1.is_bootable() {
+            return Err(OtaError::InvalidOtaDataCrc);
+        }
+        let flash_active = Self::compute_active_slot(&s0, &s1);
+        if flash_active != self.running_slot {
+            return Err(OtaError::RollbackStateInvalid);
+        }
+        self.sector_0 = s0;
+        self.sector_1 = s1;
+        Ok(())
+    }
+
+    /// Resynchronizes this manager's memory state against real flash before an
+    /// OTA partition write begins (`FW-NET-12`, `M-004`, `M-005`, `M-037`,
+    /// `M-038`).
+    ///
+    /// Allows recovery when:
+    /// - one sector is valid, bootable, confirmed (`!has_pending_rollback()`),
+    ///   and matches `running_slot`, even if the inactive sector is erased,
+    ///   torn, or has a corrupt CRC (`M-038`);
+    /// - both sectors hold identical `(ota_seq, Valid)` matching
+    ///   `running_slot` after an interrupted backup-copy cancel (`M-037`).
+    ///
+    /// Rejects states where neither sector is bootable (`InvalidOtaDataCrc` /
+    /// `RollbackStateInvalid`), unconfirmed `PendingVerify` running slots
+    /// (`M-005`), and already-committed pending-reboot states (`M-004`).
+    pub fn resync_from_flash_for_ota<F: OtaFlashStorage>(
+        &mut self,
+        flash: &mut F,
+    ) -> Result<(), OtaError> {
+        if self.pending_reboot_slot.is_some() {
+            return Err(OtaError::RollbackStateInvalid);
+        }
+        if !flash.has_persistent_otadata() {
+            if self.has_pending_rollback() {
+                return Err(OtaError::RollbackStateInvalid);
+            }
             return Ok(());
         }
         let mut buf0 = AlignedOtaBuf::default();
@@ -1137,47 +1897,65 @@ impl OtaDataManager {
 
         let s0_erased = buf0.0 == [0xFF; 32];
         let s1_erased = buf1.0 == [0xFF; 32];
-        let s0 = OtaDataSelect::from_bytes(&buf0.0);
-        let s1 = OtaDataSelect::from_bytes(&buf1.0);
-
-        if (!s0_erased && !s0.is_crc_valid()) || (!s1_erased && !s1.is_crc_valid()) {
-            return Err(OtaError::InvalidOtaDataCrc);
-        }
-
         if s0_erased && s1_erased {
-            if self.active_slot() != OtaSlot::Ota0 {
+            if self.running_slot != OtaSlot::Ota0 {
                 return Err(OtaError::RollbackStateInvalid);
             }
-            *self = Self::new_booted_ota0();
+            self.sector_0 = OtaDataSelect::new(1, OtaImgState::Valid);
+            self.sector_1 = OtaDataSelect::erased();
             return Ok(());
         }
 
+        let s0 = OtaDataSelect::from_bytes(&buf0.0);
+        let s1 = OtaDataSelect::from_bytes(&buf1.0);
+
+        if !s0.is_bootable() && !s1.is_bootable() {
+            let s0_bad_crc = !s0_erased && !s0.is_crc_valid();
+            let s1_bad_crc = !s1_erased && !s1.is_crc_valid();
+            if s0_bad_crc || s1_bad_crc {
+                return Err(OtaError::InvalidOtaDataCrc);
+            }
+            return Err(OtaError::RollbackStateInvalid);
+        }
+
         let flash_mgr = Self::from_sectors(s0, s1);
-        if (!s0.is_bootable() && !s1.is_bootable())
-            || (s0.is_crc_valid() && s1.is_crc_valid() && s0.ota_seq == s1.ota_seq)
-            || flash_mgr.active_slot() != self.active_slot()
+        let equal_seq = s0.is_crc_valid() && s1.is_crc_valid() && s0.ota_seq == s1.ota_seq;
+        let equal_valid_running = equal_seq
+            && s0.state() == OtaImgState::Valid
+            && s1.state() == OtaImgState::Valid
+            && s0.slot() == Some(self.running_slot);
+        if (equal_seq && !equal_valid_running)
+            || flash_mgr.active_slot() != self.running_slot
+            || flash_mgr.has_pending_rollback()
         {
             return Err(OtaError::RollbackStateInvalid);
         }
-        *self = flash_mgr;
+        self.sector_0 = s0;
+        self.sector_1 = s1;
         Ok(())
     }
 
     /// Validates an ESP32 OTA firmware `payload`, resyncs against `flash`
-    /// (`FW-NET-12`), erases the 4KB-rounded range in the passive [`OtaSlot`]
-    /// partition, writes the image in 1024-byte 4-byte-aligned chunks (padding
-    /// any trailing `1..=3` bytes with `0xFF`), updates `otadata` to
-    /// [`OtaImgState::PendingVerify`], and syncs the updated `otadata` sector
-    /// to `flash`.
+    /// (`FW-NET-12`), enforces confirmed running slot and single-commit latch
+    /// (`M-004` / `M-005`), erases the 4KB-rounded range in the passive
+    /// [`OtaSlot`] partition, writes the image in 1024-byte 4-byte-aligned
+    /// chunks (padding any trailing `1..=3` bytes with `0xFF`), verifies
+    /// readback SHA-256 (`FW-NET-18`), and commits `otadata`.
     pub fn write_ota_image_to_flash<F: OtaFlashStorage>(
         &mut self,
         flash: &mut F,
         payload: &[u8],
     ) -> Result<OtaSlot, OtaError> {
+        if self.pending_reboot_slot.is_some() {
+            return Err(OtaError::RollbackStateInvalid);
+        }
         validate_ota_image_header(payload, payload.len(), OTA_PARTITION_MAX_SIZE)?;
         validate_ota_image_integrity(payload)?;
 
         self.resync_from_flash_for_ota(flash)?;
+        if self.has_pending_rollback() {
+            return Err(OtaError::RollbackStateInvalid);
+        }
 
         let target_slot = self.select_inactive_slot();
         let partition = target_slot.partition();
@@ -1193,8 +1971,28 @@ impl OtaDataManager {
             });
         }
 
-        let erase_len = ((payload.len() as u32) + 0xFFF) & !0xFFF;
-        flash.erase_range(partition.offset, partition.offset.saturating_add(erase_len))?;
+        let payload_u32 = u32::try_from(payload.len()).map_err(|_| OtaError::ImageTooLarge {
+            image_size: payload.len(),
+            partition_size: max_size,
+        })?;
+        let erase_len = payload_u32
+            .checked_add(0xFFF)
+            .ok_or(OtaError::ImageTooLarge {
+                image_size: payload.len(),
+                partition_size: max_size,
+            })?
+            & !0xFFF;
+        if erase_len > partition.size {
+            return Err(OtaError::ImageTooLarge {
+                image_size: payload.len(),
+                partition_size: max_size,
+            });
+        }
+        let erase_end = partition
+            .offset
+            .checked_add(erase_len)
+            .ok_or(OtaError::FlashWriteError)?;
+        flash.erase_range(partition.offset, erase_end)?;
 
         let mut written_hash = Sha256::new();
         let mut chunk = AlignedFlashChunk::default();
@@ -1214,10 +2012,11 @@ impl OtaDataManager {
                 pad += 1;
             }
             written_hash.update(&chunk.0[..step]);
-            flash.write_aligned(
-                partition.offset.saturating_add(received as u32),
-                &chunk.0[..aligned_step],
-            )?;
+            let write_addr = partition
+                .offset
+                .checked_add(received as u32)
+                .ok_or(OtaError::FlashWriteError)?;
+            flash.write_aligned(write_addr, &chunk.0[..aligned_step])?;
             received += step;
         }
 
@@ -1247,14 +2046,136 @@ impl OtaDataManager {
         while off < len {
             let step = (len - off).min(OTA_CHUNK_SIZE);
             let aligned_step = (step + 3) & !3;
-            flash.read_aligned(
-                base.saturating_add(off as u32),
-                &mut chunk.0[..aligned_step],
-            )?;
+            let addr = base
+                .checked_add(off as u32)
+                .ok_or(OtaError::FlashWriteError)?;
+            flash.read_aligned(addr, &mut chunk.0[..aligned_step])?;
             hasher.update(&chunk.0[..step]);
             off += step;
         }
         Ok(hasher.finalize())
+    }
+
+    /// Reads back a flashed image from `base` (`len` bytes), verifies its
+    /// header, segment structure, 8-bit XOR checksum, exact length, and
+    /// mandatory appended SHA-256 digest (`M-028` / `M-035`), and returns the
+    /// full-image SHA-256 digest for comparison against the streamed hash.
+    fn readback_verify_image<F: OtaFlashStorage>(
+        flash: &mut F,
+        base: u32,
+        len: usize,
+        chunk: &mut AlignedFlashChunk,
+    ) -> Result<[u8; 32], OtaError> {
+        if len < ESP_IMAGE_HEADER_LEN + ESP_IMAGE_DIGEST_LEN {
+            return Err(OtaError::ImageTooSmall);
+        }
+        let mut hdr_buf = AlignedOtaBuf::default();
+        flash.read_aligned(base, &mut hdr_buf.0)?;
+        let header = validate_ota_image_header(
+            &hdr_buf.0[..ESP_IMAGE_HEADER_LEN],
+            len,
+            OTA_PARTITION_MAX_SIZE,
+        )?;
+        if hdr_buf.0[23] != 1 {
+            return Err(OtaError::InvalidDigestPlacement);
+        }
+
+        // Walk segments from flash to verify XOR checksum & exact aligned_end.
+        let mut offset = ESP_IMAGE_HEADER_LEN;
+        let mut chk = 0xEFu8;
+        let mut seg_idx = 0u8;
+        let mut seg_hdr = [0u8; 8];
+        while seg_idx < header.segment_count {
+            if offset.checked_add(8).ok_or(OtaError::ImageTooSmall)? > len {
+                return Err(OtaError::ImageTooSmall);
+            }
+            Self::read_exact_unaligned(flash, base, offset, &mut seg_hdr, chunk)?;
+            let load_addr = u32::from_le_bytes([seg_hdr[0], seg_hdr[1], seg_hdr[2], seg_hdr[3]]);
+            let data_len =
+                u32::from_le_bytes([seg_hdr[4], seg_hdr[5], seg_hdr[6], seg_hdr[7]]) as usize;
+            if data_len > 0 && (load_addr & 3) != 0 {
+                return Err(OtaError::InvalidEntryAddr(load_addr));
+            }
+            offset += 8;
+            let end_seg = offset
+                .checked_add(data_len)
+                .ok_or(OtaError::ImageTooSmall)?;
+            if end_seg > len {
+                return Err(OtaError::ImageTooSmall);
+            }
+            let mut pos = offset;
+            while pos < end_seg {
+                let take = (end_seg - pos).min(OTA_CHUNK_SIZE);
+                let mut tmp = AlignedFlashChunk::default();
+                Self::read_exact_unaligned(flash, base, pos, &mut tmp.0[..take], chunk)?;
+                let mut b = 0;
+                while b < take {
+                    chk ^= tmp.0[b];
+                    b += 1;
+                }
+                pos += take;
+            }
+            offset = end_seg;
+            seg_idx += 1;
+        }
+
+        let aligned_end = (offset.checked_add(16).ok_or(OtaError::ImageTooSmall)?) & !15;
+        if aligned_end.checked_add(ESP_IMAGE_DIGEST_LEN) != Some(len) {
+            return Err(OtaError::InvalidDigestPlacement);
+        }
+        let checksum_offset = aligned_end.checked_sub(1).ok_or(OtaError::ImageTooSmall)?;
+        let mut chk_byte = [0u8; 1];
+        Self::read_exact_unaligned(flash, base, checksum_offset, &mut chk_byte, chunk)?;
+        if chk_byte[0] != chk {
+            return Err(OtaError::InvalidChecksum);
+        }
+
+        let mut img_hasher = Sha256::new();
+        let mut full_hasher = Sha256::new();
+        let mut off = 0usize;
+        while off < aligned_end {
+            let step = (aligned_end - off).min(OTA_CHUNK_SIZE);
+            let aligned_step = (step + 3) & !3;
+            let addr = base
+                .checked_add(off as u32)
+                .ok_or(OtaError::FlashWriteError)?;
+            flash.read_aligned(addr, &mut chunk.0[..aligned_step])?;
+            img_hasher.update(&chunk.0[..step]);
+            full_hasher.update(&chunk.0[..step]);
+            off += step;
+        }
+        let mut expected_digest = [0u8; ESP_IMAGE_DIGEST_LEN];
+        Self::read_exact_unaligned(flash, base, aligned_end, &mut expected_digest, chunk)?;
+        if img_hasher.finalize() != expected_digest {
+            return Err(OtaError::InvalidSha256);
+        }
+        full_hasher.update(&expected_digest);
+        Ok(full_hasher.finalize())
+    }
+
+    /// Reads an arbitrary byte slice from flash using 4-byte-aligned reads.
+    fn read_exact_unaligned<F: OtaFlashStorage>(
+        flash: &mut F,
+        base: u32,
+        rel_offset: usize,
+        out: &mut [u8],
+        scratch: &mut AlignedFlashChunk,
+    ) -> Result<(), OtaError> {
+        let mut done = 0usize;
+        while done < out.len() {
+            let cur = rel_offset + done;
+            let aligned_cur = cur & !3;
+            let lead = cur - aligned_cur;
+            let max_copy = (OTA_CHUNK_SIZE - lead).min(out.len() - done);
+            let read_len = ((lead + max_copy) + 3) & !3;
+            let addr = base
+                .checked_add(aligned_cur as u32)
+                .ok_or(OtaError::FlashWriteError)?;
+            flash.read_aligned(addr, &mut scratch.0[..read_len])?;
+            out[done..done + max_copy].copy_from_slice(&scratch.0[lead..lead + max_copy]);
+            done += max_copy;
+        }
+        Ok(())
     }
 
     /// Returns `true` when at least one sector is bootable and the winning
@@ -1281,36 +2202,21 @@ impl OtaDataManager {
         )
     }
 
-    /// Returns the currently active [`OtaSlot`] according to ESP-IDF bootloader
-    /// selection rules.
+    /// Returns the winning next-boot [`OtaSlot`] according to ESP-IDF
+    /// bootloader selection rules.
     ///
     /// If neither sector contains a valid bootable record, defaults to
     /// [`OtaSlot::Ota0`] (factory fallback).
     pub const fn active_slot(&self) -> OtaSlot {
-        let s0_ok = self.sector_0.is_bootable();
-        let s1_ok = self.sector_1.is_bootable();
-        let winning_seq = match (s0_ok, s1_ok) {
-            (true, true) => {
-                if is_seq_greater(self.sector_0.ota_seq, self.sector_1.ota_seq) {
-                    self.sector_0.ota_seq
-                } else {
-                    self.sector_1.ota_seq
-                }
-            }
-            (true, false) => self.sector_0.ota_seq,
-            (false, true) => self.sector_1.ota_seq,
-            (false, false) => return OtaSlot::Ota0,
-        };
-        match OtaSlot::from_seq(winning_seq) {
-            Some(slot) => slot,
-            None => OtaSlot::Ota0,
-        }
+        Self::compute_active_slot(&self.sector_0, &self.sector_1)
     }
 
-    /// Returns the inactive target slot opposite to the currently active slot.
+    /// Returns the inactive target slot derived strictly from the immutable
+    /// `running_slot.opposite()` (`M-004` / `C1-004`), so committing an update
+    /// never flips the target slot onto the live XIP-executing partition.
     #[inline]
     pub const fn select_inactive_slot(&self) -> OtaSlot {
-        self.active_slot().opposite()
+        self.running_slot.opposite()
     }
 
     /// Returns the passive [`OtaSlot`] targeted by the next OTA update.
@@ -1321,8 +2227,21 @@ impl OtaDataManager {
 
     /// Updates `otadata` to boot into `target_slot` on the next restart, setting
     /// its state to [`OtaImgState::PendingVerify`] with a newly calculated
-    /// IEEE 802.3 CRC-32.
+    /// ESP-IDF `otadata` CRC-32.
+    ///
+    /// Enforces:
+    /// - Single-commit pending-reboot latch & non-XIP target (`M-004`)
+    /// - Confirmed running slot (`M-005`)
+    /// - Inactive sector selection via `is_bootable()` with `next_seq` strictly
+    ///   above the maximum valid-CRC `ota_seq` across both sectors (`M-003`)
+    /// - Fail-safe [`OtaError::SequenceOverflow`] near `u32::MAX` (`M-033`)
     pub fn set_boot_slot(&mut self, target_slot: OtaSlot) -> Result<OtaDataSelect, OtaError> {
+        if self.pending_reboot_slot.is_some()
+            || self.has_pending_rollback()
+            || target_slot == self.running_slot
+        {
+            return Err(OtaError::RollbackStateInvalid);
+        }
         let current_max = match (self.sector_0.is_crc_valid(), self.sector_1.is_crc_valid()) {
             (true, true) => {
                 if is_seq_greater(self.sector_0.ota_seq, self.sector_1.ota_seq) {
@@ -1336,47 +2255,54 @@ impl OtaDataManager {
             (false, false) => 0,
         };
 
-        let next_seq = if current_max >= u32::MAX - 3 {
-            match target_slot {
-                OtaSlot::Ota0 => 1,
-                OtaSlot::Ota1 => 2,
-            }
-        } else {
-            let mut seq = current_max
-                .checked_add(1)
-                .ok_or(OtaError::SequenceOverflow)?;
-            if OtaSlot::from_seq(seq) != Some(target_slot) {
-                seq = seq.checked_add(1).ok_or(OtaError::SequenceOverflow)?;
-            }
-            seq
-        };
-
-        let entry = OtaDataSelect::new(next_seq, OtaImgState::PendingVerify);
-        let inactive_sector = self.select_inactive_otadata_sector();
-        match inactive_sector {
-            0 => self.sector_0 = entry,
-            _ => self.sector_1 = entry,
+        let mut next_seq = current_max
+            .checked_add(1)
+            .ok_or(OtaError::SequenceOverflow)?;
+        if next_seq == u32::MAX {
+            return Err(OtaError::SequenceOverflow);
         }
+        if OtaSlot::from_seq(next_seq) != Some(target_slot) {
+            next_seq = next_seq.checked_add(1).ok_or(OtaError::SequenceOverflow)?;
+            if next_seq == u32::MAX {
+                return Err(OtaError::SequenceOverflow);
+            }
+        }
+
+        let entry = OtaDataSelect::try_new(next_seq, OtaImgState::PendingVerify)
+            .ok_or(OtaError::SequenceOverflow)?;
+        let inactive_sector = self.select_inactive_sector();
+        match inactive_sector {
+            OtaDataSector::Sector0 => self.sector_0 = entry,
+            OtaDataSector::Sector1 => self.sector_1 = entry,
+        }
+        self.pending_reboot_slot = Some(target_slot);
         Ok(entry)
     }
 
-    /// Cancels rollback on the currently running OTA slot
-    /// (`esp_ota_mark_app_valid_cancel_rollback`, `EMB-003`).
+    /// Cancels rollback on the currently running OTA slot in RAM
+    /// (`esp_ota_mark_app_valid_cancel_rollback`, `EMB-003` / `M-004`).
     pub fn mark_app_valid_cancel_rollback(&mut self) -> Result<bool, OtaError> {
+        if self.pending_reboot_slot.is_some() {
+            return Err(OtaError::RollbackStateInvalid);
+        }
         let s0_ok = self.sector_0.is_bootable();
         let s1_ok = self.sector_1.is_bootable();
-        match (s0_ok, s1_ok) {
+        let target = match (s0_ok, s1_ok) {
             (true, true) => {
                 if is_seq_greater(self.sector_0.ota_seq, self.sector_1.ota_seq) {
-                    self.sector_0.mark_app_valid_cancel_rollback()
+                    &mut self.sector_0
                 } else {
-                    self.sector_1.mark_app_valid_cancel_rollback()
+                    &mut self.sector_1
                 }
             }
-            (true, false) => self.sector_0.mark_app_valid_cancel_rollback(),
-            (false, true) => self.sector_1.mark_app_valid_cancel_rollback(),
-            (false, false) => Err(OtaError::InvalidOtaDataCrc),
+            (true, false) => &mut self.sector_0,
+            (false, true) => &mut self.sector_1,
+            (false, false) => return Err(OtaError::InvalidOtaDataCrc),
+        };
+        if target.slot() != Some(self.running_slot) {
+            return Err(OtaError::RollbackStateInvalid);
         }
+        target.mark_app_valid_cancel_rollback()
     }
 }
 
@@ -1421,42 +2347,64 @@ impl EspImageHeader {
         hdr
     }
 
-    /// Constructs a valid 64-byte single-segment ESP32 application
-    /// image with valid XOR checksum.
-    pub const fn minimal_valid_image_64() -> [u8; 64] {
-        let mut img = [0u8; 64];
-        img[0] = ESP_IMAGE_HEADER_MAGIC;
-        img[1] = 1;
-        img[2] = 0x02; // DIO
-        img[3] = 0x20; // 4MB, 40MHz
-        img[4] = 0x00;
-        img[5] = 0x04;
-        img[6] = 0x08;
-        img[7] = 0x40; // Entry point 0x4008_0400
-                       // Segment 0 header
-        img[24] = 0x00;
-        img[25] = 0x04;
-        img[26] = 0x08;
-        img[27] = 0x40; // Load address 0x4008_0400
-        img[28] = 16;
-        img[29] = 0;
-        img[30] = 0;
-        img[31] = 0; // Length 16 bytes
+    /// Constructs a valid 96-byte single-segment ESP32 application image
+    /// (64-byte aligned image + mandatory 32-byte appended SHA-256 digest,
+    /// `M-028`).
+    pub const fn minimal_valid_image_96() -> [u8; 96] {
+        let mut base = [0u8; 64];
+        base[0] = ESP_IMAGE_HEADER_MAGIC;
+        base[1] = 1;
+        base[2] = 0x02; // DIO
+        base[3] = 0x20; // 4MB, 40MHz
+        base[4] = 0x00;
+        base[5] = 0x04;
+        base[6] = 0x08;
+        base[7] = 0x40; // Entry point 0x4008_0400
+        base[23] = 0x01; // Mandatory appended SHA-256 digest (M-028)
+                         // Segment 0 header
+        base[24] = 0x00;
+        base[25] = 0x04;
+        base[26] = 0x08;
+        base[27] = 0x40; // Load address 0x4008_0400
+        base[28] = 16;
+        base[29] = 0;
+        base[30] = 0;
+        base[31] = 0; // Length 16 bytes
         let mut chk = 0xEFu8;
         let mut i = 0usize;
         while i < 16 {
             let val = (i as u8) ^ 0x5A;
-            img[32 + i] = val;
+            base[32 + i] = val;
             chk ^= val;
             i += 1;
         }
-        img[63] = chk;
+        base[63] = chk;
+        let digest = sha256_digest(&base);
+        let mut img = [0u8; 96];
+        let mut j = 0usize;
+        while j < 64 {
+            img[j] = base[j];
+            j += 1;
+        }
+        let mut k = 0usize;
+        while k < 32 {
+            img[64 + k] = digest[k];
+            k += 1;
+        }
         img
+    }
+
+    /// Constructs a valid minimal single-segment ESP32 application image with
+    /// valid XOR checksum and mandatory appended 32-byte SHA-256 (`96` bytes,
+    /// `M-028`).
+    #[inline]
+    pub const fn minimal_valid_image_64() -> [u8; 96] {
+        Self::minimal_valid_image_96()
     }
 }
 
 /// Validates an ESP32 OTA image prefix and total `Content-Length`
-/// against target partition bounds (`OTA-002`, `APP-008`).
+/// against target partition bounds (`OTA-002`, `APP-008`, `M-028`, `M-029`).
 ///
 /// Checks:
 /// 1. `total_image_len >= ESP_IMAGE_HEADER_LEN` (`24`) and
@@ -1465,10 +2413,12 @@ impl EspImageHeader {
 /// 3. `image_prefix[0] == ESP_IMAGE_HEADER_MAGIC` (`0xE9`)
 /// 4. `segment_count` in `1..=16`
 ///    (`ESP_IMAGE_MIN_SEGMENTS..=ESP_IMAGE_MAX_SEGMENTS`)
-/// 5. `chip_id` (bytes `12..14`) equals [`ESP_IMAGE_CHIP_ID_ESP32`]
-/// 6. `entry_addr` in ESP32 IRAM ([`ESP32_IRAM_ENTRY_RANGE`]) or IROM
+/// 5. `spi_mode <= 5` (`M-029` / `C1-008`)
+/// 6. `chip_id` (bytes `12..14`) equals [`ESP_IMAGE_CHIP_ID_ESP32`]
+/// 7. `entry_addr` in ESP32 IRAM ([`ESP32_IRAM_ENTRY_RANGE`]) or IROM
 ///    ([`ESP32_IROM_ENTRY_RANGE`]); DROM/DRAM entry points are rejected
 ///    (`FW-NET-18`)
+/// 8. `image_prefix[23] == 1` (mandatory SHA-256 digest appended, `M-028`)
 pub fn validate_ota_image_header(
     image_prefix: &[u8],
     total_image_len: usize,
@@ -1498,6 +2448,9 @@ pub fn validate_ota_image_header(
     }
 
     let spi_mode = image_prefix[2];
+    if spi_mode > 5 {
+        return Err(OtaError::InvalidSpiMode(spi_mode));
+    }
     let spi_speed_size = image_prefix[3];
     let entry_addr = u32::from_le_bytes([
         image_prefix[4],
@@ -1515,6 +2468,10 @@ pub fn validate_ota_image_header(
         || ESP32_IROM_ENTRY_RANGE.contains(&entry_addr);
     if !is_valid_entry {
         return Err(OtaError::InvalidEntryAddr(entry_addr));
+    }
+
+    if image_prefix[23] != 1 {
+        return Err(OtaError::InvalidDigestPlacement);
     }
 
     Ok(EspImageHeader {
@@ -1572,7 +2529,7 @@ impl Sha256 {
     }
 
     /// Appends `data` bytes to the hash state.
-    pub fn update(&mut self, data: &[u8]) {
+    pub const fn update(&mut self, data: &[u8]) {
         self.total_len = self.total_len.saturating_add(data.len() as u64);
         let mut i = 0;
         while i < data.len() {
@@ -1587,7 +2544,7 @@ impl Sha256 {
     }
 
     /// Consumes the hasher and returns the computed 32-byte SHA-256 digest.
-    pub fn finalize(mut self) -> [u8; 32] {
+    pub const fn finalize(mut self) -> [u8; 32] {
         let bit_len = self.total_len.wrapping_mul(8);
         self.buffer[self.buf_len] = 0x80;
         self.buf_len += 1;
@@ -1627,7 +2584,7 @@ impl Sha256 {
         out
     }
 
-    fn process_block(&mut self) {
+    const fn process_block(&mut self) {
         const K: [u32; 64] = [
             0x428a_2f98,
             0x7137_4491,
@@ -1768,8 +2725,8 @@ impl Default for Sha256 {
 }
 
 /// Computes the 32-byte SHA-256 digest of `data` (`#![no_std]`,
-/// zero allocation).
-pub fn sha256_digest(data: &[u8]) -> [u8; 32] {
+/// zero allocation, `const fn`).
+pub const fn sha256_digest(data: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(data);
     h.finalize()
@@ -1777,15 +2734,16 @@ pub fn sha256_digest(data: &[u8]) -> [u8; 32] {
 
 /// Validates the full integrity of an ESP32 firmware application image.
 ///
-/// 1. Validates the 24-byte header via [`validate_ota_image_header`].
+/// 1. Validates the 24-byte header via [`validate_ota_image_header`] (including
+///    mandatory `image[23] == 1` SHA-256 flag, `M-028`).
 /// 2. Iterates over each of the `segment_count` segments starting at offset 24,
-///    verifying that each segment's header (8 bytes) and payload lie within
-///    `image`.
+///    verifying 4-byte `load_addr` alignment and that each segment's header
+///    (8 bytes) and payload lie within `image` (`M-029`).
 /// 3. Computes the ESP-IDF 8-bit XOR checksum (seeded with `0xEF`) over all
 ///    segment payloads and verifies the byte at boundary `aligned_end - 1`.
-/// 4. If `image[23] == 1` (`hash_appended`), requires the 32-byte SHA-256
-///    digest at exactly `aligned_end..aligned_end + 32 == image.len()` and
-///    validates it.
+/// 4. Unconditionally requires the 32-byte SHA-256 digest at exactly
+///    `aligned_end..aligned_end + 32 == image.len()` (rejecting unverified
+///    trailing bytes and `image[23] != 1`, `M-028` / `M-029`).
 pub fn validate_ota_image_integrity(image: &[u8]) -> Result<EspImageHeaderSummary, OtaError> {
     let header = validate_ota_image_header(image, image.len(), OTA_PARTITION_MAX_SIZE)?;
 
@@ -1798,7 +2756,7 @@ pub fn validate_ota_image_integrity(image: &[u8]) -> Result<EspImageHeaderSummar
         if offset.checked_add(8).ok_or(OtaError::ImageTooSmall)? > image.len() {
             return Err(OtaError::ImageTooSmall);
         }
-        let _load_addr = u32::from_le_bytes([
+        let load_addr = u32::from_le_bytes([
             image[offset],
             image[offset + 1],
             image[offset + 2],
@@ -1810,6 +2768,9 @@ pub fn validate_ota_image_integrity(image: &[u8]) -> Result<EspImageHeaderSummar
             image[offset + 6],
             image[offset + 7],
         ]) as usize;
+        if data_len > 0 && (load_addr & 3) != 0 {
+            return Err(OtaError::InvalidEntryAddr(load_addr));
+        }
         offset += 8;
 
         let end_seg = offset
@@ -1840,18 +2801,18 @@ pub fn validate_ota_image_integrity(image: &[u8]) -> Result<EspImageHeaderSummar
         return Err(OtaError::InvalidChecksum);
     }
 
-    let hash_appended = image[23] == 1;
-    if hash_appended {
-        // The digest must sit immediately after the checksum block and end
-        // the image exactly (`FW-NET-18`); no fallback placement.
-        if aligned_end.checked_add(ESP_IMAGE_DIGEST_LEN) != Some(image.len()) {
-            return Err(OtaError::InvalidDigestPlacement);
-        }
-        let expected_hash = &image[aligned_end..];
-        let computed_hash = sha256_digest(&image[..aligned_end]);
-        if computed_hash != expected_hash {
-            return Err(OtaError::InvalidSha256);
-        }
+    if image[23] != 1 {
+        return Err(OtaError::InvalidDigestPlacement);
+    }
+    // The digest must sit immediately after the checksum block and end
+    // the image exactly (`FW-NET-18` / `M-028` / `M-029`); no trailing bytes.
+    if aligned_end.checked_add(ESP_IMAGE_DIGEST_LEN) != Some(image.len()) {
+        return Err(OtaError::InvalidDigestPlacement);
+    }
+    let expected_hash = &image[aligned_end..];
+    let computed_hash = sha256_digest(&image[..aligned_end]);
+    if computed_hash != expected_hash {
+        return Err(OtaError::InvalidSha256);
     }
 
     Ok(EspImageHeaderSummary {
@@ -1860,7 +2821,7 @@ pub fn validate_ota_image_integrity(image: &[u8]) -> Result<EspImageHeaderSummar
         entry_addr: header.entry_addr,
         total_segment_len: total_seg_len,
         checksum: chk,
-        hash_appended,
+        hash_appended: true,
     })
 }
 
@@ -1891,6 +2852,9 @@ pub enum OtaError {
     /// Segment count in ESP32 image header is outside `1..=16`
     /// (`400 Bad Request`, `OTA-002`).
     InvalidSegmentCount(u8),
+    /// SPI flash interface mode in ESP32 image header is outside `0..=5`
+    /// (`400 Bad Request`, `M-029`).
+    InvalidSpiMode(u8),
     /// Entry address outside ESP32 executable memory regions (`400 Bad Request`).
     InvalidEntryAddr(u32),
     /// Image `chip_id` is not ESP32 (`0x0000`), e.g. an ESP32-S3 build
@@ -1950,6 +2914,13 @@ impl fmt::Display for OtaError {
                     f,
                     "Firmware image validation failed: invalid segments {}",
                     c
+                )
+            }
+            Self::InvalidSpiMode(m) => {
+                write!(
+                    f,
+                    "Firmware image validation failed: invalid spi_mode {}",
+                    m
                 )
             }
             Self::InvalidEntryAddr(addr) => {
@@ -2117,14 +3088,21 @@ mod tests {
         assert_eq!(s0.slot(), Some(OtaSlot::Ota0));
         assert_eq!(s0.state(), OtaImgState::PendingVerify);
 
-        // Round-trip serialization and ESP-IDF bootloader_common_ota_select_crc parity
+        // M-032: Verbatim round-trip serialization for both PendingVerify (1)
+        // and New (0) with ESP-IDF bootloader_common_ota_select_crc parity.
         let raw = s0.to_bytes();
-        assert_eq!(&raw[24..28], &[0, 0, 0, 0]);
+        assert_eq!(&raw[24..28], &[1, 0, 0, 0]);
         assert_eq!(&raw[28..32], &[154, 152, 67, 71]);
-        let s1_raw = OtaDataSelect::new(2, OtaImgState::PendingVerify).to_bytes();
-        assert_eq!(&s1_raw[24..32], &[0, 0, 0, 0, 116, 55, 246, 85]);
-        let decoded = OtaDataSelect::from_bytes(&raw);
-        assert_eq!(decoded, s0);
+        assert_eq!(OtaDataSelect::from_bytes(&raw), s0);
+
+        let s_new = OtaDataSelect::new(2, OtaImgState::New);
+        let s_new_raw = s_new.to_bytes();
+        assert_eq!(&s_new_raw[24..32], &[0, 0, 0, 0, 116, 55, 246, 85]);
+        assert_eq!(OtaDataSelect::from_bytes(&s_new_raw), s_new);
+        assert_eq!(
+            OtaDataSelect::from_bytes(&s_new_raw).state(),
+            OtaImgState::New
+        );
 
         // Rollback cancellation transition: PendingVerify -> Valid
         let res = s0.mark_app_valid_cancel_rollback();
@@ -2144,6 +3122,7 @@ mod tests {
         let s1 = OtaDataSelect::new(1, OtaImgState::Valid);
         let mut mgr = OtaDataManager::from_sectors(s0, s1);
 
+        assert_eq!(mgr.running_slot(), OtaSlot::Ota1);
         assert_eq!(mgr.active_slot(), OtaSlot::Ota1);
         assert_eq!(mgr.select_inactive_slot(), OtaSlot::Ota0);
         assert_eq!(mgr.select_inactive_otadata_sector(), 1);
@@ -2165,9 +3144,17 @@ mod tests {
         assert_eq!(mgr.sector_1.ota_seq, 3);
         assert_eq!(mgr.sector_1.state(), OtaImgState::PendingVerify);
 
-        // After commit, active_slot is Ota0 and inactive slot flips to Ota1
+        // M-004: After commit, next-boot active_slot is Ota0, while running_slot
+        // stays Ota1, select_inactive_slot stays Ota0 (never XIP self-erase),
+        // and pending_reboot_slot latches Some(Ota0).
         assert_eq!(mgr.active_slot(), OtaSlot::Ota0);
-        assert_eq!(mgr.select_inactive_slot(), OtaSlot::Ota1);
+        assert_eq!(mgr.running_slot(), OtaSlot::Ota1);
+        assert_eq!(mgr.select_inactive_slot(), OtaSlot::Ota0);
+        assert_eq!(mgr.pending_reboot_slot(), Some(OtaSlot::Ota0));
+        assert_eq!(
+            mgr.commit_update(&mut flash, OtaSlot::Ota0),
+            Err(OtaError::RollbackStateInvalid)
+        );
 
         // Flash sector 1 (0x18000) was written with the new entry
         let mut buf1 = AlignedOtaBuf::default();
@@ -2187,19 +3174,31 @@ mod tests {
         let e1 = mgr.set_boot_slot(OtaSlot::Ota1);
         assert!(e1.is_ok());
         assert_eq!(mgr.active_slot(), OtaSlot::Ota1);
-        assert_eq!(mgr.next_update_slot(), OtaSlot::Ota0);
+        assert_eq!(mgr.running_slot(), OtaSlot::Ota0);
+        assert_eq!(mgr.next_update_slot(), OtaSlot::Ota1);
         assert_eq!(mgr.sector_1.state(), OtaImgState::PendingVerify);
 
-        // Confirm valid after Wi-Fi GOT_IP
-        assert_eq!(mgr.mark_app_valid_cancel_rollback(), Ok(true));
-        assert_eq!(mgr.sector_1.state(), OtaImgState::Valid);
+        // Cannot validate unbooted Ota1 before reboot (M-004)
+        assert_eq!(
+            mgr.mark_app_valid_cancel_rollback(),
+            Err(OtaError::RollbackStateInvalid)
+        );
+
+        // Simulate reboot into Ota1
+        let mut booted = OtaDataManager::from_sectors(mgr.sector_0, mgr.sector_1);
+        assert_eq!(booted.running_slot(), OtaSlot::Ota1);
+        assert_eq!(booted.next_update_slot(), OtaSlot::Ota0);
+
+        // Confirm valid after Wi-Fi GOT_IP + HTTP
+        assert_eq!(booted.mark_app_valid_cancel_rollback(), Ok(true));
+        assert_eq!(booted.sector_1.state(), OtaImgState::Valid);
 
         // Next OTA back to ota_0
-        let e2 = mgr.set_boot_slot(OtaSlot::Ota0);
+        let e2 = booted.set_boot_slot(OtaSlot::Ota0);
         assert!(e2.is_ok());
-        assert_eq!(mgr.active_slot(), OtaSlot::Ota0);
-        assert_eq!(mgr.sector_0.ota_seq, 3);
-        assert_eq!(mgr.sector_0.state(), OtaImgState::PendingVerify);
+        assert_eq!(booted.active_slot(), OtaSlot::Ota0);
+        assert_eq!(booted.sector_0.ota_seq, 3);
+        assert_eq!(booted.sector_0.state(), OtaImgState::PendingVerify);
     }
 
     #[test]
@@ -2271,26 +3270,49 @@ mod tests {
 
     #[test]
     fn test_validate_ota_image_integrity() {
-        // Valid image without appended SHA-256
+        // M-028: Images without mandatory SHA-256 (image[23] != 1) are rejected.
         let img_no_hash = make_valid_esp_image(false);
-        let summary_no_hash = validate_ota_image_integrity(&img_no_hash);
-        assert!(summary_no_hash.is_ok());
-        if let Ok(sum) = summary_no_hash {
-            assert_eq!(sum.segment_count, 1);
-            assert_eq!(sum.entry_addr, 0x4008_0400);
-            assert!(!sum.hash_appended);
-        }
+        assert_eq!(
+            validate_ota_image_integrity(&img_no_hash),
+            Err(OtaError::InvalidDigestPlacement)
+        );
+        let mut bad_hash_flag = make_valid_esp_image(true);
+        bad_hash_flag[23] = 2;
+        assert_eq!(
+            validate_ota_image_integrity(&bad_hash_flag),
+            Err(OtaError::InvalidDigestPlacement)
+        );
 
         // Valid image with appended SHA-256
         let img_hash = make_valid_esp_image(true);
         let summary_hash = validate_ota_image_integrity(&img_hash);
         assert!(summary_hash.is_ok());
         if let Ok(sum) = summary_hash {
+            assert_eq!(sum.segment_count, 1);
+            assert_eq!(sum.entry_addr, 0x4008_0400);
             assert!(sum.hash_appended);
         }
 
+        // Const minimal_valid_image_96() / minimal_valid_image_64() passes full check.
+        let min96 = EspImageHeader::minimal_valid_image_96();
+        assert!(validate_ota_image_integrity(&min96).is_ok());
+
+        // M-029: Invalid spi_mode (> 5) and unaligned segment load_addr rejected.
+        let mut bad_spi = img_hash.clone();
+        bad_spi[2] = 6;
+        assert_eq!(
+            validate_ota_image_integrity(&bad_spi),
+            Err(OtaError::InvalidSpiMode(6))
+        );
+        let mut unaligned_seg = img_hash.clone();
+        unaligned_seg[24..28].copy_from_slice(&0x4008_0401u32.to_le_bytes());
+        assert_eq!(
+            validate_ota_image_integrity(&unaligned_seg),
+            Err(OtaError::InvalidEntryAddr(0x4008_0401))
+        );
+
         // Corrupted checksum byte
-        let mut corrupted_chk = img_no_hash.clone();
+        let mut corrupted_chk = img_hash.clone();
         let chk_idx = 63;
         corrupted_chk[chk_idx] ^= 0xFF;
         assert_eq!(
@@ -2299,7 +3321,7 @@ mod tests {
         );
 
         // Corrupted payload byte -> checksum mismatch
-        let mut corrupted_payload = img_no_hash.clone();
+        let mut corrupted_payload = img_hash.clone();
         corrupted_payload[35] ^= 0x01;
         assert_eq!(
             validate_ota_image_integrity(&corrupted_payload),
@@ -2317,36 +3339,33 @@ mod tests {
 
         // Truncated image
         assert_eq!(
-            validate_ota_image_integrity(&img_no_hash[..40]),
+            validate_ota_image_integrity(&img_hash[..40]),
             Err(OtaError::ImageTooSmall)
         );
     }
 
     #[test]
     fn test_set_boot_slot_wraparound() {
-        let mut mgr = OtaDataManager::new_booted_ota0();
-        mgr.sector_0.ota_seq = u32::MAX - 2;
-        mgr.sector_0.crc = mgr.sector_0.calculate_crc();
+        // M-033: Near u32::MAX must fail-safe with SequenceOverflow instead of
+        // wrapping to 1/2 and diverging from ESP-IDF unsigned bootloader order.
+        let mut mgr = OtaDataManager::from_sectors(
+            OtaDataSelect::new(u32::MAX - 2, OtaImgState::Valid),
+            OtaDataSelect::erased(),
+        );
+        // u32::MAX - 2 (Ota0) -> u32::MAX - 1 (Ota1) is the last valid seq.
+        let last = mgr.set_boot_slot(OtaSlot::Ota1).expect("last valid seq");
+        assert_eq!(last.ota_seq, u32::MAX - 1);
+        assert_eq!(last.slot(), Some(OtaSlot::Ota1));
 
-        let res = mgr.set_boot_slot(OtaSlot::Ota1);
-        assert!(res.is_ok());
-        assert_eq!(mgr.sector_1.ota_seq, 2);
-        assert_eq!(mgr.sector_1.slot(), Some(OtaSlot::Ota1));
-        assert_eq!(mgr.active_slot(), OtaSlot::Ota1);
-
-        let res0 = mgr.set_boot_slot(OtaSlot::Ota0);
-        assert!(res0.is_ok());
-        assert_eq!(mgr.sector_0.ota_seq, 3);
-        assert_eq!(mgr.sector_0.slot(), Some(OtaSlot::Ota0));
-        assert_eq!(mgr.active_slot(), OtaSlot::Ota0);
-
+        // Any advance past u32::MAX - 1 overflows instead of wrapping.
         let mut mgr_ota0_wrap = OtaDataManager::from_sectors(
             OtaDataSelect::erased(),
             OtaDataSelect::new(u32::MAX - 1, OtaImgState::Valid),
         );
-        assert!(mgr_ota0_wrap.set_boot_slot(OtaSlot::Ota0).is_ok());
-        assert_eq!(mgr_ota0_wrap.sector_0.ota_seq, 1);
-        assert_eq!(mgr_ota0_wrap.active_slot(), OtaSlot::Ota0);
+        assert_eq!(
+            mgr_ota0_wrap.set_boot_slot(OtaSlot::Ota0),
+            Err(OtaError::SequenceOverflow)
+        );
     }
 
     #[test]
@@ -2362,8 +3381,8 @@ mod tests {
         mgr.sync_slot_to_flash(&mut flash, OtaSlot::Ota0)
             .expect("sync initial ota_0 sector");
 
-        // 2. Build a valid firmware image with multi-chunk data
-        let image = make_valid_esp_image_with_len(980, false);
+        // 2. Build a valid firmware image with multi-chunk data + SHA-256
+        let image = make_valid_esp_image_with_len(980, true);
         let img_len = image.len();
 
         let slot = mgr
@@ -2411,7 +3430,7 @@ mod tests {
     #[test]
     fn test_wp09_rejects_non_esp32_chip_id() {
         // ESP32-S3 images carry `chip_id = 0x0009` at header bytes 12..14.
-        let mut s3 = make_valid_esp_image(false);
+        let mut s3 = make_valid_esp_image(true);
         s3[12..14].copy_from_slice(&0x0009u16.to_le_bytes());
         assert_eq!(
             validate_ota_image_header(&s3, s3.len(), OTA_PARTITION_MAX_SIZE),
@@ -2432,7 +3451,7 @@ mod tests {
         assert_eq!(flash, before, "rejected image must not touch flash");
 
         // chip_id == 0 (ESP32) is accepted.
-        let esp32 = make_valid_esp_image(false);
+        let esp32 = make_valid_esp_image(true);
         assert!(validate_ota_image_integrity(&esp32).is_ok());
     }
 
@@ -2577,6 +3596,444 @@ mod tests {
         assert_eq!(
             mgr.write_ota_image_to_flash(&mut NoOpFlashStorage, &image),
             Ok(OtaSlot::Ota1)
+        );
+    }
+
+    #[test]
+    fn test_m003_post_rollback_preserves_sole_valid_sector_and_advances_seq() {
+        let mut flash: MockNorFlash<8192> = MockNorFlash::new();
+        let s0 = OtaDataSelect::new(1, OtaImgState::Valid);
+        let s1 = OtaDataSelect::new(2, OtaImgState::Aborted);
+        flash.otadata_s0[..32].copy_from_slice(&s0.to_bytes());
+        flash.otadata_s1[..32].copy_from_slice(&s1.to_bytes());
+
+        let mut mgr = OtaDataManager::load_from_flash(&mut flash).expect("load");
+        assert_eq!(mgr.running_slot(), OtaSlot::Ota0);
+        // Must select aborted sector 1, NEVER sole valid sector 0.
+        assert_eq!(mgr.select_inactive_otadata_sector(), 1);
+
+        let image = make_valid_esp_image(true);
+        let slot = mgr
+            .write_ota_image_to_flash(&mut flash, &image)
+            .expect("post-rollback OTA succeeds");
+        assert_eq!(slot, OtaSlot::Ota1);
+        assert_eq!(
+            mgr.sector_0, s0,
+            "sole valid fallback sector 0 must remain intact"
+        );
+        assert_eq!(
+            mgr.sector_1.ota_seq, 4,
+            "next_seq must advance above aborted seq 2"
+        );
+        assert_eq!(mgr.sector_1.state(), OtaImgState::PendingVerify);
+
+        let mut raw0 = [0u8; 32];
+        raw0.copy_from_slice(&flash.otadata_s0[..32]);
+        assert_eq!(OtaDataSelect::from_bytes(&raw0), s0);
+    }
+
+    #[test]
+    fn test_m004_pending_reboot_blocks_second_ota_and_premature_cancel() {
+        let mut flash: MockNorFlash<8192> = MockNorFlash::new_booted_ota0();
+        let mut mgr = OtaDataManager::load_from_flash(&mut flash).expect("load");
+        let image = make_valid_esp_image(true);
+
+        let slot = mgr
+            .write_ota_image_to_flash(&mut flash, &image)
+            .expect("first OTA to Ota1");
+        assert_eq!(slot, OtaSlot::Ota1);
+        assert_eq!(mgr.running_slot(), OtaSlot::Ota0);
+        assert_eq!(mgr.select_inactive_slot(), OtaSlot::Ota1);
+        assert_eq!(mgr.pending_reboot_slot(), Some(OtaSlot::Ota1));
+
+        let erases = flash.erase_count;
+        // Second OTA before reboot must be blocked (never erases live XIP Ota0).
+        assert_eq!(
+            mgr.write_ota_image_to_flash(&mut flash, &image),
+            Err(OtaError::RollbackStateInvalid)
+        );
+        assert_eq!(
+            mgr.begin_ota(&mut flash, image.len()),
+            Err(OtaError::RollbackStateInvalid)
+        );
+        assert_eq!(flash.erase_count, erases);
+
+        // Premature cancel_rollback_in_flash before reboot must be blocked.
+        assert_eq!(
+            mgr.cancel_rollback_in_flash(&mut flash),
+            Err(OtaError::RollbackStateInvalid)
+        );
+    }
+
+    #[test]
+    fn test_m005_blocks_ota_while_running_slot_pending_verify() {
+        let mut flash: MockNorFlash<8192> = MockNorFlash::new();
+        flash.otadata_s0[..32]
+            .copy_from_slice(&OtaDataSelect::new(1, OtaImgState::Valid).to_bytes());
+        flash.otadata_s1[..32]
+            .copy_from_slice(&OtaDataSelect::new(2, OtaImgState::PendingVerify).to_bytes());
+
+        let mut mgr = OtaDataManager::load_from_flash(&mut flash).expect("load");
+        assert!(mgr.has_pending_rollback());
+        let erases = flash.erase_count;
+        let image = make_valid_esp_image(true);
+
+        assert_eq!(
+            mgr.write_ota_image_to_flash(&mut flash, &image),
+            Err(OtaError::RollbackStateInvalid)
+        );
+        assert_eq!(
+            mgr.begin_ota(&mut flash, image.len()),
+            Err(OtaError::RollbackStateInvalid)
+        );
+        assert_eq!(
+            mgr.write_chunk(&mut flash, OtaSlot::Ota0, 0, &[0xFF; 4]),
+            Err(OtaError::RollbackStateInvalid)
+        );
+        assert_eq!(
+            flash.erase_count, erases,
+            "passive rollback slot must not be erased"
+        );
+    }
+
+    #[test]
+    fn test_m019_m034_core1_pause_guard_timeout_cleanup_and_resume_error() {
+        use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+        struct FaultPark {
+            pause_ok: AtomicBool,
+            resume_ok: AtomicBool,
+            resumes: AtomicU32,
+        }
+
+        impl Core1ParkControl for FaultPark {
+            fn pause_core1(&self) -> bool {
+                self.pause_ok.load(Ordering::SeqCst)
+            }
+            fn resume_core1(&self) -> bool {
+                self.resumes.fetch_add(1, Ordering::SeqCst);
+                self.resume_ok.load(Ordering::SeqCst)
+            }
+        }
+
+        // M-019: Pause failure MUST NOT call resume_core1() (rollback is
+        // pause_core1()'s contract so a failed nested pause never unparks an
+        // outer guard).
+        let park_timeout = FaultPark {
+            pause_ok: AtomicBool::new(false),
+            resume_ok: AtomicBool::new(true),
+            resumes: AtomicU32::new(0),
+        };
+        assert!(Core1PauseGuard::new(&park_timeout).is_err());
+        assert_eq!(park_timeout.resumes.load(Ordering::SeqCst), 0);
+
+        // Nested failure preserves outer guard depth without unparking Core 1.
+        struct DepthPark {
+            depth: AtomicU32,
+            fail_next_pause: AtomicBool,
+        }
+        impl Core1ParkControl for DepthPark {
+            fn pause_core1(&self) -> bool {
+                if self.fail_next_pause.swap(false, Ordering::SeqCst) {
+                    return false;
+                }
+                self.depth.fetch_add(1, Ordering::SeqCst);
+                true
+            }
+            fn resume_core1(&self) -> bool {
+                self.depth.fetch_sub(1, Ordering::SeqCst);
+                true
+            }
+        }
+        let depth_park = DepthPark {
+            depth: AtomicU32::new(0),
+            fail_next_pause: AtomicBool::new(false),
+        };
+        let outer = Core1PauseGuard::new(&depth_park).expect("outer pause");
+        assert_eq!(depth_park.depth.load(Ordering::SeqCst), 1);
+        depth_park.fail_next_pause.store(true, Ordering::SeqCst);
+        assert!(Core1PauseGuard::new(&depth_park).is_err());
+        assert_eq!(
+            depth_park.depth.load(Ordering::SeqCst),
+            1,
+            "failed inner guard must NOT decrement outer guard depth"
+        );
+        outer.resume().expect("outer resume");
+        assert_eq!(depth_park.depth.load(Ordering::SeqCst), 0);
+
+        // Resume failure propagates Err(FlashWriteError) via GuardedFlash.
+        let park_resume_fail = FaultPark {
+            pause_ok: AtomicBool::new(true),
+            resume_ok: AtomicBool::new(false),
+            resumes: AtomicU32::new(0),
+        };
+        let mut guarded =
+            GuardedFlashStorage::new(MockNorFlash::<8192>::new_booted_ota0(), park_resume_fail);
+        let mut buf = AlignedOtaBuf::default();
+        assert_eq!(
+            guarded.read_aligned(OTADATA_SECTOR_0_OFFSET, &mut buf.0),
+            Err(OtaError::FlashWriteError)
+        );
+        assert_eq!(guarded.park().resumes.load(Ordering::SeqCst), 1);
+        let (_flash, _park) = guarded.into_inner();
+    }
+
+    #[test]
+    fn test_m033_is_seq_greater_strict_weak_ordering_no_cycles() {
+        let vals = [0u32, 1, 5, 100, u32::MAX - 5, u32::MAX - 1, u32::MAX];
+        for &a in &vals {
+            assert!(!is_seq_greater(a, a), "irreflexive failed for {a}");
+            for &b in &vals {
+                if is_seq_greater(a, b) {
+                    assert!(!is_seq_greater(b, a), "asymmetric failed for ({a}, {b})");
+                }
+                for &c in &vals {
+                    if is_seq_greater(a, b) && is_seq_greater(b, c) {
+                        assert!(
+                            is_seq_greater(a, c),
+                            "transitive failed for ({a}, {b}, {c})"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(is_seq_greater(u32::MAX - 5, 100));
+        assert!(is_seq_greater(100, 5));
+        assert!(is_seq_greater(u32::MAX - 5, 5));
+    }
+
+    #[test]
+    fn test_m035_ota_write_session_and_bounds_checks() {
+        let mut flash: MockNorFlash<8192> = MockNorFlash::new_booted_ota0();
+        let mut mgr = OtaDataManager::load_from_flash(&mut flash).expect("load");
+        let image = make_valid_esp_image_with_len(128, true);
+
+        // Out-of-partition and active-slot write_chunk rejected.
+        assert_eq!(
+            mgr.write_chunk(&mut flash, OtaSlot::Ota0, 0, &[0; 4]),
+            Err(OtaError::RollbackStateInvalid)
+        );
+        assert!(matches!(
+            mgr.write_chunk(&mut flash, OtaSlot::Ota1, OTA_1_SIZE - 4, &[0; 8]),
+            Err(OtaError::ImageTooLarge { .. })
+        ));
+        assert_eq!(
+            mgr.write_chunk(&mut flash, OtaSlot::Ota1, 2, &[0; 4]),
+            Err(OtaError::FlashWriteError)
+        );
+
+        // Stateful OtaWriteSession streams chunks, verifies readback, commits.
+        let mut session = mgr
+            .begin_ota_session(&mut flash, image.len())
+            .expect("begin session");
+        assert_eq!(session.target_slot(), OtaSlot::Ota1);
+        session
+            .write_chunk(&mut flash, &image[..64])
+            .expect("first chunk");
+        session
+            .write_chunk(&mut flash, &image[64..])
+            .expect("final chunk");
+        let entry = session
+            .finish(&mut mgr, &mut flash)
+            .expect("finish verified session");
+        assert_eq!(entry.ota_seq, 2);
+        assert_eq!(mgr.pending_reboot_slot(), Some(OtaSlot::Ota1));
+
+        // M-035: Direct `finish_ota` rejects a valid 24-byte header + blank or
+        // corrupt body without mutating otadata, and accepts a valid full image.
+        let mut flash_bad: MockNorFlash<8192> = MockNorFlash::new_booted_ota0();
+        let mut mgr_bad = OtaDataManager::load_from_flash(&mut flash_bad).expect("load");
+        let otadata_before = (flash_bad.otadata_s0, flash_bad.otadata_s1);
+        let slot_bad = mgr_bad
+            .begin_ota(&mut flash_bad, image.len())
+            .expect("begin_ota");
+        // Write only the valid 24-byte header + 0xFF blank body.
+        mgr_bad
+            .write_chunk(&mut flash_bad, slot_bad, 0, &image[..24])
+            .expect("write header only");
+        assert!(
+            mgr_bad.finish_ota(&mut flash_bad, slot_bad).is_err(),
+            "finish_ota must reject header-only/blank body"
+        );
+        assert_eq!((flash_bad.otadata_s0, flash_bad.otadata_s1), otadata_before);
+        assert_eq!(mgr_bad.pending_reboot_slot(), None);
+
+        // Write full image with a flipped payload byte -> SHA-256/XOR mismatch.
+        let mut corrupt = image.clone();
+        corrupt[32] ^= 0xFF;
+        let slot_bad2 = mgr_bad
+            .begin_ota(&mut flash_bad, corrupt.len())
+            .expect("begin_ota corrupt");
+        mgr_bad
+            .write_chunk(&mut flash_bad, slot_bad2, 0, &corrupt)
+            .expect("write corrupt");
+        assert!(
+            mgr_bad.finish_ota(&mut flash_bad, slot_bad2).is_err(),
+            "finish_ota must reject corrupt body"
+        );
+        assert_eq!((flash_bad.otadata_s0, flash_bad.otadata_s1), otadata_before);
+
+        // Write intact image -> finish_ota verifies and commits.
+        let slot_ok = mgr_bad
+            .begin_ota(&mut flash_bad, image.len())
+            .expect("begin_ota ok");
+        mgr_bad
+            .write_chunk(&mut flash_bad, slot_ok, 0, &image)
+            .expect("write valid image");
+        let committed = mgr_bad
+            .finish_ota(&mut flash_bad, slot_ok)
+            .expect("finish_ota valid");
+        assert_eq!(committed.ota_seq, 2);
+        assert_eq!(mgr_bad.pending_reboot_slot(), Some(OtaSlot::Ota1));
+    }
+
+    #[test]
+    fn test_m036_m037_deferred_ram_mutation_and_blank_sector0_persistence() {
+        // 1. Factory-blank flash persists sector_0 before writing sector_1.
+        let mut blank_flash: MockNorFlash<8192> = MockNorFlash::new();
+        let mut mgr = OtaDataManager::load_from_flash(&mut blank_flash).expect("load blank");
+        let image = make_valid_esp_image(true);
+        mgr.write_ota_image_to_flash(&mut blank_flash, &image)
+            .expect("commit from blank flash");
+        let mut raw0 = [0u8; 32];
+        raw0.copy_from_slice(&blank_flash.otadata_s0[..32]);
+        let s0_flash = OtaDataSelect::from_bytes(&raw0);
+        assert_eq!(s0_flash.ota_seq, 1);
+        assert_eq!(s0_flash.state(), OtaImgState::Valid);
+
+        // 2. Flash error on commit_update leaves RAM unchanged (M-036).
+        let mut fail_flash: MockNorFlash<8192> = MockNorFlash::new_booted_ota0();
+        let mut mgr2 = OtaDataManager::load_from_flash(&mut fail_flash).expect("load");
+        let snapshot = mgr2;
+        fail_flash.fail_writes = true;
+        assert!(mgr2.commit_update(&mut fail_flash, OtaSlot::Ota1).is_err());
+        assert_eq!(mgr2, snapshot);
+
+        // 3. rollback() rejected on already-Valid slot (M-036).
+        fail_flash.fail_writes = false;
+        assert_eq!(
+            mgr2.rollback(&mut fail_flash),
+            Err(OtaError::RollbackStateInvalid)
+        );
+
+        // 4. Undefined -> Valid programs in-place with zero erases (M-037).
+        let mut undef_flash: MockNorFlash<8192> = MockNorFlash::new();
+        undef_flash.otadata_s0[..32]
+            .copy_from_slice(&OtaDataSelect::new(1, OtaImgState::Undefined).to_bytes());
+        let mut mgr3 = OtaDataManager::load_from_flash(&mut undef_flash).expect("load undef");
+        let erases_before = undef_flash.erase_count;
+        assert_eq!(mgr3.cancel_rollback_in_flash(&mut undef_flash), Ok(true));
+        assert_eq!(undef_flash.erase_count, erases_before);
+        let mut raw_u = [0u8; 32];
+        raw_u.copy_from_slice(&undef_flash.otadata_s0[..32]);
+        assert_eq!(
+            OtaDataSelect::from_bytes(&raw_u).state(),
+            OtaImgState::Valid
+        );
+    }
+
+    #[test]
+    fn test_m037_atomic_sole_sector_cancel_and_dual_equal_valid_recovery() {
+        // 1. Sole bootable sector `(2, PendingVerify)` in sector 1 with sector 0
+        // erased: `cancel_rollback_in_flash` writes `(4, Valid)` atomically to
+        // sector 0 without erasing sector 1.
+        let mut flash: MockNorFlash<8192> = MockNorFlash::new();
+        let orig_s1 = OtaDataSelect::new(2, OtaImgState::PendingVerify);
+        flash.otadata_s1[..32].copy_from_slice(&orig_s1.to_bytes());
+        let mut mgr = OtaDataManager::load_from_flash(&mut flash).expect("load sole s1");
+        let erases_before = flash.erase_count;
+        assert_eq!(mgr.cancel_rollback_in_flash(&mut flash), Ok(true));
+        // Only sector 0 was erased/written; sector 1 was never erased.
+        assert_eq!(flash.erase_count, erases_before + 1);
+        let mut raw0 = [0u8; 32];
+        let mut raw1 = [0u8; 32];
+        raw0.copy_from_slice(&flash.otadata_s0[..32]);
+        raw1.copy_from_slice(&flash.otadata_s1[..32]);
+        let s0_after = OtaDataSelect::from_bytes(&raw0);
+        let s1_after = OtaDataSelect::from_bytes(&raw1);
+        assert_eq!(s0_after.ota_seq, 4);
+        assert_eq!(s0_after.state(), OtaImgState::Valid);
+        assert_eq!(s1_after, orig_s1, "sole active sector 1 must not be erased");
+        assert!(!mgr.has_pending_rollback());
+        assert_eq!(mgr.active_slot(), OtaSlot::Ota1);
+        // Second cancel is idempotent with zero writes.
+        let writes_before = flash.write_count;
+        assert_eq!(mgr.cancel_rollback_in_flash(&mut flash), Ok(false));
+        assert_eq!(flash.write_count, writes_before);
+
+        // 2. Dual-equal `(ota_seq, Valid)` sectors matching `running_slot`
+        // (e.g. power loss during fallback cancel near u32::MAX) must NOT
+        // permanently lock out OTA.
+        let mut eq_flash: MockNorFlash<8192> = MockNorFlash::new();
+        let dup = OtaDataSelect::new(5, OtaImgState::Valid).to_bytes();
+        eq_flash.otadata_s0[..32].copy_from_slice(&dup);
+        eq_flash.otadata_s1[..32].copy_from_slice(&dup);
+        let mut eq_mgr = OtaDataManager::load_from_flash(&mut eq_flash).expect("load dual equal");
+        assert_eq!(eq_mgr.running_slot(), OtaSlot::Ota0);
+        let image = make_valid_esp_image(true);
+        let next_slot = eq_mgr
+            .write_ota_image_to_flash(&mut eq_flash, &image)
+            .expect("OTA must recover from dual-equal (seq, Valid) sectors");
+        assert_eq!(next_slot, OtaSlot::Ota1);
+        assert_eq!(eq_mgr.active_slot(), OtaSlot::Ota1);
+        assert_eq!(eq_mgr.running_slot(), OtaSlot::Ota0);
+    }
+
+    #[test]
+    fn test_m038_torn_inactive_sector_recovery() {
+        // 1. Torn write with erased CRC (0xFFFF_FFFF).
+        let mut flash: MockNorFlash<8192> = MockNorFlash::new_booted_ota0();
+        let partial = OtaDataSelect::new(2, OtaImgState::PendingVerify).to_bytes();
+        flash.otadata_s1[..28].copy_from_slice(&partial[..28]);
+
+        let mut mgr = OtaDataManager::load_from_flash(&mut flash).expect("load");
+        let image = make_valid_esp_image(true);
+        let slot = mgr
+            .write_ota_image_to_flash(&mut flash, &image)
+            .expect("OTA must recover from torn inactive sector");
+        assert_eq!(slot, OtaSlot::Ota1);
+        let mut raw1 = [0u8; 32];
+        raw1.copy_from_slice(&flash.otadata_s1[..32]);
+        let committed = OtaDataSelect::from_bytes(&raw1);
+        assert!(committed.is_crc_valid());
+        assert_eq!(committed.ota_seq, 2);
+
+        // 2. Brownout during Stage-2 CRC programming (`crc = 0xFFFF_FF9A`,
+        // `ota_state = 1`) in inactive sector while active sector is valid &
+        // confirmed matching `running_slot` must also recover cleanly.
+        let mut flash_crc: MockNorFlash<8192> = MockNorFlash::new_booted_ota0();
+        let mut partial_crc = OtaDataSelect::new(2, OtaImgState::PendingVerify).to_bytes();
+        partial_crc[28..32].copy_from_slice(&0xFFFF_FF9Au32.to_le_bytes());
+        flash_crc.otadata_s1[..32].copy_from_slice(&partial_crc);
+
+        let mut mgr_crc = OtaDataManager::load_from_flash(&mut flash_crc).expect("load");
+        let slot_crc = mgr_crc
+            .write_ota_image_to_flash(&mut flash_crc, &image)
+            .expect("OTA must recover from partial-CRC corrupt inactive sector");
+        assert_eq!(slot_crc, OtaSlot::Ota1);
+
+        // 3. When NEITHER sector is bootable (both corrupt), OTA refuses with
+        // InvalidOtaDataCrc without erasing flash.
+        let mut flash_both_bad: MockNorFlash<8192> = MockNorFlash::new();
+        flash_both_bad.otadata_s0[..32].copy_from_slice(&partial_crc);
+        flash_both_bad.otadata_s1[..32].copy_from_slice(&partial_crc);
+        let mut mgr_bad = OtaDataManager::new_booted_ota0();
+        let erases_before = flash_both_bad.erase_count;
+        assert_eq!(
+            mgr_bad.write_ota_image_to_flash(&mut flash_both_bad, &image),
+            Err(OtaError::InvalidOtaDataCrc)
+        );
+        assert_eq!(flash_both_bad.erase_count, erases_before);
+    }
+
+    #[test]
+    fn test_m136_m137_otadata_try_new_and_storage_parity() {
+        assert_eq!(OtaDataSelect::try_new(0, OtaImgState::Valid), None);
+        assert_eq!(OtaDataSelect::try_new(u32::MAX, OtaImgState::Valid), None);
+        assert!(OtaDataSelect::try_new(1, OtaImgState::Valid).is_some());
+        assert_eq!(
+            OtaDataManager::load_from_flash(&mut NoOpFlashStorage),
+            Err(OtaError::FlashWriteError)
         );
     }
 }

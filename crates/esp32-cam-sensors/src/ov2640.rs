@@ -693,6 +693,12 @@ impl Ov2640 {
     pub const SLV_ADDR: u8 = CameraSccbAddr::OV2640;
     /// Expected PID value (`0x26`).
     pub const PID: u16 = CameraPid::OV2640.as_u16();
+    /// Expected OmniVision manufacturer ID high byte (`0x7F`).
+    pub const MIDH: u8 = 0x7F;
+    /// Expected OmniVision manufacturer ID low byte (`0xA2`).
+    pub const MIDL: u8 = 0xA2;
+    /// Maximum supported external clock frequency in MHz (OV2640 datasheet).
+    pub const MAX_XCLK_MHZ: i32 = 24;
     /// Default JPEG quantization quality factor (`SENS-21`).
     pub const DEFAULT_JPEG_QUALITY: u8 = 12;
 
@@ -757,24 +763,42 @@ impl Ov2640 {
 
     /// Probes and verifies the OV2640 sensor on `bus` at `slv_addr`
     /// (`esp32_camera_ov2640_detect`).
+    ///
+    /// Probes the slave address before writing `BANK_SEL`, checks both
+    /// `REG_PID` (`0x26`) and OmniVision `MIDH`/`MIDL` (`0x7FA2`), and
+    /// restores the prior `BANK_SEL` value if identification fails.
     pub fn detect<B: SccbBus>(bus: &mut B, slv_addr: u8) -> Result<SensorId, CameraError> {
         if slv_addr != Self::SLV_ADDR {
             return Err(CameraError::NotDetected);
         }
-        bus.write_reg8(slv_addr, BANK_SEL, Ov2640Bank::Sensor as u8)?;
-        let pid = bus.read_reg8(slv_addr, REG_PID)? as u16;
-        if pid != Self::PID {
-            return Err(CameraError::NotDetected);
+        bus.probe(slv_addr)?;
+        let prev_bank = bus.read_reg8(slv_addr, BANK_SEL)?;
+        let switched_bank = prev_bank != Ov2640Bank::Sensor as u8;
+        if switched_bank {
+            bus.write_reg8(slv_addr, BANK_SEL, Ov2640Bank::Sensor as u8)?;
         }
-        let ver = bus.read_reg8(slv_addr, REG_VER)?;
-        let midl = bus.read_reg8(slv_addr, REG_MIDL)?;
-        let midh = bus.read_reg8(slv_addr, REG_MIDH)?;
-        Ok(SensorId {
-            midh,
-            midl,
-            pid,
-            ver,
-        })
+        let detected = (|| -> Result<SensorId, CameraError> {
+            let pid = bus.read_reg8(slv_addr, REG_PID)? as u16;
+            if pid != Self::PID {
+                return Err(CameraError::NotDetected);
+            }
+            let ver = bus.read_reg8(slv_addr, REG_VER)?;
+            let midl = bus.read_reg8(slv_addr, REG_MIDL)?;
+            let midh = bus.read_reg8(slv_addr, REG_MIDH)?;
+            if midh != Self::MIDH || midl != Self::MIDL {
+                return Err(CameraError::NotDetected);
+            }
+            Ok(SensorId {
+                midh,
+                midl,
+                pid,
+                ver,
+            })
+        })();
+        if detected.is_err() && switched_bank {
+            let _ = bus.write_reg8(slv_addr, BANK_SEL, prev_bank);
+        }
+        detected
     }
 
     /// Returns the configured 7-bit SCCB slave address.
@@ -865,6 +889,9 @@ impl Ov2640 {
             if entry.reg == BANK_SEL {
                 self.set_bank(bus, Ov2640Bank::from_u8(entry.val))?;
             } else {
+                if self.reg_bank == Ov2640Bank::Max {
+                    return Err(CameraError::InvalidState);
+                }
                 if let Err(err) = bus.write_reg8(self.slv_addr, entry.reg, entry.val) {
                     self.reg_bank = Ov2640Bank::Max;
                     return Err(err);
@@ -959,6 +986,54 @@ impl Ov2640 {
         self.write_regs(bus, regs)
     }
 
+    const fn sensor_mode_for_framesize(framesize: FrameSize) -> Ov2640SensorMode {
+        let res = framesize.resolution();
+        let ratio = RATIO_TABLE[res.aspect_ratio as usize];
+        let cif_max_x = ratio.max_x / 4;
+        let cif_max_y = if ratio.max_y / 4 > 296 {
+            296
+        } else {
+            ratio.max_y / 4
+        };
+        if (framesize as u8) <= (FrameSize::Cif as u8)
+            && res.width <= cif_max_x
+            && res.height <= cif_max_y
+        {
+            Ov2640SensorMode::Cif
+        } else if (framesize as u8) <= (FrameSize::Svga as u8)
+            && res.width <= ratio.max_x / 2
+            && res.height <= ratio.max_y / 2
+        {
+            Ov2640SensorMode::Svga
+        } else {
+            Ov2640SensorMode::Uxga
+        }
+    }
+
+    const fn clock_dividers(pixformat: PixelFormat, mode: Ov2640SensorMode) -> (u8, u8) {
+        let (clk_2x, clk_div, pclk_auto, pclk_div): (u8, u8, u8, u8) =
+            if matches!(pixformat, PixelFormat::Jpeg) {
+                let div = match mode {
+                    Ov2640SensorMode::Cif | Ov2640SensorMode::Svga => 8,
+                    Ov2640SensorMode::Uxga => 12,
+                };
+                (0, 0, 0, div)
+            } else {
+                let c_div = match mode {
+                    Ov2640SensorMode::Cif => 3,
+                    Ov2640SensorMode::Svga | Ov2640SensorMode::Uxga => 7,
+                };
+                let p_div = match mode {
+                    Ov2640SensorMode::Uxga => 12,
+                    Ov2640SensorMode::Cif | Ov2640SensorMode::Svga => 8,
+                };
+                (0, c_div, 1, p_div)
+            };
+        let clk = (clk_div & 0x3F) | ((clk_2x & 0x01) << 7);
+        let pclk = (pclk_div & 0x7F) | ((pclk_auto & 0x01) << 7);
+        (clk, pclk)
+    }
+
     /// Configures the OV2640 DSP window, scaling, and pixel clock dividers.
     ///
     /// ### `OV-105` Invariant
@@ -980,6 +1055,23 @@ impl Ov2640 {
         w: u16,
         h: u16,
     ) -> Result<(), CameraError> {
+        let (sensor_w, sensor_h) = match mode {
+            Ov2640SensorMode::Cif => (400u16, 296u16),
+            Ov2640SensorMode::Svga => (800u16, 600u16),
+            Ov2640SensorMode::Uxga => (1600u16, 1200u16),
+        };
+        if max_x < 4
+            || max_y < 4
+            || w < 4
+            || h < 4
+            || w > max_x
+            || h > max_y
+            || offset_x.checked_add(max_x).is_none_or(|end| end > sensor_w)
+            || offset_y.checked_add(max_y).is_none_or(|end| end > sensor_h)
+        {
+            return Err(CameraError::InvalidArg);
+        }
+
         let max_x_q = max_x / 4;
         let max_y_q = max_y / 4;
         let w_q = w / 4;
@@ -1004,43 +1096,31 @@ impl Ov2640 {
             Reg8::new(ZMHH, (((h_q >> 6) & 0x04) | ((w_q >> 8) & 0x03)) as u8),
         ];
 
-        let (clk_2x, clk_div, pclk_auto, pclk_div): (u8, u8, u8, u8) =
-            if self.pixformat == PixelFormat::Jpeg {
-                let div = match mode {
-                    Ov2640SensorMode::Cif | Ov2640SensorMode::Svga => 8,
-                    Ov2640SensorMode::Uxga => 12,
-                };
-                (0, 0, 0, div)
-            } else {
-                let c_div = if mode == Ov2640SensorMode::Cif { 3 } else { 7 };
-                let p_div = if mode == Ov2640SensorMode::Uxga {
-                    12
-                } else {
-                    8
-                };
-                (0, c_div, 1, p_div)
-            };
-
-        let clk = (clk_div & 0x3F) | ((clk_2x & 0x01) << 7);
-        let pclk = (pclk_div & 0x7F) | ((pclk_auto & 0x01) << 7);
+        let (clk, pclk) = Self::clock_dividers(self.pixformat, mode);
 
         self.write_reg(bus, Ov2640Bank::Dsp, R_BYPASS, R_BYPASS_DSP_BYPAS)?;
-        self.write_reg(bus, Ov2640Bank::Sensor, CLKRC, clk)?;
-        match mode {
-            Ov2640SensorMode::Cif => {
-                self.write_regs(bus, &OV2640_SETTINGS_TO_CIF)?;
-                self.write_regs(bus, &OV2640_SETTINGS_TO_CIF_TAIL)?;
+        let apply_res = (|| -> Result<(), CameraError> {
+            self.write_reg(bus, Ov2640Bank::Sensor, CLKRC, clk)?;
+            match mode {
+                Ov2640SensorMode::Cif => {
+                    self.write_regs(bus, &OV2640_SETTINGS_TO_CIF)?;
+                    self.write_regs(bus, &OV2640_SETTINGS_TO_CIF_TAIL)?;
+                }
+                Ov2640SensorMode::Svga => {
+                    self.write_regs(bus, &OV2640_SETTINGS_TO_SVGA)?;
+                }
+                Ov2640SensorMode::Uxga => {
+                    self.write_regs(bus, &OV2640_SETTINGS_TO_UXGA)?;
+                }
             }
-            Ov2640SensorMode::Svga => {
-                self.write_regs(bus, &OV2640_SETTINGS_TO_SVGA)?;
-            }
-            Ov2640SensorMode::Uxga => {
-                self.write_regs(bus, &OV2640_SETTINGS_TO_UXGA)?;
-            }
+            self.write_regs(bus, &win_regs)?;
+            self.apply_pixformat_regs(bus, self.pixformat)?;
+            self.write_reg(bus, Ov2640Bank::Dsp, R_DVP_SP, pclk)
+        })();
+        if let Err(err) = apply_res {
+            let _ = self.write_reg(bus, Ov2640Bank::Dsp, R_BYPASS, R_BYPASS_DSP_EN);
+            return Err(err);
         }
-        self.write_regs(bus, &win_regs)?;
-        self.apply_pixformat_regs(bus, self.pixformat)?;
-        self.write_reg(bus, Ov2640Bank::Dsp, R_DVP_SP, pclk)?;
         self.write_reg(bus, Ov2640Bank::Dsp, R_BYPASS, R_BYPASS_DSP_EN)?;
         bus.delay_ms(10);
         Ok(())
@@ -1072,16 +1152,9 @@ impl<B: SccbBus> CameraSensor<B> for Ov2640 {
     }
 
     fn init_status(&mut self, bus: &mut B) -> Result<(), CameraError> {
-        self.status.brightness = 0;
-        self.status.contrast = 0;
-        self.status.saturation = 0;
-        self.status.ae_level = 0;
-        self.status.special_effect = 0;
-        self.status.wb_mode = 0;
-
         // SENS-19: batch 7 Sensor bank reads first, then 5 DSP bank reads
-        // (<= 14 bus ops).
-        let agc_gain = self.read_reg(bus, Ov2640Bank::Sensor, GAIN)?;
+        // (<= 14 bus ops). Defer status mutations until every read succeeds.
+        let agc_gain_reg = self.read_reg(bus, Ov2640Bank::Sensor, GAIN)?;
         let com7 = self.read_reg(bus, Ov2640Bank::Sensor, COM7)?;
         let com8 = self.read_reg(bus, Ov2640Bank::Sensor, COM8)?;
         let com9 = self.read_reg(bus, Ov2640Bank::Sensor, COM9)?;
@@ -1095,13 +1168,21 @@ impl<B: SccbBus> CameraSensor<B> for Ov2640 {
         let ctrl2 = self.read_reg(bus, Ov2640Bank::Dsp, CTRL2)?;
         let ctrl3 = self.read_reg(bus, Ov2640Bank::Dsp, CTRL3)?;
 
-        self.status.agc_gain = 30;
+        let mut agc_gain = 30u8;
         for i in 0..30usize {
-            if agc_gain >= AGC_GAIN_TBL[i] && agc_gain < AGC_GAIN_TBL[i + 1] {
-                self.status.agc_gain = i as u8;
+            if agc_gain_reg >= AGC_GAIN_TBL[i] && agc_gain_reg < AGC_GAIN_TBL[i + 1] {
+                agc_gain = i as u8;
                 break;
             }
         }
+
+        self.status.brightness = 0;
+        self.status.contrast = 0;
+        self.status.saturation = 0;
+        self.status.ae_level = 0;
+        self.status.special_effect = 0;
+        self.status.wb_mode = 0;
+        self.status.agc_gain = agc_gain;
 
         let aec_hi = (reg45 & 0x3F) as u16;
         let aec_lo = (reg04 & 0x03) as u16;
@@ -1144,15 +1225,10 @@ impl<B: SccbBus> CameraSensor<B> for Ov2640 {
             _ => return Err(CameraError::NotSupported),
         };
         self.write_regs(bus, regs)?;
-        if pixformat == PixelFormat::Jpeg {
-            let pclk_div = if (self.status.framesize as u8) > (FrameSize::Svga as u8) {
-                0x0c
-            } else {
-                0x08
-            };
-            self.write_reg(bus, Ov2640Bank::Sensor, CLKRC, 0x00)?;
-            self.write_reg(bus, Ov2640Bank::Dsp, R_DVP_SP, pclk_div)?;
-        }
+        let mode = Self::sensor_mode_for_framesize(self.status.framesize);
+        let (clk, pclk) = Self::clock_dividers(pixformat, mode);
+        self.write_reg(bus, Ov2640Bank::Sensor, CLKRC, clk)?;
+        self.write_reg(bus, Ov2640Bank::Dsp, R_DVP_SP, pclk)?;
         bus.delay_ms(10);
         self.pixformat = pixformat;
         Ok(())
@@ -1171,73 +1247,71 @@ impl<B: SccbBus> CameraSensor<B> for Ov2640 {
         let mut max_y = ratio_entry.max_y;
         let mut offset_x = ratio_entry.offset_x;
         let mut offset_y = ratio_entry.offset_y;
-        let mut mode = Ov2640SensorMode::Uxga;
+        let mode = Self::sensor_mode_for_framesize(framesize);
 
-        if (framesize as u8) <= (FrameSize::Cif as u8) {
-            mode = Ov2640SensorMode::Cif;
-            max_x /= 4;
-            max_y /= 4;
-            offset_x /= 4;
-            offset_y /= 4;
-            if max_y > 296 {
-                max_y = 296;
+        match mode {
+            Ov2640SensorMode::Cif => {
+                max_x /= 4;
+                max_y /= 4;
+                offset_x /= 4;
+                offset_y /= 4;
+                if max_y > 296 {
+                    max_y = 296;
+                }
             }
-        } else if (framesize as u8) <= (FrameSize::Svga as u8) {
-            mode = Ov2640SensorMode::Svga;
-            max_x /= 2;
-            max_y /= 2;
-            offset_x /= 2;
-            offset_y /= 2;
+            Ov2640SensorMode::Svga => {
+                max_x /= 2;
+                max_y /= 2;
+                offset_x /= 2;
+                offset_y /= 2;
+            }
+            Ov2640SensorMode::Uxga => {}
         }
 
-        let prev_framesize = self.status.framesize;
+        self.set_window(bus, mode, offset_x, offset_y, max_x, max_y, w, h)?;
         self.status.framesize = framesize;
-        if let Err(err) = self.set_window(bus, mode, offset_x, offset_y, max_x, max_y, w, h) {
-            self.status.framesize = prev_framesize;
-            return Err(err);
-        }
         Ok(())
     }
 
     fn set_contrast(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
-        let idx = level + 3;
-        if !(1..=5).contains(&idx) {
+        if !(-2..=2).contains(&level) {
             return Err(CameraError::InvalidArg);
         }
-        self.status.contrast = level as i8;
-        let row = &CONTRAST_REGS[idx as usize];
+        let idx = (level + 3) as usize;
+        let row = &CONTRAST_REGS[idx];
         let addrs = &CONTRAST_REGS[0];
         for i in 0..7 {
             self.write_reg(bus, Ov2640Bank::Dsp, addrs[i], row[i])?;
         }
+        self.status.contrast = level as i8;
         Ok(())
     }
 
     fn set_brightness(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
-        let idx = level + 3;
-        if !(1..=5).contains(&idx) {
+        if !(-2..=2).contains(&level) {
             return Err(CameraError::InvalidArg);
         }
-        self.status.brightness = level as i8;
-        let row = &BRIGHTNESS_REGS[idx as usize];
+        let idx = (level + 3) as usize;
+        let row = &BRIGHTNESS_REGS[idx];
         let addrs = &BRIGHTNESS_REGS[0];
         for i in 0..5 {
             self.write_reg(bus, Ov2640Bank::Dsp, addrs[i], row[i])?;
         }
+        self.status.brightness = level as i8;
         Ok(())
     }
 
     fn set_saturation(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
-        let idx = level + 3;
-        if !(1..=5).contains(&idx) {
+        if !(-2..=2).contains(&level) {
             return Err(CameraError::InvalidArg);
         }
-        self.status.saturation = level as i8;
-        let row = &SATURATION_REGS[idx as usize];
+        let idx = (level + 3) as usize;
+        let row = &SATURATION_REGS[idx];
         let addrs = &SATURATION_REGS[0];
         for i in 0..5 {
             self.write_reg(bus, Ov2640Bank::Dsp, addrs[i], row[i])?;
         }
+        self.status.saturation = level as i8;
         Ok(())
     }
 
@@ -1247,8 +1321,9 @@ impl<B: SccbBus> CameraSensor<B> for Ov2640 {
         gainceiling: GainCeiling,
     ) -> Result<(), CameraError> {
         let val = gainceiling as u8;
+        self.set_reg_bits(bus, Ov2640Bank::Sensor, COM9, 5, 0x07, val)?;
         self.status.gainceiling = val;
-        self.set_reg_bits(bus, Ov2640Bank::Sensor, COM9, 5, 0x07, val)
+        Ok(())
     }
 
     /// Sets the JPEG compression quality factor (`SENS-21`).
@@ -1262,33 +1337,39 @@ impl<B: SccbBus> CameraSensor<B> for Ov2640 {
             return Err(CameraError::InvalidArg);
         }
         let q = quality as u8;
+        self.write_reg(bus, Ov2640Bank::Dsp, QS, q)?;
         self.status.quality = q;
-        self.write_reg(bus, Ov2640Bank::Dsp, QS, q)
+        Ok(())
     }
 
     fn set_colorbar(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
+        self.write_reg_bits(bus, Ov2640Bank::Sensor, COM7, COM7_COLOR_BAR, enable)?;
         self.status.colorbar = enable;
-        self.write_reg_bits(bus, Ov2640Bank::Sensor, COM7, COM7_COLOR_BAR, enable)
+        Ok(())
     }
 
     fn set_whitebal(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
+        self.set_reg_bits(bus, Ov2640Bank::Dsp, CTRL1, 3, 1, u8::from(enable))?;
         self.status.awb = enable;
-        self.set_reg_bits(bus, Ov2640Bank::Dsp, CTRL1, 3, 1, u8::from(enable))
+        Ok(())
     }
 
     fn set_gain_ctrl(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
+        self.write_reg_bits(bus, Ov2640Bank::Sensor, COM8, COM8_AGC_EN, enable)?;
         self.status.agc = enable;
-        self.write_reg_bits(bus, Ov2640Bank::Sensor, COM8, COM8_AGC_EN, enable)
+        Ok(())
     }
 
     fn set_exposure_ctrl(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
+        self.write_reg_bits(bus, Ov2640Bank::Sensor, COM8, COM8_AEC_EN, enable)?;
         self.status.aec = enable;
-        self.write_reg_bits(bus, Ov2640Bank::Sensor, COM8, COM8_AEC_EN, enable)
+        Ok(())
     }
 
     fn set_hmirror(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
+        self.write_reg_bits(bus, Ov2640Bank::Sensor, REG04, REG04_HFLIP_IMG, enable)?;
         self.status.hmirror = enable;
-        self.write_reg_bits(bus, Ov2640Bank::Sensor, REG04, REG04_HFLIP_IMG, enable)
+        Ok(())
     }
 
     fn set_vflip(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
@@ -1304,13 +1385,15 @@ impl<B: SccbBus> CameraSensor<B> for Ov2640 {
     }
 
     fn set_aec2(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
+        self.set_reg_bits(bus, Ov2640Bank::Dsp, CTRL0, 6, 1, u8::from(enable))?;
         self.status.aec2 = enable;
-        self.set_reg_bits(bus, Ov2640Bank::Dsp, CTRL0, 6, 1, u8::from(enable))
+        Ok(())
     }
 
     fn set_awb_gain(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
+        self.set_reg_bits(bus, Ov2640Bank::Dsp, CTRL1, 2, 1, u8::from(enable))?;
         self.status.awb_gain = enable;
-        self.set_reg_bits(bus, Ov2640Bank::Dsp, CTRL1, 2, 1, u8::from(enable))
+        Ok(())
     }
 
     fn set_agc_gain(&mut self, bus: &mut B, gain: i32) -> Result<(), CameraError> {
@@ -1318,8 +1401,9 @@ impl<B: SccbBus> CameraSensor<B> for Ov2640 {
             return Err(CameraError::InvalidArg);
         }
         let g = gain as usize;
+        self.write_reg(bus, Ov2640Bank::Sensor, GAIN, AGC_GAIN_TBL[g])?;
         self.status.agc_gain = g as u8;
-        self.write_reg(bus, Ov2640Bank::Sensor, GAIN, AGC_GAIN_TBL[g])
+        Ok(())
     }
 
     fn set_aec_value(&mut self, bus: &mut B, value: i32) -> Result<(), CameraError> {
@@ -1327,7 +1411,6 @@ impl<B: SccbBus> CameraSensor<B> for Ov2640 {
             return Err(CameraError::InvalidArg);
         }
         let val = value as u16;
-        self.status.aec_value = val;
         self.set_reg_bits(bus, Ov2640Bank::Sensor, REG04, 0, 0x03, (val & 0x03) as u8)?;
         self.write_reg(bus, Ov2640Bank::Sensor, AEC, ((val >> 2) & 0xFF) as u8)?;
         self.set_reg_bits(
@@ -1337,20 +1420,22 @@ impl<B: SccbBus> CameraSensor<B> for Ov2640 {
             0,
             0x3F,
             ((val >> 10) & 0x3F) as u8,
-        )
+        )?;
+        self.status.aec_value = val;
+        Ok(())
     }
 
     fn set_special_effect(&mut self, bus: &mut B, effect: i32) -> Result<(), CameraError> {
-        let idx = effect + 1;
-        if !(1..=7).contains(&idx) {
+        if !(0..=6).contains(&effect) {
             return Err(CameraError::InvalidArg);
         }
-        self.status.special_effect = effect as u8;
-        let row = &SPECIAL_EFFECTS_REGS[idx as usize];
+        let idx = (effect + 1) as usize;
+        let row = &SPECIAL_EFFECTS_REGS[idx];
         let addrs = &SPECIAL_EFFECTS_REGS[0];
         for i in 0..5 {
             self.write_reg(bus, Ov2640Bank::Dsp, addrs[i], row[i])?;
         }
+        self.status.special_effect = effect as u8;
         Ok(())
     }
 
@@ -1358,7 +1443,6 @@ impl<B: SccbBus> CameraSensor<B> for Ov2640 {
         if !(0..=4).contains(&mode) {
             return Err(CameraError::InvalidArg);
         }
-        self.status.wb_mode = mode as u8;
         self.set_reg_bits(
             bus,
             Ov2640Bank::Dsp,
@@ -1374,46 +1458,52 @@ impl<B: SccbBus> CameraSensor<B> for Ov2640 {
                 self.write_reg(bus, Ov2640Bank::Dsp, addrs[i], row[i])?;
             }
         }
+        self.status.wb_mode = mode as u8;
         Ok(())
     }
 
     fn set_ae_level(&mut self, bus: &mut B, level: i32) -> Result<(), CameraError> {
-        let idx = level + 3;
-        if !(1..=5).contains(&idx) {
+        if !(-2..=2).contains(&level) {
             return Err(CameraError::InvalidArg);
         }
-        self.status.ae_level = level as i8;
-        let row = &AE_LEVELS_REGS[idx as usize];
+        let idx = (level + 3) as usize;
+        let row = &AE_LEVELS_REGS[idx];
         let addrs = &AE_LEVELS_REGS[0];
         for i in 0..3 {
             self.write_reg(bus, Ov2640Bank::Sensor, addrs[i], row[i])?;
         }
+        self.status.ae_level = level as i8;
         Ok(())
     }
 
     fn set_dcw(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
+        self.set_reg_bits(bus, Ov2640Bank::Dsp, CTRL2, 5, 1, u8::from(enable))?;
         self.status.dcw = enable;
-        self.set_reg_bits(bus, Ov2640Bank::Dsp, CTRL2, 5, 1, u8::from(enable))
+        Ok(())
     }
 
     fn set_bpc(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
+        self.set_reg_bits(bus, Ov2640Bank::Dsp, CTRL3, 7, 1, u8::from(enable))?;
         self.status.bpc = enable;
-        self.set_reg_bits(bus, Ov2640Bank::Dsp, CTRL3, 7, 1, u8::from(enable))
+        Ok(())
     }
 
     fn set_wpc(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
+        self.set_reg_bits(bus, Ov2640Bank::Dsp, CTRL3, 6, 1, u8::from(enable))?;
         self.status.wpc = enable;
-        self.set_reg_bits(bus, Ov2640Bank::Dsp, CTRL3, 6, 1, u8::from(enable))
+        Ok(())
     }
 
     fn set_raw_gma(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
+        self.set_reg_bits(bus, Ov2640Bank::Dsp, CTRL1, 5, 1, u8::from(enable))?;
         self.status.raw_gma = enable;
-        self.set_reg_bits(bus, Ov2640Bank::Dsp, CTRL1, 5, 1, u8::from(enable))
+        Ok(())
     }
 
     fn set_lenc(&mut self, bus: &mut B, enable: bool) -> Result<(), CameraError> {
+        self.set_reg_bits(bus, Ov2640Bank::Dsp, CTRL1, 1, 1, u8::from(enable))?;
         self.status.lenc = enable;
-        self.set_reg_bits(bus, Ov2640Bank::Dsp, CTRL1, 1, 1, u8::from(enable))
+        Ok(())
     }
 
     fn get_reg(&mut self, bus: &mut B, reg: i32, mask: i32) -> Result<i32, CameraError> {
@@ -1426,13 +1516,24 @@ impl<B: SccbBus> CameraSensor<B> for Ov2640 {
     }
 
     fn set_reg(&mut self, bus: &mut B, reg: i32, mask: i32, value: i32) -> Result<(), CameraError> {
-        if !(0..=0x1FF).contains(&reg) {
+        if !(0..=0x1FF).contains(&reg)
+            || !(0..=0xFF).contains(&mask)
+            || !(0..=0xFF).contains(&value)
+        {
             return Err(CameraError::InvalidArg);
+        }
+        let mask_u8 = mask as u8;
+        if mask_u8 == 0 {
+            return Ok(());
         }
         let bank = Ov2640Bank::from_u8(((reg >> 8) & 0x01) as u8);
         let addr = (reg & 0xFF) as u8;
-        let current = self.read_reg(bus, bank, addr)? as i32;
-        let next = ((current & !mask) | (value & mask)) as u8;
+        let value_u8 = value as u8;
+        if mask_u8 == 0xFF {
+            return self.write_reg(bus, bank, addr, value_u8);
+        }
+        let current = self.read_reg(bus, bank, addr)?;
+        let next = (current & !mask_u8) | (value_u8 & mask_u8);
         self.write_reg(bus, bank, addr, next)
     }
 
@@ -1452,6 +1553,12 @@ impl<B: SccbBus> CameraSensor<B> for Ov2640 {
         _scale: bool,
         _binning: bool,
     ) -> Result<(), CameraError> {
+        let mode = match start_x {
+            0 => Ov2640SensorMode::Uxga,
+            1 => Ov2640SensorMode::Svga,
+            2 => Ov2640SensorMode::Cif,
+            _ => return Err(CameraError::InvalidArg),
+        };
         if offset_x < 0
             || offset_y < 0
             || offset_x > u16::MAX as i32
@@ -1467,7 +1574,6 @@ impl<B: SccbBus> CameraSensor<B> for Ov2640 {
         {
             return Err(CameraError::InvalidArg);
         }
-        let mode = Ov2640SensorMode::from_i32(start_x);
         self.set_window(
             bus,
             mode,
@@ -1481,10 +1587,10 @@ impl<B: SccbBus> CameraSensor<B> for Ov2640 {
     }
 
     fn set_xclk(&mut self, _bus: &mut B, _timer: i32, xclk: i32) -> Result<(), CameraError> {
-        if xclk <= 0 {
+        if !(1..=Self::MAX_XCLK_MHZ).contains(&xclk) {
             return Err(CameraError::InvalidArg);
         }
-        self.xclk_freq_hz = (xclk as u32).saturating_mul(1_000_000);
+        self.xclk_freq_hz = (xclk as u32) * 1_000_000;
         Ok(())
     }
 }
@@ -1564,5 +1670,208 @@ mod tests {
         bus.clear_transactions();
         assert_eq!(sensor.set_hmirror(&mut bus, false), Ok(()));
         assert_eq!(bus.register_write_count(), 0);
+    }
+
+    #[test]
+    fn test_m120_i32_overflow_inputs_rejected_without_panic() {
+        let mut bus: MockSccbBus<64> = MockSccbBus::new();
+        let mut sensor = Ov2640::new();
+
+        for bad in [i32::MAX, i32::MAX - 1, i32::MAX - 2, i32::MIN, -3, 3] {
+            assert_eq!(
+                sensor.set_contrast(&mut bus, bad),
+                Err(CameraError::InvalidArg)
+            );
+            assert_eq!(
+                sensor.set_brightness(&mut bus, bad),
+                Err(CameraError::InvalidArg)
+            );
+            assert_eq!(
+                sensor.set_saturation(&mut bus, bad),
+                Err(CameraError::InvalidArg)
+            );
+            assert_eq!(
+                sensor.set_ae_level(&mut bus, bad),
+                Err(CameraError::InvalidArg)
+            );
+        }
+        for bad in [i32::MAX, i32::MIN, -1, 7] {
+            assert_eq!(
+                sensor.set_special_effect(&mut bus, bad),
+                Err(CameraError::InvalidArg)
+            );
+        }
+        assert_eq!(bus.register_write_count(), 0);
+    }
+
+    #[test]
+    fn test_m121_set_window_restores_dsp_on_intermediate_sccb_error() {
+        let mut bus: MockSccbBus<256> = MockSccbBus::new();
+        let mut sensor = Ov2640::new();
+
+        // Transactions: 1=BANK_SEL(Dsp), 2=R_BYPASS(BYPASS), 3=BANK_SEL(Sensor),
+        // 4=CLKRC (fail here so intermediate write errors after DSP bypass).
+        bus.fail_at(4);
+        assert!(sensor
+            .set_window(&mut bus, Ov2640SensorMode::Svga, 0, 0, 800, 600, 640, 480)
+            .is_err());
+        assert_eq!(
+            bus.reg8(CameraSccbAddr::OV2640, R_BYPASS),
+            R_BYPASS_DSP_EN,
+            "set_window must re-enable DSP on intermediate SCCB error"
+        );
+    }
+
+    #[test]
+    fn test_m201_deferred_status_updates_on_sccb_error() {
+        let mut bus: MockSccbBus<128> = MockSccbBus::new();
+        let mut sensor = Ov2640::new();
+
+        assert_eq!(sensor.set_contrast(&mut bus, 1), Ok(()));
+        assert_eq!(sensor.set_brightness(&mut bus, -1), Ok(()));
+        assert_eq!(sensor.set_saturation(&mut bus, 2), Ok(()));
+        assert_eq!(sensor.set_quality(&mut bus, 15), Ok(()));
+        assert_eq!(sensor.set_aec_value(&mut bus, 500), Ok(()));
+        assert_eq!(sensor.set_wb_mode(&mut bus, 2), Ok(()));
+        assert_eq!(sensor.set_ae_level(&mut bus, 1), Ok(()));
+        assert_eq!(sensor.set_special_effect(&mut bus, 3), Ok(()));
+        assert_eq!(sensor.set_hmirror(&mut bus, true), Ok(()));
+        let snapshot = *sensor.status();
+
+        bus.set_fail(true);
+        assert!(sensor.set_contrast(&mut bus, -2).is_err());
+        assert!(sensor.set_brightness(&mut bus, 2).is_err());
+        assert!(sensor.set_saturation(&mut bus, -2).is_err());
+        assert!(sensor
+            .set_gainceiling(&mut bus, GainCeiling::Gain32x)
+            .is_err());
+        assert!(sensor.set_quality(&mut bus, 20).is_err());
+        assert!(sensor.set_colorbar(&mut bus, true).is_err());
+        assert!(sensor.set_whitebal(&mut bus, false).is_err());
+        assert!(sensor.set_gain_ctrl(&mut bus, false).is_err());
+        assert!(sensor.set_exposure_ctrl(&mut bus, false).is_err());
+        assert!(sensor.set_hmirror(&mut bus, false).is_err());
+        assert!(sensor.set_vflip(&mut bus, true).is_err());
+        assert!(sensor.set_aec2(&mut bus, true).is_err());
+        assert!(sensor.set_awb_gain(&mut bus, false).is_err());
+        assert!(sensor.set_agc_gain(&mut bus, 10).is_err());
+        assert!(sensor.set_aec_value(&mut bus, 100).is_err());
+        assert!(sensor.set_special_effect(&mut bus, 0).is_err());
+        assert!(sensor.set_wb_mode(&mut bus, 0).is_err());
+        assert!(sensor.set_ae_level(&mut bus, -2).is_err());
+        assert!(sensor.set_dcw(&mut bus, false).is_err());
+        assert!(sensor.set_bpc(&mut bus, true).is_err());
+        assert!(sensor.set_wpc(&mut bus, false).is_err());
+        assert!(sensor.set_raw_gma(&mut bus, false).is_err());
+        assert!(sensor.set_lenc(&mut bus, false).is_err());
+        assert!(sensor.init_status(&mut bus).is_err());
+
+        assert_eq!(
+            *sensor.status(),
+            snapshot,
+            "failed SCCB I/O must not mutate cached CameraStatus"
+        );
+    }
+
+    #[test]
+    fn test_m202_set_window_and_set_res_raw_bounds() {
+        let mut bus: MockSccbBus<256> = MockSccbBus::new();
+        let mut sensor = Ov2640::new();
+
+        // Zero-sized (/ 4) window rejected.
+        assert_eq!(
+            sensor.set_window(&mut bus, Ov2640SensorMode::Cif, 0, 0, 3, 200, 3, 200),
+            Err(CameraError::InvalidArg)
+        );
+        // Upscaling (w > max_x) rejected.
+        assert_eq!(
+            sensor.set_window(&mut bus, Ov2640SensorMode::Svga, 0, 0, 400, 300, 640, 300),
+            Err(CameraError::InvalidArg)
+        );
+        // Exceeding sensor mode bounds (offset + max > sensor_dim) rejected.
+        assert_eq!(
+            sensor.set_window(&mut bus, Ov2640SensorMode::Cif, 100, 0, 320, 240, 320, 240),
+            Err(CameraError::InvalidArg)
+        );
+        // Invalid start_x mode discriminant rejected by set_res_raw.
+        assert_eq!(
+            sensor.set_res_raw(&mut bus, 99, 0, 0, 0, 0, 0, 640, 480, 640, 480, false, false),
+            Err(CameraError::InvalidArg)
+        );
+        // Valid SVGA set_res_raw succeeds.
+        assert_eq!(
+            sensor.set_res_raw(&mut bus, 1, 0, 0, 0, 0, 0, 800, 600, 640, 480, false, false),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn test_m203_set_pixformat_restores_non_jpeg_dividers() {
+        let mut bus: MockSccbBus<512> = MockSccbBus::new();
+        let mut sensor = Ov2640::new();
+
+        assert_eq!(sensor.set_framesize(&mut bus, FrameSize::Svga), Ok(()));
+        assert_eq!(sensor.set_pixformat(&mut bus, PixelFormat::Jpeg), Ok(()));
+        assert_eq!(bus.reg8(CameraSccbAddr::OV2640, CLKRC), 0x00);
+        assert_eq!(bus.reg8(CameraSccbAddr::OV2640, R_DVP_SP), 0x08);
+
+        assert_eq!(sensor.set_pixformat(&mut bus, PixelFormat::Rgb565), Ok(()));
+        assert_eq!(bus.reg8(CameraSccbAddr::OV2640, CLKRC), 0x07);
+        assert_eq!(
+            bus.reg8(CameraSccbAddr::OV2640, R_DVP_SP),
+            R_DVP_SP_AUTO_MODE | 0x08
+        );
+    }
+
+    #[test]
+    fn test_m230_m231_m232_m233_low_hardening() {
+        let mut bus: MockSccbBus<64> = MockSccbBus::new();
+        let mut sensor = Ov2640::new();
+
+        // M-230: write_regs refuses non-BANK_SEL writes when reg_bank == Max.
+        assert_eq!(
+            sensor.write_regs(&mut bus, &[Reg8::new(QS, 0x0C)]),
+            Err(CameraError::InvalidState)
+        );
+
+        // M-231: set_reg mask == 0 is a no-op; out-of-range mask/value rejected.
+        bus.clear_transactions();
+        assert_eq!(sensor.set_reg(&mut bus, 0x0044, 0, 0x55), Ok(()));
+        assert_eq!(bus.transactions().len(), 0);
+        assert_eq!(
+            sensor.set_reg(&mut bus, 0x0044, 0x100, 0x55),
+            Err(CameraError::InvalidArg)
+        );
+        assert_eq!(
+            sensor.set_reg(&mut bus, 0x0044, 0xFF, -1),
+            Err(CameraError::InvalidArg)
+        );
+
+        // M-232: set_xclk rejects frequencies above 24 MHz instead of saturating.
+        assert_eq!(
+            sensor.set_xclk(&mut bus, 0, i32::MAX),
+            Err(CameraError::InvalidArg)
+        );
+        assert_eq!(
+            sensor.set_xclk(&mut bus, 0, 25),
+            Err(CameraError::InvalidArg)
+        );
+        assert_eq!(sensor.set_xclk(&mut bus, 0, 20), Ok(()));
+        assert_eq!(sensor.xclk_freq_hz(), 20_000_000);
+
+        // M-233: detect validates MIDH/MIDL and restores BANK_SEL on mismatch.
+        bus.preset_reg8(CameraSccbAddr::OV2640, BANK_SEL, Ov2640Bank::Dsp as u8);
+        bus.preset_reg8(CameraSccbAddr::OV2640, REG_PID, 0x26);
+        bus.preset_reg8(CameraSccbAddr::OV2640, REG_VER, 0x42);
+        bus.preset_reg8(CameraSccbAddr::OV2640, REG_MIDH, 0x00);
+        bus.preset_reg8(CameraSccbAddr::OV2640, REG_MIDL, 0x00);
+        assert_eq!(
+            Ov2640::detect(&mut bus, CameraSccbAddr::OV2640),
+            Err(CameraError::NotDetected)
+        );
+        assert_eq!(
+            bus.reg8(CameraSccbAddr::OV2640, BANK_SEL),
+            Ov2640Bank::Dsp as u8
+        );
     }
 }

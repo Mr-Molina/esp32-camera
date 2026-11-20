@@ -335,6 +335,9 @@ pub const fn validate_dma_ring(
     let Some(desc_bytes) = l.desc_count.checked_mul(DESC_BYTES) else {
         return Err(CameraError::Overflow);
     };
+    if ring_bytes > isize::MAX as usize || desc_bytes > isize::MAX as usize {
+        return Err(CameraError::Overflow);
+    }
     if l.buf_len < ring_bytes {
         return Err(CameraError::BufferTooSmall);
     }
@@ -364,21 +367,23 @@ pub const fn validate_dma_ring(
 /// [`CameraError::InvalidState`], because the DMA may still be writing.
 #[derive(Debug)]
 pub struct DmaRing<'a> {
-    descriptors: &'a mut [Lldesc],
+    /// Root pointer of the descriptor array. Every descriptor's `qe_stqe_next`
+    /// is `descriptors.add(next_idx)` and carries this same root provenance,
+    /// keeping the circular links valid across `parts_mut` / `arm` calls.
+    descriptors: ptr::NonNull<Lldesc>,
+    /// Number of descriptors in the ring (`>= 2`).
+    desc_count: usize,
     /// Root pointer of the ring buffer. Every descriptor's `buf` is
     /// `buf.add(offset)` and so carries this same provenance, and every
-    /// `&mut [u8]` the ring hands out is a short-lived child of it. That is
-    /// what keeps the descriptor pointers valid across `parts_mut` calls:
-    /// a child reference cannot invalidate its own root. Holding the
-    /// buffer as `&'a mut [u8]` instead made each reborrow a fresh Unique
-    /// retag that popped the descriptors' pointers off the borrow stack
-    /// (Miri, Stacked Borrows: "tag does not exist in the borrow stack").
+    /// `&mut [u8]` the ring hands out is a short-lived child of it.
     buf: ptr::NonNull<u8>,
     /// Bytes of the ring: `desc_count * node_size`. The caller's buffer may
     /// be longer; the rest is not part of the ring.
     buf_len: usize,
     node_size: usize,
     armed: bool,
+    /// Keeps the caller's `&'a mut [Lldesc]` borrowed for `'a`.
+    _descriptors: PhantomData<&'a mut [Lldesc]>,
     /// Keeps the caller's `&'a mut [u8]` borrowed for as long as the ring
     /// exists, so nobody else can touch the buffer meanwhile.
     _buffer: PhantomData<&'a mut [u8]>,
@@ -396,40 +401,45 @@ impl<'a> DmaRing<'a> {
         buffer: &'a mut [u8],
         node_size: usize,
     ) -> Result<Self, CameraError> {
+        let desc_count = descriptors.len();
         let layout = DmaRingLayout {
             desc_addr: descriptors.as_ptr() as usize,
-            desc_count: descriptors.len(),
+            desc_count,
             buf_addr: buffer.as_ptr() as usize,
             buf_len: buffer.len(),
             node_size,
         };
         validate_dma_ring(&layout, cfg!(target_arch = "xtensa"))?;
-        let ring_bytes = layout.desc_count * node_size;
-        // The one and only derivation from the caller's `&mut [u8]`. Nothing
-        // below touches `buffer` again, so this pointer stays the root of
-        // every later access to the ring bytes (see the `buf` field).
+        let ring_bytes = desc_count * node_size;
+        // Single root derivation from `&'a mut [Lldesc]` and `&'a mut [u8]`.
+        // Neither original slice is touched again below so every descriptor
+        // `buf` and `qe_stqe_next` pointer shares root provenance.
+        let desc_ptr =
+            ptr::NonNull::new(descriptors.as_mut_ptr()).ok_or(CameraError::InvalidArg)?;
         let buf = ptr::NonNull::new(buffer.as_mut_ptr()).ok_or(CameraError::InvalidArg)?;
-        // JUSTIFICATION: Link the ring over the root pointer, not over a
-        // reborrow, so the descriptors' `buf` pointers share its provenance.
+        // JUSTIFICATION: Link the ring over root pointers, not reborrows, so
+        // `buf` and `qe_stqe_next` pointers keep root provenance.
         // SAFETY:
-        // 1. Alignment & Non-null: `buf` is non-null (checked) and
-        //    `validate_dma_ring` checked 4-byte alignment of the buffer and
-        //    descriptors.
-        // 2. Memory layout: `ring_bytes <= buffer.len()` was checked by
-        //    `validate_dma_ring` (`buf_len >= desc_count * node_size`).
-        // 3. Provenance & Lifetime: `buf` was just derived from a live
-        //    `&'a mut [u8]`, which `_buffer` keeps borrowed for `'a`.
-        // 4. Exclusive aliasing: `buffer` is not used again in this function
-        //    and is unreachable to the caller for `'a`.
-        // 5. Volatile semantics: Not applicable (address arithmetic only).
+        // 1. Alignment & Non-null: `desc_ptr` and `buf` are non-null and
+        //    `validate_dma_ring` verified 4-byte alignment for both.
+        // 2. Memory layout: `desc_count >= 2`, `node_size <= 4092`,
+        //    `ring_bytes <= buffer.len()`, and both byte spans fit in
+        //    `isize::MAX` (checked by `validate_dma_ring`).
+        // 3. Provenance & Lifetime: Both root pointers derive from live `'a`
+        //    mutable slices kept borrowed by `_descriptors` and `_buffer`.
+        // 4. Exclusive aliasing: Neither original slice is used again here
+        //    and both are unreachable to the caller for `'a`.
+        // 5. Volatile semantics: Not applicable (ring setup before DMA start).
         // 6. Panic safety: `link_ring_raw` cannot unwind.
-        unsafe { link_ring_raw(descriptors, buf, ring_bytes, node_size) };
+        unsafe { link_ring_raw(desc_ptr, desc_count, buf, ring_bytes, node_size) };
         Ok(Self {
-            descriptors,
+            descriptors: desc_ptr,
+            desc_count,
             buf,
             buf_len: ring_bytes,
             node_size,
             armed: false,
+            _descriptors: PhantomData,
             _buffer: PhantomData,
         })
     }
@@ -459,8 +469,8 @@ impl<'a> DmaRing<'a> {
 
     /// Number of descriptors (nodes).
     #[inline]
-    pub fn desc_count(&self) -> usize {
-        self.descriptors.len()
+    pub const fn desc_count(&self) -> usize {
+        self.desc_count
     }
 
     /// Bytes per node.
@@ -471,14 +481,14 @@ impl<'a> DmaRing<'a> {
 
     /// Bytes of DMA buffer in the ring (`desc_count * node_size`).
     #[inline]
-    pub fn len_bytes(&self) -> usize {
+    pub const fn len_bytes(&self) -> usize {
         self.buf_len
     }
 
     /// 20-bit `in_link` address of the first descriptor.
     #[inline]
     pub fn first_desc_addr(&self) -> u32 {
-        self.descriptors[0].link_addr_20bit()
+        (self.descriptors.as_ptr() as usize as u32) & 0x000F_FFFF
     }
 
     /// `true` while a [`crate::RunningCapture`] over this ring is live, or
@@ -494,7 +504,18 @@ impl<'a> DmaRing<'a> {
         if self.armed {
             return Err(CameraError::InvalidState);
         }
-        Ok(self.descriptors)
+        let ptr = self.descriptors.as_ptr();
+        let len = self.desc_count;
+        // JUSTIFICATION: Materialise shared descriptor view from root pointer
+        // while the ring is idle and not armed for DMA.
+        // SAFETY:
+        // 1. Alignment & Non-null: `ptr` is non-null and 4-byte aligned.
+        // 2. Memory layout: `len` initialized `Lldesc` items fit `isize::MAX`.
+        // 3. Provenance & Lifetime: Derived from `'a` root, bounded by `&self`.
+        // 4. Aliasing: `self.armed` is `false`; no mutable alias exists.
+        // 5. Volatile semantics: Descriptor headers use `AtomicU32`.
+        // 6. Panic safety: `from_raw_parts` cannot unwind.
+        Ok(unsafe { core::slice::from_raw_parts(ptr, len) })
     }
 
     /// The descriptors and the buffer, e.g. for
@@ -504,13 +525,31 @@ impl<'a> DmaRing<'a> {
         if self.armed {
             return Err(CameraError::InvalidState);
         }
-        let buf_len = self.buf_len;
+        let desc_ptr = self.descriptors;
+        let desc_count = self.desc_count;
         let buf = self.buf;
-        // Same derivation as `buffer_mut`, written out because the
-        // descriptors are borrowed at the same time.
-        // JUSTIFICATION / SAFETY: see `buffer_mut`; identical argument.
-        let bytes = unsafe { core::slice::from_raw_parts_mut(buf.as_ptr(), buf_len) };
-        Ok((self.descriptors, bytes))
+        let buf_len = self.buf_len;
+        // JUSTIFICATION: Materialise short-lived mutable slices over the idle
+        // descriptors and ring buffer from their root pointers.
+        // SAFETY:
+        // 1. Alignment & Non-null: Both root pointers are non-null and 4-byte
+        //    aligned as verified by `validate_dma_ring` in `new`.
+        // 2. Memory layout: `desc_count` `Lldesc` entries and `buf_len` bytes
+        //    lie within the caller's allocations and within `isize::MAX`.
+        // 3. Provenance & Lifetime: Derived from the `'a` mutable slices kept
+        //    borrowed by `_descriptors` and `_buffer`; bounded by `&mut self`.
+        // 4. Exclusive aliasing: `self.armed` is `false` (DMA stopped), `&mut
+        //    self` guarantees exclusivity, and descriptors/buffer are disjoint
+        //    `&mut` inputs to `new`.
+        // 5. Volatile semantics: Not applicable while DMA is stopped.
+        // 6. Panic safety: `from_raw_parts_mut` cannot unwind.
+        let parts = unsafe {
+            (
+                core::slice::from_raw_parts_mut(desc_ptr.as_ptr(), desc_count),
+                core::slice::from_raw_parts_mut(buf.as_ptr(), buf_len),
+            )
+        };
+        Ok(parts)
     }
 
     /// Fills the whole ring buffer with [`crate::DMA_POISON_BYTE`] (LL-06).
@@ -528,12 +567,27 @@ impl<'a> DmaRing<'a> {
         if self.armed {
             return Err(CameraError::InvalidState);
         }
-        // Re-link over the root pointer, not over a `parts_mut` slice: a
-        // slice is a child of the root, and pointers derived from it would
-        // be popped by the next `parts_mut`.
-        // JUSTIFICATION / SAFETY: as in `new`; the layout has not changed
-        // since it was validated there.
-        unsafe { link_ring_raw(self.descriptors, self.buf, self.buf_len, self.node_size) };
+        // JUSTIFICATION: Re-link over root pointers so descriptor `buf` and
+        // `qe_stqe_next` links retain root provenance across re-arms.
+        // SAFETY:
+        // 1. Alignment & Non-null: `descriptors` and `buf` are non-null and
+        //    4-byte aligned, unchanged since `validate_dma_ring` in `new`.
+        // 2. Memory layout: `desc_count`, `buf_len`, and `node_size` are
+        //    immutable since `new` validated them against `isize::MAX`.
+        // 3. Provenance & Lifetime: Both root pointers remain valid for `'a`.
+        // 4. Exclusive aliasing: `self.armed` is `false` and `&mut self`
+        //    ensures no live references alias descriptors or buffer.
+        // 5. Volatile semantics: Not applicable while DMA is stopped.
+        // 6. Panic safety: `link_ring_raw` cannot unwind.
+        unsafe {
+            link_ring_raw(
+                self.descriptors,
+                self.desc_count,
+                self.buf,
+                self.buf_len,
+                self.node_size,
+            );
+        }
         Ok(())
     }
 
@@ -545,8 +599,10 @@ impl<'a> DmaRing<'a> {
         }
         self.armed = true;
         Ok(RingParts {
-            descriptors: ptr::NonNull::from(&mut *self.descriptors),
-            buffer: ptr::NonNull::slice_from_raw_parts(self.buf, self.buf_len),
+            descriptors: self.descriptors,
+            desc_count: self.desc_count,
+            buffer: self.buf,
+            buf_len: self.buf_len,
             node_size: self.node_size,
             armed: &mut self.armed,
         })
@@ -556,8 +612,10 @@ impl<'a> DmaRing<'a> {
 /// Raw view of an armed [`DmaRing`], held by [`crate::RunningCapture`].
 #[derive(Debug)]
 pub(crate) struct RingParts<'r> {
-    pub(crate) descriptors: ptr::NonNull<[Lldesc]>,
-    pub(crate) buffer: ptr::NonNull<[u8]>,
+    pub(crate) descriptors: ptr::NonNull<Lldesc>,
+    pub(crate) desc_count: usize,
+    pub(crate) buffer: ptr::NonNull<u8>,
+    pub(crate) buf_len: usize,
     pub(crate) node_size: usize,
     pub(crate) armed: &'r mut bool,
 }
@@ -643,8 +701,11 @@ impl<const NODES: usize, const BYTES: usize> DmaRingStorage<NODES, BYTES> {
         //    other reference to either cell exists or will ever be created.
         // 5. Volatile semantics: Not applicable.
         // 6. Panic safety: Creating references cannot unwind.
-        let (descriptors, buffer) =
-            unsafe { (&mut *self.descriptors.get(), &mut (*self.buffer.get()).0) };
+        let (descriptors, buffer) = unsafe {
+            let d = &mut *self.descriptors.get();
+            let b = &mut (*self.buffer.get()).0;
+            (d, b)
+        };
         DmaRing::new(descriptors, buffer, node_size)
     }
 }
@@ -877,16 +938,17 @@ pub fn calc_dma_sizes(
 /// the mutable `buffer` the DMA writes into (`allocate_dma_descriptors` in
 /// `driver/cam_hal.c:465-482`), returning the descriptor count.
 ///
-/// LL-02: this is the only builder; it takes `&mut [u8]`, so the `buf`
-/// pointers it stores carry write provenance. Prefer [`DmaRing::new`], which
-/// also checks the DMA window on Xtensa.
+/// LL-02: takes `&mut [u8]` so stored `buf` pointers carry write provenance,
+/// and validates the Xtensa DMA-capable internal SRAM window on target builds.
+/// Prefer [`DmaRing::new`], which also prevents CPU access while armed.
 ///
 /// Validates that:
 /// - `descriptors.len() >= 2`,
 /// - `node_size` is non-zero, `<= LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE` (`4092`),
 ///   and a multiple of 4,
 /// - `descriptors` and `buffer` are 4-byte aligned,
-/// - `buffer.len() >= descriptors.len() * node_size`.
+/// - `buffer.len() >= descriptors.len() * node_size`,
+/// - on Xtensa, descriptors and buffer lie in DMA-capable internal SRAM.
 pub fn build_circular_ring(
     descriptors: &mut [Lldesc],
     buffer: &mut [u8],
@@ -901,75 +963,108 @@ pub fn build_circular_ring(
             buf_len: buffer.len(),
             node_size,
         },
-        false,
+        cfg!(target_arch = "xtensa"),
     )?;
 
+    let Some(desc_ptr) = ptr::NonNull::new(descriptors.as_mut_ptr()) else {
+        return Err(CameraError::InvalidArg);
+    };
     let Some(buf) = ptr::NonNull::new(buffer.as_mut_ptr()) else {
         return Err(CameraError::InvalidArg);
     };
-    // Provenance note: the descriptors' `buf` pointers derive from `buffer`'s
-    // borrow as it is *here*. Reborrowing `buffer` mutably afterwards
-    // invalidates them for Rust-side access (they remain correct addresses
-    // for the DMA engine). [`DmaRing`] avoids this by owning a root pointer
-    // and linking through [`link_ring_raw`]; callers of this free function
-    // should treat the descriptors' pointers as addresses, not as pointers
-    // to dereference.
-    // JUSTIFICATION / SAFETY: `validate_dma_ring` above checked alignment and
-    // that `count * node_size <= buffer.len()`; `buf` is non-null.
-    unsafe { link_ring_raw(descriptors, buf, count * node_size, node_size) };
+    let ring_bytes = count * node_size;
+    // JUSTIFICATION: Links descriptors over root raw pointers without creating
+    // aliasing slice reborrows during ring construction.
+    // SAFETY:
+    // 1. Alignment & Non-null: `desc_ptr` and `buf` are non-null and 4-byte
+    //    aligned as verified by `validate_dma_ring`.
+    // 2. Memory layout: `count >= 2`, `node_size <= 4092`, `ring_bytes <=
+    //    buffer.len()`, and both spans fit in `isize::MAX`.
+    // 3. Provenance & Lifetime: Both pointers derive directly from the live
+    //    `&mut` inputs and are not reborrowed afterwards in this function.
+    // 4. Exclusive aliasing: Exclusive `&mut` borrows guarantee no concurrent
+    //    access during descriptor writes.
+    // 5. Volatile semantics: Not applicable (initialization prior to DMA).
+    // 6. Panic safety: `link_ring_raw` cannot unwind.
+    unsafe { link_ring_raw(desc_ptr, count, buf, ring_bytes, node_size) };
     Ok(count)
 }
 
-/// Links `descriptors` into a circular ring over `ring_bytes` bytes at
-/// `buf`, `node_size` per node, every descriptor DMA-owned with
-/// `length == 0`. The core of [`build_circular_ring`] and of
-/// [`DmaRing::new`]/[`DmaRing::rearm`], which call it with the ring's root
-/// pointer so the descriptors' `buf` pointers share the root's provenance.
+/// Links `count` descriptors at `descriptors` into a circular ring over
+/// `ring_bytes` bytes at `buf`, `node_size` per node, every descriptor
+/// DMA-owned with `length == 0`. Core of [`build_circular_ring`],
+/// [`DmaRing::new`], and [`DmaRing::rearm`].
 ///
 /// # Safety
 ///
-/// `buf` must point to at least `ring_bytes >= descriptors.len() * node_size`
-/// bytes that the caller may write, 4-byte aligned, and `descriptors` must
-/// be 4-byte aligned. Nothing is dereferenced here; the pointers are only
-/// computed and stored.
+/// - `count >= 2`, `node_size` is in `1..=LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE`
+///   and 4-byte aligned.
+/// - `count.checked_mul(node_size)` and `count.checked_mul(DESC_BYTES)` do
+///   not overflow and each is `<= isize::MAX as usize`.
+/// - `descriptors` points to a single writable allocation of at least `count`
+///   4-byte-aligned `Lldesc` slots with no live aliasing Rust references.
+/// - `buf` points to a single writable allocation of at least
+///   `ring_bytes >= count * node_size` 4-byte-aligned bytes.
+// JUSTIFICATION: Direct raw-pointer descriptor initialization preserves root
+// provenance for both `buf` and `qe_stqe_next` links across Stacked Borrows.
+// SAFETY:
+// 1. Alignment & Non-null: Callers guarantee non-null, 4-byte-aligned roots.
+// 2. Memory layout: Callers guarantee `count`, `node_size`, `ring_bytes`, and
+//    descriptor/buffer spans fit within `isize::MAX`.
+// 3. Provenance & Lifetime: Offsets stay strictly within single allocations.
+// 4. Exclusive aliasing: Callers guarantee exclusive write access to all
+//    `count` descriptors while linking.
+// 5. Volatile semantics: Plain writes before the DMA engine is armed.
+// 6. Panic safety: Pointer arithmetic and `ptr::write` cannot unwind.
 unsafe fn link_ring_raw(
-    descriptors: &mut [Lldesc],
+    descriptors: ptr::NonNull<Lldesc>,
+    count: usize,
     buf: ptr::NonNull<u8>,
     ring_bytes: usize,
     node_size: usize,
 ) {
-    let count = descriptors.len();
-    debug_assert!(count * node_size <= ring_bytes);
+    debug_assert!(count >= 2);
+    debug_assert!(node_size > 0 && node_size <= LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE);
+    debug_assert!(count
+        .checked_mul(node_size)
+        .is_some_and(|n| n <= ring_bytes && n <= isize::MAX as usize));
+    debug_assert!(count
+        .checked_mul(DESC_BYTES)
+        .is_some_and(|n| n <= isize::MAX as usize));
+
     let buf_base = buf.as_ptr();
-    let desc_base = descriptors.as_mut_ptr();
-    let flags = Lldesc::pack_flags(node_size as u16, 0, 0, false, false, true);
+    let desc_base = descriptors.as_ptr();
+    let node_u16 = node_size.min(LCD_CAM_DMA_NODE_BUFFER_MAX_SIZE) as u16;
+    let flags = Lldesc::pack_flags(node_u16, 0, 0, false, false, true);
 
     let mut x = 0;
     while x < count {
         let next_idx = (x + 1) % count;
         let byte_offset = x * node_size;
 
-        // JUSTIFICATION: Initializing descriptor linked list and slice offsets.
+        // JUSTIFICATION: Initializing descriptor linked list and buffer offsets
+        // directly via root pointer writes so `qe_stqe_next` keeps provenance.
         // SAFETY:
-        // 1. Alignment & Non-null: `buf_base` and `desc_base` are non-null
-        //    and 4-byte aligned by this function's contract.
-        // 2. Memory layout: `Lldesc` is `#[repr(C, align(4))]`.
-        // 3. Provenance & Bounds: `byte_offset = x * node_size < count *
-        //    node_size <= ring_bytes`, and `next_idx < count ==
-        //    descriptors.len()`, staying within the allocations. `chunk_ptr`
-        //    keeps `buf`'s provenance, which is the point of this function.
-        // 4. Aliasing: The pointers are only stored in descriptor fields for
-        //    the DMA engine; nothing is dereferenced here.
-        // 5. Volatile semantics: Not applicable (address arithmetic only).
-        // 6. Panic safety: Pointer arithmetic cannot unwind.
-        let (chunk_ptr, next_desc_ptr) =
-            unsafe { (buf_base.add(byte_offset), desc_base.add(next_idx)) };
-
-        descriptors[x] = Lldesc {
-            size_length_flags: AtomicU32::new(flags),
-            buf: chunk_ptr,
-            qe_stqe_next: next_desc_ptr,
-        };
+        // 1. Alignment & Non-null: `buf_base` and `desc_base` are non-null and
+        //    4-byte aligned by this function's safety contract.
+        // 2. Memory layout: `Lldesc` is `#[repr(C, align(4))]` and `node_size`
+        //    fits within the 12-bit hardware `size` field.
+        // 3. Provenance & Bounds: `byte_offset < count * node_size <=
+        //    ring_bytes <= isize::MAX`, and `x < count`, `next_idx < count`
+        //    stay within the single descriptor allocation.
+        // 4. Exclusive aliasing: Writing through `desc_base.add(x)` avoids any
+        //    `&mut [Lldesc]` retag that would pop `qe_stqe_next` provenance.
+        // 5. Volatile semantics: Not applicable (ring setup prior to DMA).
+        // 6. Panic safety: Pointer arithmetic and `ptr::write` cannot unwind.
+        unsafe {
+            let chunk_ptr = buf_base.add(byte_offset);
+            let next_desc_ptr = desc_base.add(next_idx).cast_const();
+            desc_base.add(x).write(Lldesc {
+                size_length_flags: AtomicU32::new(flags),
+                buf: chunk_ptr,
+                qe_stqe_next: next_desc_ptr,
+            });
+        }
         x += 1;
     }
 }
@@ -1025,11 +1120,16 @@ pub fn verify_circular_ring(
 
         // JUSTIFICATION: Verifying descriptor pointer continuity and alignment.
         // SAFETY:
-        // 1. Alignment & Non-null: `buf_base` and `desc_base` come from live slice
-        //    references.
-        // 2. Provenance & Bounds: `x * expected_node_size < required <= buffer.len()`
-        //    and `next_idx < count`,
-        //    so pointer arithmetic remains within the allocated slice bounds.
+        // 1. Alignment & Non-null: `buf_base` and `desc_base` come from live
+        //    4-byte-aligned slice references verified above.
+        // 2. Memory layout: `Lldesc` is `#[repr(C, align(4))]` and `u8` has
+        //    size 1.
+        // 3. Provenance & Bounds: `x * expected_node_size < required <=
+        //    buffer.len()` and `next_idx < count`, staying within the slices.
+        // 4. Aliasing: Pointers are only compared via `ptr::eq`, never
+        //    dereferenced.
+        // 5. Volatile semantics: Not applicable (address arithmetic only).
+        // 6. Panic safety: Pointer arithmetic cannot unwind.
         let (expected_buf, expected_next) = unsafe {
             (
                 buf_base.add(x * expected_node_size),
@@ -1531,5 +1631,62 @@ mod tests {
             ),
             Ok(2)
         );
+    }
+
+    #[test]
+    fn dma_ring_qe_stqe_next_provenance_survives_parts_mut_and_rearm() {
+        let mut desc = [Lldesc::EMPTY; 4];
+        let mut buf = AlignedBuffer([0u8; 4096]);
+        let mut ring = DmaRing::new(&mut desc, &mut buf.0, 1024).expect("ring");
+
+        // Grab `qe_stqe_next` pointers, re-arm, take `parts_mut`, drop it, and
+        // verify reading through `qe_stqe_next` remains sound under Miri.
+        let next_ptr = {
+            let d = ring.descriptors().expect("idle");
+            d[0].qe_stqe_next
+        };
+        // JUSTIFICATION: Verifies `qe_stqe_next` retains valid root provenance
+        // under Miri after `DmaRing::new` and `descriptors()`.
+        // SAFETY:
+        // 1. Alignment & Non-null: `next_ptr` points to `desc[1]` (4-byte
+        //    aligned, non-null).
+        // 2. Memory layout: Points to an initialized `Lldesc`.
+        // 3. Provenance & Lifetime: Derived from `DmaRing`'s root descriptor
+        //    pointer; no `&mut [Lldesc]` is live here.
+        // 4. Aliasing: Read-only access while ring is idle.
+        // 5. Volatile semantics: `Lldesc::size` reads `AtomicU32`.
+        // 6. Panic safety: Cannot unwind.
+        let next_size = unsafe { (*next_ptr).size() };
+        assert_eq!(next_size, 1024);
+
+        ring.rearm().expect("rearm");
+        let after_rearm = {
+            let (d, _) = ring.parts_mut().expect("parts_mut");
+            d[3].qe_stqe_next
+        };
+        // JUSTIFICATION: Verifies `qe_stqe_next` wrap-around pointer retains
+        // root provenance across `rearm()` and `parts_mut()`.
+        // SAFETY:
+        // 1. Alignment & Non-null: `after_rearm` points to `desc[0]`.
+        // 2. Memory layout: Initialized `Lldesc`.
+        // 3. Provenance & Lifetime: Derived from `DmaRing`'s root descriptor
+        //    pointer; the short-lived `parts_mut` borrow ended above.
+        // 4. Aliasing: Read-only access while ring is idle.
+        // 5. Volatile semantics: `Lldesc::owner` reads `AtomicU32`.
+        // 6. Panic safety: Cannot unwind.
+        let wraps_owner = unsafe { (*after_rearm).owner() };
+        assert!(wraps_owner);
+    }
+
+    #[test]
+    fn validator_rejects_isize_max_overflow() {
+        let huge = DmaRingLayout {
+            desc_addr: 0x1000,
+            desc_count: (isize::MAX as usize) / 4 + 1,
+            buf_addr: 0x2000,
+            buf_len: usize::MAX,
+            node_size: 4,
+        };
+        assert_eq!(validate_dma_ring(&huge, false), Err(CameraError::Overflow));
     }
 }

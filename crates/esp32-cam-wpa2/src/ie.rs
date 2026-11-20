@@ -158,12 +158,17 @@ fn parse_suites(
     oui: &[u8; 3],
     tbl: &[(u32, u8)],
 ) -> Result<u32, IeError> {
-    if *pos + 2 > body.len() {
+    if *pos == body.len() {
         return Ok(0);
+    }
+    if *pos + 2 > body.len() {
+        return Err(IeError);
     }
     let count = u16::from_le_bytes([body[*pos], body[*pos + 1]]) as usize;
     *pos += 2;
-    if *pos + count * 4 > body.len() {
+    let bytes = count.checked_mul(4).ok_or(IeError)?;
+    let end = pos.checked_add(bytes).ok_or(IeError)?;
+    if end > body.len() {
         return Err(IeError);
     }
     let mut mask = 0u32;
@@ -190,8 +195,11 @@ fn parse_ie_body(
         proto,
         ..Default::default()
     };
-    if body.len() < 6 {
+    if body.len() == 2 {
         return Ok(data);
+    }
+    if body.len() < 6 {
+        return Err(IeError);
     }
     let mut g_suite = [0u8; 4];
     g_suite.copy_from_slice(&body[2..6]);
@@ -201,35 +209,57 @@ fn parse_ie_body(
     data.pairwise_cipher = parse_suites(body, &mut pos, oui, c_tbl)?;
     data.key_mgmt = parse_suites(body, &mut pos, oui, a_tbl)?;
 
-    if pos + 2 <= body.len() {
+    if pos < body.len() {
+        if pos + 2 > body.len() {
+            return Err(IeError);
+        }
         data.capabilities = u16::from_le_bytes([body[pos], body[pos + 1]]);
         pos += 2;
     }
     if proto == WPA_PROTO_RSN {
-        if pos + 2 <= body.len() {
+        if pos < body.len() {
+            if pos + 2 > body.len() {
+                return Err(IeError);
+            }
             let pmkid_count = u16::from_le_bytes([body[pos], body[pos + 1]]) as usize;
             pos += 2;
-            if pmkid_count > 0 && pos + pmkid_count * 16 <= body.len() {
+            let pmkid_bytes = pmkid_count.checked_mul(16).ok_or(IeError)?;
+            let end = pos.checked_add(pmkid_bytes).ok_or(IeError)?;
+            if end > body.len() {
+                return Err(IeError);
+            }
+            if pmkid_count > 0 {
                 data.has_pmkid = true;
                 data.first_pmkid_offset = 2 + pos;
-                pos += pmkid_count * 16;
+                pos = end;
             }
         }
-        if pos + 4 <= body.len() {
+        if pos < body.len() {
+            if pos + 4 > body.len() {
+                return Err(IeError);
+            }
             let mut mgmt_suite = [0u8; 4];
             mgmt_suite.copy_from_slice(&body[pos..pos + 4]);
             data.mgmt_group_cipher = suite_to_val(oui, c_tbl, &mgmt_suite);
+            pos += 4;
         }
+    }
+    if pos != body.len() {
+        return Err(IeError);
     }
     Ok(data)
 }
 
+/// Parses a standalone IEEE 802.11 RSN Information Element (Tag 0x30).
+///
+/// Rejects truncated buffers and trailing unparsed bytes
+/// (`ie.len() != 2 + len`).
 pub fn parse_rsn_ie(ie: &[u8]) -> Result<WpaIeData, IeError> {
     if ie.len() < 4 || ie[0] != 0x30 {
         return Err(IeError);
     }
     let len = ie[1] as usize;
-    if ie.len() < 2 + len || len < 2 {
+    if ie.len() != 2 + len || len < 2 {
         return Err(IeError);
     }
     parse_ie_body(
@@ -241,12 +271,16 @@ pub fn parse_rsn_ie(ie: &[u8]) -> Result<WpaIeData, IeError> {
     )
 }
 
+/// Parses a standalone WPA1 Vendor Specific Information Element (Tag 0xDD).
+///
+/// Rejects truncated buffers and trailing unparsed bytes
+/// (`ie.len() != 2 + len`).
 pub fn parse_wpa_ie(ie: &[u8]) -> Result<WpaIeData, IeError> {
     if ie.len() < 8 || ie[0] != 0xDD {
         return Err(IeError);
     }
     let len = ie[1] as usize;
-    if ie.len() < 2 + len || len < 6 || ie[2..6] != [0x00, 0x50, 0xF2, 0x01] {
+    if ie.len() != 2 + len || len < 6 || ie[2..6] != [0x00, 0x50, 0xF2, 0x01] {
         return Err(IeError);
     }
     parse_ie_body(
@@ -335,38 +369,68 @@ pub struct ParsedKeyData<'a> {
     pub igtk: Option<&'a [u8]>,
 }
 
-pub fn parse_key_data_kdes(key_data: &[u8]) -> ParsedKeyData<'_> {
+/// Parses EAPOL-Key Data IEs and KDEs per IEEE 802.11-2016 Clause 12.7.2.
+///
+/// # Errors
+///
+/// Returns [`IeError`] if:
+/// - Unexpected `0x00` bytes appear outside trailing `0xDD` padding;
+/// - Non-zero trailing bytes follow a `0xDD 0x00` padding terminator;
+/// - Any TLV is truncated;
+/// - Duplicate RSN IE, WPA IE, GTK KDE, or IGTK KDE elements occur;
+/// - A GTK or IGTK KDE carries fewer than 16 or more than 32 key bytes.
+pub fn parse_key_data_kdes(key_data: &[u8]) -> Result<ParsedKeyData<'_>, IeError> {
     let mut parsed = ParsedKeyData::default();
     let mut pos = 0;
-    while pos + 2 <= key_data.len() {
+    while pos < key_data.len() {
         let tag = key_data[pos];
-        let len = key_data[pos + 1] as usize;
-        if tag == 0x00 {
-            pos += 1;
-            continue;
+        if tag == 0xDD && pos + 1 == key_data.len() {
+            // Single-octet 0xDD padding at end of Key Data (IEEE 802.11 §12.7.2).
+            break;
         }
+        if pos + 2 > key_data.len() {
+            return Err(IeError);
+        }
+        if tag == 0x00 {
+            return Err(IeError);
+        }
+        let len = key_data[pos + 1] as usize;
         if tag == 0xDD && len == 0 {
-            pos += 2;
-            continue;
+            if key_data[pos + 2..].iter().all(|&b| b == 0x00) {
+                break;
+            }
+            return Err(IeError);
         }
         let total = 2 + len;
         if pos + total > key_data.len() {
-            break;
+            return Err(IeError);
         }
         let elem = &key_data[pos..pos + total];
         if tag == 0x30 {
+            if parsed.rsn_ie.is_some() {
+                return Err(IeError);
+            }
             parsed.rsn_ie = Some(elem);
         } else if tag == 0xDD && len >= 4 {
             let oui_type = &key_data[pos + 2..pos + 6];
             if oui_type == [0x00, 0x50, 0xF2, 0x01] {
+                if parsed.wpa_ie.is_some() {
+                    return Err(IeError);
+                }
                 parsed.wpa_ie = Some(elem);
             } else if oui_type[0..3] == OUI_RSN {
                 let payload = &key_data[pos + 6..pos + total];
-                if oui_type[3] == 0x01 && payload.len() >= 2 {
+                if oui_type[3] == 0x01 {
+                    if parsed.gtk.is_some() || payload.len() < 2 + 16 || payload.len() > 2 + 32 {
+                        return Err(IeError);
+                    }
                     parsed.gtk_key_id = payload[0] & 0x03;
                     parsed.gtk_tx = (payload[0] & 0x04) != 0;
                     parsed.gtk = Some(&payload[2..]);
-                } else if oui_type[3] == 0x09 && payload.len() >= 8 {
+                } else if oui_type[3] == 0x09 {
+                    if parsed.igtk.is_some() || payload.len() < 8 + 16 || payload.len() > 8 + 32 {
+                        return Err(IeError);
+                    }
                     parsed.igtk_key_id = u16::from_le_bytes([payload[0], payload[1]]);
                     parsed.igtk_ipn.copy_from_slice(&payload[2..8]);
                     parsed.igtk = Some(&payload[8..]);
@@ -375,7 +439,7 @@ pub fn parse_key_data_kdes(key_data: &[u8]) -> ParsedKeyData<'_> {
         }
         pos += total;
     }
-    parsed
+    Ok(parsed)
 }
 
 #[cfg(test)]
@@ -411,7 +475,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rsn_and_wpa_ie_roundtrip() {
+    fn test_rsn_and_wpa_ie_roundtrip_and_trailing_bytes_rejected() {
         let mut buf = [0u8; 32];
         let len = gen_wpa_ie(
             WPA_PROTO_RSN,
@@ -434,6 +498,9 @@ mod tests {
                 WPA_KEY_MGMT_PSK
             )
         );
+        // Trailing garbage byte after RSN IE must be rejected (C2-057).
+        buf[len] = 0xAA;
+        assert_eq!(parse_rsn_ie(&buf[..len + 1]), Err(IeError));
 
         let wlen = gen_wpa_ie(
             WPA_PROTO_WPA,
@@ -456,10 +523,13 @@ mod tests {
                 WPA_KEY_MGMT_PSK
             )
         );
+        // Trailing garbage byte after WPA IE must be rejected (C2-057).
+        buf[wlen] = 0xBB;
+        assert_eq!(parse_wpa_ie(&buf[..wlen + 1]), Err(IeError));
     }
 
     #[test]
-    fn test_kde_gtk_extraction() {
+    fn test_kde_gtk_extraction_and_padding() {
         let mut key_data = [0u8; 32];
         key_data[0] = 0xDD;
         key_data[1] = 22;
@@ -468,12 +538,66 @@ mod tests {
         key_data[6] = 0x05; // ID 1, Tx
         key_data[7] = 0x00;
         key_data[8..24].fill(0xAA);
+        // Valid 0xDD 0x00 ... 0x00 padding to 32 bytes.
+        key_data[24] = 0xDD;
 
-        let parsed = parse_key_data_kdes(&key_data[..24]);
+        let parsed = parse_key_data_kdes(&key_data).expect("valid padded KDEs");
         assert_eq!(parsed.gtk_key_id, 1);
         assert!(parsed.gtk_tx);
         assert_eq!(parsed.gtk, Some(&key_data[8..24]));
         assert!(parse_rsn_ie(&[0x30, 0x10, 0x01, 0x00]).is_err());
         assert!(parse_wpa_or_rsn_ie(&[]).is_err());
+
+        // Single-byte 0xDD padding terminator at end is also valid.
+        let single_pad = parse_key_data_kdes(&key_data[..25]).expect("single 0xDD pad");
+        assert_eq!(single_pad.gtk, Some(&key_data[8..24]));
+    }
+
+    #[test]
+    fn test_kde_malformed_padding_truncation_duplicates_and_zero_len_rejected() {
+        // Non-zero byte smuggled after 0xDD 0x00 padding terminator.
+        let mut bad_pad = [0u8; 32];
+        bad_pad[0] = 0xDD;
+        bad_pad[1] = 22;
+        bad_pad[2..5].copy_from_slice(&OUI_RSN);
+        bad_pad[5] = 0x01;
+        bad_pad[8..24].fill(0x11);
+        bad_pad[24] = 0xDD;
+        bad_pad[25] = 0x00;
+        bad_pad[26] = 0x30;
+        assert_eq!(parse_key_data_kdes(&bad_pad), Err(IeError));
+
+        // Unexpected leading 0x00 byte.
+        assert_eq!(parse_key_data_kdes(&[0x00, 0xDD, 0x00]), Err(IeError));
+
+        // Truncated TLV.
+        assert_eq!(parse_key_data_kdes(&[0x30, 0x10, 0x01, 0x00]), Err(IeError));
+        // Single trailing non-0xDD byte.
+        assert_eq!(parse_key_data_kdes(&[0x30]), Err(IeError));
+
+        // Zero-length GTK KDE (payload len == 2 -> 0 key bytes).
+        let zero_gtk = [0xDD, 6, 0x00, 0x0F, 0xAC, 0x01, 0x01, 0x00];
+        assert_eq!(parse_key_data_kdes(&zero_gtk), Err(IeError));
+
+        // Zero-length IGTK KDE (payload len == 8 -> 0 key bytes).
+        let zero_igtk = [
+            0xDD, 12, 0x00, 0x0F, 0xAC, 0x09, 0x04, 0x00, 0, 0, 0, 0, 0, 0,
+        ];
+        assert_eq!(parse_key_data_kdes(&zero_igtk), Err(IeError));
+
+        // Duplicate GTK KDE must be rejected (no last-wins overwrite).
+        let mut dup_gtk = [0u8; 48];
+        for off in [0usize, 24usize] {
+            dup_gtk[off] = 0xDD;
+            dup_gtk[off + 1] = 22;
+            dup_gtk[off + 2..off + 5].copy_from_slice(&OUI_RSN);
+            dup_gtk[off + 5] = 0x01;
+            dup_gtk[off + 8..off + 24].fill(0x22);
+        }
+        assert_eq!(parse_key_data_kdes(&dup_gtk), Err(IeError));
+
+        // Duplicate RSN IE must be rejected.
+        let dup_rsn = [0x30, 2, 0x01, 0x00, 0x30, 2, 0x01, 0x00];
+        assert_eq!(parse_key_data_kdes(&dup_rsn), Err(IeError));
     }
 }

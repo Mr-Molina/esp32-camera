@@ -11,6 +11,10 @@ build = "build.rs"
 # feature the firmware refuses to start Wi-Fi on an empty passphrase, and an
 # Xtensa release build fails in build.rs (FW-NET-03, BUILD-07).
 allow-open-wifi = []
+# Enable SoftAP captive-portal web provisioning on first boot / STA fallback.
+# Allows unset/empty compile-time WIFI_PASS and WIFI_OTA_TOKEN on Xtensa
+# release builds while still rejecting any invalid non-empty values in build.rs.
+provisioning-ap = []
 
 [dependencies]
 esp32-cam-types.workspace = true

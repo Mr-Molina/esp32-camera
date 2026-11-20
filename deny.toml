@@ -8,9 +8,24 @@ targets = [
 ]
 
 [advisories]
+unsound = "all"
 ignore = [
     "RUSTSEC-2024-0436", # paste is unmaintained
     "RUSTSEC-2024-0449", # unsafe-libyaml is unmaintained (via serde_yaml / esp-config)
+    # Audited temporary ignores for upstream-gated heapless 0.8.0 (transitive via
+    # smoltcp 0.12.0 and esp-sync 0.3.0 -> embassy-sync 0.6.2/0.7.2). The
+    # heapless 0.9.x line in Cargo.lock is upgraded to >=0.9.4, which patches
+    # all 9 advisories. Remove these ignores once smoltcp and esp-sync drop
+    # heapless 0.8.
+    "RUSTSEC-2026-0574", # heapless 0.8.0 FindMutView::pop unsound (upstream-gated)
+    "RUSTSEC-2026-0575", # heapless 0.8.0 Spsc::peek Relaxed ordering (upstream-gated)
+    "RUSTSEC-2026-0576", # heapless 0.8.0 IndexMap::truncate unsound (upstream-gated)
+    "RUSTSEC-2026-0577", # heapless 0.8.0 panicking Drop UB (upstream-gated)
+    "RUSTSEC-2026-0578", # heapless 0.8.0 SortedLinkedList::zeroize (upstream-gated)
+    "RUSTSEC-2026-0579", # heapless 0.8.0 Deque TryFrom unsound (upstream-gated)
+    "RUSTSEC-2026-0580", # heapless 0.8.0 Treiber stack race (upstream-gated)
+    "RUSTSEC-2026-0581", # heapless 0.8.0 Deque::make_contiguous (upstream-gated)
+    "RUSTSEC-2026-0582", # heapless 0.8.0 IndexMap::insert u16::MAX (upstream-gated)
 ]
 
 [licenses]
@@ -18,11 +33,6 @@ allow = [
     "0BSD",
     "Apache-2.0",
     "MIT",
-    "BSD-2-Clause",
-    "BSD-3-Clause",
-    "ISC",
-    "CC0-1.0",
-    "Unicode-DFS-2016",
     "Unicode-3.0",
     "Zlib",
 ]
@@ -30,9 +40,13 @@ confidence-threshold = 0.8
 
 [bans]
 multiple-versions = "warn"
-wildcards = "allow"
+# Hardened from "allow" to "warn" with allow-wildcard-paths = true.
+# Upgrading to "deny" requires `publish = false` on internal workspace
+# Cargo.toml manifests that use path dependencies without version pins.
+wildcards = "warn"
+allow-wildcard-paths = true
 
 [sources]
-unknown-registry = "warn"
-unknown-git = "warn"
+unknown-registry = "deny"
+unknown-git = "deny"
 allow-git = []

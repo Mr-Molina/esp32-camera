@@ -1,8 +1,10 @@
 //! Serial port passivity controller.
 //!
 //! HW-06 (H2-BUS-001): Ensure host CH340 serial port passivity.
-//! Disables HUPCL and clears DTR/RTS without pulsing EN to avoid unwanted board resets.
-//! Verifies camera HTTP status endpoint before and after to ensure device uptime continuity.
+//! Disables HUPCL and clears DTR/RTS without pulsing EN to avoid unwanted
+//! board resets.
+//! Verifies camera HTTP status endpoint before and after to ensure device
+//! uptime continuity.
 
 use std::env;
 use std::io::{Read, Write};
@@ -231,8 +233,10 @@ pub fn ensure_passive(opts: &SerialPassiveOptions) -> Result<(), String> {
     let c_port = std::ffi::CString::new(opts.port.as_str())
         .map_err(|e| format!("Invalid port string: {e}"))?;
 
-    // JUSTIFICATION: Opening character device with O_RDWR | O_NONBLOCK | O_NOCTTY to avoid blocking or acquiring a controlling terminal.
-    // SAFETY: The path is a valid null-terminated CString; we check fd >= 0 immediately.
+    // JUSTIFICATION: Opening character device with O_RDWR | O_NONBLOCK |
+    // O_NOCTTY avoids blocking or acquiring a controlling terminal.
+    // SAFETY: The path is a valid NUL-terminated CString; fd >= 0 is checked
+    // immediately.
     let fd = unsafe {
         libc::open(
             c_port.as_ptr(),
@@ -247,8 +251,9 @@ pub fn ensure_passive(opts: &SerialPassiveOptions) -> Result<(), String> {
         ));
     }
 
-    // JUSTIFICATION: Querying and modifying terminal control flags to disable HUPCL.
-    // SAFETY: fd is a valid open file descriptor; term is initialized and valid for tcgetattr/tcsetattr.
+    // JUSTIFICATION: Query and modify terminal control flags to disable HUPCL.
+    // SAFETY: fd is a valid open file descriptor; term is zero-initialized and
+    // valid for tcgetattr/tcsetattr.
     let termios_res = unsafe {
         let mut term: libc::termios = std::mem::zeroed();
         let get_ret = libc::tcgetattr(fd, &mut term);
@@ -275,7 +280,8 @@ pub fn ensure_passive(opts: &SerialPassiveOptions) -> Result<(), String> {
 
     // 2. Clear DTR and RTS via TIOCMBIC
     let clear_bits: libc::c_int = libc::TIOCM_DTR | libc::TIOCM_RTS;
-    // JUSTIFICATION: Clearing DTR and RTS modem control lines to prevent board reset pulses.
+    // JUSTIFICATION: Clearing DTR and RTS modem control lines prevents board
+    // reset pulses.
     // SAFETY: fd is valid; &clear_bits is a valid pointer to c_int.
     let bic_res = unsafe { libc::ioctl(fd, libc::TIOCMBIC, &clear_bits) };
     if bic_res != 0 {
@@ -291,7 +297,8 @@ pub fn ensure_passive(opts: &SerialPassiveOptions) -> Result<(), String> {
 
     // 3. Read back modem bits via TIOCMGET
     let mut modem_bits: libc::c_int = 0;
-    // JUSTIFICATION: Reading back modem line state to verify DTR and RTS are deasserted.
+    // JUSTIFICATION: Read back modem line state to verify DTR and RTS are
+    // deasserted.
     // SAFETY: fd is valid; &mut modem_bits is a valid pointer to c_int.
     let get_modem_res = unsafe { libc::ioctl(fd, libc::TIOCMGET, &mut modem_bits) };
     if get_modem_res != 0 {
@@ -350,7 +357,7 @@ pub fn ensure_passive(opts: &SerialPassiveOptions) -> Result<(), String> {
 }
 
 #[cfg(not(target_os = "linux"))]
-/// Fallback for non-Linux platforms where serial passivity control is not supported.
+/// Fallback for non-Linux platforms without serial passivity support.
 pub fn ensure_passive(_opts: &SerialPassiveOptions) -> Result<(), String> {
     Err("Serial passivity control is only supported on Linux".to_string())
 }

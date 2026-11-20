@@ -1,6 +1,6 @@
 //! Pure-Rust RFC 6234 compliant SHA-256 implementation.
 //!
-//! Provides a zero-external-dependency SHA-256 cryptographic digest computation.
+//! Provides zero-external-dependency SHA-256 cryptographic digest computation.
 
 /// Initial hash values (RFC 6234 Section 6.2).
 const INITIAL_H: [u32; 8] = [

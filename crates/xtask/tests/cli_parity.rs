@@ -29,7 +29,8 @@ use xtask::verify_invariants::{
     AUTHORITATIVE_MMIO_REGISTERS,
 };
 
-/// RAII helper for managing unique temporary directories with guaranteed cleanup.
+/// RAII helper for managing unique temporary directories with guaranteed
+/// cleanup.
 struct TestTempDir {
     path: PathBuf,
 }
@@ -138,7 +139,12 @@ fn test_read_http_response_content_length() {
             drain_http_request(&mut stream, 64);
             let body = "Firmware update successful! Rebooting...\n";
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                concat!(
+                    "HTTP/1.1 200 OK\r\n",
+                    "Content-Type: text/plain\r\n",
+                    "Content-Length: {}\r\n",
+                    "Connection: close\r\n\r\n{}"
+                ),
                 body.len(),
                 body
             );
@@ -195,14 +201,26 @@ fn test_read_http_response_invalid_raises_error() {
 
 #[test]
 fn test_app_sha256_check() {
-    let mut header = [0u8; 24];
-    header[0] = 0xE9; // Magic
-    header[1] = 1; // Segment count
-    header[23] = 1; // hash_appended = true
+    let mut payload_body = vec![0u8; 24];
+    payload_body[0] = 0xE9; // Magic
+    payload_body[1] = 1; // Segment count
+    payload_body[2] = 2; // DIO SPI flash mode
+    payload_body[3] = 0x20; // Flash size / freq
+    payload_body[4..8].copy_from_slice(&0x4008_0400u32.to_le_bytes()); // Valid IRAM entry
+    payload_body[23] = 1; // hash_appended = true
 
-    let mut payload_body = Vec::new();
-    payload_body.extend_from_slice(&header);
-    payload_body.extend_from_slice(b"ESP32_FIRMWARE_PAYLOAD_TEST_DATA");
+    // Segment 0: 4-byte aligned IRAM load_addr = 0x4008_0400, len = 16
+    payload_body.extend_from_slice(&0x4008_0400u32.to_le_bytes());
+    payload_body.extend_from_slice(&16u32.to_le_bytes());
+    let seg_data = b"ESP32_FW_TEST_01";
+    let mut xor_chk = 0xEFu8;
+    for &b in seg_data {
+        xor_chk ^= b;
+    }
+    payload_body.extend_from_slice(seg_data);
+    let pad_len = 16 - (payload_body.len() % 16);
+    payload_body.resize(payload_body.len() + pad_len - 1, 0u8);
+    payload_body.push(xor_chk);
 
     let valid_digest = Sha256::digest(&payload_body);
 
@@ -225,6 +243,7 @@ fn test_app_sha256_check() {
     let parsed_header = valid_res.expect("valid header");
     assert_eq!(parsed_header.magic, 0xE9);
     assert_eq!(parsed_header.segment_count, 1);
+    assert_eq!(parsed_header.entry_addr, 0x4008_0400);
     assert!(parsed_header.hash_appended);
 }
 
@@ -250,7 +269,11 @@ fn test_jpeg_dimensions_parser() {
 
 #[test]
 fn test_parse_status_json() {
-    let json = r#"{"active_partition": "ota_0", "uptime_ms": 12345, "framesize": "1280x720", "wifi_rssi": -55, "app_sha256": "abcdef123456"}"#;
+    let json = concat!(
+        r#"{"active_partition": "ota_0", "uptime_ms": 12345, "#,
+        r#""framesize": "1280x720", "wifi_rssi": -55, "#,
+        r#""app_sha256": "abcdef123456"}"#,
+    );
     let status = parse_status_json(json).expect("parse status");
     assert_eq!(status.active_partition, "ota_0");
     assert_eq!(status.uptime_ms, 12345);

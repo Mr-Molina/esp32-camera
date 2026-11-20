@@ -19,27 +19,103 @@ pub const BSSID_FILTER_SLOT_COUNT: usize = 3;
 /// Filter enable bit in `BSSID_MASK_BASE_HIGH_CTRL` (`1 << 16`).
 pub const BSSID_BIT_ENABLE: u32 = 1 << 16;
 
-/// Returns the MMIO address for BSSID filter slot low-word register.
+/// Checked MMIO address for BSSID filter slot low-word register (`slot < 3`).
 #[inline]
+#[must_use]
+pub const fn try_bssid_filter_low_reg(slot: usize) -> Option<u32> {
+    if slot < BSSID_FILTER_SLOT_COUNT {
+        Some(BSSID_FILTER_BASE_LOW + (slot as u32) * BSSID_FILTER_STRIDE)
+    } else {
+        None
+    }
+}
+
+/// Checked MMIO address for BSSID filter slot high-word register (`slot < 3`).
+#[inline]
+#[must_use]
+pub const fn try_bssid_filter_high_reg(slot: usize) -> Option<u32> {
+    if slot < BSSID_FILTER_SLOT_COUNT {
+        Some(BSSID_FILTER_BASE_HIGH + (slot as u32) * BSSID_FILTER_STRIDE)
+    } else {
+        None
+    }
+}
+
+/// Checked MMIO address for BSSID filter slot mask-low register (`slot < 3`).
+#[inline]
+#[must_use]
+pub const fn try_bssid_mask_low_reg(slot: usize) -> Option<u32> {
+    if slot < BSSID_FILTER_SLOT_COUNT {
+        Some(BSSID_MASK_BASE_LOW + (slot as u32) * BSSID_FILTER_STRIDE)
+    } else {
+        None
+    }
+}
+
+/// Checked MMIO address for BSSID filter slot mask-high control (`slot < 3`).
+#[inline]
+#[must_use]
+pub const fn try_bssid_mask_high_ctrl_reg(slot: usize) -> Option<u32> {
+    if slot < BSSID_FILTER_SLOT_COUNT {
+        Some(BSSID_MASK_BASE_HIGH_CTRL + (slot as u32) * BSSID_FILTER_STRIDE)
+    } else {
+        None
+    }
+}
+
+/// Returns the MMIO address for BSSID filter slot low-word register.
+///
+/// # Panics
+/// Panics if `slot >= BSSID_FILTER_SLOT_COUNT`.
+#[inline]
+#[must_use]
 pub const fn bssid_filter_low_reg(slot: usize) -> u32 {
+    assert!(
+        slot < BSSID_FILTER_SLOT_COUNT,
+        "BSSID filter slot out of bounds"
+    );
     BSSID_FILTER_BASE_LOW + (slot as u32) * BSSID_FILTER_STRIDE
 }
 
 /// Returns the MMIO address for BSSID filter slot high-word register.
+///
+/// # Panics
+/// Panics if `slot >= BSSID_FILTER_SLOT_COUNT`.
 #[inline]
+#[must_use]
 pub const fn bssid_filter_high_reg(slot: usize) -> u32 {
+    assert!(
+        slot < BSSID_FILTER_SLOT_COUNT,
+        "BSSID filter slot out of bounds"
+    );
     BSSID_FILTER_BASE_HIGH + (slot as u32) * BSSID_FILTER_STRIDE
 }
 
 /// Returns the MMIO address for BSSID filter slot mask-low register.
+///
+/// # Panics
+/// Panics if `slot >= BSSID_FILTER_SLOT_COUNT`.
 #[inline]
+#[must_use]
 pub const fn bssid_mask_low_reg(slot: usize) -> u32 {
+    assert!(
+        slot < BSSID_FILTER_SLOT_COUNT,
+        "BSSID filter slot out of bounds"
+    );
     BSSID_MASK_BASE_LOW + (slot as u32) * BSSID_FILTER_STRIDE
 }
 
 /// Returns the MMIO address for BSSID filter slot mask-high control register.
+///
+/// # Panics
+/// Panics if `slot >= BSSID_FILTER_SLOT_COUNT`.
 #[inline]
+#[must_use]
 pub const fn bssid_mask_high_ctrl_reg(slot: usize) -> u32 {
+    assert!(
+        slot < BSSID_FILTER_SLOT_COUNT,
+        "BSSID filter slot out of bounds"
+    );
     BSSID_MASK_BASE_HIGH_CTRL + (slot as u32) * BSSID_FILTER_STRIDE
 }
 
@@ -60,43 +136,125 @@ pub const STA_MAC_SLOT_COUNT: usize = 3;
 /// Table enable bit in `STA_MAC_MASK_BASE_HIGH_CTRL` (`1 << 16`).
 pub const STA_MAC_BIT_ENABLE: u32 = 1 << 16;
 
-/// Returns the MMIO address for STA MAC address slot low-word register.
+/// Checked MMIO address for STA MAC slot low-word register (`slot < 3`).
 #[inline]
+#[must_use]
+pub const fn try_sta_mac_low_reg(slot: usize) -> Option<u32> {
+    if slot < STA_MAC_SLOT_COUNT {
+        Some(STA_MAC_BASE_LOW + (slot as u32) * STA_MAC_STRIDE)
+    } else {
+        None
+    }
+}
+
+/// Checked MMIO address for STA MAC slot high-word register (`slot < 3`).
+#[inline]
+#[must_use]
+pub const fn try_sta_mac_high_reg(slot: usize) -> Option<u32> {
+    if slot < STA_MAC_SLOT_COUNT {
+        Some(STA_MAC_BASE_HIGH + (slot as u32) * STA_MAC_STRIDE)
+    } else {
+        None
+    }
+}
+
+/// Checked MMIO address for STA MAC slot mask-low register (`slot < 3`).
+#[inline]
+#[must_use]
+pub const fn try_sta_mac_mask_low_reg(slot: usize) -> Option<u32> {
+    if slot < STA_MAC_SLOT_COUNT {
+        Some(STA_MAC_MASK_BASE_LOW + (slot as u32) * STA_MAC_STRIDE)
+    } else {
+        None
+    }
+}
+
+/// Checked MMIO address for STA MAC slot mask-high control (`slot < 3`).
+#[inline]
+#[must_use]
+pub const fn try_sta_mac_mask_high_ctrl_reg(slot: usize) -> Option<u32> {
+    if slot < STA_MAC_SLOT_COUNT {
+        Some(STA_MAC_MASK_BASE_HIGH_CTRL + (slot as u32) * STA_MAC_STRIDE)
+    } else {
+        None
+    }
+}
+
+/// Returns the MMIO address for STA MAC address slot low-word register.
+///
+/// # Panics
+/// Panics if `slot >= STA_MAC_SLOT_COUNT`.
+#[inline]
+#[must_use]
 pub const fn sta_mac_low_reg(slot: usize) -> u32 {
+    assert!(slot < STA_MAC_SLOT_COUNT, "STA MAC slot out of bounds");
     STA_MAC_BASE_LOW + (slot as u32) * STA_MAC_STRIDE
 }
 
 /// Returns the MMIO address for STA MAC address slot high-word register.
+///
+/// # Panics
+/// Panics if `slot >= STA_MAC_SLOT_COUNT`.
 #[inline]
+#[must_use]
 pub const fn sta_mac_high_reg(slot: usize) -> u32 {
+    assert!(slot < STA_MAC_SLOT_COUNT, "STA MAC slot out of bounds");
     STA_MAC_BASE_HIGH + (slot as u32) * STA_MAC_STRIDE
 }
 
 /// Returns the MMIO address for STA MAC address slot mask-low register.
+///
+/// # Panics
+/// Panics if `slot >= STA_MAC_SLOT_COUNT`.
 #[inline]
+#[must_use]
 pub const fn sta_mac_mask_low_reg(slot: usize) -> u32 {
+    assert!(slot < STA_MAC_SLOT_COUNT, "STA MAC slot out of bounds");
     STA_MAC_MASK_BASE_LOW + (slot as u32) * STA_MAC_STRIDE
 }
 
 /// Returns the MMIO address for STA MAC slot mask-high control register.
+///
+/// # Panics
+/// Panics if `slot >= STA_MAC_SLOT_COUNT`.
 #[inline]
+#[must_use]
 pub const fn sta_mac_mask_high_ctrl_reg(slot: usize) -> u32 {
+    assert!(slot < STA_MAC_SLOT_COUNT, "STA MAC slot out of bounds");
     STA_MAC_MASK_BASE_HIGH_CTRL + (slot as u32) * STA_MAC_STRIDE
 }
 
 // --- RX Policy & DMA Registers ---
 
-/// Base address of RX policy registers (slots 0..=2).
+/// Base address of RX policy registers (slots 0..=3).
 pub const RX_POLICY_BASE_REG: u32 = 0x3FF7_30D8;
+/// Total number of hardware RX policy slots (`0..=3`).
+pub const RX_POLICY_SLOT_COUNT: usize = 4;
 /// RX policy bit 1 (`1 << 1`). Vendor `hal_mac_rx_set_policy` never writes
 /// it, so the driver leaves it as found; kept for tests and diagnostics.
 pub const RX_POLICY_BIT_BSSID_CHECK: u32 = 1 << 1;
 /// Promiscuous bypass mask for RX policy (`0x110`).
 pub const RX_POLICY_PROMISC_BYPASS: u32 = 0x110;
 
-/// Returns the MMIO address for RX policy slot register.
+/// Checked MMIO address for RX policy slot register (`slot < 4`).
 #[inline]
+#[must_use]
+pub const fn try_rx_policy_reg(slot: usize) -> Option<u32> {
+    if slot < RX_POLICY_SLOT_COUNT {
+        Some(RX_POLICY_BASE_REG + (slot as u32) * 4)
+    } else {
+        None
+    }
+}
+
+/// Returns the MMIO address for RX policy slot register.
+///
+/// # Panics
+/// Panics if `slot >= RX_POLICY_SLOT_COUNT`.
+#[inline]
+#[must_use]
 pub const fn rx_policy_reg(slot: usize) -> u32 {
+    assert!(slot < RX_POLICY_SLOT_COUNT, "RX policy slot out of bounds");
     RX_POLICY_BASE_REG + (slot as u32) * 4
 }
 
@@ -167,14 +325,18 @@ pub const INT_CLEAR_REG: u32 = 0x3FF7_3C4C;
 
 /// Interrupt clear/status bit: Watchdog panic (`1 << 11`).
 pub const INT_PANIC_WDT: u32 = 1 << 11;
-/// Interrupt clear/status bit: Composite RX interrupt mask (`0x0100_0024`).
-pub const INT_RX_MASK: u32 = 0x0100_0024;
+/// Interrupt clear/status bit: Composite RX interrupt mask (`0x0100_0020`,
+/// aligned to enabled bits 24 and 5 in [`INT_ENABLE_OPERATIONAL`]).
+pub const INT_RX_MASK: u32 = 0x0100_0020;
 /// Interrupt clear/status bit: Transmission completed (`1 << 7`).
 pub const INT_TX_DONE: u32 = 1 << 7;
 /// Interrupt clear/status bit: Transmission collision (`1 << 8`).
 pub const INT_TX_COLL: u32 = 1 << 8;
 /// Interrupt clear/status bit: Transmission timeout (`1 << 19`).
 pub const INT_TX_TIMEOUT: u32 = 1 << 19;
+/// Composite mask of all interrupt status bits decoded by this driver.
+pub const INT_HANDLED_MASK: u32 =
+    INT_RX_MASK | INT_TX_DONE | INT_TX_COLL | INT_TX_TIMEOUT | INT_PANIC_WDT;
 
 /// MAC control register 0x3C04 (transceiver enable / power control).
 pub const MAC_CTRL_REG_3C04: u32 = 0x3FF7_3C04;
@@ -253,11 +415,14 @@ pub const TX_PLCP0_MODE_HT: u32 = 0x0020_0000;
 pub const TX_PLCP0_MODE_LEGACY: u32 = 0x0060_0000;
 /// Wait ACK flag for unicast transmission (`0x0100_0000`).
 pub const TX_PLCP0_WAIT_ACK: u32 = 0x0100_0000;
-/// No-ACK flag for broadcast, multicast, and probe request transmission (`3 << 24`).
-pub const TX_PLCP0_NO_ACK: u32 = 0x0300_0000;
+/// No-ACK flag for broadcast, multicast, and probe request transmission
+/// (`0x0000_0000`; leaving bits 25:24 clear disables `WAIT_FOR_ACK`).
+pub const TX_PLCP0_NO_ACK: u32 = 0x0000_0000;
 
 /// TX PLCP1 register.
 pub const TX_PLCP1_REG: u32 = 0x3FF7_4258;
+/// Bandwidth bit (`1 << 28`) in `TX_PLCP1_REG`.
+pub const TX_PLCP1_BANDWIDTH_BIT: u32 = 0x1000_0000;
 /// TX PLCP2 register.
 pub const TX_PLCP2_REG: u32 = 0x3FF7_425C;
 /// TX HT-SIG1 register.
@@ -271,8 +436,8 @@ pub const TX_HTSIG1_FIXED: u32 = 0x0700_0000;
 ///
 /// Provisional: derived from the 802.11n HT-SIG2 field order (short GI is
 /// HT-SIG2 bit 7, with HT-SIG2 bits 2:0 at register bits [26:24]) and not
-/// yet confirmed against the vendor `mac_tx_set_htsig` disassembly. Dormant
-/// while the data rate ladder holds no HT rates.
+/// yet confirmed against the vendor `mac_tx_set_htsig` disassembly. Rejected
+/// by `LmacHal::submit_and_poll_tx` until confirmed on silicon.
 pub const TX_HTSIG1_SHORT_GI: u32 = 0x8000_0000;
 /// Fixed `TX_HTSIG2_REG` bits above the PSDU length in [15:0].
 pub const TX_HTSIG2_FIXED: u32 = 0x0005_0000;
@@ -298,8 +463,9 @@ pub const HW_CRYPTO_DISABLE_START: u32 = 0x3FF7_3800;
 pub const HW_CRYPTO_DISABLE_END: u32 = 0x3FF7_3814;
 /// Key table base register in MAC MMIO space.
 pub const KEY_TABLE_BASE_REG: u32 = 0x3FF7_4400;
-/// Total number of hardware crypto key table slots.
-pub const KEY_SLOT_COUNT: usize = 32;
+/// Total number of hardware crypto key table slots
+/// (`0x3FF7_4400..0x3FF7_47E8`).
+pub const KEY_SLOT_COUNT: usize = 25;
 /// Stride between consecutive hardware key slots (`0x28` bytes).
 pub const KEY_SLOT_STRIDE: u32 = 0x28;
 
@@ -314,6 +480,55 @@ pub const WDEV_RND_REG: u32 = 0x3FF7_5144;
 pub const EFUSE_BLK0_RDATA1_REG: u32 = 0x3FF5_A004;
 /// eFuse Block 0 MAC address high word register (`DR_REG_EFUSE_BASE + 0x8`).
 pub const EFUSE_BLK0_RDATA2_REG: u32 = 0x3FF5_A008;
+
+// --- ESP32 Internal DMA DRAM & MMIO Allowlist Bounds ---
+
+/// Start of ESP32 internal DMA-capable DRAM window (`MAC_RX_REG_311C`).
+pub const ESP32_DMA_DRAM_START: u32 = 0x3FFA_E000;
+/// End (inclusive) of ESP32 internal DMA-capable DRAM window.
+pub const ESP32_DMA_DRAM_END: u32 = 0x3FFF_FFFF;
+
+/// Returns `true` if `addr` is 4-byte aligned and within ESP32 internal
+/// DMA-capable DRAM (`0x3FFA_E000..=0x3FFF_FFFF`).
+#[inline]
+#[must_use]
+pub const fn is_valid_xtensa_dma_addr(addr: u32) -> bool {
+    (addr & 0x3) == 0 && addr >= ESP32_DMA_DRAM_START && addr <= ESP32_DMA_DRAM_END
+}
+
+/// Returns `true` if `addr` is a 4-byte aligned ESP32 Wi-Fi MAC, WDEV,
+/// low-rate PeriBus2, DPORT Wi-Fi clock/reset, or eFuse Block 0 MAC
+/// register permitted for MMIO reads.
+#[inline]
+#[must_use]
+pub const fn is_valid_wifi_mmio_read_addr(addr: u32) -> bool {
+    if (addr & 0x3) != 0 {
+        return false;
+    }
+    let in_wifi_mac_peribus1 = addr >= 0x3FF7_3000 && addr <= 0x3FF7_4FFF;
+    let is_wdev_rng = addr == WDEV_RND_REG;
+    let is_low_rate_peribus2 =
+        addr == MAC_LOW_RATE_DISABLE_REG_6860 || addr == MAC_LOW_RATE_DISABLE_REG_687C;
+    let is_efuse_mac = addr == EFUSE_BLK0_RDATA1_REG || addr == EFUSE_BLK0_RDATA2_REG;
+    let is_dport_wifi = addr == DPORT_WIFI_CLK_EN_REG || addr == DPORT_CORE_RST_EN_REG;
+    in_wifi_mac_peribus1 || is_wdev_rng || is_low_rate_peribus2 || is_efuse_mac || is_dport_wifi
+}
+
+/// Returns `true` if `addr` is a 4-byte aligned writable ESP32 Wi-Fi MAC or
+/// low-rate PeriBus2 MMIO register (excludes read-only eFuse, hardware RNG,
+/// and DPORT clock/reset registers managed exclusively under `phy_bridge`'s
+/// ECO 3.10 spinlock).
+#[inline]
+#[must_use]
+pub const fn is_valid_wifi_mmio_write_addr(addr: u32) -> bool {
+    if (addr & 0x3) != 0 {
+        return false;
+    }
+    let in_wifi_mac_peribus1 = addr >= 0x3FF7_3000 && addr <= 0x3FF7_4FFF;
+    let is_low_rate_peribus2 =
+        addr == MAC_LOW_RATE_DISABLE_REG_6860 || addr == MAC_LOW_RATE_DISABLE_REG_687C;
+    in_wifi_mac_peribus1 || is_low_rate_peribus2
+}
 
 // --- PHY Transmission Rates ---
 
@@ -389,13 +604,82 @@ pub enum WifiPhyRate {
 impl WifiPhyRate {
     /// Returns `true` if this PHY rate is an 802.11n High Throughput (HT) rate.
     #[inline]
+    #[must_use]
     pub const fn is_ht(self) -> bool {
         matches!(self as u8, 0x10..=0x1F)
     }
 
+    /// Returns `true` if this PHY rate uses 802.11n Short Guard Interval (SGI).
+    #[inline]
+    #[must_use]
+    pub const fn is_sgi(self) -> bool {
+        matches!(self as u8, 0x18..=0x1F)
+    }
+
     /// Returns the raw hardware rate code.
     #[inline]
+    #[must_use]
     pub const fn hw_code(self) -> u8 {
         self as u8
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_checked_slot_helpers_enforce_bounds() {
+        assert_eq!(try_bssid_filter_low_reg(0), Some(BSSID_FILTER_BASE_LOW));
+        assert_eq!(
+            try_bssid_filter_low_reg(2),
+            Some(BSSID_FILTER_BASE_LOW + 16)
+        );
+        assert_eq!(try_bssid_filter_low_reg(3), None);
+        assert_eq!(try_bssid_filter_high_reg(3), None);
+        assert_eq!(try_bssid_mask_low_reg(3), None);
+        assert_eq!(try_bssid_mask_high_ctrl_reg(3), None);
+
+        assert_eq!(try_sta_mac_low_reg(0), Some(STA_MAC_BASE_LOW));
+        assert_eq!(try_sta_mac_low_reg(2), Some(STA_MAC_BASE_LOW + 16));
+        assert_eq!(try_sta_mac_low_reg(3), None);
+        assert_eq!(try_sta_mac_high_reg(3), None);
+        assert_eq!(try_sta_mac_mask_low_reg(3), None);
+        assert_eq!(try_sta_mac_mask_high_ctrl_reg(3), None);
+
+        assert_eq!(try_rx_policy_reg(0), Some(RX_POLICY_BASE_REG));
+        assert_eq!(try_rx_policy_reg(3), Some(RX_POLICY_BASE_REG + 12));
+        assert_eq!(try_rx_policy_reg(4), None);
+    }
+
+    #[test]
+    fn test_int_rx_mask_subset_of_operational_enable() {
+        assert_eq!(INT_RX_MASK & !INT_ENABLE_OPERATIONAL, 0);
+        assert_eq!(INT_HANDLED_MASK & !INT_ENABLE_OPERATIONAL, 0);
+    }
+
+    #[test]
+    fn test_mmio_allowlist_and_dma_window() {
+        assert!(is_valid_wifi_mmio_read_addr(RX_CTRL_REG));
+        assert!(is_valid_wifi_mmio_write_addr(RX_CTRL_REG));
+        assert!(is_valid_wifi_mmio_read_addr(WDEV_RND_REG));
+        assert!(!is_valid_wifi_mmio_write_addr(WDEV_RND_REG));
+        assert!(is_valid_wifi_mmio_read_addr(EFUSE_BLK0_RDATA1_REG));
+        assert!(!is_valid_wifi_mmio_write_addr(EFUSE_BLK0_RDATA1_REG));
+        // M-016: DPORT clock/reset registers are excluded from generic MMIO writes.
+        assert!(is_valid_wifi_mmio_read_addr(DPORT_WIFI_CLK_EN_REG));
+        assert!(!is_valid_wifi_mmio_write_addr(DPORT_WIFI_CLK_EN_REG));
+        assert!(is_valid_wifi_mmio_read_addr(DPORT_CORE_RST_EN_REG));
+        assert!(!is_valid_wifi_mmio_write_addr(DPORT_CORE_RST_EN_REG));
+        assert!(!is_valid_wifi_mmio_read_addr(RX_CTRL_REG + 1));
+        assert!(!is_valid_wifi_mmio_read_addr(0x3FFB_0000));
+        assert!(!is_valid_wifi_mmio_write_addr(0x0000_0000));
+
+        assert!(is_valid_xtensa_dma_addr(0x3FFA_E000));
+        assert!(is_valid_xtensa_dma_addr(0x3FFF_FFFC));
+        assert!(!is_valid_xtensa_dma_addr(0x3FFA_E002));
+        assert!(!is_valid_xtensa_dma_addr(0x3FFA_DFFC));
+        assert!(!is_valid_xtensa_dma_addr(0x3F80_0000));
+        assert!(!is_valid_xtensa_dma_addr(0x0000_0000));
     }
 }

@@ -183,15 +183,24 @@ fn paused_flag_set_during_every_erase_and_write() {
         "Core 1 must be resumed after guard drop"
     );
 
-    // When Core 1 parking times out / fails, OTA returns HTTP 500
-    park.allow_pause.store(false, Ordering::SeqCst);
+    // When Core 1 parking times out / fails on a fresh server (since `M-043`
+    // returns `409 Conflict` once `reboot_scheduled` is true), OTA returns 500.
+    let park_500 = MockPark::new();
+    park_500.allow_pause.store(false, Ordering::SeqCst);
+    let inner_flash_500 = MockNorFlash::<8192>::new_booted_ota0();
+    let asserting_flash_500 = AssertingFlash {
+        inner: inner_flash_500,
+        is_paused: &park_500.is_paused,
+    };
+    let mut guarded_500 = GuardedFlashStorage::new(asserting_flash_500, &park_500);
+    let mut server_500 = test_server();
     let mut out_buf_500 = [0u8; 1024];
-    let resp_500 = server
+    let resp_500 = server_500
         .handle_raw_request_with_flash(
             ServerPort::Control,
             &req_bytes,
             &mut out_buf_500,
-            &mut guarded,
+            &mut guarded_500,
         )
         .expect("handle POST /update with failed parking");
 
@@ -200,7 +209,7 @@ fn paused_flag_set_during_every_erase_and_write() {
         "expected 500 when Core 1 cannot be parked"
     );
     assert!(
-        !park.is_paused.load(Ordering::SeqCst),
+        !park_500.is_paused.load(Ordering::SeqCst),
         "Core 1 must remain resumed on failure"
     );
 }
@@ -231,8 +240,17 @@ fn boot_sector1_seq2_new_then_ip_and_http_commits_valid() {
         "runtime rollback_cancelled must be false"
     );
 
-    // Phase 2: First HTTP request served
-    runtime.on_http_request_served();
+    // Phase 2: Non-2xx HTTP status must not confirm rollback; 2xx confirms it
+    runtime.on_http_request_served_status(401);
+    assert!(
+        !runtime.first_http_served,
+        "non-2xx response must not mark first_http_served"
+    );
+    runtime.on_http_request_served_status(200);
+    assert!(
+        runtime.first_http_served,
+        "2xx response must mark first_http_served"
+    );
 
     // Transient flash failure leaves rollback_cancelled false for retry
     flash.fail_writes = true;
@@ -260,15 +278,27 @@ fn boot_sector1_seq2_new_then_ip_and_http_commits_valid() {
         "runtime rollback_cancelled must be true"
     );
 
+    // M-037: Because sector 1 was the sole bootable sector (`sector 0` erased),
+    // rollback cancellation writes `(seq + 2 = 4, Valid)` atomically to sector 0
+    // without ever erasing sector 1 (zero brick window).
+    let decoded_s0 = read_otadata_record(&flash.otadata_s0);
+    assert_eq!(decoded_s0.ota_seq, 4);
+    assert_eq!(decoded_s0.state(), OtaImgState::Valid);
+    assert!(
+        decoded_s0.is_crc_valid(),
+        "persisted sector 0 CRC must be valid"
+    );
     let decoded_s1 = read_otadata_record(&flash.otadata_s1);
     assert_eq!(decoded_s1.ota_seq, 2);
-    assert_eq!(decoded_s1.state(), OtaImgState::Valid);
-    assert!(
-        decoded_s1.is_crc_valid(),
-        "persisted sector 1 CRC must be valid"
+    assert_eq!(
+        decoded_s1.state(),
+        OtaImgState::New,
+        "sole active sector 1 must remain intact without erase"
     );
 
-    // Also test direct on_wifi_got_ip_with_flash path on a second flash instance
+    // M-039: Direct `on_wifi_got_ip_with_flash` MUST NOT cancel rollback in
+    // flash before the first HTTP 2xx response is served; once HTTP 2xx is
+    // served, it delegates to `try_cancel_rollback_with_flash` and commits.
     let mut flash2: MockNorFlash<8192> = MockNorFlash::new();
     flash2.otadata_s1[..32].copy_from_slice(&s1_bytes);
     let mgr2 = OtaDataManager::load_from_flash(&mut flash2).expect("load mgr2 from flash");
@@ -277,14 +307,27 @@ fn boot_sector1_seq2_new_then_ip_and_http_commits_valid() {
 
     runtime2
         .on_wifi_got_ip_with_flash(Ipv4Addr::new(172, 22, 1, 52), &mut flash2)
-        .expect("on_wifi_got_ip_with_flash");
-
-    let decoded2 = read_otadata_record(&flash2.otadata_s1);
-    assert_eq!(decoded2.ota_seq, 2);
-    assert_eq!(decoded2.state(), OtaImgState::Valid);
+        .expect("on_wifi_got_ip_with_flash before HTTP 2xx");
     assert!(
-        decoded2.is_crc_valid(),
-        "direct got_ip path must persist Valid state with valid CRC"
+        !runtime2.rollback_cancelled,
+        "GOT_IP alone must not cancel rollback before HTTP 2xx"
+    );
+    assert_eq!(
+        read_otadata_record(&flash2.otadata_s1).state(),
+        OtaImgState::New
+    );
+
+    runtime2.on_http_request_served_status(200);
+    runtime2
+        .on_wifi_got_ip_with_flash(Ipv4Addr::new(172, 22, 1, 52), &mut flash2)
+        .expect("on_wifi_got_ip_with_flash after HTTP 2xx");
+    assert!(runtime2.rollback_cancelled);
+    let decoded2_s0 = read_otadata_record(&flash2.otadata_s0);
+    assert_eq!(decoded2_s0.ota_seq, 4);
+    assert_eq!(decoded2_s0.state(), OtaImgState::Valid);
+    assert!(
+        decoded2_s0.is_crc_valid(),
+        "post-HTTP got_ip path must persist Valid state with valid CRC"
     );
 }
 
@@ -329,12 +372,13 @@ fn seq_7_8_commits_to_seq_9_in_sector_0_and_inconsistent_otadata_returns_500() {
     );
     assert!(s0_after.is_crc_valid(), "sector 0 CRC must be valid");
 
-    // Inconsistent / corrupted otadata on flash must abort with HTTP 500
-    // without erasing application partitions
+    // M-038: Corrupting the ACTIVE sector (making flash disagree with
+    // `running_slot` or leaving neither sector bootable) must abort with HTTP
+    // 500 without erasing application partitions.
     let mut flash_corrupt: MockNorFlash<8192> = MockNorFlash::new();
     flash_corrupt.otadata_s0[..32].copy_from_slice(&s0_init);
     flash_corrupt.otadata_s1[..32].copy_from_slice(&s1_init);
-    flash_corrupt.otadata_s0[0] ^= 0x55; // Corrupt CRC in sector 0
+    flash_corrupt.otadata_s1[0] ^= 0x55; // Corrupt CRC in active sector 1
 
     let mut server_corrupt = test_server();
     server_corrupt.ota_manager = mgr;
@@ -348,16 +392,43 @@ fn seq_7_8_commits_to_seq_9_in_sector_0_and_inconsistent_otadata_returns_500() {
             &mut out_buf_corrupt,
             &mut flash_corrupt,
         )
-        .expect("handle POST /update with corrupted otadata");
+        .expect("handle POST /update with corrupted active otadata");
 
     assert!(
         resp_corrupt.starts_with(b"HTTP/1.1 500 Internal Server Error"),
-        "expected 500 on corrupted otadata flash"
+        "expected 500 on corrupted active otadata flash"
     );
     assert_eq!(
         flash_corrupt.erase_count, erases_before,
-        "corrupted otadata must abort before erasing any flash partitions"
+        "corrupted active otadata must abort before erasing any flash partitions"
     );
+
+    // M-038: Conversely, corrupting only the INACTIVE sector while the active
+    // sector (`sector_1`, seq 8, Valid) matches `running_slot` (`Ota1`) must
+    // recover cleanly by overwriting the corrupt inactive sector.
+    let mut flash_recover: MockNorFlash<8192> = MockNorFlash::new();
+    flash_recover.otadata_s0[..32].copy_from_slice(&s0_init);
+    flash_recover.otadata_s1[..32].copy_from_slice(&s1_init);
+    flash_recover.otadata_s0[28..32].copy_from_slice(&0xFFFF_FF9Au32.to_le_bytes());
+
+    let mut server_recover = test_server();
+    server_recover.ota_manager = mgr;
+    let mut out_buf_recover = [0u8; 1024];
+    let resp_recover = server_recover
+        .handle_raw_request_with_flash(
+            ServerPort::Control,
+            &req_bytes,
+            &mut out_buf_recover,
+            &mut flash_recover,
+        )
+        .expect("handle POST /update recovering corrupt inactive sector");
+    assert!(
+        resp_recover.starts_with(b"HTTP/1.1 200 OK"),
+        "corrupt inactive sector must be recoverable when active sector is valid"
+    );
+    let s0_recovered = read_otadata_record(&flash_recover.otadata_s0);
+    assert_eq!(s0_recovered.ota_seq, 9);
+    assert!(s0_recovered.is_crc_valid());
 }
 
 #[test]

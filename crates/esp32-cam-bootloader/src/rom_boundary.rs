@@ -108,15 +108,138 @@ pub trait FlashIo {
     fn erase_sector(&mut self, sector: u32) -> Result<(), FlashError>;
 }
 
+/// Minimum flash byte offset permitted for bootloader write/erase operations.
+///
+/// Protects sectors `0..9`: the 2nd-stage bootloader (`0x1000..0x8000`) and
+/// the partition table (`0x8000..0x9000`).
+pub const MIN_WRITABLE_FLASH_OFFSET: u32 = 0x9000;
+
+/// Minimum 4 KiB flash sector index permitted for bootloader erase operations.
+pub const MIN_WRITABLE_FLASH_SECTOR: u32 = MIN_WRITABLE_FLASH_OFFSET / (FLASH_SECTOR_SIZE as u32);
+
+/// ESP32 CPU core identifier accepted by Mask ROM cache and MMU routines.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CpuId {
+    /// PRO CPU (core 0).
+    Pro = 0,
+    /// APP CPU (core 1).
+    App = 1,
+}
+
+impl CpuId {
+    /// Converts a raw CPU index into a validated [`CpuId`].
+    #[inline]
+    #[must_use]
+    pub const fn try_from_u32(cpu: u32) -> Option<Self> {
+        match cpu {
+            0 => Some(Self::Pro),
+            1 => Some(Self::App),
+            _ => None,
+        }
+    }
+
+    /// Returns the raw hardware CPU index (`0` or `1`).
+    #[inline]
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Returns `true` if `cpu` is a valid ESP32 CPU index (`0` or `1`).
+#[inline]
+#[must_use]
+pub const fn is_valid_cpu_id(cpu: u32) -> bool {
+    CpuId::try_from_u32(cpu).is_some()
+}
+
+/// Validates flash read offset, length, and 4-byte aligned read ceiling
+/// against `chip_size` before issuing SPI flash I/O.
+#[inline]
+pub const fn validate_rom_read_bounds(
+    offset: u32,
+    len: usize,
+    chip_size: u32,
+) -> Result<(), FlashError> {
+    if chip_size == 0 || len > u32::MAX as usize {
+        return Err(FlashError::OutOfBounds);
+    }
+    let len_u32 = len as u32;
+    let Some(end) = offset.checked_add(len_u32) else {
+        return Err(FlashError::OutOfBounds);
+    };
+    if end > chip_size {
+        return Err(FlashError::OutOfBounds);
+    }
+    if len_u32 > 0 {
+        let Some(aligned_end_raw) = end.checked_add(3) else {
+            return Err(FlashError::OutOfBounds);
+        };
+        let aligned_end = aligned_end_raw & !3;
+        if aligned_end > chip_size {
+            return Err(FlashError::OutOfBounds);
+        }
+    }
+    Ok(())
+}
+
+/// Validates flash write alignment, protected bootloader/partition-table
+/// floor, overflow safety, and `chip_size` ceiling before SPI flash I/O.
+#[inline]
+pub const fn validate_rom_write_bounds(
+    offset: u32,
+    len: usize,
+    chip_size: u32,
+) -> Result<(), FlashError> {
+    if (offset & 3) != 0 || (len & 3) != 0 {
+        return Err(FlashError::UnalignedLength);
+    }
+    if chip_size == 0 || len > u32::MAX as usize {
+        return Err(FlashError::OutOfBounds);
+    }
+    if offset < MIN_WRITABLE_FLASH_OFFSET {
+        return Err(FlashError::OutOfBounds);
+    }
+    let len_u32 = len as u32;
+    let Some(end) = offset.checked_add(len_u32) else {
+        return Err(FlashError::OutOfBounds);
+    };
+    if end > chip_size {
+        return Err(FlashError::OutOfBounds);
+    }
+    Ok(())
+}
+
+/// Validates flash sector index against protected bootloader/partition-table
+/// sectors and `chip_size` before issuing SPI flash sector erase.
+#[inline]
+pub const fn validate_rom_erase_sector(sector: u32, chip_size: u32) -> Result<(), FlashError> {
+    if sector < MIN_WRITABLE_FLASH_SECTOR {
+        return Err(FlashError::OutOfBounds);
+    }
+    let sector_count = chip_size / (FLASH_SECTOR_SIZE as u32);
+    if sector >= sector_count {
+        return Err(FlashError::OutOfBounds);
+    }
+    Ok(())
+}
+
 /// Cache disable, flush, MMU mapping, and UART synchronization contract.
 pub trait CacheControl {
     /// Disables and flushes cache across PRO and APP CPUs.
     fn disable_and_flush(&mut self);
 
+    /// Initializes the Flash MMU table for the specified CPU (`0` or `1`).
+    fn mmu_init(&mut self, cpu: u32);
+
     /// Maps virtual address to physical flash pages in 64 KiB increments.
     fn mmu_map_pages(&mut self, cpu: u32, vaddr: u32, paddr: u32, page_count: u32) -> bool;
 
-    /// Re-enables cache for the specified CPU.
+    /// Flushes cache lines for the specified CPU (`0` or `1`).
+    fn flush_cache(&mut self, cpu: u32);
+
+    /// Re-enables cache for the specified CPU (`0` or `1`).
     fn enable_cache(&mut self, cpu: u32);
 
     /// Drains any pending UART0 transmission FIFO.
@@ -230,9 +353,13 @@ impl MockCache {
 impl CacheControl for MockCache {
     fn disable_and_flush(&mut self) {}
 
-    fn mmu_map_pages(&mut self, _cpu: u32, _vaddr: u32, _paddr: u32, _page_count: u32) -> bool {
-        true
+    fn mmu_init(&mut self, _cpu: u32) {}
+
+    fn mmu_map_pages(&mut self, cpu: u32, _vaddr: u32, _paddr: u32, _page_count: u32) -> bool {
+        is_valid_cpu_id(cpu)
     }
+
+    fn flush_cache(&mut self, _cpu: u32) {}
 
     fn enable_cache(&mut self, _cpu: u32) {}
 
@@ -242,17 +369,40 @@ impl CacheControl for MockCache {
 }
 
 #[cfg(target_arch = "xtensa")]
+use core::sync::atomic::AtomicBool;
+#[cfg(target_arch = "xtensa")]
+use core::sync::atomic::Ordering;
+
+#[cfg(target_arch = "xtensa")]
 use crate::clock_spi_psram::RomSpiflashChip;
+
+#[cfg(target_arch = "xtensa")]
+static ROM_FLASH_TAKEN: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_arch = "xtensa")]
+static ROM_CACHE_TAKEN: AtomicBool = AtomicBool::new(false);
+
+/// Maximum poll iterations when waiting for SPI NOR WIP bit to clear.
+///
+/// With a 10 us delay per poll, 50,000 iterations caps wait time at ~500 ms.
+#[cfg(target_arch = "xtensa")]
+const FLASH_WIP_MAX_POLLS: u32 = 50_000;
+
+/// Microsecond delay between RDSR (0x05) WIP polls.
+#[cfg(target_arch = "xtensa")]
+const FLASH_WIP_POLL_DELAY_US: u32 = 10;
 
 #[cfg(target_arch = "xtensa")]
 // JUSTIFICATION: Mask ROM hardware functions for ESP32 Xtensa target
 // require FFI linkage.
-// SAFETY: Hardware functions match ESP32 ROM symbol addresses in linkall.x.
+// SAFETY: Hardware functions match ESP32 ROM symbol addresses in linkall.x
+// and ESP-IDF `esp32/rom/{spi_flash,cache,uart,ets_sys}.h` C signatures.
 extern "C" {
     static mut g_rom_flashchip: RomSpiflashChip;
     fn esp_rom_spiflash_wait_idle(spi: *mut RomSpiflashChip) -> i32;
     fn esp_rom_spiflash_read_user_cmd(status: *mut u32, cmd: u8) -> i32;
 
+    fn mmu_init(cpu: u32);
     fn Cache_Read_Disable_rom(cpu: u32);
     fn Cache_Flush_rom(cpu: u32);
     fn cache_flash_mmu_set_rom(
@@ -264,12 +414,19 @@ extern "C" {
         page_count: u32,
     ) -> u32;
     fn Cache_Read_Enable_rom(cpu: u32);
-    fn uart_tx_flush(uart_no: u8);
+    fn uart_tx_flush(uart_no: u8) -> i32;
     fn ets_delay_us(us: u32);
 
-    fn esp_rom_spiflash_read(src_addr: u32, dest: *mut u32, len: u32) -> i32;
-    fn esp_rom_spiflash_write(dest_addr: u32, src: *const u32, len: u32) -> i32;
+    fn esp_rom_spiflash_read(src_addr: u32, dest: *mut u32, len: i32) -> i32;
+    fn esp_rom_spiflash_write(dest_addr: u32, src: *const u32, len: i32) -> i32;
     fn esp_rom_spiflash_erase_sector(sector_num: u32) -> i32;
+}
+
+#[cfg(target_arch = "xtensa")]
+fn rom_flash_chip_size() -> u32 {
+    // JUSTIFICATION: Reading flash capacity from ESP32 ROM chip descriptor.
+    // SAFETY: `g_rom_flashchip` is initialized by Mask ROM and flash attach.
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(g_rom_flashchip.chip_size)) }
 }
 
 #[cfg(target_arch = "xtensa")]
@@ -283,7 +440,7 @@ fn wait_flash_wip_clear(err: FlashError) -> Result<(), FlashError> {
     }
 
     let mut status = 0x01_u32;
-    for _ in 0..10_000_000 {
+    for _ in 0..FLASH_WIP_MAX_POLLS {
         // JUSTIFICATION: Mask ROM read user command queries RDSR (0x05) to
         // check WIP bit.
         // SAFETY: Pointer to local stack variable `status` is valid for
@@ -295,27 +452,48 @@ fn wait_flash_wip_clear(err: FlashError) -> Result<(), FlashError> {
         if (status & 0x01) == 0 {
             return Ok(());
         }
+        // JUSTIFICATION: Bounded delay prevents tight-loop WDT starvation.
+        // SAFETY: Mask ROM `ets_delay_us` accepts any `u32` microsecond count.
+        unsafe {
+            ets_delay_us(FLASH_WIP_POLL_DELAY_US);
+        }
     }
     Err(err)
 }
 
-/// Xtensa Mask ROM SPI flash driver.
+/// Xtensa Mask ROM SPI flash singleton driver.
 #[cfg(target_arch = "xtensa")]
-#[derive(Debug, Default, Clone, Copy)]
-pub struct RomFlash;
+#[derive(Debug)]
+pub struct RomFlash {
+    _private: (),
+}
 
 #[cfg(target_arch = "xtensa")]
 impl RomFlash {
-    /// Creates a new [`RomFlash`] interface.
+    /// Claims exclusive ownership of the Mask ROM SPI flash singleton.
+    ///
+    /// Returns `None` if the singleton has already been claimed.
     #[must_use]
-    pub const fn new() -> Self {
-        Self
+    pub fn take() -> Option<Self> {
+        if ROM_FLASH_TAKEN
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            Some(Self { _private: () })
+        } else {
+            None
+        }
     }
 }
 
 #[cfg(target_arch = "xtensa")]
 impl FlashIo for RomFlash {
     fn read(&mut self, mut offset: u32, mut buf: &mut [u8]) -> Result<(), FlashError> {
+        let chip_size = rom_flash_chip_size();
+        validate_rom_read_bounds(offset, buf.len(), chip_size)?;
+        if buf.is_empty() {
+            return Ok(());
+        }
         wait_flash_wip_clear(FlashError::ReadFailed)?;
         let mut bounce = AlignedBounce64::new();
         while !buf.is_empty() {
@@ -323,12 +501,14 @@ impl FlashIo for RomFlash {
             let misalign = (offset & 3) as usize;
             let max_payload = 64 - misalign;
             let chunk_len = buf.len().min(max_payload);
-            let flash_read_len = ((misalign + chunk_len + 3) & !3) as u32;
+            let flash_read_len_usize = (misalign + chunk_len + 3) & !3;
+            let flash_read_len =
+                i32::try_from(flash_read_len_usize).map_err(|_| FlashError::OutOfBounds)?;
 
             // JUSTIFICATION: Mask ROM SPI flash read requires a 4-byte aligned
             // destination buffer.
             // SAFETY: `bounce.bytes` is 4-byte aligned by `#[repr(C, align(4))]`,
-            // and `flash_read_len <= 64`.
+            // `flash_read_len <= 64`, and span was validated against `chip_size`.
             let res = unsafe {
                 esp_rom_spiflash_read(
                     aligned_addr,
@@ -341,23 +521,27 @@ impl FlashIo for RomFlash {
             }
 
             buf[..chunk_len].copy_from_slice(&bounce.bytes[misalign..misalign + chunk_len]);
-            offset = offset
-                .checked_add(chunk_len as u32)
-                .ok_or(FlashError::OutOfBounds)?;
             buf = &mut buf[chunk_len..];
+            if !buf.is_empty() {
+                offset = offset
+                    .checked_add(chunk_len as u32)
+                    .ok_or(FlashError::OutOfBounds)?;
+            }
         }
         Ok(())
     }
 
-    #[allow(clippy::manual_is_multiple_of)]
     fn write(&mut self, mut offset: u32, mut data: &[u8]) -> Result<(), FlashError> {
-        if offset % 4 != 0 || data.len() % 4 != 0 {
-            return Err(FlashError::UnalignedLength);
+        let chip_size = rom_flash_chip_size();
+        validate_rom_write_bounds(offset, data.len(), chip_size)?;
+        if data.is_empty() {
+            return Ok(());
         }
 
         let mut bounce = AlignedBounce64::new();
         while !data.is_empty() {
             let chunk_len = next_program_chunk_len(offset, data.len());
+            let chunk_len_i32 = i32::try_from(chunk_len).map_err(|_| FlashError::OutOfBounds)?;
             bounce.bytes[..chunk_len].copy_from_slice(&data[..chunk_len]);
 
             wait_flash_wip_clear(FlashError::WriteFailed)?;
@@ -365,13 +549,9 @@ impl FlashIo for RomFlash {
             // JUSTIFICATION: Mask ROM SPI flash write requires 4-byte aligned
             // source buffer and 4-byte aligned length.
             // SAFETY: `bounce.bytes` is 4-byte aligned by `#[repr(C, align(4))]`,
-            // and `chunk_len % 4 == 0` because chunks are multiples of 4.
+            // `chunk_len % 4 == 0`, and span was validated against `chip_size`.
             let res = unsafe {
-                esp_rom_spiflash_write(
-                    offset,
-                    bounce.bytes.as_ptr() as *const u32,
-                    chunk_len as u32,
-                )
+                esp_rom_spiflash_write(offset, bounce.bytes.as_ptr() as *const u32, chunk_len_i32)
             };
             if res != 0 {
                 return Err(FlashError::WriteFailed);
@@ -379,19 +559,24 @@ impl FlashIo for RomFlash {
 
             wait_flash_wip_clear(FlashError::WriteFailed)?;
 
-            offset = offset
-                .checked_add(chunk_len as u32)
-                .ok_or(FlashError::OutOfBounds)?;
             data = &data[chunk_len..];
+            if !data.is_empty() {
+                offset = offset
+                    .checked_add(chunk_len as u32)
+                    .ok_or(FlashError::OutOfBounds)?;
+            }
         }
         Ok(())
     }
 
     fn erase_sector(&mut self, sector: u32) -> Result<(), FlashError> {
+        let chip_size = rom_flash_chip_size();
+        validate_rom_erase_sector(sector, chip_size)?;
         wait_flash_wip_clear(FlashError::EraseFailed)?;
         // JUSTIFICATION: Calling Mask ROM SPI flash erase function for
         // sector erasure.
-        // SAFETY: `sector` is a 32-bit sector index accepted by ROM function.
+        // SAFETY: `sector` was validated against protected sectors and
+        // `g_rom_flashchip.chip_size`.
         let res = unsafe { esp_rom_spiflash_erase_sector(sector) };
         if res != 0 {
             return Err(FlashError::EraseFailed);
@@ -401,17 +586,28 @@ impl FlashIo for RomFlash {
     }
 }
 
-/// Xtensa Mask ROM cache and MMU controller.
+/// Xtensa Mask ROM cache and MMU singleton controller.
 #[cfg(target_arch = "xtensa")]
-#[derive(Debug, Default, Clone, Copy)]
-pub struct RomCache;
+#[derive(Debug)]
+pub struct RomCache {
+    _private: (),
+}
 
 #[cfg(target_arch = "xtensa")]
 impl RomCache {
-    /// Creates a new [`RomCache`] interface.
+    /// Claims exclusive ownership of the Mask ROM cache singleton.
+    ///
+    /// Returns `None` if the singleton has already been claimed.
     #[must_use]
-    pub const fn new() -> Self {
-        Self
+    pub fn take() -> Option<Self> {
+        if ROM_CACHE_TAKEN
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            Some(Self { _private: () })
+        } else {
+            None
+        }
     }
 }
 
@@ -419,33 +615,60 @@ impl RomCache {
 impl CacheControl for RomCache {
     fn disable_and_flush(&mut self) {
         // JUSTIFICATION: ESP32 dual-core cache disable and flush required
-        // before MMU re-mapping.
+        // before SPI flash reads and MMU re-mapping.
         // SAFETY: Calling Cache_Read_Disable_rom and Cache_Flush_rom for
-        // CPU 0 (PRO) and CPU 1 (APP).
+        // validated CPU IDs 0 (PRO) and 1 (APP).
         unsafe {
-            Cache_Read_Disable_rom(0);
-            Cache_Read_Disable_rom(1);
-            Cache_Flush_rom(0);
-            Cache_Flush_rom(1);
+            Cache_Read_Disable_rom(CpuId::Pro.as_u32());
+            Cache_Read_Disable_rom(CpuId::App.as_u32());
+            Cache_Flush_rom(CpuId::Pro.as_u32());
+            Cache_Flush_rom(CpuId::App.as_u32());
+        }
+    }
+
+    fn mmu_init(&mut self, cpu: u32) {
+        let Some(cpu_id) = CpuId::try_from_u32(cpu) else {
+            return;
+        };
+        // JUSTIFICATION: ESP32 Mask ROM MMU table reset for the target CPU.
+        // SAFETY: `cpu_id` is validated to be 0 (PRO) or 1 (APP).
+        unsafe {
+            mmu_init(cpu_id.as_u32());
         }
     }
 
     fn mmu_map_pages(&mut self, cpu: u32, vaddr: u32, paddr: u32, page_count: u32) -> bool {
+        let Some(cpu_id) = CpuId::try_from_u32(cpu) else {
+            return false;
+        };
+        let cpu_raw = cpu_id.as_u32();
         // JUSTIFICATION: ESP32 Mask ROM MMU configuration to map virtual
         // address to physical flash address.
-        // SAFETY: Calling cache_flash_mmu_set_rom with valid CPU ID (0 or 1),
-        // PID 0, and 64KB page size.
-        let ret = unsafe { cache_flash_mmu_set_rom(cpu, 0, vaddr, paddr, 64, page_count) };
+        // SAFETY: `cpu_raw` is validated (0 or 1), PID is 0, page size 64 KiB.
+        let ret = unsafe { cache_flash_mmu_set_rom(cpu_raw, 0, vaddr, paddr, 64, page_count) };
         ret == 0
     }
 
-    fn enable_cache(&mut self, cpu: u32) {
-        // JUSTIFICATION: ESP32 Mask ROM cache enable after MMU re-mapping.
-        // SAFETY: Calling Cache_Flush_rom and Cache_Read_Enable_rom on
-        // the requested CPU.
+    fn flush_cache(&mut self, cpu: u32) {
+        let Some(cpu_id) = CpuId::try_from_u32(cpu) else {
+            return;
+        };
+        // JUSTIFICATION: ESP32 Mask ROM cache flush after MMU update.
+        // SAFETY: `cpu_id` is validated to be 0 (PRO) or 1 (APP).
         unsafe {
-            Cache_Flush_rom(cpu);
-            Cache_Read_Enable_rom(cpu);
+            Cache_Flush_rom(cpu_id.as_u32());
+        }
+    }
+
+    fn enable_cache(&mut self, cpu: u32) {
+        let Some(cpu_id) = CpuId::try_from_u32(cpu) else {
+            return;
+        };
+        // JUSTIFICATION: ESP32 Mask ROM cache enable after MMU re-mapping.
+        // SAFETY: `cpu_id` is validated to be 0 (PRO) or 1 (APP).
+        unsafe {
+            Cache_Flush_rom(cpu_id.as_u32());
+            Cache_Read_Enable_rom(cpu_id.as_u32());
         }
     }
 
@@ -453,9 +676,7 @@ impl CacheControl for RomCache {
         // JUSTIFICATION: ESP32 Mask ROM UART flush to drain output before
         // boot transitions.
         // SAFETY: Calling uart_tx_flush with valid UART ID 0.
-        unsafe {
-            uart_tx_flush(0);
-        }
+        let _status: i32 = unsafe { uart_tx_flush(0) };
     }
 
     fn delay_us(&mut self, us: u32) {
@@ -549,10 +770,86 @@ mod tests {
     fn test_mock_cache() {
         let mut cache = MockCache::new();
         cache.disable_and_flush();
+        cache.mmu_init(0);
+        cache.mmu_init(1);
         assert!(cache.mmu_map_pages(0, 0x3F40_0000, 0x20000, 1));
+        assert!(cache.mmu_map_pages(1, 0x3F40_0000, 0x20000, 1));
+        assert!(!cache.mmu_map_pages(2, 0x3F40_0000, 0x20000, 1));
+        cache.flush_cache(1);
         cache.enable_cache(0);
         cache.flush_uart0();
         cache.delay_us(10);
+    }
+
+    #[test]
+    fn test_cpu_id_validation() {
+        assert_eq!(CpuId::try_from_u32(0), Some(CpuId::Pro));
+        assert_eq!(CpuId::try_from_u32(1), Some(CpuId::App));
+        assert_eq!(CpuId::try_from_u32(2), None);
+        assert_eq!(CpuId::try_from_u32(u32::MAX), None);
+        assert!(is_valid_cpu_id(0));
+        assert!(is_valid_cpu_id(1));
+        assert!(!is_valid_cpu_id(2));
+    }
+
+    #[test]
+    fn test_rom_flash_bounds_validators() {
+        const CHIP_4M: u32 = 4 * 1024 * 1024;
+
+        // Read validation: partition table at 0x8000 allowed, overflow/OOB rejected.
+        assert_eq!(validate_rom_read_bounds(0x8000, 32, CHIP_4M), Ok(()));
+        assert_eq!(validate_rom_read_bounds(CHIP_4M - 4, 4, CHIP_4M), Ok(()));
+        assert_eq!(
+            validate_rom_read_bounds(CHIP_4M - 2, 4, CHIP_4M),
+            Err(FlashError::OutOfBounds)
+        );
+        assert_eq!(
+            validate_rom_read_bounds(u32::MAX - 2, 4, CHIP_4M),
+            Err(FlashError::OutOfBounds)
+        );
+        assert_eq!(
+            validate_rom_read_bounds(0x8000, 32, 0),
+            Err(FlashError::OutOfBounds)
+        );
+
+        // Write validation: protects < 0x9000, alignment, overflow, chip_size.
+        assert_eq!(validate_rom_write_bounds(0x9000, 32, CHIP_4M), Ok(()));
+        assert_eq!(
+            validate_rom_write_bounds(0x1000, 32, CHIP_4M),
+            Err(FlashError::OutOfBounds)
+        );
+        assert_eq!(
+            validate_rom_write_bounds(0x8000, 32, CHIP_4M),
+            Err(FlashError::OutOfBounds)
+        );
+        assert_eq!(
+            validate_rom_write_bounds(0x9002, 32, CHIP_4M),
+            Err(FlashError::UnalignedLength)
+        );
+        assert_eq!(
+            validate_rom_write_bounds(0x9000, 30, CHIP_4M),
+            Err(FlashError::UnalignedLength)
+        );
+        assert_eq!(
+            validate_rom_write_bounds(u32::MAX - 3, 8, CHIP_4M),
+            Err(FlashError::OutOfBounds)
+        );
+
+        // Erase validation: protects sectors 0..9 and rejects >= chip_size/4K.
+        assert_eq!(validate_rom_erase_sector(9, CHIP_4M), Ok(()));
+        assert_eq!(validate_rom_erase_sector(1023, CHIP_4M), Ok(()));
+        assert_eq!(
+            validate_rom_erase_sector(0, CHIP_4M),
+            Err(FlashError::OutOfBounds)
+        );
+        assert_eq!(
+            validate_rom_erase_sector(8, CHIP_4M),
+            Err(FlashError::OutOfBounds)
+        );
+        assert_eq!(
+            validate_rom_erase_sector(1024, CHIP_4M),
+            Err(FlashError::OutOfBounds)
+        );
     }
 
     #[test]

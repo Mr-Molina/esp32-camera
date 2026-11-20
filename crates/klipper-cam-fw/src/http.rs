@@ -9,10 +9,13 @@ use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use esp32_cam_types::{CameraError, FrameSize};
 
-use crate::config::KlipperCamConfig;
+use crate::config::{IpMode, Ipv4Addr, KlipperCamConfig};
 use crate::ota::{
     validate_ota_image_header, NoOpFlashStorage, OtaDataManager, OtaError, OtaFlashStorage,
     OtaSlot, OTA_PARTITION_MAX_SIZE,
+};
+use crate::prov_store::{
+    ProvStore, ProvStoreError, ProvisionedConfig, MAX_OTA_TOKEN_LEN, MAX_PASS_LEN, MAX_SSID_LEN,
 };
 use crate::telemetry::FwStatsSnapshot;
 
@@ -28,8 +31,8 @@ pub const MJPEG_CONTENT_TYPE: &str =
 /// `APP-013`).
 pub const MAX_URL_QUERY_LEN: usize = 256;
 
-/// Stack buffer size for `GET /status` JSON serialization (`1024` bytes).
-pub const STATUS_JSON_BUF_LEN: usize = 1024;
+/// Stack buffer size for `GET /status` JSON serialization (`1536` bytes).
+pub const STATUS_JSON_BUF_LEN: usize = 1536;
 
 /// Stack buffer size for `GET /control` JSON serialization (`384` bytes).
 pub const CONTROL_JSON_BUF_LEN: usize = 384;
@@ -286,8 +289,127 @@ fn parse_isize_ascii(s: &str) -> Option<isize> {
     Some(val)
 }
 
+/// Returns `true` if `b` is a valid RFC 9110 §5.6.2 token character (`tchar`).
+#[inline]
+const fn is_http_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// Trims only RFC 9110 §5.6.3 optional whitespace (`SP` / `HTAB`), never
+/// stripping vertical tabs, form feeds, CR/LF, or Unicode whitespace.
+#[inline]
+fn trim_ows(s: &str) -> &str {
+    s.trim_matches(|c| c == ' ' || c == '\t')
+}
+
+/// Returns `true` if `s` contains only valid RFC 9110 ASCII field-value bytes
+/// (`HTAB` or printable ASCII `0x20..=0x7E`), rejecting bare CR/LF, `0x0B`,
+/// other CTLs, and non-ASCII/Unicode whitespace.
+#[inline]
+fn is_valid_field_value_bytes(s: &str) -> bool {
+    s.bytes().all(|b| b == b'\t' || (0x20..=0x7E).contains(&b))
+}
+
+/// Parses an RFC 9110 §7.2 `host[:port]` authority into `(host, Option<port>)`.
+///
+/// Rejects userinfo (`@`), paths (`/`), queries (`?`), fragments (`#`),
+/// whitespace, empty labels, leading/trailing hyphens, port `0`, or ports
+/// exceeding `65535`.
+fn parse_http_host_port(authority: &str) -> Option<(&str, Option<u16>)> {
+    if authority.is_empty() {
+        return None;
+    }
+    if authority.starts_with('[') {
+        let close_idx = authority.find(']')?;
+        let inner = &authority[1..close_idx];
+        if inner.is_empty()
+            || !inner.contains(':')
+            || !inner
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
+        {
+            return None;
+        }
+        let host_part = &authority[..=close_idx];
+        let rest = &authority[close_idx + 1..];
+        if rest.is_empty() {
+            return Some((host_part, None));
+        }
+        let port_str = rest.strip_prefix(':')?;
+        let port = parse_http_port(port_str)?;
+        return Some((host_part, Some(port)));
+    }
+
+    let (host_part, port) = match authority.split_once(':') {
+        Some((h, port_str)) => {
+            if port_str.contains(':') {
+                return None;
+            }
+            (h, Some(parse_http_port(port_str)?))
+        }
+        None => (authority, None),
+    };
+
+    if host_part.is_empty() || host_part.len() > 253 {
+        return None;
+    }
+    for label in host_part.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return None;
+        }
+        let bytes = label.as_bytes();
+        if !bytes[0].is_ascii_alphanumeric() || !bytes[bytes.len() - 1].is_ascii_alphanumeric() {
+            return None;
+        }
+        if !bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+        {
+            return None;
+        }
+    }
+    Some((host_part, port))
+}
+
+/// Parses a strict numeric TCP port (`1..=65535`, ASCII digits only).
+fn parse_http_port(s: &str) -> Option<u16> {
+    if s.is_empty() || s.len() > 5 || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let port = s.parse::<u16>().ok()?;
+    if port == 0 {
+        None
+    } else {
+        Some(port)
+    }
+}
+
+/// Returns `true` if `host` conforms to strict RFC 9110 `host[:port]` syntax.
+#[inline]
+pub fn is_valid_http_host(host: &str) -> bool {
+    parse_http_host_port(host).is_some()
+}
+
 /// Zero-allocation HTTP/1.1 request parser (`#![no_std]`).
-/// Enforces RFC 9112 request-line and header syntax invariants (`SEC-201`).
+/// Enforces RFC 9110/9112 request-line and header syntax invariants
+/// (`SEC-201`).
 pub fn parse_http_request(raw: &[u8]) -> Result<HttpRequest<'_>, HttpError> {
     let hdr_end = find_subslice(raw, b"\r\n\r\n").ok_or(HttpError::MalformedRequest)?;
     let header_block = core::str::from_utf8(&raw[..hdr_end]).map_err(|_| HttpError::InvalidUtf8)?;
@@ -296,11 +418,22 @@ pub fn parse_http_request(raw: &[u8]) -> Result<HttpRequest<'_>, HttpError> {
     let request_line = lines
         .find(|l| !l.is_empty())
         .ok_or(HttpError::MalformedRequest)?;
-    let mut parts = request_line.split(' ').filter(|s| !s.is_empty());
+    // Reject bare CR/LF, CTLs, and non-ASCII bytes in request-line (M-044).
+    if !request_line.bytes().all(|b| (0x20..=0x7E).contains(&b)) {
+        return Err(HttpError::MalformedRequest);
+    }
+
+    // Enforce exact single-SP delimiters per RFC 9112 §3 (M-141).
+    let mut parts = request_line.split(' ');
     let method_str = parts.next().ok_or(HttpError::MalformedRequest)?;
     let target_str = parts.next().ok_or(HttpError::MalformedRequest)?;
     let version = parts.next().ok_or(HttpError::MalformedRequest)?;
-    if parts.next().is_some() {
+    if parts.next().is_some()
+        || method_str.is_empty()
+        || !method_str.bytes().all(is_http_tchar)
+        || target_str.is_empty()
+        || version.is_empty()
+    {
         return Err(HttpError::MalformedRequest);
     }
 
@@ -340,14 +473,18 @@ pub fn parse_http_request(raw: &[u8]) -> Result<HttpRequest<'_>, HttpError> {
 
     for line in lines {
         if line.is_empty() {
-            continue;
+            return Err(HttpError::MalformedRequest);
         }
         let colon = line.find(':').ok_or(HttpError::MalformedRequest)?;
         let name = &line[..colon];
-        if name.is_empty() || name.bytes().any(|b| b.is_ascii_whitespace()) {
+        if name.is_empty() || !name.bytes().all(is_http_tchar) {
             return Err(HttpError::MalformedRequest);
         }
-        let val = line[colon + 1..].trim();
+        let raw_val = &line[colon + 1..];
+        if !is_valid_field_value_bytes(raw_val) {
+            return Err(HttpError::MalformedRequest);
+        }
+        let val = trim_ows(raw_val);
         if name.eq_ignore_ascii_case("X-OTA-Token") {
             if ota_token.is_some() {
                 return Err(HttpError::MalformedRequest);
@@ -370,9 +507,12 @@ pub fn parse_http_request(raw: &[u8]) -> Result<HttpRequest<'_>, HttpError> {
             }
             content_length = Some(cl);
         } else if name.eq_ignore_ascii_case("Content-Type") {
+            if content_type.is_some() {
+                return Err(HttpError::MalformedRequest);
+            }
             content_type = Some(val);
         } else if name.eq_ignore_ascii_case("Host") {
-            if host.is_some() {
+            if host.is_some() || !is_valid_http_host(val) {
                 return Err(HttpError::MalformedRequest);
             }
             host = Some(val);
@@ -386,12 +526,13 @@ pub fn parse_http_request(raw: &[u8]) -> Result<HttpRequest<'_>, HttpError> {
         }
     }
 
-    let mut body = &raw[hdr_end + 4..];
-    if let Some(cl) = content_length {
-        if raw.len() > hdr_end + 4 + cl {
-            body = &raw[hdr_end + 4..hdr_end + 4 + cl];
-        }
-    }
+    // RFC 9112 §6.3: without Content-Length (and Transfer-Encoding is
+    // rejected above), message body length is 0 (M-141).
+    let body = if content_length.is_some() {
+        &raw[hdr_end + 4..]
+    } else {
+        &[]
+    };
 
     Ok(HttpRequest {
         method,
@@ -409,26 +550,41 @@ pub fn parse_http_request(raw: &[u8]) -> Result<HttpRequest<'_>, HttpError> {
 }
 
 /// Returns `true` if the browser-supplied `origin` (`scheme://host[:port]`)
-/// names the same host and port as the request's `Host` header
-/// (`FW-NET-27`). A missing `Host`, an opaque `null` origin or any mismatch
-/// is cross-origin.
-pub fn is_same_origin(origin: &str, host: Option<&str>) -> bool {
-    let Some(host) = host else {
+/// matches `expected_scheme`, `host`, and effective port (normalizing an
+/// omitted port to `default_port`) per RFC 6454 §4 (`M-046` / `FW-NET-27`).
+pub fn is_same_origin_for_scheme(
+    origin: &str,
+    host: Option<&str>,
+    expected_scheme: &str,
+    default_port: u16,
+) -> bool {
+    let Some(host_str) = host else {
         return false;
     };
-    let (origin_authority, default_port) = if let Some(rest) = origin.strip_prefix("http://") {
-        (rest, ":80")
-    } else if let Some(rest) = origin.strip_prefix("https://") {
-        (rest, ":443")
-    } else {
+    let Some((scheme, origin_authority)) = origin.split_once("://") else {
         return false;
     };
-    fn without_port<'s>(authority: &'s str, default_port: &str) -> &'s str {
-        authority.strip_suffix(default_port).unwrap_or(authority)
+    if !scheme.eq_ignore_ascii_case(expected_scheme) {
+        return false;
     }
-    let o = without_port(origin_authority, default_port);
-    let h = without_port(host, default_port);
-    !o.is_empty() && o.eq_ignore_ascii_case(h)
+    let Some((origin_host, origin_port)) = parse_http_host_port(origin_authority) else {
+        return false;
+    };
+    let Some((host_name, host_port)) = parse_http_host_port(host_str) else {
+        return false;
+    };
+    let eff_origin_port = origin_port.unwrap_or(default_port);
+    let eff_host_port = host_port.unwrap_or(default_port);
+    origin_host.eq_ignore_ascii_case(host_name) && eff_origin_port == eff_host_port
+}
+
+/// Returns `true` if the browser-supplied `origin` (`http://host[:port]`)
+/// names the same plaintext HTTP origin (scheme, host, and effective port) as
+/// the request's `Host` header (`FW-NET-27`). A missing `Host`, an opaque
+/// `null` origin, a non-`http` scheme, or any host/port mismatch is
+/// cross-origin.
+pub fn is_same_origin(origin: &str, host: Option<&str>) -> bool {
+    is_same_origin_for_scheme(origin, host, "http", 80)
 }
 
 /// Status line and body for a refused request (no CORS header).
@@ -475,12 +631,28 @@ impl<'a> HttpResponseView<'a> {
 
         let mut lines = headers_raw.split("\r\n");
         let status_line = lines.next().ok_or(HttpError::MalformedRequest)?;
-        let mut status_parts = status_line.split_whitespace();
-        let _http_ver = status_parts.next().ok_or(HttpError::MalformedRequest)?;
-        let code_str = status_parts.next().ok_or(HttpError::MalformedRequest)?;
-        let status_code = parse_isize_ascii(code_str)
-            .and_then(|v| u16::try_from(v).ok())
+        if !status_line.bytes().all(|b| (0x20..=0x7E).contains(&b)) {
+            return Err(HttpError::MalformedRequest);
+        }
+        let (http_ver, rest) = status_line
+            .split_once(' ')
             .ok_or(HttpError::MalformedRequest)?;
+        if http_ver != "HTTP/1.1" && http_ver != "HTTP/1.0" {
+            return Err(HttpError::MalformedRequest);
+        }
+        let code_str = match rest.split_once(' ') {
+            Some((code, _reason)) => code,
+            None => rest,
+        };
+        if code_str.len() != 3 || !code_str.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(HttpError::MalformedRequest);
+        }
+        let status_code = code_str
+            .parse::<u16>()
+            .map_err(|_| HttpError::MalformedRequest)?;
+        if !(100..=599).contains(&status_code) {
+            return Err(HttpError::MalformedRequest);
+        }
 
         let mut content_type = None;
         let mut content_disposition = None;
@@ -489,20 +661,44 @@ impl<'a> HttpResponseView<'a> {
         let mut x_framerate = None;
 
         for line in lines {
-            if let Some(colon) = line.find(':') {
-                let name = line[..colon].trim();
-                let val = line[colon + 1..].trim();
-                if name.eq_ignore_ascii_case("Content-Type") {
-                    content_type = Some(val);
-                } else if name.eq_ignore_ascii_case("Content-Disposition") {
-                    content_disposition = Some(val);
-                } else if name.eq_ignore_ascii_case("Access-Control-Allow-Origin") {
-                    access_control_allow_origin = Some(val);
-                } else if name.eq_ignore_ascii_case("Cache-Control") {
-                    cache_control = Some(val);
-                } else if name.eq_ignore_ascii_case("X-Framerate") {
-                    x_framerate = Some(val);
+            if line.is_empty() {
+                return Err(HttpError::MalformedRequest);
+            }
+            let colon = line.find(':').ok_or(HttpError::MalformedRequest)?;
+            let name = &line[..colon];
+            if name.is_empty() || !name.bytes().all(is_http_tchar) {
+                return Err(HttpError::MalformedRequest);
+            }
+            let raw_val = &line[colon + 1..];
+            if !is_valid_field_value_bytes(raw_val) {
+                return Err(HttpError::MalformedRequest);
+            }
+            let val = trim_ows(raw_val);
+            if name.eq_ignore_ascii_case("Content-Type") {
+                if content_type.is_some() {
+                    return Err(HttpError::MalformedRequest);
                 }
+                content_type = Some(val);
+            } else if name.eq_ignore_ascii_case("Content-Disposition") {
+                if content_disposition.is_some() {
+                    return Err(HttpError::MalformedRequest);
+                }
+                content_disposition = Some(val);
+            } else if name.eq_ignore_ascii_case("Access-Control-Allow-Origin") {
+                if access_control_allow_origin.is_some() {
+                    return Err(HttpError::MalformedRequest);
+                }
+                access_control_allow_origin = Some(val);
+            } else if name.eq_ignore_ascii_case("Cache-Control") {
+                if cache_control.is_some() {
+                    return Err(HttpError::MalformedRequest);
+                }
+                cache_control = Some(val);
+            } else if name.eq_ignore_ascii_case("X-Framerate") {
+                if x_framerate.is_some() {
+                    return Err(HttpError::MalformedRequest);
+                }
+                x_framerate = Some(val);
             }
         }
 
@@ -589,7 +785,7 @@ fn sanitize_status_json_field<'a>(field: &'a str, buf: &'a mut [u8; 64]) -> &'a 
     core::str::from_utf8(&buf[..len]).unwrap_or("unknown")
 }
 
-/// Formats the JSON telemetry payload into a 1024-byte stack buffer.
+/// Formats the JSON telemetry payload into a 1536-byte stack buffer.
 /// Sanitizes `active_partition`, `framesize`, `reset_reason`, and `app_sha256`
 /// to prevent JSON injection (`SEC-202`).
 pub fn format_status_json<'a>(
@@ -690,6 +886,10 @@ pub struct CameraControlState {
     pub aec: bool,
     pub ae_level: i32,
     pub dirty: bool,
+    /// Set after `apply_framesize` succeeds until `apply_quality` succeeds
+    /// (`M-049` / `C1-029`), ensuring OV2640 JPEG quality re-apply is retried
+    /// even when `desired.quality == last_applied.quality`.
+    pub quality_needs_reapply: bool,
 }
 
 impl CameraControlState {
@@ -709,6 +909,7 @@ impl CameraControlState {
             aec: true,
             ae_level: 0,
             dirty: false,
+            quality_needs_reapply: false,
         }
     }
 }
@@ -760,13 +961,12 @@ pub fn apply_camera_control_diff<A: CameraControlApplier>(
     last_applied: &mut CameraControlState,
 ) -> u32 {
     let mut errors = 0u32;
-    let mut force_quality = false;
 
     if desired.framesize != last_applied.framesize {
         match applier.apply_framesize(desired.framesize) {
             Ok(()) => {
                 last_applied.framesize = desired.framesize;
-                force_quality = true;
+                last_applied.quality_needs_reapply = true;
             }
             Err(_) => {
                 errors += 1;
@@ -774,10 +974,11 @@ pub fn apply_camera_control_diff<A: CameraControlApplier>(
         }
     }
 
-    if force_quality || desired.quality != last_applied.quality {
+    if last_applied.quality_needs_reapply || desired.quality != last_applied.quality {
         match applier.apply_quality(desired.quality) {
             Ok(()) => {
                 last_applied.quality = desired.quality;
+                last_applied.quality_needs_reapply = false;
             }
             Err(_) => {
                 errors += 1;
@@ -1000,7 +1201,8 @@ h+='<div class=\"r\"><label>'+x[1]+'</label><input id=\"'+x[0]+'\" type=\"checkb
 (x[2]?' checked':'')+' onchange=\"setCtrl(\\''+x[0]+'\\',this.checked?1:0)\"></div>';});\
 $('sl').innerHTML=h;\
 var m='stream',lu=0,ne=0,ie=0,pb=0,ls=0,rt=0;\
-function ss(){m='stream';ie=0;ls=Date.now();$('view').src='http://'+location.hostname+':81/stream?t='+ls;}\
+function ss(){m='stream';ie=0;ls=Date.now();\
+$('view').src=location.protocol+'//'+location.hostname+':81/stream?t='+ls;}\
 function snap(){m='snap';ie=0;$('view').src='/snapshot?t='+Date.now();}\
 function oe(){ie=1;if(!rt)rt=setTimeout(recover,1500);}\
 function recover(){if(rt){clearTimeout(rt);rt=0;}if(m==='stream')ss();else snap();}\
@@ -1176,12 +1378,14 @@ impl<'a> CameraDriver<'a> {
     }
 
     /// Forces the frame-buffer mutex state (for testing mutex timeout/busy paths).
+    #[cfg(test)]
     pub fn set_mutex_locked(&self, locked: bool) {
         self.fb_mutex.store(locked, Ordering::Release);
     }
 
     /// Enables or disables simulated sensor capture failure (`esp_camera_fb_get()
     /// == NULL`).
+    #[cfg(test)]
     pub fn set_simulate_failure(&self, fail: bool) {
         self.simulate_failure.store(fail, Ordering::Release);
     }
@@ -1230,16 +1434,19 @@ impl<'a> StreamSessionGuard<'a> {
 
     /// Writes the initial Port 81 MJPEG HTTP response headers into `out_buf`:
     /// - `HTTP/1.1 200 OK`
-    /// - `Content-Type: multipart/x-mixed-
-    /// replace;boundary=123456789000000000000987654321`
+    /// - `Content-Type: multipart/x-mixed-replace;boundary=...`
     /// - `Access-Control-Allow-Origin: *`
     /// - `Cache-Control: no-store` (`FW-NET-21`)
+    /// - `Connection: close` & `X-Content-Type-Options: nosniff` (`M-211`)
     pub fn write_stream_headers<'b>(&self, out_buf: &'b mut [u8]) -> Result<&'b [u8], HttpError> {
         let mut writer = SliceWriter::new(out_buf);
         write!(
             writer,
             "HTTP/1.1 200 OK\r\nContent-Type: {}\r\n\
-            Access-Control-Allow-Origin: *\r\nCache-Control: no-store\r\n\r\n",
+            Access-Control-Allow-Origin: *\r\n\
+            Cache-Control: no-store\r\n\
+            Connection: close\r\n\
+            X-Content-Type-Options: nosniff\r\n\r\n",
             MJPEG_CONTENT_TYPE
         )
         .map_err(|_| HttpError::BufferTooSmall)?;
@@ -1247,25 +1454,26 @@ impl<'a> StreamSessionGuard<'a> {
     }
 
     /// Acquires one frame from `camera`, formats the MJPEG multipart boundary
-    /// header and
-    /// JPEG payload into `out_buf`, and immediately releases the [`FrameGuard`] so
-    /// Port 80
-    /// `/snapshot` requests are never starved during inter-frame pacing.
+    /// header and JPEG payload into `out_buf`, and immediately releases the
+    /// [`FrameGuard`] so Port 80 `/snapshot` requests are never starved during
+    /// inter-frame pacing.
     ///
-    /// Tracks consecutive capture failures and returns [`HttpError::CaptureFailed`]
-    /// if
-    /// [`STREAM_MAX_CAPTURE_FAILURES`] (`5`) consecutive failures occur.
+    /// Tracks consecutive capture, busy, and formatting failures (`M-048`),
+    /// resetting the counter only after header and JPEG bytes are written, and
+    /// enforces [`Self::should_abort`] before acquiring another frame.
     pub fn write_next_frame_chunk<'b>(
         &mut self,
         camera: &CameraDriver<'_>,
         out_buf: &'b mut [u8],
     ) -> Result<&'b [u8], HttpError> {
+        if self.should_abort() {
+            return Err(HttpError::CaptureFailed);
+        }
+
         let guard = match camera.acquire_frame() {
-            Ok(g) => {
-                self.consecutive_failures = 0;
-                g
-            }
+            Ok(g) => g,
             Err(CameraError::InvalidState) => {
+                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
                 return Err(HttpError::CameraBusy);
             }
             Err(_) => {
@@ -1274,14 +1482,27 @@ impl<'a> StreamSessionGuard<'a> {
             }
         };
 
-        let mut part_hdr_buf = [0u8; MJPEG_PART_HDR_BUF_LEN];
-        let part_hdr = format_mjpeg_part_header(guard.len(), &mut part_hdr_buf)?;
+        let write_res = (|| -> Result<usize, HttpError> {
+            let mut part_hdr_buf = [0u8; MJPEG_PART_HDR_BUF_LEN];
+            let part_hdr = format_mjpeg_part_header(guard.len(), &mut part_hdr_buf)?;
 
-        let mut writer = SliceWriter::new(out_buf);
-        writer.write_bytes(part_hdr)?;
-        writer.write_bytes(guard.bytes())?;
+            let mut writer = SliceWriter::new(out_buf);
+            writer.write_bytes(part_hdr)?;
+            writer.write_bytes(guard.bytes())?;
+            Ok(writer.written_len())
+        })();
         drop(guard);
-        Ok(writer.into_bytes())
+
+        match write_res {
+            Ok(written) => {
+                self.consecutive_failures = 0;
+                Ok(&out_buf[..written])
+            }
+            Err(e) => {
+                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+                Err(e)
+            }
+        }
     }
 
     /// Returns the number of consecutive capture failures on this stream session.
@@ -1325,6 +1546,8 @@ pub struct KlipperCamServer<'a> {
     last_ota_bytes_written: usize,
     last_ota_target_slot: Option<OtaSlot>,
     reboot_scheduled: bool,
+    active_ip: Option<Ipv4Addr>,
+    device_mac: [u8; 6],
 }
 
 impl<'a> KlipperCamServer<'a> {
@@ -1349,6 +1572,8 @@ impl<'a> KlipperCamServer<'a> {
             last_ota_bytes_written: 0,
             last_ota_target_slot: None,
             reboot_scheduled: false,
+            active_ip: None,
+            device_mac: [0u8; 6],
         }
     }
 
@@ -1367,16 +1592,75 @@ impl<'a> KlipperCamServer<'a> {
         self.config.ota_token.as_bytes()
     }
 
-    /// Authorizes an OTA upload (`X-OTA-Token`, `FW-NET-04` / `FW-NET-08`).
+    /// Records the runtime assigned IPv4 address (e.g. from DHCP or static
+    /// interface configuration) for `Host` allowlist verification (`M-047`).
+    #[inline]
+    pub fn set_active_ip(&mut self, ip: Ipv4Addr) {
+        self.active_ip = Some(ip);
+    }
+
+    /// Returns the runtime assigned IPv4 address if configured (`M-047`).
+    #[inline]
+    pub const fn active_ip(&self) -> Option<Ipv4Addr> {
+        self.active_ip
+    }
+
+    /// Records the hardware Wi-Fi MAC address displayed by STA `GET /setup`.
+    #[inline]
+    pub fn set_device_mac(&mut self, mac: [u8; 6]) {
+        self.device_mac = mac;
+    }
+
+    /// Returns the recorded hardware Wi-Fi MAC address.
+    #[inline]
+    pub const fn device_mac(&self) -> [u8; 6] {
+        self.device_mac
+    }
+
+    /// Returns `true` if `host` (from the HTTP `Host` header) is permitted for
+    /// state-mutating endpoints (`POST /control`, `POST /update`), mitigating
+    /// DNS-rebinding attacks from external domains (`M-047`).
     ///
-    /// A firmware still configured with the public [`DEFAULT_OTA_TOKEN`]
-    /// refuses every upload with `403 Forbidden`, whatever token is sent.
-    /// Otherwise the token is compared in constant time; a mismatch is
-    /// `401 Unauthorized`.
+    /// Permits the configured static IPv4, the runtime assigned IPv4,
+    /// loopback (`127.0.0.1`, `[::1]`, `localhost`), and `.local` mDNS
+    /// hostnames while rejecting arbitrary external domains with `403`.
+    pub fn is_allowed_host(&self, host: Option<&str>) -> bool {
+        let Some(host_str) = host else {
+            return false;
+        };
+        let Some((host_name, _port)) = parse_http_host_port(host_str) else {
+            return false;
+        };
+        if host_name.eq_ignore_ascii_case("localhost")
+            || host_name == "127.0.0.1"
+            || host_name == "[::1]"
+        {
+            return true;
+        }
+        if let Some(ip) = crate::config::Ipv4Addr::parse_ascii(host_name) {
+            return ip == self.config.static_ip().ip || self.active_ip == Some(ip);
+        }
+        if host_name.len() > 6
+            && host_name.as_bytes()[host_name.len() - 6..].eq_ignore_ascii_case(b".local")
+        {
+            return true;
+        }
+        false
+    }
+
+    /// Authorizes an OTA upload (`X-OTA-Token`, `FW-NET-04` / `FW-NET-08` /
+    /// `M-031`).
+    ///
+    /// A firmware still configured with the public [`DEFAULT_OTA_TOKEN`] or an
+    /// invalid token (short, whitespace, or non-graphic ASCII) refuses every
+    /// upload with `403 Forbidden`, whatever token is sent. Otherwise the token
+    /// is compared in constant time; a mismatch is `401 Unauthorized`.
     ///
     /// [`DEFAULT_OTA_TOKEN`]: crate::config::DEFAULT_OTA_TOKEN
     pub fn check_ota_auth(&self, provided: &[u8]) -> Result<(), HttpRejection> {
-        if self.config.is_default_ota_token() {
+        if !crate::config::is_valid_ota_token(self.config.ota_token.as_bytes())
+            || self.config.is_default_ota_token()
+        {
             return Err(HttpRejection {
                 status: 403,
                 reason: "Forbidden",
@@ -1384,7 +1668,7 @@ impl<'a> KlipperCamServer<'a> {
                        Rebuild with WIFI_OTA_TOKEN set.\n",
             });
         }
-        if !constant_time_eq(provided, self.config.ota_token.as_bytes()) {
+        if provided.is_empty() || !constant_time_eq(provided, self.config.ota_token.as_bytes()) {
             return Err(HttpRejection {
                 status: 401,
                 reason: "Unauthorized",
@@ -1402,9 +1686,8 @@ impl<'a> KlipperCamServer<'a> {
         self.control_state.dirty
     }
 
-    /// Returns `Some(CameraControlState)` and clears `dirty` if a camera control
-    /// setting
-    /// was modified via `GET /control?var=<param>&val=<int>`.
+    /// Returns `Some(CameraControlState)` and clears `dirty` if a camera
+    /// control setting was modified via `POST /control`.
     pub fn take_pending_control_update(&mut self) -> Option<CameraControlState> {
         if self.control_state.dirty {
             self.control_state.dirty = false;
@@ -1412,6 +1695,25 @@ impl<'a> KlipperCamServer<'a> {
         } else {
             None
         }
+    }
+
+    /// Reconciles pending control state against sensor hardware via `applier`,
+    /// keeping `dirty` set if any hardware write fails so callers retry on the
+    /// next pass (`M-145` / `C1-047`).
+    pub fn reconcile_controls<A: CameraControlApplier>(
+        &mut self,
+        applier: &mut A,
+        last_applied: &mut CameraControlState,
+    ) -> u32 {
+        if !self.control_state.dirty && !last_applied.quality_needs_reapply {
+            return 0;
+        }
+        let errors = apply_camera_control_diff(applier, &self.control_state, last_applied);
+        self.camera.set_frame_size(last_applied.framesize);
+        if errors == 0 {
+            self.control_state.dirty = false;
+        }
+        errors
     }
 
     /// Updates the live system telemetry metrics reported by `GET /status`.
@@ -1543,10 +1845,9 @@ impl<'a> KlipperCamServer<'a> {
     ) -> Result<&'b [u8], HttpError> {
         let req = match parse_http_request(raw_req) {
             Ok(r) => r,
-            Err(HttpError::MalformedRequest) | Err(HttpError::InvalidUtf8) => {
+            Err(_) => {
                 return write_http_error(out_buf, 400, "Bad Request", "400 Bad Request\n", false);
             }
-            Err(e) => return Err(e),
         };
         self.handle_request_with_flash(port, &req, out_buf, flash)
     }
@@ -1591,6 +1892,8 @@ impl<'a> KlipperCamServer<'a> {
             (HttpMethod::Get, "/status") => self.handle_status(out_buf),
             (HttpMethod::Get | HttpMethod::Post, "/control") => self.handle_control(req, out_buf),
             (HttpMethod::Get, "/panel") => self.handle_panel_get(out_buf),
+            (HttpMethod::Get, "/setup") => self.handle_setup_get(out_buf),
+            (HttpMethod::Post, "/setup") => self.handle_setup_post(req, out_buf, flash),
             (HttpMethod::Get, "/update") => self.handle_ota_get(out_buf),
             (HttpMethod::Post, "/update") => self.handle_ota_post(req, out_buf, flash),
             // Port 80 explicitly does NOT serve /stream (NET-001 / APP-005 -> 404 Not
@@ -1684,7 +1987,7 @@ impl<'a> KlipperCamServer<'a> {
 
     /// Handles `GET /status` on Port 80 (`klipper_cam.c` lines 196-230).
     fn handle_status<'b>(&self, out_buf: &'b mut [u8]) -> Result<&'b [u8], HttpError> {
-        let active_label = self.ota_manager.active_slot().label();
+        let active_label = self.ota_manager.running_slot().label();
         let telemetry = TelemetrySnapshot {
             uptime_ms: self.uptime_ms,
             free_heap: self.free_heap,
@@ -1731,17 +2034,50 @@ impl<'a> KlipperCamServer<'a> {
         out_buf: &'b mut [u8],
     ) -> Result<&'b [u8], HttpError> {
         let is_post = req.method == HttpMethod::Post;
-        let params = match req.query {
-            Some(q) if !q.is_empty() => Some(q),
-            _ if is_post => core::str::from_utf8(req.body)
-                .ok()
-                .map(str::trim)
-                .filter(|b| !b.is_empty()),
-            _ => None,
+        let body_params = if is_post && !req.body.is_empty() {
+            let body_str = match core::str::from_utf8(req.body) {
+                Ok(s) => s.trim(),
+                Err(_) => {
+                    return write_http_error(
+                        out_buf,
+                        400,
+                        "Bad Request",
+                        "Invalid UTF-8 in /control body\n",
+                        false,
+                    );
+                }
+            };
+            if body_str.is_empty() {
+                None
+            } else {
+                Some(body_str)
+            }
+        } else {
+            None
         };
-        if params.is_some() {
-            if !is_post && !req.x_requested_with {
+        let query_params = req.query.filter(|q| !q.is_empty());
+        if query_params.is_some() && body_params.is_some() {
+            return write_http_error(
+                out_buf,
+                400,
+                "Bad Request",
+                "Ambiguous /control parameters in both query and body\n",
+                false,
+            );
+        }
+        let params = query_params.or(body_params);
+        if is_post || params.is_some() {
+            if params.is_some() && !is_post && !req.x_requested_with {
                 return write_control_method_not_allowed(out_buf);
+            }
+            if !self.is_allowed_host(req.host) {
+                return write_http_error(
+                    out_buf,
+                    403,
+                    "Forbidden",
+                    "Host header not allowed for /control\n",
+                    false,
+                );
             }
             if let Some(origin) = req.origin {
                 if !is_same_origin(origin, req.host) {
@@ -2015,7 +2351,14 @@ impl<'a> KlipperCamServer<'a> {
         write!(
             writer,
             "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\
-            Access-Control-Allow-Origin: *\r\nConnection: close\r\n\
+            Access-Control-Allow-Origin: *\r\n\
+            X-Frame-Options: DENY\r\n\
+            Content-Security-Policy: default-src 'self'; script-src 'unsafe-inline'; \
+            style-src 'unsafe-inline'; img-src 'self' http: https: data:; \
+            frame-ancestors 'none'\r\n\
+            X-Content-Type-Options: nosniff\r\n\
+            Cache-Control: no-store\r\n\
+            Connection: close\r\n\
             Content-Length: {}\r\n\r\n{}",
             KLIPPER_CONTROL_PANEL_HTML.len(),
             KLIPPER_CONTROL_PANEL_HTML
@@ -2026,7 +2369,7 @@ impl<'a> KlipperCamServer<'a> {
 
     /// Handles `GET /update` on Port 80 (`klipper_cam.c` lines 280-348).
     fn handle_ota_get<'b>(&self, out_buf: &'b mut [u8]) -> Result<&'b [u8], HttpError> {
-        let running_label = self.ota_manager.active_slot().label();
+        let running_label = self.ota_manager.running_slot().label();
         let next_label = self.ota_manager.next_update_slot().label();
 
         let html_prefix = "<!DOCTYPE html><html><head><title>Klipper Cam OTA Update</title>\
@@ -2088,6 +2431,11 @@ xhr.send(file);}</script></body></html>";
         write!(
             writer,
             "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\
+            X-Frame-Options: DENY\r\n\
+            Content-Security-Policy: default-src 'self'; script-src 'unsafe-inline'; \
+            style-src 'unsafe-inline'; frame-ancestors 'none'\r\n\
+            X-Content-Type-Options: nosniff\r\n\
+            Cache-Control: no-store\r\n\
             Connection: close\r\nContent-Length: {}\r\n\r\n{}{}{}",
             body_len, html_prefix, info_str, html_suffix
         )
@@ -2099,18 +2447,51 @@ xhr.send(file);}</script></body></html>";
     /// 1. [`Self::check_ota_auth`]: `403 Forbidden` while the public default
     ///    token is configured (`FW-NET-04`), else constant-time `X-OTA-Token`
     ///    authentication (`401 Unauthorized` without CORS, `FW-NET-08`).
-    /// 2. `Content-Length` validation (`> 0` and `<= 0x1B0000`, `FW-NET-09`).
-    /// 3. ESP32 `0xE9` image magic and segment count validation (`1..=16`).
-    /// 4. 1024-byte chunked write loop to passive OTA slot + `otadata` CRC32
-    ///    update + reboot flag (`FW-NET-12`).
+    /// 2. Rejects re-entrant OTA after commit (`reboot_scheduled`) or while a
+    ///    Port 81 MJPEG stream is active (`409 Conflict`, `M-043`).
+    /// 3. `Content-Length` validation (`> 0`, `<= 0x1B0000`, exact body length
+    ///    match `req.body.len() == content_len`, `FW-NET-09` / `M-139`).
+    /// 4. ESP32 `0xE9` image magic, segment count, and mandatory SHA-256
+    ///    validation, plus pre-flash `out_buf` capacity check (`M-043`).
+    /// 5. Write to passive OTA slot + `otadata` CRC32 update + reboot flag
+    ///    (`FW-NET-12`).
     fn handle_ota_post<'b, F: OtaFlashStorage>(
         &mut self,
         req: &HttpRequest<'_>,
         out_buf: &'b mut [u8],
         flash: &mut F,
     ) -> Result<&'b [u8], HttpError> {
+        if !self.is_allowed_host(req.host) {
+            return write_http_error(
+                out_buf,
+                403,
+                "Forbidden",
+                "Host header not allowed for /update\n",
+                false,
+            );
+        }
         if let Err(rej) = self.check_ota_auth(req.ota_token.unwrap_or(b"")) {
             return write_http_error(out_buf, rej.status, rej.reason, rej.body, false);
+        }
+
+        if self.reboot_scheduled {
+            return write_http_error(
+                out_buf,
+                409,
+                "Conflict",
+                "OTA update already committed; reboot pending\n",
+                false,
+            );
+        }
+
+        if self.is_stream_active() {
+            return write_http_error(
+                out_buf,
+                409,
+                "Conflict",
+                "Active MJPEG stream must stop before OTA update\n",
+                false,
+            );
         }
 
         let content_len = match req.content_length {
@@ -2144,7 +2525,7 @@ xhr.send(file);}</script></body></html>";
             );
         }
 
-        if req.body.is_empty() || req.body.len() < content_len {
+        if req.body.is_empty() || req.body.len() != content_len {
             return write_http_error(
                 out_buf,
                 400,
@@ -2154,7 +2535,7 @@ xhr.send(file);}</script></body></html>";
             );
         }
 
-        let payload = &req.body[..content_len];
+        let payload = req.body;
         if validate_ota_image_header(payload, content_len, max_size).is_err() {
             return write_http_error(
                 out_buf,
@@ -2163,6 +2544,26 @@ xhr.send(file);}</script></body></html>";
                 "Firmware image validation failed",
                 false,
             );
+        }
+
+        // Pre-format the 200 OK response and verify `out_buf` capacity before
+        // mutating SPI flash or setting `reboot_scheduled` (M-043).
+        let ok_body = "Firmware update successful! Rebooting...\n";
+        let mut ok_resp_buf = [0u8; 160];
+        let ok_resp_len = {
+            let mut ok_writer = SliceWriter::new(&mut ok_resp_buf);
+            write!(
+                ok_writer,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
+                Connection: close\r\nContent-Length: {}\r\n\r\n{}",
+                ok_body.len(),
+                ok_body
+            )
+            .map_err(|_| HttpError::BufferTooSmall)?;
+            ok_writer.written_len()
+        };
+        if out_buf.len() < ok_resp_len {
+            return Err(HttpError::BufferTooSmall);
         }
 
         let written_slot = match self.ota_manager.write_ota_image_to_flash(flash, payload) {
@@ -2206,17 +2607,158 @@ xhr.send(file);}</script></body></html>";
         self.last_ota_target_slot = Some(written_slot);
         self.reboot_scheduled = true;
 
-        let ok_body = "Firmware update successful! Rebooting...\n";
+        out_buf[..ok_resp_len].copy_from_slice(&ok_resp_buf[..ok_resp_len]);
+        Ok(&out_buf[..ok_resp_len])
+    }
+
+    /// Handles `GET /setup` on Port 80 in normal STA mode, serving a blank
+    /// provisioning form (displaying MAC, current SSID, and current IP mode
+    /// without ever echoing secrets) that submits via `fetch('/setup')` with
+    /// `X-OTA-Token` and `X-Requested-With: fetch`.
+    fn handle_setup_get<'b>(&self, out_buf: &'b mut [u8]) -> Result<&'b [u8], HttpError> {
+        let mut mac_buf = [0u8; 17];
+        let mac_str = format_mac_lower(&self.device_mac, &mut mac_buf);
+
+        let mut info_buf = [0u8; 512];
+        let info_str = {
+            let mut iw = SliceWriter::new(&mut info_buf);
+            iw.write_str_checked("<p class=\"m\">MAC: ")?;
+            iw.write_str_checked(mac_str)?;
+            iw.write_str_checked("<br>Current SSID: ")?;
+            if self.config.network.wifi_ssid.is_empty() {
+                iw.write_str_checked("(not set)")?;
+            } else {
+                write_html_escaped(
+                    &mut iw,
+                    truncate_utf8_prefix(self.config.network.wifi_ssid, MAX_SSID_LEN),
+                )?;
+            }
+            iw.write_str_checked("<br>IP Mode: ")?;
+            match self.config.ip_mode() {
+                IpMode::Dhcp => iw.write_str_checked("DHCP")?,
+                IpMode::Static(static_cfg) => {
+                    write!(iw, "Static ({}/{})", static_cfg.ip, static_cfg.prefix_len)
+                        .map_err(|_| HttpError::BufferTooSmall)?;
+                }
+            }
+            iw.write_str_checked("</p>")?;
+            let n = iw.written_len();
+            core::str::from_utf8(&info_buf[..n]).map_err(|_| HttpError::InvalidUtf8)?
+        };
+
+        let body_len = SETUP_HTML_PREFIX.len() + info_str.len() + SETUP_STA_HTML_SUFFIX.len();
         let mut writer = SliceWriter::new(out_buf);
         write!(
             writer,
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
-            Connection: close\r\nContent-Length: {}\r\n\r\n{}",
-            ok_body.len(),
-            ok_body
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\
+            X-Frame-Options: DENY\r\n\
+            Content-Security-Policy: {SETUP_HTML_CSP}\r\n\
+            X-Content-Type-Options: nosniff\r\n\
+            Cache-Control: no-store\r\n\
+            Connection: close\r\nContent-Length: {}\r\n\r\n{}{}{}",
+            body_len, SETUP_HTML_PREFIX, info_str, SETUP_STA_HTML_SUFFIX
         )
         .map_err(|_| HttpError::BufferTooSmall)?;
         Ok(writer.into_bytes())
+    }
+
+    /// Handles `POST /setup` on Port 80 in normal STA mode:
+    /// 1. Enforces `Host` allowlist (`M-047`), same-origin (`M-046`), and
+    ///    constant-time `X-OTA-Token` authentication (`401`/`403`, fail-closed).
+    /// 2. Rejects re-entrant commit while a reboot is pending (`409 Conflict`).
+    /// 3. Strictly parses and validates a full replacement
+    ///    [`ProvisionedConfig`] (`application/x-www-form-urlencoded`,
+    ///    `<= 512 B`, never echoing secrets in error responses).
+    /// 4. Persists via [`ProvStore::save`] and sets `self.reboot_scheduled`.
+    fn handle_setup_post<'b, F: OtaFlashStorage>(
+        &mut self,
+        req: &HttpRequest<'_>,
+        out_buf: &'b mut [u8],
+        flash: &mut F,
+    ) -> Result<&'b [u8], HttpError> {
+        if !self.is_allowed_host(req.host) {
+            return write_http_error(
+                out_buf,
+                403,
+                "Forbidden",
+                "Host header not allowed for /setup\n",
+                false,
+            );
+        }
+        if let Some(origin) = req.origin {
+            if !is_same_origin(origin, req.host) {
+                return write_http_error(
+                    out_buf,
+                    403,
+                    "Forbidden",
+                    "Cross-origin /setup request refused\n",
+                    false,
+                );
+            }
+        }
+        if let Err(rej) = self.check_ota_auth(req.ota_token.unwrap_or(b"")) {
+            return write_http_error(out_buf, rej.status, rej.reason, rej.body, false);
+        }
+        if self.reboot_scheduled {
+            return write_http_error(
+                out_buf,
+                409,
+                "Conflict",
+                "Update or setup already committed; reboot pending\n",
+                false,
+            );
+        }
+
+        let cfg = match parse_setup_post_config(req) {
+            Ok(cfg) => cfg,
+            Err(msg) => {
+                return write_http_error(out_buf, 400, "Bad Request", msg, false);
+            }
+        };
+
+        let ok_body = "Configuration saved. Rebooting...\n";
+        let mut ok_resp_buf = [0u8; 256];
+        let ok_resp_len = {
+            let mut ok_writer = SliceWriter::new(&mut ok_resp_buf);
+            write!(
+                ok_writer,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
+                Cache-Control: no-store\r\n\
+                X-Content-Type-Options: nosniff\r\n\
+                Connection: close\r\nContent-Length: {}\r\n\r\n{}",
+                ok_body.len(),
+                ok_body
+            )
+            .map_err(|_| HttpError::BufferTooSmall)?;
+            ok_writer.written_len()
+        };
+        if out_buf.len() < ok_resp_len {
+            return Err(HttpError::BufferTooSmall);
+        }
+
+        if let Err(err) = ProvStore::save(flash, &cfg) {
+            return match err {
+                ProvStoreError::InvalidSsid
+                | ProvStoreError::InvalidPassphrase
+                | ProvStoreError::InvalidOtaToken
+                | ProvStoreError::InvalidStaticIp => {
+                    write_http_error(out_buf, 400, "Bad Request", prov_error_message(err), false)
+                }
+                ProvStoreError::FlashError(_)
+                | ProvStoreError::ReadbackMismatch
+                | ProvStoreError::SequenceExhausted => write_http_error(
+                    out_buf,
+                    500,
+                    "Internal Server Error",
+                    "Failed to save provisioning configuration to flash\n",
+                    false,
+                ),
+            };
+        }
+
+        self.reboot_scheduled = true;
+        out_buf[..ok_resp_len].copy_from_slice(&ok_resp_buf[..ok_resp_len]);
+        Ok(&out_buf[..ok_resp_len])
     }
 
     /// Handles requests arriving on Port 81 (`s_stream_httpd` in `klipper_cam.c`
@@ -2278,7 +2820,7 @@ pub fn format_ota_minimal_root<'a>(
     free_heap: u32,
     out_buf: &'a mut [u8],
 ) -> Result<&'a [u8], HttpError> {
-    let running = ota_manager.active_slot().partition();
+    let running = ota_manager.running_slot().partition();
     let next = ota_manager.next_update_slot().partition();
 
     let mut body_buf = [0u8; 512];
@@ -2364,6 +2906,705 @@ pub fn write_http_error<'a>(
         .map_err(|_| HttpError::BufferTooSmall)?;
     }
     Ok(writer.into_bytes())
+}
+
+/// Maximum accepted `POST /setup` form-urlencoded request body size in bytes
+/// (`512`).
+pub const MAX_SETUP_FORM_BODY_LEN: usize = 512;
+
+/// Content-Security-Policy header applied to `/setup` HTML responses.
+const SETUP_HTML_CSP: &str = "default-src 'self' 'unsafe-inline'; frame-ancestors 'none'";
+
+/// Shared mobile-friendly dark-mode HTML prefix for SoftAP and STA `/setup`.
+const SETUP_HTML_PREFIX: &str = "\
+<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+<title>Klipper Cam Setup</title><style>\
+body{font-family:sans-serif;margin:16px;background:#121212;color:#eee}\
+.c{max-width:440px;margin:auto;background:#1e1e1e;padding:18px;border-radius:8px;\
+border:1px solid #333}h2{margin:0 0 10px;font-size:18px}\
+.m{font-size:12px;color:#9cdcfe;margin:0 0 12px}\
+label{display:block;font-size:13px;margin:8px 0 3px}\
+input,select,button{width:100%;padding:8px;border-radius:4px;border:1px solid #444;\
+background:#2a2a2a;color:#eee;box-sizing:border-box;font-size:14px}\
+button{margin-top:14px;background:#007acc;border:none;cursor:pointer;font-weight:700}\
+#sip{margin-top:6px}#st{font-size:13px;margin-top:10px;color:#f88}\
+</style></head><body><div class=\"c\"><h2>Klipper Cam Setup</h2>";
+
+/// SoftAP `GET /setup` HTML form suffix (direct `POST /setup` submission).
+const SETUP_AP_HTML_SUFFIX: &str = "\
+<form method=\"POST\" action=\"/setup\">\
+<label>Wi-Fi SSID</label><input name=\"ssid\" maxlength=\"32\" required>\
+<label>Wi-Fi Passphrase (8-63 chars)</label>\
+<input name=\"pass\" type=\"password\" maxlength=\"63\" autocomplete=\"off\">\
+<label>OTA Token (16-64 chars)</label>\
+<input name=\"token\" type=\"password\" minlength=\"16\" maxlength=\"64\" \
+placeholder=\"&gt;= 16 chars\" required autocomplete=\"off\">\
+<label>IP Mode</label>\
+<select name=\"ip_mode\" id=\"im\" onchange=\"tg()\">\
+<option value=\"dhcp\">DHCP</option><option value=\"static\">Static IP</option></select>\
+<div id=\"sip\" style=\"display:none\">\
+<label>Static IP</label><input name=\"static_ip\" placeholder=\"172.22.1.52\">\
+<label>Gateway</label><input name=\"gateway\" placeholder=\"172.22.1.1\">\
+<label>Prefix Length (8-30)</label><input name=\"prefix\" value=\"24\" placeholder=\"24\">\
+</div><button type=\"submit\">Save &amp; Reboot</button></form></div>\
+<script>function tg(){document.getElementById('sip').style.display=\
+document.getElementById('im').value==='static'?'block':'none';}tg();</script>\
+</body></html>";
+
+/// STA-mode `GET /setup` HTML form suffix (authenticated `fetch('/setup')`
+/// carrying `X-OTA-Token` and `X-Requested-With: fetch`).
+const SETUP_STA_HTML_SUFFIX: &str = "\
+<form id=\"sf\" onsubmit=\"return sub(event)\">\
+<label>Current OTA Token</label>\
+<input id=\"cur_tok\" type=\"password\" maxlength=\"64\" required autocomplete=\"off\">\
+<label>Wi-Fi SSID</label><input id=\"ssid\" name=\"ssid\" maxlength=\"32\" required>\
+<label>Wi-Fi Passphrase (8-63 chars)</label>\
+<input id=\"pass\" name=\"pass\" type=\"password\" maxlength=\"63\" autocomplete=\"off\">\
+<label>New OTA Token (16-64 chars)</label>\
+<input id=\"token\" name=\"token\" type=\"password\" minlength=\"16\" maxlength=\"64\" \
+placeholder=\"&gt;= 16 chars\" required autocomplete=\"off\">\
+<label>IP Mode</label>\
+<select id=\"im\" name=\"ip_mode\" onchange=\"tg()\">\
+<option value=\"dhcp\">DHCP</option><option value=\"static\">Static IP</option></select>\
+<div id=\"sip\" style=\"display:none\">\
+<label>Static IP</label><input id=\"static_ip\" name=\"static_ip\" placeholder=\"172.22.1.52\">\
+<label>Gateway</label><input id=\"gateway\" name=\"gateway\" placeholder=\"172.22.1.1\">\
+<label>Prefix Length (8-30)</label>\
+<input id=\"prefix\" name=\"prefix\" value=\"24\" placeholder=\"24\">\
+</div><button id=\"btn\" type=\"submit\">Save &amp; Reboot</button></form>\
+<p id=\"st\"></p></div><script>\
+function g(i){return document.getElementById(i);}\
+function tg(){g('sip').style.display=g('im').value==='static'?'block':'none';}tg();\
+function sub(e){e.preventDefault();var cur=g('cur_tok').value;\
+var q=function(k,v){return k+'='+encodeURIComponent(v);};\
+var body=[q('ssid',g('ssid').value),q('pass',g('pass').value),\
+q('token',g('token').value),q('ip_mode',g('im').value),\
+q('static_ip',g('static_ip').value),q('gateway',g('gateway').value),\
+q('prefix',g('prefix').value)].join('&');\
+g('btn').disabled=true;g('st').innerText='Saving...';\
+fetch('/setup',{method:'POST',headers:{\
+'Content-Type':'application/x-www-form-urlencoded',\
+'X-OTA-Token':cur,'X-Requested-With':'fetch'},body:body})\
+.then(function(r){return r.text().then(function(t){\
+g('st').innerText=r.ok?'Configuration saved. Rebooting...':t;\
+if(!r.ok)g('btn').disabled=false;});})\
+.catch(function(){g('st').innerText='Network error';g('btn').disabled=false;});\
+return false;}</script></body></html>";
+
+/// SoftAP `POST /setup` 200 OK reboot confirmation HTML body.
+const SETUP_SAVED_HTML: &str = "\
+<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+<title>Saved</title><style>\
+body{font-family:sans-serif;margin:24px;background:#121212;color:#eee;text-align:center}\
+</style></head><body><h2>Configuration Saved</h2>\
+<p>Rebooting into Wi-Fi STA mode...</p></body></html>";
+
+/// SoftAP `POST /setup` 400 Bad Request HTML prefix.
+const SETUP_ERR_HTML_PREFIX: &str = "\
+<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+<title>Setup Error</title><style>\
+body{font-family:sans-serif;margin:24px;background:#121212;color:#eee}\
+.c{max-width:440px;margin:auto;background:#1e1e1e;padding:18px;border-radius:8px;\
+border:1px solid #633}a{color:#569cd6}\
+</style></head><body><div class=\"c\"><h2>Invalid Configuration</h2><p>";
+
+/// SoftAP `POST /setup` 400 Bad Request HTML suffix.
+const SETUP_ERR_HTML_SUFFIX: &str =
+    "</p><p><a href=\"/setup\">Back to setup</a></p></div></body></html>";
+
+/// Outcome of handling one SoftAP Setup Mode HTTP request via
+/// [`handle_setup_http_request`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetupHttpOutcome {
+    /// Complete HTTP response of `usize` bytes was written to `out_buf`.
+    Responded(usize),
+    /// Valid [`ProvisionedConfig`] was parsed and a `200 OK` reboot page of
+    /// `resp_len` bytes was written to `out_buf`.
+    SavedAndReboot {
+        /// Number of HTTP response bytes written to `out_buf`.
+        resp_len: usize,
+        /// Validated configuration ready to persist via [`ProvStore::save`].
+        config: ProvisionedConfig,
+    },
+}
+
+/// Stack buffer zeroized automatically on drop so decoded secrets do not
+/// linger in stack frames (`#![forbid(unsafe_code)]`).
+struct SecretStackBuf<const N: usize>([u8; N]);
+
+impl<const N: usize> SecretStackBuf<N> {
+    #[inline]
+    const fn zeroed() -> Self {
+        Self([0u8; N])
+    }
+}
+
+impl<const N: usize> Drop for SecretStackBuf<N> {
+    #[inline]
+    fn drop(&mut self) {
+        self.0.fill(0);
+    }
+}
+
+/// Formats a 6-byte hardware MAC address as lowercase `"xx:xx:xx:xx:xx:xx"`.
+fn format_mac_lower<'a>(mac: &[u8; 6], buf: &'a mut [u8; 17]) -> &'a str {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut i = 0;
+    while i < 6 {
+        let base = i * 3;
+        buf[base] = HEX[(mac[i] >> 4) as usize];
+        buf[base + 1] = HEX[(mac[i] & 0x0F) as usize];
+        if i < 5 {
+            buf[base + 2] = b':';
+        }
+        i += 1;
+    }
+    core::str::from_utf8(buf).unwrap_or("00:00:00:00:00:00")
+}
+
+/// Returns the longest valid UTF-8 prefix of `s` with length `<= max_bytes`.
+fn truncate_utf8_prefix(s: &str, max_bytes: usize) -> &str {
+    let mut len = s.len().min(max_bytes);
+    while !s.is_char_boundary(len) {
+        len = len.saturating_sub(1);
+    }
+    &s[..len]
+}
+
+/// Escapes HTML special characters and replaces ASCII control bytes with `'_'`.
+fn write_html_escaped(writer: &mut SliceWriter<'_>, input: &str) -> Result<(), HttpError> {
+    for b in input.bytes() {
+        match b {
+            b'&' => writer.write_str_checked("&amp;")?,
+            b'<' => writer.write_str_checked("&lt;")?,
+            b'>' => writer.write_str_checked("&gt;")?,
+            b'"' => writer.write_str_checked("&quot;")?,
+            b'\'' => writer.write_str_checked("&#39;")?,
+            0x00..=0x1F | 0x7F => writer.write_str_checked("_")?,
+            _ => writer.write_bytes(&[b])?,
+        }
+    }
+    Ok(())
+}
+
+/// Decodes one ASCII hexadecimal digit (`0-9`, `a-f`, `A-F`) into `0..=15`.
+#[inline]
+const fn decode_hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Strictly decodes an `application/x-www-form-urlencoded` field value into
+/// `dst`.
+///
+/// Maps `+` to space (`0x20`) and `%XX` to its byte value while rejecting
+/// truncated or non-hex `%` escapes (e.g. `%ZZ`), decoded ASCII control bytes
+/// (`< 0x20` or `0x7F`, including `%00` and `%0D%0A`), buffer overflow, and
+/// invalid UTF-8.
+fn decode_form_value(src: &[u8], dst: &mut [u8]) -> Result<usize, &'static str> {
+    let mut i = 0;
+    let mut out_len = 0;
+    while i < src.len() {
+        let decoded = match src[i] {
+            b'+' => {
+                i += 1;
+                b' '
+            }
+            b'%' => {
+                if i + 2 >= src.len() {
+                    return Err("Invalid percent-encoding in form submission\n");
+                }
+                let Some(hi) = decode_hex_nibble(src[i + 1]) else {
+                    return Err("Invalid percent-encoding in form submission\n");
+                };
+                let Some(lo) = decode_hex_nibble(src[i + 2]) else {
+                    return Err("Invalid percent-encoding in form submission\n");
+                };
+                i += 3;
+                (hi << 4) | lo
+            }
+            b => {
+                i += 1;
+                b
+            }
+        };
+        if decoded < 0x20 || decoded == 0x7F {
+            return Err("Control characters are not allowed in setup fields\n");
+        }
+        if out_len >= dst.len() {
+            return Err("Form field exceeds maximum allowed length\n");
+        }
+        dst[out_len] = decoded;
+        out_len += 1;
+    }
+    if core::str::from_utf8(&dst[..out_len]).is_err() {
+        return Err("Form field contains invalid UTF-8\n");
+    }
+    Ok(out_len)
+}
+
+/// Validates percent-encoding and rejects control bytes in an ignored/unknown
+/// form field without retaining its bytes.
+fn validate_ignored_form_value(src: &[u8]) -> Result<(), &'static str> {
+    let mut i = 0;
+    while i < src.len() {
+        let decoded = match src[i] {
+            b'+' => {
+                i += 1;
+                b' '
+            }
+            b'%' => {
+                if i + 2 >= src.len() {
+                    return Err("Invalid percent-encoding in form submission\n");
+                }
+                let Some(hi) = decode_hex_nibble(src[i + 1]) else {
+                    return Err("Invalid percent-encoding in form submission\n");
+                };
+                let Some(lo) = decode_hex_nibble(src[i + 2]) else {
+                    return Err("Invalid percent-encoding in form submission\n");
+                };
+                i += 3;
+                (hi << 4) | lo
+            }
+            b => {
+                i += 1;
+                b
+            }
+        };
+        if decoded < 0x20 || decoded == 0x7F {
+            return Err("Control characters are not allowed in setup fields\n");
+        }
+    }
+    Ok(())
+}
+
+/// Returns `true` if `content_type` has media type
+/// `application/x-www-form-urlencoded` (ignoring optional parameters such as
+/// `; charset=utf-8`).
+fn is_form_urlencoded_content_type(content_type: Option<&str>) -> bool {
+    let Some(ct) = content_type else {
+        return false;
+    };
+    let media = ct.split(';').next().unwrap_or("").trim();
+    media.eq_ignore_ascii_case("application/x-www-form-urlencoded")
+}
+
+/// Maps a [`ProvStoreError`] to a static user-safe error message (never
+/// echoing any user input or secret).
+const fn prov_error_message(err: ProvStoreError) -> &'static str {
+    match err {
+        ProvStoreError::InvalidSsid => {
+            "Invalid SSID: must be 1..=32 UTF-8 bytes without control characters\n"
+        }
+        ProvStoreError::InvalidPassphrase => {
+            "Invalid Wi-Fi passphrase: must be 8..=63 printable ASCII bytes\n"
+        }
+        ProvStoreError::InvalidOtaToken => {
+            "Invalid OTA token: must be 16..=64 graphic ASCII bytes and not the factory default\n"
+        }
+        ProvStoreError::InvalidStaticIp => {
+            "Invalid static IPv4 settings: requires valid unicast IP, gateway, and /8../30 prefix\n"
+        }
+        ProvStoreError::SequenceExhausted => "Provisioning sequence counter exhausted\n",
+        ProvStoreError::FlashError(_) => "Flash storage error\n",
+        ProvStoreError::ReadbackMismatch => "Flash readback verification failed\n",
+    }
+}
+
+/// Parses a strict ASCII unsigned CIDR prefix length (`8..=30`).
+fn parse_prefix_len_ascii(s: &str) -> Option<u8> {
+    if s.is_empty() || s.len() > 2 || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse::<u8>().ok()
+}
+
+/// Parses and validates a `POST /setup` `application/x-www-form-urlencoded`
+/// body (`<= 512 B`) into a complete [`ProvisionedConfig`].
+///
+/// Returned error strings are strictly static and never echo secrets or raw
+/// request bytes.
+fn parse_setup_post_config(req: &HttpRequest<'_>) -> Result<ProvisionedConfig, &'static str> {
+    if !is_form_urlencoded_content_type(req.content_type) {
+        return Err("Content-Type must be application/x-www-form-urlencoded\n");
+    }
+    let Some(content_len) = req.content_length else {
+        return Err("Content-Length header is required\n");
+    };
+    if content_len == 0 || content_len > MAX_SETUP_FORM_BODY_LEN {
+        return Err("Form body must be 1..=512 bytes\n");
+    }
+    if req.body.len() != content_len || req.body.len() > MAX_SETUP_FORM_BODY_LEN {
+        return Err("Form body length does not match Content-Length\n");
+    }
+
+    let mut ssid_buf = [0u8; MAX_SSID_LEN];
+    let mut ssid_len = 0usize;
+    let mut seen_ssid = false;
+
+    let mut pass_buf = SecretStackBuf::<MAX_PASS_LEN>::zeroed();
+    let mut pass_len = 0usize;
+    let mut seen_pass = false;
+
+    let mut token_buf = SecretStackBuf::<MAX_OTA_TOKEN_LEN>::zeroed();
+    let mut token_len = 0usize;
+    let mut seen_token = false;
+
+    let mut ip_mode_buf = [0u8; 8];
+    let mut ip_mode_len = 0usize;
+    let mut seen_ip_mode = false;
+
+    let mut static_ip_buf = [0u8; 15];
+    let mut static_ip_len = 0usize;
+    let mut seen_static_ip = false;
+
+    let mut gateway_buf = [0u8; 15];
+    let mut gateway_len = 0usize;
+    let mut seen_gateway = false;
+
+    let mut dns_buf = [0u8; 15];
+    let mut dns_len = 0usize;
+    let mut seen_dns = false;
+
+    let mut prefix_buf = [0u8; 4];
+    let mut prefix_len = 0usize;
+    let mut seen_prefix = false;
+
+    for pair in req.body.split(|&b| b == b'&') {
+        if pair.is_empty() {
+            return Err("Malformed empty form parameter\n");
+        }
+        let Some(eq_idx) = pair.iter().position(|&b| b == b'=') else {
+            return Err("Malformed form parameter missing '='\n");
+        };
+        let key = &pair[..eq_idx];
+        let raw_val = &pair[eq_idx + 1..];
+        if key.is_empty() {
+            return Err("Malformed form parameter with empty key\n");
+        }
+        match key {
+            b"ssid" => {
+                if seen_ssid {
+                    return Err("Duplicate 'ssid' field\n");
+                }
+                seen_ssid = true;
+                ssid_len = decode_form_value(raw_val, &mut ssid_buf)?;
+            }
+            b"pass" => {
+                if seen_pass {
+                    return Err("Duplicate 'pass' field\n");
+                }
+                seen_pass = true;
+                pass_len = decode_form_value(raw_val, &mut pass_buf.0)?;
+            }
+            b"token" => {
+                if seen_token {
+                    return Err("Duplicate 'token' field\n");
+                }
+                seen_token = true;
+                token_len = decode_form_value(raw_val, &mut token_buf.0)?;
+            }
+            b"ip_mode" => {
+                if seen_ip_mode {
+                    return Err("Duplicate 'ip_mode' field\n");
+                }
+                seen_ip_mode = true;
+                ip_mode_len = decode_form_value(raw_val, &mut ip_mode_buf)?;
+            }
+            b"static_ip" => {
+                if seen_static_ip {
+                    return Err("Duplicate 'static_ip' field\n");
+                }
+                seen_static_ip = true;
+                static_ip_len = decode_form_value(raw_val, &mut static_ip_buf)?;
+            }
+            b"gateway" => {
+                if seen_gateway {
+                    return Err("Duplicate 'gateway' field\n");
+                }
+                seen_gateway = true;
+                gateway_len = decode_form_value(raw_val, &mut gateway_buf)?;
+            }
+            b"dns" => {
+                if seen_dns {
+                    return Err("Duplicate 'dns' field\n");
+                }
+                seen_dns = true;
+                dns_len = decode_form_value(raw_val, &mut dns_buf)?;
+            }
+            b"prefix" => {
+                if seen_prefix {
+                    return Err("Duplicate 'prefix' field\n");
+                }
+                seen_prefix = true;
+                prefix_len = decode_form_value(raw_val, &mut prefix_buf)?;
+            }
+            _ => {
+                validate_ignored_form_value(raw_val)?;
+            }
+        }
+    }
+
+    if !seen_ssid {
+        return Err("Missing required 'ssid' field\n");
+    }
+    if !seen_token {
+        return Err("Missing required 'token' field\n");
+    }
+    if !seen_ip_mode {
+        return Err("Missing required 'ip_mode' field\n");
+    }
+
+    let ssid =
+        core::str::from_utf8(&ssid_buf[..ssid_len]).map_err(|_| "Invalid UTF-8 in ssid\n")?;
+    let pass =
+        core::str::from_utf8(&pass_buf.0[..pass_len]).map_err(|_| "Invalid UTF-8 in pass\n")?;
+    let token =
+        core::str::from_utf8(&token_buf.0[..token_len]).map_err(|_| "Invalid UTF-8 in token\n")?;
+    let ip_mode_str =
+        core::str::from_utf8(&ip_mode_buf[..ip_mode_len]).map_err(|_| "Invalid ip_mode value\n")?;
+
+    if ip_mode_str.eq_ignore_ascii_case("dhcp") {
+        ProvisionedConfig::new_dhcp(ssid, pass, token).map_err(prov_error_message)
+    } else if ip_mode_str.eq_ignore_ascii_case("static") {
+        let static_ip_str = core::str::from_utf8(&static_ip_buf[..static_ip_len])
+            .map_err(|_| "Invalid static_ip value\n")?;
+        let gateway_str = core::str::from_utf8(&gateway_buf[..gateway_len])
+            .map_err(|_| "Invalid gateway value\n")?;
+        let prefix_str = core::str::from_utf8(&prefix_buf[..prefix_len])
+            .map_err(|_| "Invalid prefix value\n")?;
+
+        let ip = Ipv4Addr::parse_ascii(static_ip_str)
+            .ok_or("Invalid static_ip: expected dotted-quad IPv4 address\n")?;
+        let gateway = Ipv4Addr::parse_ascii(gateway_str)
+            .ok_or("Invalid gateway: expected dotted-quad IPv4 address\n")?;
+        let dns = if dns_len > 0 {
+            let dns_str =
+                core::str::from_utf8(&dns_buf[..dns_len]).map_err(|_| "Invalid dns value\n")?;
+            Ipv4Addr::parse_ascii(dns_str)
+                .ok_or("Invalid dns: expected dotted-quad IPv4 address\n")?
+        } else {
+            gateway
+        };
+        let prefix = parse_prefix_len_ascii(prefix_str)
+            .ok_or("Invalid prefix: expected CIDR prefix length 8..=30\n")?;
+
+        ProvisionedConfig::new_static(ssid, pass, token, ip, gateway, dns, prefix)
+            .map_err(prov_error_message)
+    } else {
+        Err("Invalid ip_mode: must be 'dhcp' or 'static'\n")
+    }
+}
+
+/// RFC 8908 Captive Portal API JSON payload returned by `GET /capport`.
+const CAPPORT_JSON_BODY: &str = r#"{"captive":true,"user-portal-url":"http://192.168.4.1/setup"}"#;
+
+/// Writes the RFC 8908 `GET /capport` JSON status response.
+fn write_capport_json(out_buf: &mut [u8]) -> Result<usize, HttpError> {
+    let mut writer = SliceWriter::new(out_buf);
+    write!(
+        writer,
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: application/captive+json\r\n\
+         Cache-Control: no-store\r\n\
+         Connection: close\r\n\
+         Content-Length: {}\r\n\r\n{}",
+        CAPPORT_JSON_BODY.len(),
+        CAPPORT_JSON_BODY
+    )
+    .map_err(|_| HttpError::BufferTooSmall)?;
+    Ok(writer.written_len())
+}
+
+/// Writes a `302 Found` captive-portal redirect to `http://192.168.4.1/setup`.
+fn write_setup_captive_redirect(out_buf: &mut [u8]) -> Result<usize, HttpError> {
+    let mut writer = SliceWriter::new(out_buf);
+    writer.write_str_checked(
+        "HTTP/1.1 302 Found\r\n\
+         Location: http://192.168.4.1/setup\r\n\
+         Cache-Control: no-store\r\n\
+         Connection: close\r\n\
+         Content-Length: 0\r\n\r\n",
+    )?;
+    Ok(writer.written_len())
+}
+
+/// Writes the SoftAP `GET /setup` mobile-friendly HTML form (`<= 3 KB`, zero
+/// external assets, strict CSP/frame/cache headers, never echoing secrets).
+fn write_softap_setup_get_html(
+    mac: &[u8; 6],
+    ap_ssid: &str,
+    current_ssid: &str,
+    out_buf: &mut [u8],
+) -> Result<usize, HttpError> {
+    let mut mac_buf = [0u8; 17];
+    let mac_str = format_mac_lower(mac, &mut mac_buf);
+
+    let mut info_buf = [0u8; 512];
+    let info_str = {
+        let mut iw = SliceWriter::new(&mut info_buf);
+        iw.write_str_checked("<p class=\"m\">MAC: ")?;
+        iw.write_str_checked(mac_str)?;
+        iw.write_str_checked("<br>AP SSID: ")?;
+        write_html_escaped(&mut iw, truncate_utf8_prefix(ap_ssid, MAX_SSID_LEN))?;
+        iw.write_str_checked("<br>Current SSID: ")?;
+        if current_ssid.is_empty() {
+            iw.write_str_checked("(not set)")?;
+        } else {
+            write_html_escaped(&mut iw, truncate_utf8_prefix(current_ssid, MAX_SSID_LEN))?;
+        }
+        iw.write_str_checked("</p>")?;
+        let n = iw.written_len();
+        core::str::from_utf8(&info_buf[..n]).map_err(|_| HttpError::InvalidUtf8)?
+    };
+
+    let body_len = SETUP_HTML_PREFIX.len() + info_str.len() + SETUP_AP_HTML_SUFFIX.len();
+    let mut writer = SliceWriter::new(out_buf);
+    write!(
+        writer,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\
+        X-Frame-Options: DENY\r\n\
+        Content-Security-Policy: {SETUP_HTML_CSP}\r\n\
+        X-Content-Type-Options: nosniff\r\n\
+        Cache-Control: no-store\r\n\
+        Connection: close\r\nContent-Length: {}\r\n\r\n{}{}{}",
+        body_len, SETUP_HTML_PREFIX, info_str, SETUP_AP_HTML_SUFFIX
+    )
+    .map_err(|_| HttpError::BufferTooSmall)?;
+    Ok(writer.written_len())
+}
+
+/// Writes a SoftAP `400 Bad Request` HTML error page with a static message
+/// (never echoing secrets).
+fn write_softap_setup_error_html(err_msg: &str, out_buf: &mut [u8]) -> Result<usize, HttpError> {
+    let trimmed = err_msg.trim_end_matches(['\r', '\n']);
+    let body_len = SETUP_ERR_HTML_PREFIX.len() + trimmed.len() + SETUP_ERR_HTML_SUFFIX.len();
+    let mut writer = SliceWriter::new(out_buf);
+    write!(
+        writer,
+        "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html\r\n\
+        X-Frame-Options: DENY\r\n\
+        Content-Security-Policy: {SETUP_HTML_CSP}\r\n\
+        X-Content-Type-Options: nosniff\r\n\
+        Cache-Control: no-store\r\n\
+        Connection: close\r\nContent-Length: {}\r\n\r\n{}{}{}",
+        body_len, SETUP_ERR_HTML_PREFIX, trimmed, SETUP_ERR_HTML_SUFFIX
+    )
+    .map_err(|_| HttpError::BufferTooSmall)?;
+    Ok(writer.written_len())
+}
+
+/// Writes the SoftAP `200 OK` reboot confirmation HTML page.
+fn write_softap_setup_saved_html(out_buf: &mut [u8]) -> Result<usize, HttpError> {
+    let mut writer = SliceWriter::new(out_buf);
+    write!(
+        writer,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\
+        X-Frame-Options: DENY\r\n\
+        Content-Security-Policy: {SETUP_HTML_CSP}\r\n\
+        X-Content-Type-Options: nosniff\r\n\
+        Cache-Control: no-store\r\n\
+        Connection: close\r\nContent-Length: {}\r\n\r\n{}",
+        SETUP_SAVED_HTML.len(),
+        SETUP_SAVED_HTML
+    )
+    .map_err(|_| HttpError::BufferTooSmall)?;
+    Ok(writer.written_len())
+}
+
+/// Handles a single SoftAP Setup Mode HTTP request received on `192.168.4.1`:
+///
+/// - Captive-portal probe paths (`/generate_204`, `/gen_204`,
+///   `/hotspot-detect.html`, `/connecttest.txt`, `/ncsi.txt`,
+///   `/canonical.html`, `/redirect`, `/`) return `302 Found` to
+///   `http://192.168.4.1/setup`.
+/// - `GET /capport` returns the RFC 8908 `application/captive+json` status
+///   object pointing `user-portal-url` to `http://192.168.4.1/setup`.
+/// - `GET /setup` returns a compact mobile-friendly HTML form (`<= 3 KB`) with
+///   zero external assets and strict security headers (`X-Frame-Options`,
+///   `Content-Security-Policy`, `X-Content-Type-Options`, `Cache-Control`).
+/// - `POST /setup` strictly decodes `application/x-www-form-urlencoded`
+///   (`<= 512 B`), validates a complete [`ProvisionedConfig`], returns `400`
+///   HTML without echoing secrets on error, or returns
+///   [`SetupHttpOutcome::SavedAndReboot`] with a `200 OK` reboot page.
+pub fn handle_setup_http_request(
+    raw_req: &[u8],
+    mac: &[u8; 6],
+    ap_ssid: &str,
+    current_ssid: &str,
+    out_buf: &mut [u8],
+) -> SetupHttpOutcome {
+    let req = match parse_http_request(raw_req) {
+        Ok(r) => r,
+        Err(_) => {
+            let n = write_http_error(out_buf, 400, "Bad Request", "400 Bad Request\n", false)
+                .map(|b| b.len())
+                .unwrap_or(0);
+            return SetupHttpOutcome::Responded(n);
+        }
+    };
+
+    match (req.method, req.path) {
+        (
+            HttpMethod::Get | HttpMethod::Head,
+            "/"
+            | "/generate_204"
+            | "/gen_204"
+            | "/hotspot-detect.html"
+            | "/connecttest.txt"
+            | "/ncsi.txt"
+            | "/canonical.html"
+            | "/redirect",
+        ) => {
+            let n = write_setup_captive_redirect(out_buf).unwrap_or(0);
+            SetupHttpOutcome::Responded(n)
+        }
+        (HttpMethod::Get, "/capport") => {
+            let n = write_capport_json(out_buf).unwrap_or(0);
+            SetupHttpOutcome::Responded(n)
+        }
+        (HttpMethod::Get, "/setup") => {
+            let n = write_softap_setup_get_html(mac, ap_ssid, current_ssid, out_buf).unwrap_or(0);
+            SetupHttpOutcome::Responded(n)
+        }
+        (HttpMethod::Post, "/setup") => match parse_setup_post_config(&req) {
+            Ok(config) => match write_softap_setup_saved_html(out_buf) {
+                Ok(resp_len) => SetupHttpOutcome::SavedAndReboot { resp_len, config },
+                Err(_) => SetupHttpOutcome::Responded(0),
+            },
+            Err(err_msg) => {
+                let n = write_softap_setup_error_html(err_msg, out_buf).unwrap_or(0);
+                SetupHttpOutcome::Responded(n)
+            }
+        },
+        (_, "/setup") => {
+            let body = "Method Not Allowed\n";
+            let mut writer = SliceWriter::new(out_buf);
+            let res = write!(
+                writer,
+                "HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, POST\r\n\
+                Content-Type: text/plain\r\nConnection: close\r\n\
+                Content-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let n = if res.is_ok() { writer.written_len() } else { 0 };
+            SetupHttpOutcome::Responded(n)
+        }
+        _ => {
+            let n = write_http_error(out_buf, 404, "Not Found", "404 Not Found\n", false)
+                .map(|b| b.len())
+                .unwrap_or(0);
+            SetupHttpOutcome::Responded(n)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2849,7 +4090,7 @@ X-OTA-Token: wrong-token\r\nContent-Length: 24\r\n\r\n\
 
         // 5. Valid token + valid 0xE9 ESP32 firmware image -> 200 OK, switches boot
         // slot to ota_1
-        let valid_img = crate::ota::make_valid_esp_image(false);
+        let valid_img = crate::ota::make_valid_esp_image(true);
         let mut valid_req = [0u8; 512];
         let valid_req_bytes = {
             let mut w = SliceWriter::new(&mut valid_req);
@@ -2881,6 +4122,8 @@ X-OTA-Token: wrong-token\r\nContent-Length: 24\r\n\r\n\
         assert!(server.ota_manager.sector_1.is_crc_valid());
 
         // 6. Simulate reboot + Wi-Fi IP acquisition cancelling rollback
+        server.ota_manager =
+            OtaDataManager::from_sectors(server.ota_manager.sector_0, server.ota_manager.sector_1);
         assert_eq!(server.on_wifi_got_ip_cancel_rollback(), Ok(true));
         assert_eq!(server.ota_manager.sector_1.state(), OtaImgState::Valid);
     }
@@ -2918,7 +4161,7 @@ X-OTA-Token: wrong-token\r\nContent-Length: 24\r\n\r\n\
         assert_eq!(snap_view.body, &updated_frame);
 
         // POST /update with flash persists firmware image to ota_1
-        let fw_img = crate::ota::make_valid_esp_image(false);
+        let fw_img = crate::ota::make_valid_esp_image(true);
         let mut ota_req = [0u8; 512];
         let ota_req_bytes = {
             let mut w = SliceWriter::new(&mut ota_req);
@@ -2946,12 +4189,13 @@ X-OTA-Token: wrong-token\r\nContent-Length: 24\r\n\r\n\
         assert_eq!(ota_view.status_code, 200);
         assert_eq!(&flash.ota_1[..fw_img.len()], &fw_img[..]);
 
-        // Confirm otadata sector 1 in flash has PendingVerify, then cancel rollback
-        // with flash
+        // Confirm otadata sector 1 in flash has PendingVerify, simulate reboot
+        // reload, then cancel rollback with flash
         let loaded = OtaDataManager::load_from_flash(&mut flash).expect("load from flash");
         assert_eq!(loaded.active_slot(), OtaSlot::Ota1);
         assert_eq!(loaded.sector_1.state(), OtaImgState::PendingVerify);
 
+        server.ota_manager = loaded;
         assert_eq!(server.on_wifi_got_ip_with_flash(&mut flash), Ok(true));
         let loaded_after =
             OtaDataManager::load_from_flash(&mut flash).expect("load after rollback cancel");
@@ -3158,7 +4402,7 @@ X-OTA-Token: wrong-token\r\nContent-Length: 24\r\n\r\n\
     #[test]
     fn test_port80_panel_get_html_dashboard() {
         let mut server = test_server();
-        let mut resp_buf = [0u8; 4096];
+        let mut resp_buf = [0u8; 5120];
 
         let resp = server
             .handle_raw_request(
@@ -3400,7 +4644,7 @@ Content-Length: 9223372036854775808\r\n\r\n";
         // Flash failure -> 500 Internal Server Error
         let mut failing_flash: MockNorFlash<8192> = MockNorFlash::new_booted_ota0();
         failing_flash.fail_writes = true;
-        let valid_img = crate::ota::make_valid_esp_image(false);
+        let valid_img = crate::ota::make_valid_esp_image(true);
         let mut buf_flash_err = [0u8; 512];
         let req_flash_err = {
             let mut w = SliceWriter::new(&mut buf_flash_err);
@@ -3500,8 +4744,8 @@ Host: 172.22.1.52\r\n\r\n";
         assert_eq!(v_max.status_code, 400);
 
         // Duplicate var parameter -> 400 Bad Request
-        let dup_var =
-            b"POST /control?var=quality&val=10&var=brightness HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n";
+        let dup_var = b"POST /control?var=quality&val=10&var=brightness HTTP/1.1\r\n\
+Host: 172.22.1.52\r\n\r\n";
         let r_dup_var = server
             .handle_raw_request(ServerPort::Control, dup_var, &mut resp_buf)
             .expect("handled");
@@ -3546,7 +4790,7 @@ Host: 172.22.1.52\r\n\r\n";
     #[test]
     fn test_port80_responses_emit_connection_close_header() {
         let mut server = test_server();
-        let mut resp_buf = [0u8; 4096];
+        let mut resp_buf = [0u8; 5120];
 
         for raw_req in [
             b"GET / HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n".as_slice(),
@@ -3578,19 +4822,20 @@ Host: 172.22.1.52\r\n\r\n";
     }
 
     #[test]
-    fn test_stream_session_guard_camera_busy_does_not_increment_failures() {
+    fn test_stream_session_guard_counts_camera_busy_and_capture_failures() {
         let camera = CameraDriver::new_hd_default();
         let flag = AtomicBool::new(false);
         let mut session = StreamSessionGuard::try_acquire(&flag).expect("acquire");
         let mut buf = [0u8; 512];
 
-        // Lock mutex to simulate camera busy (InvalidState)
+        // Lock mutex to simulate camera busy (InvalidState): M-048 counts busy
+        // toward consecutive_failures so a wedged mutex cannot pin the stream.
         camera.set_mutex_locked(true);
         assert_eq!(
             session.write_next_frame_chunk(&camera, &mut buf),
             Err(HttpError::CameraBusy)
         );
-        assert_eq!(session.consecutive_failures(), 0);
+        assert_eq!(session.consecutive_failures(), 1);
         assert!(!session.should_abort());
 
         // Now simulate hardware failure
@@ -3600,7 +4845,7 @@ Host: 172.22.1.52\r\n\r\n";
             session.write_next_frame_chunk(&camera, &mut buf),
             Err(HttpError::CaptureFailed)
         );
-        assert_eq!(session.consecutive_failures(), 1);
+        assert_eq!(session.consecutive_failures(), 2);
     }
 
     #[test]
@@ -3657,6 +4902,7 @@ Content-Type: image/jpeg\r\nContent-Length: 51200\r\n\r\n";
         agc_calls: u32,
         aec_calls: u32,
         ae_level_calls: u32,
+        fail_quality: bool,
         fail_contrast: bool,
     }
 
@@ -3675,6 +4921,7 @@ Content-Type: image/jpeg\r\nContent-Length: 51200\r\n\r\n";
                 agc_calls: 0,
                 aec_calls: 0,
                 ae_level_calls: 0,
+                fail_quality: false,
                 fail_contrast: false,
             }
         }
@@ -3703,7 +4950,11 @@ Content-Type: image/jpeg\r\nContent-Length: 51200\r\n\r\n";
 
         fn apply_quality(&mut self, _val: i32) -> Result<(), CameraError> {
             self.quality_calls += 1;
-            Ok(())
+            if self.fail_quality {
+                Err(CameraError::SccbError)
+            } else {
+                Ok(())
+            }
         }
 
         fn apply_brightness(&mut self, _val: i32) -> Result<(), CameraError> {
@@ -3843,7 +5094,7 @@ Content-Type: image/jpeg\r\nContent-Length: 51200\r\n\r\n";
         cfg.ota_token = DEFAULT_OTA_TOKEN;
         let mut server = KlipperCamServer::new(cfg, CameraDriver::new_hd_default());
         assert!(server.config.is_default_ota_token());
-        let image = crate::ota::make_valid_esp_image(false);
+        let image = crate::ota::make_valid_esp_image(true);
         let mut resp_buf = [0u8; 1024];
 
         // Even the matching (public) token is forbidden.
@@ -3892,7 +5143,7 @@ Content-Type: image/jpeg\r\nContent-Length: 51200\r\n\r\n";
     fn test_wp09_ota_post_rejects_s3_image_and_misplaced_digest() {
         let mut resp_buf = [0u8; 1024];
 
-        let mut s3 = crate::ota::make_valid_esp_image(false);
+        let mut s3 = crate::ota::make_valid_esp_image(true);
         s3[12..14].copy_from_slice(&0x0009u16.to_le_bytes());
         let mut misplaced = crate::ota::make_valid_esp_image(true);
         misplaced.extend_from_slice(&[0xFF; 16]);
@@ -3932,7 +5183,7 @@ Content-Type: image/jpeg\r\nContent-Length: 51200\r\n\r\n";
         let mut flash = FlakyFlash(crate::ota::MockNorFlash::new_booted_ota0());
         let otadata_before = (flash.0.otadata_s0, flash.0.otadata_s1);
         let mut server = test_server();
-        let image = crate::ota::make_valid_esp_image(false);
+        let image = crate::ota::make_valid_esp_image(true);
         let req = ota_post_request(TEST_OTA_TOKEN, &image);
         let mut resp_buf = [0u8; 1024];
         let resp = server
@@ -4193,5 +5444,1169 @@ Content-Type: image/jpeg\r\nContent-Length: 51200\r\n\r\n";
         let get_req = b"GET /snapshot HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n";
         let parsed_get = parse_http_request(get_req).expect("valid get request");
         assert_eq!(parsed_get.content_length, None);
+    }
+
+    // ---- CL-L Phase 3 Remediation Unit Tests (M-043..M-049, M-138..M-211) ----
+
+    #[test]
+    fn test_m043_ota_reentrant_active_stream_and_buffer_precheck() {
+        use crate::ota::MockNorFlash;
+
+        let image = crate::ota::make_valid_esp_image(true);
+        let req = ota_post_request(TEST_OTA_TOKEN, &image);
+        let mut resp_buf = [0u8; 1024];
+
+        // 1. Pre-check out_buf capacity before touching flash or scheduling reboot.
+        let mut server = test_server();
+        let mut flash: MockNorFlash<8192> = MockNorFlash::new_booted_ota0();
+        let mut tiny_buf = [0u8; 32];
+        assert_eq!(
+            server.handle_raw_request_with_flash(
+                ServerPort::Control,
+                &req,
+                &mut tiny_buf,
+                &mut flash,
+            ),
+            Err(HttpError::BufferTooSmall)
+        );
+        assert!(!server.is_reboot_scheduled());
+        assert_eq!(flash.erase_count, 0);
+        assert_eq!(flash.write_count, 0);
+
+        // 2. Active Port 81 stream blocks POST /update with 409 Conflict
+        // before flash I/O.
+        server.stream_active_flag().store(true, Ordering::Release);
+        let resp = server
+            .handle_raw_request_with_flash(ServerPort::Control, &req, &mut resp_buf, &mut flash)
+            .expect("409 written");
+        let view = HttpResponseView::parse(resp).expect("parse 409");
+        assert_eq!(view.status_code, 409);
+        assert!(!server.is_reboot_scheduled());
+        assert_eq!(flash.erase_count, 0);
+        server.stream_active_flag().store(false, Ordering::Release);
+
+        // 3. First OTA after stream stops succeeds (200 OK) and schedules reboot.
+        let ok_resp = server
+            .handle_raw_request_with_flash(ServerPort::Control, &req, &mut resp_buf, &mut flash)
+            .expect("200 written");
+        let ok_view = HttpResponseView::parse(ok_resp).expect("parse 200");
+        assert_eq!(ok_view.status_code, 200);
+        assert!(server.is_reboot_scheduled());
+        let erases_after_first = flash.erase_count;
+
+        // 4. Re-entrant POST /update before reboot is rejected with 409 Conflict.
+        let dup_resp = server
+            .handle_raw_request_with_flash(ServerPort::Control, &req, &mut resp_buf, &mut flash)
+            .expect("409 written");
+        let dup_view = HttpResponseView::parse(dup_resp).expect("parse 409");
+        assert_eq!(dup_view.status_code, 409);
+        assert_eq!(flash.erase_count, erases_after_first);
+    }
+
+    #[test]
+    fn test_m044_reject_bare_lf_cr_in_request_line_and_headers() {
+        // Bare LF inside header value (smuggling Transfer-Encoding).
+        let bare_lf_hdr = b"POST /update HTTP/1.1\r\nHost: 172.22.1.52\r\n\
+X-Pad: a\nTransfer-Encoding: chunked\r\n\r\n";
+        assert_eq!(
+            parse_http_request(bare_lf_hdr),
+            Err(HttpError::MalformedRequest)
+        );
+
+        // Bare CR inside header value.
+        let bare_cr_hdr = b"GET /status HTTP/1.1\r\nHost: 172.22.1.52\r\nX-Pad: a\rb\r\n\r\n";
+        assert_eq!(
+            parse_http_request(bare_cr_hdr),
+            Err(HttpError::MalformedRequest)
+        );
+
+        // Bare LF in request line.
+        let bare_lf_rl = b"GET /status\n HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n";
+        assert_eq!(
+            parse_http_request(bare_lf_rl),
+            Err(HttpError::MalformedRequest)
+        );
+
+        // Bare CR in request line.
+        let bare_cr_rl = b"GET /status\r HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n";
+        assert_eq!(
+            parse_http_request(bare_cr_rl),
+            Err(HttpError::MalformedRequest)
+        );
+    }
+
+    #[test]
+    fn test_m045_rfc9110_tchar_header_names_and_ascii_ows_only() {
+        // Vertical tab (0x0B) in header name must be rejected.
+        let vt_name = b"POST /update HTTP/1.1\r\nHost: 172.22.1.52\r\n\
+Transfer-Encoding\x0b: chunked\r\n\r\n";
+        assert_eq!(
+            parse_http_request(vt_name),
+            Err(HttpError::MalformedRequest)
+        );
+
+        // NUL and non-tchar delimiters in header name must be rejected.
+        let nul_name = b"GET /status HTTP/1.1\r\nX-A\x00B: 1\r\n\r\n";
+        assert_eq!(
+            parse_http_request(nul_name),
+            Err(HttpError::MalformedRequest)
+        );
+        let paren_name = b"GET /status HTTP/1.1\r\nX-Bad(Name): 1\r\n\r\n";
+        assert_eq!(
+            parse_http_request(paren_name),
+            Err(HttpError::MalformedRequest)
+        );
+
+        // 0x0B / 0x0C / Unicode NBSP in header value must be rejected.
+        let vt_val = b"POST /update HTTP/1.1\r\nHost: 172.22.1.52\r\n\
+Content-Length: \x0b10\r\n\r\n";
+        assert_eq!(parse_http_request(vt_val), Err(HttpError::MalformedRequest));
+
+        let nbsp_val =
+            "POST /update HTTP/1.1\r\nHost: 172.22.1.52\r\nContent-Length: \u{00A0}10\r\n\r\n";
+        assert_eq!(
+            parse_http_request(nbsp_val.as_bytes()),
+            Err(HttpError::MalformedRequest)
+        );
+
+        // ASCII SP and HTAB OWS around values remain valid.
+        let ok_ows = b"GET /status HTTP/1.1\r\nHost: \t172.22.1.52\t \r\n\r\n";
+        let req = parse_http_request(ok_ows).expect("valid SP/HTAB OWS");
+        assert_eq!(req.host, Some("172.22.1.52"));
+    }
+
+    #[test]
+    fn test_m046_is_same_origin_enforces_scheme_and_port() {
+        // Plaintext HTTP server default (http / 80).
+        assert!(is_same_origin("http://172.22.1.52", Some("172.22.1.52")));
+        assert!(is_same_origin("http://172.22.1.52:80", Some("172.22.1.52")));
+        assert!(is_same_origin("http://172.22.1.52", Some("172.22.1.52:80")));
+        assert!(is_same_origin(
+            "http://camera.local:8080",
+            Some("camera.local:8080")
+        ));
+
+        // Cross-scheme and default-port confusion MUST be rejected.
+        assert!(!is_same_origin("https://172.22.1.52", Some("172.22.1.52")));
+        assert!(!is_same_origin(
+            "https://172.22.1.52:443",
+            Some("172.22.1.52")
+        ));
+        assert!(!is_same_origin(
+            "http://172.22.1.52:443",
+            Some("172.22.1.52")
+        ));
+        assert!(!is_same_origin(
+            "http://172.22.1.52:81",
+            Some("172.22.1.52")
+        ));
+        assert!(!is_same_origin(
+            "http://172.22.1.52/path",
+            Some("172.22.1.52")
+        ));
+        assert!(!is_same_origin("null", Some("172.22.1.52")));
+        assert!(!is_same_origin("http://172.22.1.52", None));
+
+        // Explicit HTTPS scheme helper matches https/:443 and rejects http.
+        assert!(is_same_origin_for_scheme(
+            "https://cam.local:443",
+            Some("cam.local"),
+            "https",
+            443
+        ));
+        assert!(!is_same_origin_for_scheme(
+            "http://cam.local",
+            Some("cam.local"),
+            "https",
+            443
+        ));
+    }
+
+    #[test]
+    fn test_m047_strict_rfc9110_host_header_validation() {
+        for valid_host in [
+            "172.22.1.52",
+            "172.22.1.52:80",
+            "camera.local:8080",
+            "[::1]",
+            "[::1]:8080",
+        ] {
+            assert!(is_valid_http_host(valid_host), "valid: {valid_host}");
+        }
+
+        for bad_host in [
+            "",
+            "user@172.22.1.52",
+            "172.22.1.52/evil",
+            "172.22.1.52:0",
+            "172.22.1.52:65536",
+            "172.22.1.52:",
+            "172.22.1.52:abc",
+            "bad..host",
+            "-bad.local",
+            "bad host",
+            "[::1]trailing",
+        ] {
+            assert!(!is_valid_http_host(bad_host), "bad: {bad_host}");
+            let raw = alloc::format!("GET /status HTTP/1.1\r\nHost: {bad_host}\r\n\r\n");
+            assert_eq!(
+                parse_http_request(raw.as_bytes()),
+                Err(HttpError::MalformedRequest),
+                "bad Host header must fail parse: {bad_host}"
+            );
+        }
+
+        // M-047: DNS rebinding Host allowlist on mutating /control & /update.
+        let mut server = test_server();
+        let mut resp_buf = [0u8; 1024];
+
+        // Attacker DNS-rebinding domain with matching Origin + X-Requested-With
+        // MUST be rejected with 403 Forbidden and leave control state intact.
+        let rebind_ctrl = b"POST /control?var=quality&val=63 HTTP/1.1\r\n\
+            Host: evil.attacker.com\r\n\
+            Origin: http://evil.attacker.com\r\n\
+            X-Requested-With: fetch\r\n\r\n";
+        let resp = server
+            .handle_raw_request(ServerPort::Control, rebind_ctrl, &mut resp_buf)
+            .expect("403 written");
+        let view = HttpResponseView::parse(resp).expect("parse 403");
+        assert_eq!(view.status_code, 403);
+        assert_eq!(view.access_control_allow_origin, None);
+        assert_eq!(server.take_pending_control_update(), None);
+
+        // DNS rebinding on POST /update MUST also be rejected with 403 before
+        // touching flash even when carrying the valid OTA token.
+        let image = crate::ota::make_valid_esp_image(true);
+        let mut rebind_ota = alloc::format!(
+            "POST /update HTTP/1.1\r\nHost: evil.attacker.com\r\n\
+             X-OTA-Token: {TEST_OTA_TOKEN}\r\nContent-Length: {}\r\n\r\n",
+            image.len()
+        )
+        .into_bytes();
+        rebind_ota.extend_from_slice(&image);
+        let ota_resp = server
+            .handle_raw_request(ServerPort::Control, &rebind_ota, &mut resp_buf)
+            .expect("403 written");
+        assert_eq!(
+            HttpResponseView::parse(ota_resp)
+                .expect("parse 403")
+                .status_code,
+            403
+        );
+        assert!(!server.is_reboot_scheduled());
+
+        // Configured static IP, runtime DHCP active IP, localhost, 127.0.0.1,
+        // and `.local` mDNS hostnames pass on mutating /control.
+        server.set_active_ip(crate::config::Ipv4Addr::new(192, 168, 50, 77));
+        for allowed in [
+            "172.22.1.52",
+            "172.22.1.52:80",
+            "192.168.50.77",
+            "127.0.0.1",
+            "localhost",
+            "klipper-cam.local",
+        ] {
+            let req = alloc::format!(
+                "POST /control?var=quality&val=15 HTTP/1.1\r\nHost: {allowed}\r\n\r\n"
+            );
+            let ok = server
+                .handle_raw_request(ServerPort::Control, req.as_bytes(), &mut resp_buf)
+                .expect("200 written");
+            assert_eq!(
+                HttpResponseView::parse(ok).expect("parse 200").status_code,
+                200,
+                "allowed Host {allowed} must succeed"
+            );
+        }
+
+        // M-031: Whitespace-only or space-prefixed default OTA token returns 403.
+        for bad_tok in ["                ", " klipper-cam-ota-2026"] {
+            let mut bad_cfg = KlipperCamConfig::WROVER_KIT_HD;
+            bad_cfg.ota_token = bad_tok;
+            let bad_srv = KlipperCamServer::new(bad_cfg, CameraDriver::new_hd_default());
+            let rej = bad_srv
+                .check_ota_auth(bad_tok.as_bytes())
+                .expect_err("whitespace token must be forbidden");
+            assert_eq!(rej.status, 403);
+        }
+
+        // M-004: Running Partition reported by /status, /update, and
+        // format_ota_minimal_root must stay `running_slot()` (ota_0) even after
+        // committing an OTA to ota_1 before reboot.
+        let mut status_srv = test_server();
+        let ok_ota_req = ota_post_request(TEST_OTA_TOKEN, &image);
+        let ok_ota_resp = status_srv
+            .handle_raw_request(ServerPort::Control, &ok_ota_req, &mut resp_buf)
+            .expect("200 OTA");
+        assert_eq!(
+            HttpResponseView::parse(ok_ota_resp)
+                .expect("parse 200")
+                .status_code,
+            200
+        );
+        let mut big_buf = [0u8; 4096];
+        let st_resp = status_srv
+            .handle_raw_request(
+                ServerPort::Control,
+                b"GET /status HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n",
+                &mut big_buf,
+            )
+            .expect("GET /status");
+        let st_body = core::str::from_utf8(HttpResponseView::parse(st_resp).expect("parse").body)
+            .expect("utf8");
+        assert!(st_body.contains("\"active_partition\":\"ota_0\""));
+        let upd_resp = status_srv
+            .handle_raw_request(
+                ServerPort::Control,
+                b"GET /update HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n",
+                &mut big_buf,
+            )
+            .expect("GET /update");
+        let upd_body = core::str::from_utf8(HttpResponseView::parse(upd_resp).expect("parse").body)
+            .expect("utf8");
+        assert!(upd_body.contains("Running Partition: <b>ota_0</b>"));
+        let min_resp = format_ota_minimal_root(&status_srv.ota_manager, 100_000, &mut big_buf)
+            .expect("minimal root");
+        let min_body = core::str::from_utf8(HttpResponseView::parse(min_resp).expect("parse").body)
+            .expect("utf8");
+        assert!(min_body.contains("Running Partition: ota_0"));
+    }
+
+    #[test]
+    fn test_m048_stream_session_guard_counts_all_failures_and_enforces_abort() {
+        let camera = CameraDriver::new_hd_default();
+        let flag = AtomicBool::new(false);
+        let mut session = StreamSessionGuard::try_acquire(&flag).expect("acquire");
+        let mut tiny_buf = [0u8; 8];
+        let mut ok_buf = [0u8; 512];
+
+        // BufferTooSmall increments consecutive_failures (does NOT reset to 0).
+        for expected in 1..=3 {
+            assert_eq!(
+                session.write_next_frame_chunk(&camera, &mut tiny_buf),
+                Err(HttpError::BufferTooSmall)
+            );
+            assert_eq!(session.consecutive_failures(), expected);
+        }
+
+        // CameraBusy increments consecutive_failures to 4.
+        camera.set_mutex_locked(true);
+        assert_eq!(
+            session.write_next_frame_chunk(&camera, &mut ok_buf),
+            Err(HttpError::CameraBusy)
+        );
+        assert_eq!(session.consecutive_failures(), 4);
+        assert!(!session.should_abort());
+
+        // One more BufferTooSmall hits STREAM_MAX_CAPTURE_FAILURES (5).
+        camera.set_mutex_locked(false);
+        assert_eq!(
+            session.write_next_frame_chunk(&camera, &mut tiny_buf),
+            Err(HttpError::BufferTooSmall)
+        );
+        assert_eq!(session.consecutive_failures(), STREAM_MAX_CAPTURE_FAILURES);
+        assert!(session.should_abort());
+
+        // Once should_abort() is true, write_next_frame_chunk refuses even with a
+        // healthy camera and large buffer.
+        let captures_before = camera.capture_count();
+        assert_eq!(
+            session.write_next_frame_chunk(&camera, &mut ok_buf),
+            Err(HttpError::CaptureFailed)
+        );
+        assert_eq!(camera.capture_count(), captures_before);
+    }
+
+    #[test]
+    fn test_m049_apply_camera_control_diff_persists_quality_reapply_retry() {
+        let mut applier = MockCameraControlApplier::new();
+        applier.fail_quality = true;
+
+        let mut last_applied = CameraControlState::new_default();
+        let mut desired = CameraControlState::new_default();
+        desired.framesize = FrameSize::Vga;
+        // Same quality as default, so only framesize triggers quality reapply.
+        assert_eq!(desired.quality, last_applied.quality);
+
+        // Pass 1: framesize succeeds, quality fails -> reapply flag stays set.
+        let err1 = apply_camera_control_diff(&mut applier, &desired, &mut last_applied);
+        assert_eq!(err1, 1);
+        assert_eq!(last_applied.framesize, FrameSize::Vga);
+        assert!(last_applied.quality_needs_reapply);
+        assert_eq!(applier.framesize_calls, 1);
+        assert_eq!(applier.quality_calls, 1);
+
+        // Pass 2: sensor recovers -> quality is retried and flag clears.
+        applier.fail_quality = false;
+        let err2 = apply_camera_control_diff(&mut applier, &desired, &mut last_applied);
+        assert_eq!(err2, 0);
+        assert!(!last_applied.quality_needs_reapply);
+        assert_eq!(applier.framesize_calls, 1);
+        assert_eq!(applier.quality_calls, 2);
+
+        // Pass 3: no further calls once reconciled.
+        let err3 = apply_camera_control_diff(&mut applier, &desired, &mut last_applied);
+        assert_eq!(err3, 0);
+        assert_eq!(applier.quality_calls, 2);
+    }
+
+    #[test]
+    fn test_m138_m139_m141_m208_m209_m210_m211_http_hardening() {
+        let mut server = test_server();
+        let mut resp_buf = [0u8; 5120];
+
+        // M-138: Security headers on /panel and /update.
+        for path in ["/panel", "/update"] {
+            let req = alloc::format!("GET {path} HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n");
+            let resp = server
+                .handle_raw_request(ServerPort::Control, req.as_bytes(), &mut resp_buf)
+                .expect("GET html");
+            let view = HttpResponseView::parse(resp).expect("parse html");
+            assert_eq!(view.status_code, 200);
+            assert_eq!(view.cache_control, Some("no-store"));
+            assert!(view.headers_raw.contains("X-Frame-Options: DENY"));
+            assert!(view.headers_raw.contains("Content-Security-Policy:"));
+            assert!(view.headers_raw.contains("X-Content-Type-Options: nosniff"));
+        }
+
+        // M-211: MJPEG stream headers include Connection: close and nosniff.
+        let stream_resp = server
+            .handle_raw_request(
+                ServerPort::Stream,
+                b"GET /stream HTTP/1.1\r\nHost: 172.22.1.52:81\r\n\r\n",
+                &mut resp_buf,
+            )
+            .expect("GET /stream");
+        let stream_view = HttpResponseView::parse(stream_resp).expect("parse stream");
+        assert!(stream_view.headers_raw.contains("Connection: close"));
+        assert!(stream_view
+            .headers_raw
+            .contains("X-Content-Type-Options: nosniff"));
+
+        // M-139: Reject OTA POST when req.body.len() != Content-Length
+        // (extra trailing bytes).
+        let image = crate::ota::make_valid_esp_image(true);
+        let mut extra_req = ota_post_request(TEST_OTA_TOKEN, &image);
+        extra_req.extend_from_slice(b"EXTRA");
+        let extra_resp = server
+            .handle_raw_request(ServerPort::Control, &extra_req, &mut resp_buf)
+            .expect("400 written");
+        assert_eq!(
+            HttpResponseView::parse(extra_resp)
+                .expect("parse 400")
+                .status_code,
+            400
+        );
+        assert!(!server.is_reboot_scheduled());
+
+        // M-141: Empty body when Content-Length absent, single-SP request line,
+        // duplicate Content-Type rejected.
+        let unframed =
+            parse_http_request(b"GET /status HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\nSMUGGLED")
+                .expect("parse unframed");
+        assert!(unframed.body.is_empty());
+        assert_eq!(
+            parse_http_request(b"GET  /status HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n"),
+            Err(HttpError::MalformedRequest)
+        );
+        assert_eq!(
+            parse_http_request(
+                b"POST /control HTTP/1.1\r\nHost: 172.22.1.52\r\n\
+Content-Type: text/plain\r\nContent-Type: application/json\r\n\r\n"
+            ),
+            Err(HttpError::MalformedRequest)
+        );
+
+        // M-208: Invalid UTF-8 POST /control body returns 400 Bad Request.
+        let bad_utf8_ctrl = b"POST /control HTTP/1.1\r\nHost: 172.22.1.52\r\n\
+Content-Length: 4\r\n\r\n\xff\xfe\xfd\xfc";
+        let ctrl_resp = server
+            .handle_raw_request(ServerPort::Control, bad_utf8_ctrl, &mut resp_buf)
+            .expect("400 written");
+        assert_eq!(
+            HttpResponseView::parse(ctrl_resp)
+                .expect("parse 400")
+                .status_code,
+            400
+        );
+
+        // M-209: HttpResponseView::parse rejects bad version, non-3-digit code,
+        // missing colon, and duplicate headers.
+        assert_eq!(
+            HttpResponseView::parse(b"HTTP/2.0 200 OK\r\n\r\n"),
+            Err(HttpError::MalformedRequest)
+        );
+        assert_eq!(
+            HttpResponseView::parse(b"HTTP/1.1 +200 OK\r\n\r\n"),
+            Err(HttpError::MalformedRequest)
+        );
+        assert_eq!(
+            HttpResponseView::parse(b"HTTP/1.1 200 OK\r\nBadHeaderLine\r\n\r\n"),
+            Err(HttpError::MalformedRequest)
+        );
+        assert_eq!(
+            HttpResponseView::parse(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Type: text/html\r\n\r\n"
+            ),
+            Err(HttpError::MalformedRequest)
+        );
+
+        // M-210: Worst-case 64-byte strings + max integers fit in 1536 bytes.
+        let s64 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let max_snap = TelemetrySnapshot {
+            uptime_ms: i64::MIN,
+            free_heap: u32::MAX,
+            free_psram: u32::MAX,
+            wifi_rssi: Some(i32::MIN),
+            active_partition: s64,
+            framesize: s64,
+            stream_active: false,
+            reset_reason: s64,
+            app_sha256: s64,
+            free_dram: u32::MAX,
+            core1_stack_hwm: u32::MAX,
+            fw_stats: FwStatsSnapshot {
+                sensor_frame_period_us: u32::MAX,
+                frame_bytes: u32::MAX,
+                c1_pushed: u32::MAX,
+                c1_dropped: u32::MAX,
+                ring_full_events: u32::MAX,
+                soi_miss: u32::MAX,
+                overflow_aborts: u32::MAX,
+                c0_spsc_cycles: u32::MAX,
+                c0_net_cycles: u32::MAX,
+                c0_p80_cycles: u32::MAX,
+                c0_p81_cycles: u32::MAX,
+                max_loop_latency_us: u32::MAX,
+                p81_frames_sent: u32::MAX,
+                p81_frames_superseded: u32::MAX,
+                c0_validation_failures: u32::MAX,
+                sccb_errors: u32::MAX,
+                send_partial: u32::MAX,
+                ring_build_failures: u32::MAX,
+                i2s_stop_timeouts: u32::MAX,
+            },
+        };
+        let mut status_buf = [0u8; STATUS_JSON_BUF_LEN];
+        let json = format_status_json(&max_snap, &mut status_buf).expect("fits 1536 bytes");
+        assert!(json.len() <= STATUS_JSON_BUF_LEN);
+    }
+
+    struct MockSetupFlash {
+        sector_a: [u8; crate::ota::FLASH_SECTOR_SIZE as usize],
+        sector_b: [u8; crate::ota::FLASH_SECTOR_SIZE as usize],
+        writes: u32,
+    }
+
+    impl MockSetupFlash {
+        fn new() -> Self {
+            Self {
+                sector_a: [0xFF; crate::ota::FLASH_SECTOR_SIZE as usize],
+                sector_b: [0xFF; crate::ota::FLASH_SECTOR_SIZE as usize],
+                writes: 0,
+            }
+        }
+
+        fn region_mut(&mut self, offset: u32, len: usize) -> Result<&mut [u8], OtaError> {
+            use crate::ota::FLASH_SECTOR_SIZE;
+            use crate::prov_store::{PROV_SECTOR_A_OFFSET, PROV_SECTOR_B_OFFSET};
+
+            let len_u32 = u32::try_from(len).map_err(|_| OtaError::FlashWriteError)?;
+            let end = offset
+                .checked_add(len_u32)
+                .ok_or(OtaError::FlashWriteError)?;
+            if offset >= PROV_SECTOR_A_OFFSET && end <= PROV_SECTOR_A_OFFSET + FLASH_SECTOR_SIZE {
+                let start = (offset - PROV_SECTOR_A_OFFSET) as usize;
+                Ok(&mut self.sector_a[start..start + len])
+            } else if offset >= PROV_SECTOR_B_OFFSET
+                && end <= PROV_SECTOR_B_OFFSET + FLASH_SECTOR_SIZE
+            {
+                let start = (offset - PROV_SECTOR_B_OFFSET) as usize;
+                Ok(&mut self.sector_b[start..start + len])
+            } else {
+                Err(OtaError::FlashWriteError)
+            }
+        }
+    }
+
+    impl OtaFlashStorage for MockSetupFlash {
+        fn read_aligned(&mut self, offset: u32, buf: &mut [u8]) -> Result<(), OtaError> {
+            if (offset & 3) != 0 || (buf.len() & 3) != 0 {
+                return Err(OtaError::FlashWriteError);
+            }
+            let slice = self.region_mut(offset, buf.len())?;
+            buf.copy_from_slice(slice);
+            Ok(())
+        }
+
+        fn erase_range(&mut self, start_offset: u32, end_offset: u32) -> Result<(), OtaError> {
+            let len = end_offset
+                .checked_sub(start_offset)
+                .ok_or(OtaError::FlashWriteError)? as usize;
+            let slice = self.region_mut(start_offset, len)?;
+            slice.fill(0xFF);
+            Ok(())
+        }
+
+        fn write_aligned(&mut self, offset: u32, data: &[u8]) -> Result<(), OtaError> {
+            if (offset & 3) != 0 || (data.len() & 3) != 0 {
+                return Err(OtaError::FlashWriteError);
+            }
+            let slice = self.region_mut(offset, data.len())?;
+            slice.copy_from_slice(data);
+            self.writes += 1;
+            Ok(())
+        }
+    }
+
+    fn build_setup_post_req(
+        host: &str,
+        origin: Option<&str>,
+        token: Option<&str>,
+        content_type: &str,
+        body: &str,
+    ) -> alloc::vec::Vec<u8> {
+        let mut req = alloc::format!(
+            "POST /setup HTTP/1.1\r\nHost: {host}\r\nContent-Type: {content_type}\r\n"
+        );
+        if let Some(orig) = origin {
+            req.push_str(&alloc::format!("Origin: {orig}\r\n"));
+        }
+        if let Some(tok) = token {
+            req.push_str(&alloc::format!("X-OTA-Token: {tok}\r\n"));
+        }
+        req.push_str(&alloc::format!(
+            "X-Requested-With: fetch\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ));
+        req.into_bytes()
+    }
+
+    #[test]
+    fn test_softap_setup_captive_portal_redirects() {
+        let mac = [0xD4, 0xD4, 0xDA, 0x5B, 0xD4, 0xEC];
+        let mut out_buf = [0u8; 4096];
+
+        for path in [
+            "/generate_204",
+            "/gen_204",
+            "/hotspot-detect.html",
+            "/connecttest.txt",
+            "/ncsi.txt",
+            "/canonical.html",
+            "/redirect",
+            "/",
+        ] {
+            let req = alloc::format!(
+                "GET {path} HTTP/1.1\r\nHost: connectivitycheck.gstatic.com\r\n\r\n"
+            );
+            let outcome = handle_setup_http_request(
+                req.as_bytes(),
+                &mac,
+                "KlipperCam-Setup-D4EC",
+                "",
+                &mut out_buf,
+            );
+            let SetupHttpOutcome::Responded(n) = outcome else {
+                panic!("captive probe {path} must return Responded");
+            };
+            let view = HttpResponseView::parse(&out_buf[..n]).expect("valid 302 response");
+            assert_eq!(view.status_code, 302, "probe {path} must redirect");
+            assert!(
+                view.headers_raw
+                    .contains("Location: http://192.168.4.1/setup"),
+                "probe {path} must redirect to http://192.168.4.1/setup"
+            );
+            assert_eq!(view.cache_control, Some("no-store"));
+        }
+
+        // Unknown path returns 404, non-GET/POST on /setup returns 405.
+        let SetupHttpOutcome::Responded(n404) = handle_setup_http_request(
+            b"GET /favicon.ico HTTP/1.1\r\nHost: 192.168.4.1\r\n\r\n",
+            &mac,
+            "KlipperCam-Setup-D4EC",
+            "",
+            &mut out_buf,
+        ) else {
+            panic!("404 must return Responded");
+        };
+        assert_eq!(
+            HttpResponseView::parse(&out_buf[..n404])
+                .expect("parse 404")
+                .status_code,
+            404
+        );
+
+        let SetupHttpOutcome::Responded(n405) = handle_setup_http_request(
+            b"DELETE /setup HTTP/1.1\r\nHost: 192.168.4.1\r\n\r\n",
+            &mac,
+            "KlipperCam-Setup-D4EC",
+            "",
+            &mut out_buf,
+        ) else {
+            panic!("405 must return Responded");
+        };
+        assert_eq!(
+            HttpResponseView::parse(&out_buf[..n405])
+                .expect("parse 405")
+                .status_code,
+            405
+        );
+    }
+
+    #[test]
+    fn test_softap_capport_rfc8908_json_endpoint() {
+        let mac = [0xD4, 0xD4, 0xDA, 0x5B, 0xD4, 0xEC];
+        let mut out_buf = [0u8; 4096];
+
+        let outcome = handle_setup_http_request(
+            b"GET /capport HTTP/1.1\r\nHost: 192.168.4.1\r\n\r\n",
+            &mac,
+            "KlipperCam-Setup-D4EC",
+            "",
+            &mut out_buf,
+        );
+        let SetupHttpOutcome::Responded(n) = outcome else {
+            panic!("GET /capport must return Responded");
+        };
+        let view = HttpResponseView::parse(&out_buf[..n]).expect("valid 200 capport JSON");
+        assert_eq!(view.status_code, 200);
+        assert_eq!(view.status_line, "HTTP/1.1 200 OK");
+        assert_eq!(view.content_type, Some("application/captive+json"));
+        assert_eq!(view.cache_control, Some("no-store"));
+        assert!(
+            view.headers_raw.contains("Connection: close"),
+            "capport response must close connection"
+        );
+        let expected_body = r#"{"captive":true,"user-portal-url":"http://192.168.4.1/setup"}"#;
+        let expected_len_hdr = alloc::format!("Content-Length: {}", expected_body.len());
+        assert!(
+            view.headers_raw.contains(&expected_len_hdr),
+            "capport response must include exact Content-Length"
+        );
+        assert_eq!(
+            core::str::from_utf8(view.body).expect("UTF-8 capport JSON"),
+            expected_body
+        );
+    }
+
+    #[test]
+    fn test_softap_setup_get_form_headers_size_and_no_secrets() {
+        let mac = [0xD4, 0xD4, 0xDA, 0x5B, 0xD4, 0xEC];
+        let mut out_buf = [0u8; 4096];
+
+        let outcome = handle_setup_http_request(
+            b"GET /setup HTTP/1.1\r\nHost: 192.168.4.1\r\n\r\n",
+            &mac,
+            "KlipperCam-Setup-D4EC",
+            "Lab<Net>&1",
+            &mut out_buf,
+        );
+        let SetupHttpOutcome::Responded(n) = outcome else {
+            panic!("GET /setup must return Responded");
+        };
+        let view = HttpResponseView::parse(&out_buf[..n]).expect("valid 200 HTML");
+        assert_eq!(view.status_code, 200);
+        assert_eq!(view.content_type, Some("text/html"));
+        assert_eq!(view.cache_control, Some("no-store"));
+        assert_eq!(view.access_control_allow_origin, None);
+        assert!(view.headers_raw.contains("X-Frame-Options: DENY"));
+        assert!(view.headers_raw.contains(
+            "Content-Security-Policy: default-src 'self' 'unsafe-inline'; frame-ancestors 'none'"
+        ));
+        assert!(view.headers_raw.contains("X-Content-Type-Options: nosniff"));
+        assert!(
+            view.body.len() <= 3072,
+            "SoftAP setup HTML body ({} B) must be <= 3 KB",
+            view.body.len()
+        );
+
+        let html = core::str::from_utf8(view.body).expect("UTF-8 HTML");
+        assert!(html.contains("d4:d4:da:5b:d4:ec"));
+        assert!(html.contains("KlipperCam-Setup-D4EC"));
+        assert!(html.contains("Lab&lt;Net&gt;&amp;1"));
+        assert!(!html.contains("http://"));
+        assert!(!html.contains("https://"));
+        for field in [
+            "name=\"ssid\"",
+            "name=\"pass\"",
+            "name=\"token\"",
+            "name=\"ip_mode\"",
+            "name=\"static_ip\"",
+            "name=\"gateway\"",
+            "name=\"prefix\"",
+        ] {
+            assert!(html.contains(field), "missing input {field}");
+        }
+    }
+
+    #[test]
+    fn test_softap_setup_post_percent_decoding_and_static_ip() {
+        let mac = [0xD4, 0xD4, 0xDA, 0x5B, 0xD4, 0xEC];
+        let mut out_buf = [0u8; 4096];
+
+        // Review Focus #2: +, %20, %26, %3D, %25 decode accurately (DHCP mode).
+        let dhcp_body = "ssid=My+Home%20WiFi%26Lab%3D1%25&\
+                         pass=Pass+Word%20%26%3D%25!99&\
+                         token=priv-tok%26%3D%25-2026-abcd&\
+                         ip_mode=dhcp&static_ip=&gateway=&prefix=24";
+        let dhcp_req = build_setup_post_req(
+            "192.168.4.1",
+            None,
+            None,
+            "application/x-www-form-urlencoded; charset=utf-8",
+            dhcp_body,
+        );
+        let outcome =
+            handle_setup_http_request(&dhcp_req, &mac, "KlipperCam-Setup-D4EC", "", &mut out_buf);
+        let SetupHttpOutcome::SavedAndReboot { resp_len, config } = outcome else {
+            panic!("valid DHCP POST /setup must return SavedAndReboot");
+        };
+        let view = HttpResponseView::parse(&out_buf[..resp_len]).expect("parse 200 reboot HTML");
+        assert_eq!(view.status_code, 200);
+        assert_eq!(view.content_type, Some("text/html"));
+        let resp_text = core::str::from_utf8(view.body).expect("utf8 body");
+        assert!(resp_text.contains("Rebooting"));
+        assert!(!resp_text.contains("Pass Word"));
+        assert!(!resp_text.contains("priv-tok"));
+
+        assert_eq!(config.ssid_str(), "My Home WiFi&Lab=1%");
+        assert_eq!(config.pass_str(), "Pass Word &=%%!99".replace("%%", "%"));
+        assert_eq!(config.ota_token_str(), "priv-tok&=%-2026-abcd");
+        assert_eq!(config.ip_mode(), IpMode::Dhcp);
+
+        // Static IPv4 submission.
+        let static_body = "ssid=PrinterNet&pass=StrongPass2026!&\
+                           token=static-ota-token-2026-ok&\
+                           ip_mode=static&static_ip=172.22.1.52&gateway=172.22.1.1&prefix=24";
+        let static_req = build_setup_post_req(
+            "192.168.4.1",
+            None,
+            None,
+            "application/x-www-form-urlencoded",
+            static_body,
+        );
+        let SetupHttpOutcome::SavedAndReboot { resp_len, config } =
+            handle_setup_http_request(&static_req, &mac, "KlipperCam-Setup-D4EC", "", &mut out_buf)
+        else {
+            panic!("valid static POST /setup must return SavedAndReboot");
+        };
+        assert_eq!(
+            HttpResponseView::parse(&out_buf[..resp_len])
+                .expect("parse 200")
+                .status_code,
+            200
+        );
+        assert_eq!(
+            config.ip_mode(),
+            IpMode::Static(crate::config::StaticIpConfig::KLIPPER_DEFAULT)
+        );
+    }
+
+    #[test]
+    fn test_softap_setup_post_rejects_bad_encoding_and_never_echoes_secrets() {
+        let mac = [0xD4, 0xD4, 0xDA, 0x5B, 0xD4, 0xEC];
+        let mut out_buf = [0u8; 4096];
+
+        let secret_pass = "UltraSecretPass9876";
+        let secret_tok = "ultra-secret-ota-token-9876";
+
+        let bad_cases = [
+            // Invalid hex %ZZ
+            alloc::format!("ssid=Bad%ZZSsid&pass={secret_pass}&token={secret_tok}&ip_mode=dhcp"),
+            // NUL byte %00 in pass
+            alloc::format!("ssid=GoodSsid&pass={secret_pass}%00&token={secret_tok}&ip_mode=dhcp"),
+            // CR/LF %0D%0A in token
+            alloc::format!(
+                "ssid=GoodSsid&pass={secret_pass}&token={secret_tok}%0D%0A&ip_mode=dhcp"
+            ),
+            // Truncated trailing %
+            alloc::format!("ssid=GoodSsid&pass={secret_pass}%2&token={secret_tok}&ip_mode=dhcp"),
+            // Default factory OTA token rejected
+            alloc::format!(
+                "ssid=GoodSsid&pass={secret_pass}&token={DEFAULT_OTA_TOKEN}&ip_mode=dhcp"
+            ),
+            // Short passphrase rejected
+            alloc::format!("ssid=GoodSsid&pass=short&token={secret_tok}&ip_mode=dhcp"),
+            // Invalid static prefix (> 30)
+            alloc::format!(
+                "ssid=GoodSsid&pass={secret_pass}&token={secret_tok}&\
+                 ip_mode=static&static_ip=172.22.1.52&gateway=172.22.1.1&prefix=32"
+            ),
+            // Body > 512 bytes rejected
+            alloc::format!(
+                "ssid=GoodSsid&pass={secret_pass}&token={secret_tok}&ip_mode=dhcp&pad={}",
+                "a".repeat(500)
+            ),
+        ];
+
+        for body in bad_cases {
+            let req = build_setup_post_req(
+                "192.168.4.1",
+                None,
+                None,
+                "application/x-www-form-urlencoded",
+                &body,
+            );
+            let outcome =
+                handle_setup_http_request(&req, &mac, "KlipperCam-Setup-D4EC", "", &mut out_buf);
+            let SetupHttpOutcome::Responded(n) = outcome else {
+                panic!("invalid POST /setup must NOT return SavedAndReboot: {body}");
+            };
+            let view = HttpResponseView::parse(&out_buf[..n]).expect("valid 400 HTML");
+            assert_eq!(view.status_code, 400);
+            assert_eq!(view.content_type, Some("text/html"));
+            let html = core::str::from_utf8(view.body).expect("utf8 error HTML");
+            assert!(!html.contains(secret_pass), "400 HTML must NEVER echo pass");
+            assert!(!html.contains(secret_tok), "400 HTML must NEVER echo token");
+        }
+
+        // Wrong Content-Type rejected with 400.
+        let wrong_ct = build_setup_post_req(
+            "192.168.4.1",
+            None,
+            None,
+            "text/plain",
+            &alloc::format!("ssid=GoodSsid&pass={secret_pass}&token={secret_tok}&ip_mode=dhcp"),
+        );
+        let SetupHttpOutcome::Responded(n) =
+            handle_setup_http_request(&wrong_ct, &mac, "KlipperCam-Setup-D4EC", "", &mut out_buf)
+        else {
+            panic!("wrong content-type must return Responded");
+        };
+        assert_eq!(
+            HttpResponseView::parse(&out_buf[..n])
+                .expect("parse 400")
+                .status_code,
+            400
+        );
+    }
+
+    #[test]
+    fn test_sta_setup_get_form_security_headers_and_no_secrets() {
+        let mut cfg = KlipperCamConfig::WROVER_KIT_HD;
+        cfg.network.wifi_ssid = "ShopWiFi-2.4G";
+        cfg.network.wifi_password = "TopSecretWifiPass99!";
+        cfg.ota_token = TEST_OTA_TOKEN;
+        let mut server = KlipperCamServer::new(cfg, CameraDriver::new_hd_default());
+        server.set_device_mac([0xD4, 0xD4, 0xDA, 0x5B, 0xD4, 0xEC]);
+
+        let mut resp_buf = [0u8; 4096];
+        let resp = server
+            .handle_raw_request(
+                ServerPort::Control,
+                b"GET /setup HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n",
+                &mut resp_buf,
+            )
+            .expect("STA GET /setup should succeed");
+        let view = HttpResponseView::parse(resp).expect("parse STA setup HTML");
+        assert_eq!(view.status_code, 200);
+        assert_eq!(view.content_type, Some("text/html"));
+        assert_eq!(view.cache_control, Some("no-store"));
+        assert_eq!(view.access_control_allow_origin, None);
+        assert!(view.headers_raw.contains("X-Frame-Options: DENY"));
+        assert!(view.headers_raw.contains(
+            "Content-Security-Policy: default-src 'self' 'unsafe-inline'; frame-ancestors 'none'"
+        ));
+        assert!(view.headers_raw.contains("X-Content-Type-Options: nosniff"));
+
+        let html = core::str::from_utf8(view.body).expect("utf8 html");
+        assert!(html.contains("d4:d4:da:5b:d4:ec"));
+        assert!(html.contains("ShopWiFi-2.4G"));
+        assert!(html.contains("Static (172.22.1.52/24)"));
+        assert!(html.contains("Current OTA Token"));
+        assert!(html.contains("fetch('/setup'"));
+        assert!(html.contains("'X-OTA-Token'"));
+        assert!(html.contains("'X-Requested-With':'fetch'"));
+        // Must NEVER echo wifi_password or ota_token.
+        assert!(!html.contains("TopSecretWifiPass99!"));
+        assert!(!html.contains(TEST_OTA_TOKEN));
+
+        // DHCP mode renders "IP Mode: DHCP".
+        server.config.network.ip_mode = IpMode::Dhcp;
+        let resp_dhcp = server
+            .handle_raw_request(
+                ServerPort::Control,
+                b"GET /setup HTTP/1.1\r\nHost: 172.22.1.52\r\n\r\n",
+                &mut resp_buf,
+            )
+            .expect("STA GET /setup DHCP");
+        let html_dhcp =
+            core::str::from_utf8(HttpResponseView::parse(resp_dhcp).expect("parse dhcp").body)
+                .expect("utf8");
+        assert!(html_dhcp.contains("IP Mode: DHCP"));
+    }
+
+    #[test]
+    fn test_sta_setup_post_auth_host_origin_persistence_and_conflict() {
+        let mut server = test_server();
+        let mut flash = MockSetupFlash::new();
+        let mut resp_buf = [0u8; 2048];
+
+        let valid_body = "ssid=Rotated+WiFi%261&pass=NewSecretPass%3D2026!&\
+                          token=rotated-ota-token-2026-%25ok&\
+                          ip_mode=static&static_ip=172.22.1.60&gateway=172.22.1.1&prefix=24";
+
+        // 1. Disallowed Host -> 403 Forbidden.
+        let bad_host = build_setup_post_req(
+            "evil.example",
+            Some("http://evil.example"),
+            Some(TEST_OTA_TOKEN),
+            "application/x-www-form-urlencoded",
+            valid_body,
+        );
+        let r = server
+            .handle_raw_request_with_flash(
+                ServerPort::Control,
+                &bad_host,
+                &mut resp_buf,
+                &mut flash,
+            )
+            .expect("403 bad host");
+        assert_eq!(HttpResponseView::parse(r).expect("parse").status_code, 403);
+        assert_eq!(flash.writes, 0);
+
+        // 2. Cross-origin Origin -> 403 Forbidden.
+        let bad_origin = build_setup_post_req(
+            "172.22.1.52",
+            Some("http://attacker.local"),
+            Some(TEST_OTA_TOKEN),
+            "application/x-www-form-urlencoded",
+            valid_body,
+        );
+        let r = server
+            .handle_raw_request_with_flash(
+                ServerPort::Control,
+                &bad_origin,
+                &mut resp_buf,
+                &mut flash,
+            )
+            .expect("403 bad origin");
+        assert_eq!(HttpResponseView::parse(r).expect("parse").status_code, 403);
+        assert_eq!(flash.writes, 0);
+
+        // 3. Missing X-OTA-Token -> 401 Unauthorized.
+        let no_tok = build_setup_post_req(
+            "172.22.1.52",
+            Some("http://172.22.1.52"),
+            None,
+            "application/x-www-form-urlencoded",
+            valid_body,
+        );
+        let r = server
+            .handle_raw_request_with_flash(ServerPort::Control, &no_tok, &mut resp_buf, &mut flash)
+            .expect("401 missing token");
+        assert_eq!(HttpResponseView::parse(r).expect("parse").status_code, 401);
+        assert_eq!(flash.writes, 0);
+
+        // 4. Wrong X-OTA-Token -> 401 Unauthorized.
+        let wrong_tok = build_setup_post_req(
+            "172.22.1.52",
+            Some("http://172.22.1.52"),
+            Some("wrong-token-12345678"),
+            "application/x-www-form-urlencoded",
+            valid_body,
+        );
+        let r = server
+            .handle_raw_request_with_flash(
+                ServerPort::Control,
+                &wrong_tok,
+                &mut resp_buf,
+                &mut flash,
+            )
+            .expect("401 wrong token");
+        assert_eq!(HttpResponseView::parse(r).expect("parse").status_code, 401);
+        assert_eq!(flash.writes, 0);
+
+        // 5. Unconfigured (default or blank) server OTA token -> 403 Forbidden.
+        for bad_server_tok in [DEFAULT_OTA_TOKEN, ""] {
+            let mut locked_cfg = KlipperCamConfig::WROVER_KIT_HD;
+            locked_cfg.ota_token = bad_server_tok;
+            let mut locked_srv = KlipperCamServer::new(locked_cfg, CameraDriver::new_hd_default());
+            let req = build_setup_post_req(
+                "172.22.1.52",
+                Some("http://172.22.1.52"),
+                Some(bad_server_tok),
+                "application/x-www-form-urlencoded",
+                valid_body,
+            );
+            let r = locked_srv
+                .handle_raw_request_with_flash(ServerPort::Control, &req, &mut resp_buf, &mut flash)
+                .expect("403 locked token");
+            assert_eq!(HttpResponseView::parse(r).expect("parse").status_code, 403);
+            assert!(!locked_srv.is_reboot_scheduled());
+        }
+        assert_eq!(flash.writes, 0);
+
+        // 6. Malformed body (%0D%0A) with valid auth -> 400, zero secret echo.
+        let bad_body_req = build_setup_post_req(
+            "172.22.1.52",
+            Some("http://172.22.1.52"),
+            Some(TEST_OTA_TOKEN),
+            "application/x-www-form-urlencoded",
+            "ssid=Ok&pass=NeverEchoPass123&token=never-echo-token-123%0D%0A&ip_mode=dhcp",
+        );
+        let r = server
+            .handle_raw_request_with_flash(
+                ServerPort::Control,
+                &bad_body_req,
+                &mut resp_buf,
+                &mut flash,
+            )
+            .expect("400 bad body");
+        let v400 = HttpResponseView::parse(r).expect("parse 400");
+        assert_eq!(v400.status_code, 400);
+        let err_str = core::str::from_utf8(v400.body).expect("utf8 err");
+        assert!(!err_str.contains("NeverEchoPass123"));
+        assert!(!err_str.contains("never-echo-token"));
+        assert_eq!(flash.writes, 0);
+        assert!(!server.is_reboot_scheduled());
+
+        // 7. Valid same-origin POST /setup -> 200 OK, persists and reboots.
+        let ok_req = build_setup_post_req(
+            "172.22.1.52",
+            Some("http://172.22.1.52"),
+            Some(TEST_OTA_TOKEN),
+            "application/x-www-form-urlencoded",
+            valid_body,
+        );
+        let r_ok = server
+            .handle_raw_request_with_flash(ServerPort::Control, &ok_req, &mut resp_buf, &mut flash)
+            .expect("200 valid setup");
+        let v_ok = HttpResponseView::parse(r_ok).expect("parse 200");
+        assert_eq!(v_ok.status_code, 200);
+        assert_eq!(v_ok.access_control_allow_origin, None);
+        assert_eq!(v_ok.cache_control, Some("no-store"));
+        assert!(server.is_reboot_scheduled());
+        assert_eq!(flash.writes, 1);
+
+        let persisted = ProvStore::load(&mut flash)
+            .expect("load persisted config")
+            .expect("config must exist in flash");
+        assert_eq!(persisted.ssid_str(), "Rotated WiFi&1");
+        assert_eq!(persisted.pass_str(), "NewSecretPass=2026!");
+        assert_eq!(persisted.ota_token_str(), "rotated-ota-token-2026-%ok");
+        assert_eq!(
+            persisted.ip_mode(),
+            IpMode::Static(crate::config::StaticIpConfig {
+                ip: Ipv4Addr::new(172, 22, 1, 60),
+                netmask: Ipv4Addr::new(255, 255, 255, 0),
+                gateway: Ipv4Addr::new(172, 22, 1, 1),
+                dns: Ipv4Addr::new(172, 22, 1, 1),
+                prefix_len: 24,
+            })
+        );
+
+        // 8. Re-entrant POST /setup once reboot_scheduled -> 409 Conflict.
+        let r_conflict = server
+            .handle_raw_request_with_flash(ServerPort::Control, &ok_req, &mut resp_buf, &mut flash)
+            .expect("409 conflict");
+        assert_eq!(
+            HttpResponseView::parse(r_conflict)
+                .expect("parse 409")
+                .status_code,
+            409
+        );
+        assert_eq!(flash.writes, 1);
     }
 }

@@ -1445,8 +1445,8 @@ const _: () = assert!(
     "DecHuffTable must fit within 640 bytes"
 );
 
-impl Default for DecHuffTable {
-    fn default() -> Self {
+impl DecHuffTable {
+    const fn new() -> Self {
         Self {
             fast_sym: [0; 256],
             fast_len: [0; 128],
@@ -1460,12 +1460,61 @@ impl Default for DecHuffTable {
     }
 }
 
+impl Default for DecHuffTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DecDcHuffTable {
+    max_lj: [u16; 17],
+    min_code: [u16; 17],
+    has_len: u16,
+    val_ptr: [u8; 17],
+    valid: bool,
+    vals: [u8; 16],
+}
+
+const _: () = assert!(
+    core::mem::size_of::<DecDcHuffTable>() <= 128,
+    "DecDcHuffTable must fit within 128 bytes"
+);
+
+impl DecDcHuffTable {
+    const fn new() -> Self {
+        Self {
+            max_lj: [0; 17],
+            min_code: [0; 17],
+            has_len: 0,
+            val_ptr: [0; 17],
+            valid: false,
+            vals: [0; 16],
+        }
+    }
+}
+
+impl Default for DecDcHuffTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[inline(never)]
 fn build_dec_huff_table_in_place(
     table: &mut DecHuffTable,
     bits: &[u8; 17],
     vals: &[u8],
 ) -> Result<(), CameraError> {
-    *table = DecHuffTable::default();
+    table.valid = false;
+    table.has_len = 0;
+    table.fast_sym.fill(0);
+    table.fast_len.fill(0);
+    table.max_lj.fill(0);
+    table.min_code.fill(0);
+    table.val_ptr.fill(0);
+    table.vals.fill(0);
+
     let mut code = 0u32;
     let mut k = 0usize;
     for (l, &b) in bits.iter().enumerate().take(17).skip(1) {
@@ -1473,7 +1522,9 @@ fn build_dec_huff_table_in_place(
         if k + count > table.vals.len() || k + count > vals.len() {
             return Err(CameraError::CodecError);
         }
-        if code + (count as u32) > (1u32 << l) {
+        // Reject Kraft oversubscription and the reserved all-1s codeword
+        // (ITU-T T.81 Annex C, Figure C.2).
+        if code + (count as u32) >= (1u32 << l) {
             return Err(CameraError::CodecError);
         }
         if count > 0 {
@@ -1510,10 +1561,60 @@ fn build_dec_huff_table_in_place(
     Ok(())
 }
 
+#[inline(never)]
+fn build_dec_dc_huff_table_in_place(
+    table: &mut DecDcHuffTable,
+    bits: &[u8; 17],
+    vals: &[u8],
+) -> Result<(), CameraError> {
+    table.valid = false;
+    table.has_len = 0;
+    table.max_lj.fill(0);
+    table.min_code.fill(0);
+    table.val_ptr.fill(0);
+    table.vals.fill(0);
+
+    let mut code = 0u32;
+    let mut k = 0usize;
+    for (l, &b) in bits.iter().enumerate().take(17).skip(1) {
+        let count = b as usize;
+        if k + count > table.vals.len() || k + count > vals.len() {
+            return Err(CameraError::CodecError);
+        }
+        // Reject Kraft oversubscription and the reserved all-1s codeword
+        // (ITU-T T.81 Annex C, Figure C.2).
+        if code + (count as u32) >= (1u32 << l) {
+            return Err(CameraError::CodecError);
+        }
+        if count > 0 {
+            table.has_len |= 1u16 << (l - 1);
+            table.min_code[l] = code as u16;
+            table.val_ptr[l] = k as u8;
+            for _ in 0..count {
+                table.vals[k] = vals[k];
+                k += 1;
+                code += 1;
+            }
+            let last_code = code - 1;
+            table.max_lj[l] = ((last_code << (16 - l)) | ((1u32 << (16 - l)) - 1)) as u16;
+        }
+        code <<= 1;
+    }
+    table.valid = true;
+    Ok(())
+}
+
 #[cfg(test)]
 fn build_dec_huff_table(bits: &[u8; 17], vals: &[u8]) -> Result<DecHuffTable, CameraError> {
-    let mut table = DecHuffTable::default();
+    let mut table = DecHuffTable::new();
     build_dec_huff_table_in_place(&mut table, bits, vals)?;
+    Ok(table)
+}
+
+#[cfg(test)]
+fn build_dec_dc_huff_table(bits: &[u8; 17], vals: &[u8]) -> Result<DecDcHuffTable, CameraError> {
+    let mut table = DecDcHuffTable::new();
+    build_dec_dc_huff_table_in_place(&mut table, bits, vals)?;
     Ok(table)
 }
 
@@ -1533,19 +1634,53 @@ struct JpegBitReader<'a> {
     bit_buf: u32,
     bits_in: u32,
     hit_marker: bool,
+    marker: Option<u8>,
+    pad_bits_in_buf: u32,
+    pad_bits_consumed: u32,
     eof_pad_bytes: usize,
+    restart_enabled: bool,
 }
 
 impl<'a> JpegBitReader<'a> {
+    #[cfg(test)]
     fn new(src: &'a [u8], start_pos: usize) -> Self {
+        Self::with_restart(src, start_pos, false)
+    }
+
+    fn with_restart(src: &'a [u8], start_pos: usize, restart_enabled: bool) -> Self {
         Self {
             src,
             pos: start_pos,
             bit_buf: 0,
             bits_in: 0,
             hit_marker: false,
+            marker: None,
+            pad_bits_in_buf: 0,
+            pad_bits_consumed: 0,
             eof_pad_bytes: 0,
+            restart_enabled,
         }
+    }
+
+    #[inline]
+    fn real_bits_remaining(&self) -> u32 {
+        self.bits_in.saturating_sub(self.pad_bits_in_buf)
+    }
+
+    #[inline]
+    fn consume_bits(&mut self, n: u32) -> Result<(), CameraError> {
+        debug_assert!(n <= self.bits_in, "consume_bits underflow");
+        let real_bits = self.real_bits_remaining();
+        if n > real_bits {
+            let pad_used = n - real_bits;
+            self.pad_bits_in_buf = self.pad_bits_in_buf.saturating_sub(pad_used);
+            self.pad_bits_consumed = self.pad_bits_consumed.saturating_add(pad_used);
+            if self.pad_bits_consumed > 7 {
+                return Err(CameraError::CorruptedFrame);
+            }
+        }
+        self.bits_in -= n;
+        Ok(())
     }
 
     #[inline]
@@ -1556,29 +1691,45 @@ impl<'a> JpegBitReader<'a> {
                     return Err(CameraError::CorruptedFrame);
                 }
                 self.eof_pad_bytes += 1;
-                // Pad with 1-bits after reaching EOI at the end of a scan.
+                // Pad with 1-bits after reaching a scan-terminating marker or EOF
+                // so 16-bit Huffman lookahead remains populated.
                 self.bit_buf = (self.bit_buf << 8) | 0xFF;
                 self.bits_in += 8;
+                self.pad_bits_in_buf += 8;
                 continue;
             }
             let b = self.src[self.pos];
             self.pos += 1;
             if b == 0xFF {
-                while self.pos < self.src.len() && self.src[self.pos] == 0xFF {
-                    self.pos += 1;
-                }
                 if self.pos >= self.src.len() {
                     return Err(CameraError::CorruptedFrame);
                 }
-                let next = self.src[self.pos];
-                if next == 0x00 {
+                if self.src[self.pos] == 0x00 {
+                    // Single-0xFF byte stuffing: 0xFF 0x00 -> literal 0xFF data byte.
                     self.pos += 1;
                     self.bit_buf = (self.bit_buf << 8) | 0xFF;
                     self.bits_in += 8;
                 } else {
-                    // Encountered marker (e.g. EOI 0xD9 or RSTn)
-                    self.pos -= 1;
+                    let marker_prefix_pos = self.pos - 1;
+                    while self.pos < self.src.len() && self.src[self.pos] == 0xFF {
+                        self.pos += 1;
+                    }
+                    if self.pos >= self.src.len() {
+                        return Err(CameraError::CorruptedFrame);
+                    }
+                    let next = self.src[self.pos];
+                    if next == 0x00 {
+                        // Illegal 0xFF 0xFF ... 0x00 stuffing (ITU-T T.81 B.1.1.2).
+                        return Err(CameraError::CorruptedFrame);
+                    }
+                    let valid_scan_marker =
+                        next == M_EOI || (self.restart_enabled && (0xD0..=0xD7).contains(&next));
+                    if !valid_scan_marker {
+                        return Err(CameraError::CorruptedFrame);
+                    }
+                    self.pos = marker_prefix_pos;
                     self.hit_marker = true;
+                    self.marker = Some(next);
                 }
             } else {
                 self.bit_buf = (self.bit_buf << 8) | u32::from(b);
@@ -1597,8 +1748,39 @@ impl<'a> JpegBitReader<'a> {
         if self.bits_in < n {
             self.refill()?;
         }
-        self.bits_in -= n;
-        Ok((self.bit_buf >> self.bits_in) & ((1u32 << n) - 1))
+        let shift = self.bits_in - n;
+        self.consume_bits(n)?;
+        Ok((self.bit_buf >> shift) & ((1u32 << n) - 1))
+    }
+
+    fn decode_huff_dc(&mut self, table: &DecDcHuffTable) -> Result<u8, CameraError> {
+        debug_assert!(
+            table.valid,
+            "DC Huffman table validity checked once per SOS"
+        );
+        if self.bits_in < 16 {
+            self.refill()?;
+        }
+        let peek16 = ((self.bit_buf >> (self.bits_in - 16)) & 0xFFFF) as u16;
+        let mut mask = table.has_len;
+        while mask != 0 {
+            let tz = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            let l = tz + 1;
+            if peek16 <= table.max_lj[l] {
+                let code = peek16 >> (16 - l);
+                let offset = code
+                    .checked_sub(table.min_code[l])
+                    .ok_or(CameraError::CodecError)? as usize;
+                let idx = (table.val_ptr[l] as usize) + offset;
+                if idx >= table.vals.len() {
+                    return Err(CameraError::CodecError);
+                }
+                self.consume_bits(l as u32)?;
+                return Ok(table.vals[idx]);
+            }
+        }
+        Err(CameraError::CodecError)
     }
 
     fn decode_huff(&mut self, table: &DecHuffTable) -> Result<u8, CameraError> {
@@ -1610,7 +1792,7 @@ impl<'a> JpegBitReader<'a> {
         let peek8 = (peek16 >> 8) as usize;
         let len8 = ((table.fast_len[peek8 >> 1] >> ((peek8 & 1) * 4)) & 0x0F) as u32;
         if len8 != 0 {
-            self.bits_in -= len8;
+            self.consume_bits(len8)?;
             return Ok(table.fast_sym[peek8]);
         }
         for l in 9..=16usize {
@@ -1623,7 +1805,7 @@ impl<'a> JpegBitReader<'a> {
                 if idx >= table.vals.len() {
                     return Err(CameraError::CodecError);
                 }
-                self.bits_in -= l as u32;
+                self.consume_bits(l as u32)?;
                 return Ok(table.vals[idx]);
             }
         }
@@ -1635,7 +1817,7 @@ impl<'a> JpegBitReader<'a> {
         if nbits == 0 {
             return Ok(0);
         }
-        if nbits > 16 {
+        if nbits > 11 {
             return Err(CameraError::CodecError);
         }
         let raw = self.get_bits(nbits)?;
@@ -1650,14 +1832,17 @@ impl<'a> JpegBitReader<'a> {
     fn decode_block(
         &mut self,
         qtable: &[u8; 64],
-        dc_huff: &DecHuffTable,
+        dc_huff: &DecDcHuffTable,
         ac_huff: &DecHuffTable,
         last_dc: &mut i32,
         out_pixels: &mut [u8; 64],
     ) -> Result<(), CameraError> {
         let mut coeffs = [0i32; 64];
 
-        let dc_nbits = self.decode_huff(dc_huff)? as u32;
+        let dc_nbits = self.decode_huff_dc(dc_huff)? as u32;
+        if dc_nbits > 11 {
+            return Err(CameraError::CodecError);
+        }
         let dc_diff = self.receive_extend(dc_nbits)?;
         let dc_val = last_dc.saturating_add(dc_diff).clamp(-2048, 2047);
         *last_dc = dc_val;
@@ -1673,6 +1858,9 @@ impl<'a> JpegBitReader<'a> {
             let s = (rs & 0x0F) as u32;
 
             if s == 0 {
+                if r == 0 {
+                    break;
+                }
                 if r == 15 {
                     if k + 16 > 64 {
                         return Err(CameraError::CorruptedFrame);
@@ -1680,7 +1868,11 @@ impl<'a> JpegBitReader<'a> {
                     k += 16;
                     continue;
                 }
-                break;
+                // Reserved baseline AC symbols 0x10..=0xE0 (progressive EOBn).
+                return Err(CameraError::CodecError);
+            }
+            if s > 10 {
+                return Err(CameraError::CodecError);
             }
 
             k += r;
@@ -1817,9 +2009,10 @@ fn decode_jpeg_internal(
 
     let mut qtables = [[0u8; 64]; 4];
     let mut qtable_valid = [false; 4];
-    let mut dc_tables = [DecHuffTable::default(); 2];
-    let mut ac_tables = [DecHuffTable::default(); 2];
+    let mut dc_tables = [DecDcHuffTable::new(); 2];
+    let mut ac_tables = [DecHuffTable::new(); 2];
     let mut comps = [ComponentSpec::default(); 3];
+    let mut sos_order = [0usize; 3];
     let mut num_components = 0usize;
     let mut width = 0u16;
     let mut height = 0u16;
@@ -1846,8 +2039,10 @@ fn decode_jpeg_internal(
         if marker == M_EOI {
             break;
         }
+        // Reject stuffed 0x00, TEM (0x01), RST0..=RST7 (0xD0..=0xD7), and
+        // nested SOI (0xD8) before SOS (ITU-T T.81 Table B.1).
         if marker == 0x00 || marker == 0x01 || (0xD0..=0xD8).contains(&marker) {
-            continue;
+            return Err(CameraError::CorruptedFrame);
         }
 
         if pos + 2 > src.len() {
@@ -1888,9 +2083,9 @@ fn decode_jpeg_internal(
                     }
                     let info = src[cur];
                     cur += 1;
-                    let is_ac = (info & 0x10) != 0;
+                    let tc = info >> 4;
                     let t_idx = (info & 0x0F) as usize;
-                    if t_idx > 1 {
+                    if tc > 1 || t_idx > 1 {
                         return Err(CameraError::CodecError);
                     }
                     let mut bits = [0u8; 17];
@@ -1903,12 +2098,19 @@ fn decode_jpeg_internal(
                     if cur + total_syms > seg_end {
                         return Err(CameraError::CodecError);
                     }
-                    let target = if is_ac {
-                        &mut ac_tables[t_idx]
+                    if tc == 1 {
+                        build_dec_huff_table_in_place(
+                            &mut ac_tables[t_idx],
+                            &bits,
+                            &src[cur..cur + total_syms],
+                        )?;
                     } else {
-                        &mut dc_tables[t_idx]
-                    };
-                    build_dec_huff_table_in_place(target, &bits, &src[cur..cur + total_syms])?;
+                        build_dec_dc_huff_table_in_place(
+                            &mut dc_tables[t_idx],
+                            &bits,
+                            &src[cur..cur + total_syms],
+                        )?;
+                    }
                     dht_seen = true;
                     cur += total_syms;
                 }
@@ -1920,7 +2122,7 @@ fn decode_jpeg_internal(
                 restart_interval = u16::from_be_bytes([src[cur], src[cur + 1]]);
             }
             M_SOF0 => {
-                if cur + 6 > seg_end {
+                if sof_parsed || cur + 6 > seg_end {
                     return Err(CameraError::CodecError);
                 }
                 let precision = src[cur];
@@ -1934,7 +2136,7 @@ fn decode_jpeg_internal(
                 if width == 0
                     || height == 0
                     || (num_components != 1 && num_components != 3)
-                    || cur + num_components * 3 > seg_end
+                    || cur + num_components * 3 != seg_end
                 {
                     return Err(CameraError::CodecError);
                 }
@@ -1944,11 +2146,14 @@ fn decode_jpeg_internal(
                 {
                     return Err(CameraError::InvalidArg);
                 }
-                for (idx, comp) in comps.iter_mut().take(num_components).enumerate() {
+                for idx in 0..num_components {
                     let id = src[cur];
                     let samp = src[cur + 1];
                     let q_idx = src[cur + 2];
                     cur += 3;
+                    if comps[..idx].iter().any(|c| c.id == id) {
+                        return Err(CameraError::CodecError);
+                    }
                     let h_samp = samp >> 4;
                     let v_samp = samp & 0x0F;
                     if h_samp == 0 || h_samp > 2 || v_samp == 0 || v_samp > 2 || q_idx >= 4 {
@@ -1957,7 +2162,7 @@ fn decode_jpeg_internal(
                     if idx >= 1 && (h_samp != 1 || v_samp != 1) {
                         return Err(CameraError::NotSupported);
                     }
-                    *comp = ComponentSpec {
+                    comps[idx] = ComponentSpec {
                         id,
                         h_samp,
                         v_samp,
@@ -1967,6 +2172,10 @@ fn decode_jpeg_internal(
                     };
                 }
             }
+            // Non-baseline SOF1..=SOF15 and DAC (arithmetic coding) are unsupported.
+            0xC1..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCF => {
+                return Err(CameraError::NotSupported);
+            }
             M_SOS => {
                 if !sof_parsed || !dht_seen || !dqt_seen || num_components == 0 || cur + 1 > seg_end
                 {
@@ -1974,10 +2183,11 @@ fn decode_jpeg_internal(
                 }
                 let sos_comps = src[cur] as usize;
                 cur += 1;
-                if sos_comps != num_components || cur + sos_comps * 2 + 3 > seg_end {
+                if sos_comps != num_components || cur + sos_comps * 2 + 3 != seg_end {
                     return Err(CameraError::CodecError);
                 }
-                for _ in 0..sos_comps {
+                let mut sos_seen_mask = 0u8;
+                for slot in sos_order.iter_mut().take(sos_comps) {
                     let cid = src[cur];
                     let huff_sel = src[cur + 1];
                     cur += 2;
@@ -1986,18 +2196,27 @@ fn decode_jpeg_internal(
                     if dc_idx > 1 || ac_idx > 1 {
                         return Err(CameraError::CodecError);
                     }
-                    let mut matched = false;
-                    for comp in comps.iter_mut().take(num_components) {
+                    let mut matched_idx = None;
+                    for (comp_idx, comp) in comps.iter_mut().take(num_components).enumerate() {
                         if comp.id == cid {
+                            if (sos_seen_mask & (1u8 << comp_idx)) != 0 {
+                                return Err(CameraError::CodecError);
+                            }
+                            sos_seen_mask |= 1u8 << comp_idx;
                             comp.dc_idx = dc_idx;
                             comp.ac_idx = ac_idx;
-                            matched = true;
+                            matched_idx = Some(comp_idx);
                             break;
                         }
                     }
-                    if !matched {
+                    let Some(comp_idx) = matched_idx else {
                         return Err(CameraError::CodecError);
-                    }
+                    };
+                    *slot = comp_idx;
+                }
+                // Baseline DCT requires Ss == 0, Se == 63, Ah/Al == 0.
+                if src[cur] != 0 || src[cur + 1] != 63 || src[cur + 2] != 0 {
+                    return Err(CameraError::NotSupported);
                 }
                 sos_payload_pos = Some(seg_end);
                 break;
@@ -2084,7 +2303,7 @@ fn decode_jpeg_internal(
     let mcu_cols = w.div_ceil(mcu_w);
     let mcu_rows = h.div_ceil(mcu_h);
 
-    let mut reader = JpegBitReader::new(src, scan_start);
+    let mut reader = JpegBitReader::with_restart(src, scan_start, restart_interval > 0);
     let mut last_dc = [0i32; 3];
     let mut mcu_counter = 0u16;
     let mut expected_rst = 0u8;
@@ -2096,11 +2315,17 @@ fn decode_jpeg_internal(
     for mcu_y in 0..mcu_rows {
         for mcu_x in 0..mcu_cols {
             if restart_interval > 0 && mcu_counter == restart_interval {
+                if reader.pad_bits_consumed > 7 || reader.real_bits_remaining() > 7 {
+                    return Err(CameraError::CorruptedFrame);
+                }
                 mcu_counter = 0;
                 last_dc = [0i32; 3];
                 reader.bit_buf = 0;
                 reader.bits_in = 0;
                 reader.hit_marker = false;
+                reader.marker = None;
+                reader.pad_bits_in_buf = 0;
+                reader.pad_bits_consumed = 0;
                 reader.eof_pad_bytes = 0;
                 if reader.pos >= src.len() || src[reader.pos] != 0xFF {
                     return Err(CameraError::CorruptedFrame);
@@ -2116,31 +2341,35 @@ fn decode_jpeg_internal(
             }
 
             let y_count = max_h_samp * max_v_samp;
-            for y_blk in y_blocks.iter_mut().take(y_count) {
-                reader.decode_block(
-                    &qtables[comps[0].quant_idx as usize],
-                    &dc_tables[comps[0].dc_idx as usize],
-                    &ac_tables[comps[0].ac_idx as usize],
-                    &mut last_dc[0],
-                    y_blk,
-                )?;
-            }
-
-            if num_components == 3 {
-                reader.decode_block(
-                    &qtables[comps[1].quant_idx as usize],
-                    &dc_tables[comps[1].dc_idx as usize],
-                    &ac_tables[comps[1].ac_idx as usize],
-                    &mut last_dc[1],
-                    &mut cb_block,
-                )?;
-                reader.decode_block(
-                    &qtables[comps[2].quant_idx as usize],
-                    &dc_tables[comps[2].dc_idx as usize],
-                    &ac_tables[comps[2].ac_idx as usize],
-                    &mut last_dc[2],
-                    &mut cr_block,
-                )?;
+            for &comp_idx in sos_order.iter().take(num_components) {
+                let comp = &comps[comp_idx];
+                if comp_idx == 0 {
+                    for y_blk in y_blocks.iter_mut().take(y_count) {
+                        reader.decode_block(
+                            &qtables[comp.quant_idx as usize],
+                            &dc_tables[comp.dc_idx as usize],
+                            &ac_tables[comp.ac_idx as usize],
+                            &mut last_dc[0],
+                            y_blk,
+                        )?;
+                    }
+                } else if comp_idx == 1 {
+                    reader.decode_block(
+                        &qtables[comp.quant_idx as usize],
+                        &dc_tables[comp.dc_idx as usize],
+                        &ac_tables[comp.ac_idx as usize],
+                        &mut last_dc[1],
+                        &mut cb_block,
+                    )?;
+                } else {
+                    reader.decode_block(
+                        &qtables[comp.quant_idx as usize],
+                        &dc_tables[comp.dc_idx as usize],
+                        &ac_tables[comp.ac_idx as usize],
+                        &mut last_dc[2],
+                        &mut cr_block,
+                    )?;
+                }
             }
 
             let img_x0 = mcu_x * mcu_w;
@@ -2197,6 +2426,27 @@ fn decode_jpeg_internal(
             }
 
             mcu_counter = mcu_counter.wrapping_add(1);
+        }
+    }
+
+    // Verify trailing M_EOI and ensure at most 7 synthetic pad bits were used.
+    if reader.pad_bits_consumed > 7 {
+        return Err(CameraError::CorruptedFrame);
+    }
+    if reader.hit_marker {
+        if reader.marker != Some(M_EOI) {
+            return Err(CameraError::CorruptedFrame);
+        }
+    } else {
+        let mut eoi_pos = reader.pos;
+        if eoi_pos >= src.len() || src[eoi_pos] != 0xFF {
+            return Err(CameraError::CorruptedFrame);
+        }
+        while eoi_pos < src.len() && src[eoi_pos] == 0xFF {
+            eoi_pos += 1;
+        }
+        if eoi_pos >= src.len() || src[eoi_pos] != M_EOI {
+            return Err(CameraError::CorruptedFrame);
         }
     }
 
@@ -2782,7 +3032,7 @@ mod tests {
 
     #[test]
     fn test_conv14_dc_only_fast_path() {
-        let dc_huff = build_dec_huff_table(&DC_LUM_BITS, &DC_LUM_VAL)
+        let dc_huff = build_dec_dc_huff_table(&DC_LUM_BITS, &DC_LUM_VAL)
             .expect("standard DC luminance Huffman table must build");
         let ac_huff = build_dec_huff_table(&AC_LUM_BITS, &AC_LUM_VAL)
             .expect("standard AC luminance Huffman table must build");
@@ -3019,13 +3269,18 @@ mod tests {
             table_size <= 640,
             "DecHuffTable size {table_size} exceeds 640-byte stack budget"
         );
+        let dc_table_size = core::mem::size_of::<DecDcHuffTable>();
+        assert!(
+            dc_table_size <= 128,
+            "DecDcHuffTable size {dc_table_size} exceeds 128-byte stack budget"
+        );
 
         let mut table = DecHuffTable::default();
-        // Pre-populate dummy 1-bit table to verify in-place reset.
+        // Pre-populate dummy 2-bit table (codes 00, 01) to verify in-place reset.
         let mut init_bits = [0u8; 17];
-        init_bits[1] = 2;
+        init_bits[2] = 2;
         build_dec_huff_table_in_place(&mut table, &init_bits, &[0xAA, 0xBB])
-            .expect("Initial 1-bit Huffman table build must succeed");
+            .expect("Initial 2-bit Huffman table build must succeed");
 
         // Canonical table: 1 code at l=1..=14, 0 at l=15, 3 at l=16.
         // Length-16 codes land at 0xFFFC..=0xFFFE (0xFFFF unassigned).
@@ -3159,11 +3414,16 @@ mod tests {
             );
         }
         assert_eq!(
-            reader.get_bits(8),
-            Ok(0xFF),
-            "Post-EOI refill must pad with 0xFF 1-bits"
+            reader.get_bits(7),
+            Ok(0x7F),
+            "Post-EOI refill may supply at most 7 synthetic 1-pad bits"
         );
         assert!(reader.hit_marker, "EOI marker must set hit_marker");
+        assert_eq!(
+            reader.get_bits(1),
+            Err(CameraError::CorruptedFrame),
+            "Consuming >7 synthetic EOF pad bits must fail with CorruptedFrame"
+        );
 
         // 2. Verify missing-DHT-table rejection once per SOS.
         let width = 16u16;
@@ -4441,5 +4701,140 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_m123_m125_m204_m235_strict_decoder_hardening() {
+        // M-123: Compact DC Huffman table rejects >16 symbols.
+        let mut dc_too_many = [0u8; 17];
+        dc_too_many[5] = 17;
+        assert_eq!(
+            build_dec_dc_huff_table(&dc_too_many, &[0u8; 17])
+                .expect_err("DC Huffman table with >16 symbols must error"),
+            CameraError::CodecError
+        );
+
+        // M-125: Reserved all-1s Huffman codewords rejected at l=1 and l=16.
+        let mut all_ones_l1 = [0u8; 17];
+        all_ones_l1[1] = 2;
+        assert_eq!(
+            build_dec_huff_table(&all_ones_l1, &[0, 1])
+                .expect_err("all-1s AC codeword at l=1 must error"),
+            CameraError::CodecError
+        );
+        assert_eq!(
+            build_dec_dc_huff_table(&all_ones_l1, &[0, 1])
+                .expect_err("all-1s DC codeword at l=1 must error"),
+            CameraError::CodecError
+        );
+
+        let mut all_ones_l16 = [0u8; 17];
+        for b in &mut all_ones_l16[1..=14] {
+            *b = 1;
+        }
+        all_ones_l16[16] = 4; // 0xFFFC..=0xFFFF includes reserved 0xFFFF.
+        assert_eq!(
+            build_dec_huff_table(&all_ones_l16, &[0u8; 18])
+                .expect_err("all-1s AC codeword at l=16 must error"),
+            CameraError::CodecError
+        );
+
+        // Build a valid baseline 8x8 grayscale JPEG to mutate for protocol checks.
+        let gray_in = [140u8; 64];
+        let mut base_jpg = [0u8; 1024];
+        let base_len = encode_grayscale_to_jpeg(&gray_in, &mut base_jpg, 8, 8, 85)
+            .expect("8x8 grayscale encode must succeed");
+        let mut out = [0u8; 8 * 8 * 3];
+
+        // M-125: Missing trailing M_EOI must fail with CorruptedFrame.
+        assert_eq!(
+            decode_jpeg_to_rgb888(&base_jpg[..base_len - 2], &mut out),
+            Err(CameraError::CorruptedFrame)
+        );
+
+        // M-125: Unexpected marker inside scan (e.g., RST0 when DRI=0) fails.
+        let mut unexpected_rst = [0u8; 1024];
+        unexpected_rst[..base_len - 2].copy_from_slice(&base_jpg[..base_len - 2]);
+        unexpected_rst[base_len - 2] = 0xFF;
+        unexpected_rst[base_len - 1] = 0xD0;
+        unexpected_rst[base_len] = 0xFF;
+        unexpected_rst[base_len + 1] = 0xD9;
+        assert_eq!(
+            decode_jpeg_to_rgb888(&unexpected_rst[..base_len + 2], &mut out),
+            Err(CameraError::CorruptedFrame)
+        );
+
+        // M-235: Illegal 0xFF 0xFF 0x00 stuffing inside scan must fail.
+        let bad_stuffing = [0xFFu8, 0xFF, 0x00, 0xFF, 0xD9];
+        let mut reader = JpegBitReader::new(&bad_stuffing, 0);
+        assert_eq!(reader.get_bits(8), Err(CameraError::CorruptedFrame));
+
+        // M-235: DHT with Tc > 1 (e.g., 0x20) must fail with CodecError.
+        let dht_pos = base_jpg[..base_len]
+            .windows(2)
+            .position(|w| w == [0xFF, M_DHT])
+            .expect("DHT marker must exist");
+        let mut bad_tc = base_jpg;
+        bad_tc[dht_pos + 4] = 0x20;
+        assert_eq!(
+            decode_jpeg_to_rgb888(&bad_tc[..base_len], &mut out),
+            Err(CameraError::CodecError)
+        );
+
+        // M-235: Non-SOF0 (SOF2 = 0xC2) must return NotSupported.
+        let sof_pos = base_jpg[..base_len]
+            .windows(2)
+            .position(|w| w == [0xFF, M_SOF0])
+            .expect("SOF0 marker must exist");
+        let mut sof2 = base_jpg;
+        sof2[sof_pos + 1] = 0xC2;
+        assert_eq!(
+            decode_jpeg_to_rgb888(&sof2[..base_len], &mut out),
+            Err(CameraError::NotSupported)
+        );
+
+        // M-204: Non-baseline SOS spectral selection (Ss != 0) returns NotSupported.
+        let sos_pos = base_jpg[..base_len]
+            .windows(2)
+            .position(|w| w == [0xFF, M_SOS])
+            .expect("SOS marker must exist");
+        let mut bad_ss = base_jpg;
+        bad_ss[sos_pos + 7] = 1; // Ss = 1
+        assert_eq!(
+            decode_jpeg_to_rgb888(&bad_ss[..base_len], &mut out),
+            Err(CameraError::NotSupported)
+        );
+
+        // M-235: Reserved AC symbol (0x10) and out-of-range DC/AC categories rejected.
+        let mut custom_dc_bits = [0u8; 17];
+        custom_dc_bits[1] = 1;
+        let dc_gt11 = build_dec_dc_huff_table(&custom_dc_bits, &[12])
+            .expect("DC table with symbol 12 builds");
+        let ac_res = build_dec_huff_table(&custom_dc_bits, &[0x10])
+            .expect("AC table with reserved 0x10 builds");
+        let dc_ok =
+            build_dec_dc_huff_table(&DC_LUM_BITS, &DC_LUM_VAL).expect("standard DC table builds");
+        let ac_gt10 =
+            build_dec_huff_table(&custom_dc_bits, &[0x0B]).expect("AC table with s=11 builds");
+        let qtable = [1u8; 64];
+        let mut blk_out = [0u8; 64];
+        let mut last_dc = 0i32;
+
+        let scan_zero = [0x00u8, 0xFF, 0xD9];
+        let mut r_dc = JpegBitReader::new(&scan_zero, 0);
+        assert_eq!(
+            r_dc.decode_block(&qtable, &dc_gt11, &ac_res, &mut last_dc, &mut blk_out),
+            Err(CameraError::CodecError)
+        );
+        let mut r_ac_res = JpegBitReader::new(&scan_zero, 0);
+        assert_eq!(
+            r_ac_res.decode_block(&qtable, &dc_ok, &ac_res, &mut last_dc, &mut blk_out),
+            Err(CameraError::CodecError)
+        );
+        let mut r_ac_s11 = JpegBitReader::new(&scan_zero, 0);
+        assert_eq!(
+            r_ac_s11.decode_block(&qtable, &dc_ok, &ac_gt10, &mut last_dc, &mut blk_out),
+            Err(CameraError::CodecError)
+        );
     }
 }

@@ -83,6 +83,34 @@ pub const SLOT_READY: u8 = 1;
 /// cannot be overwritten.
 pub const SLOT_LEASED: u8 = 2;
 
+/// Internal slot state: buffer has been atomically reserved via CAS for an
+/// in-flight producer write and is neither free nor readable (`M-118`).
+const SLOT_WRITING: u8 = 3;
+
+/// RAII cleanup guard for an in-flight slot write (`M-118`).
+///
+/// If the producer closure returns `Err`, reports a length exceeding `BUF_CAP`,
+/// or unwinds via panic before `committed` is set, dropping this guard zeroes
+/// the partially written buffer, resets `meta_len` to `0`, and returns the
+/// slot to [`SLOT_FREE`].
+struct WriteSlotGuard<'a> {
+    state: &'a AtomicU8,
+    buf: &'a mut [u8],
+    meta_len: &'a mut usize,
+    committed: bool,
+}
+
+impl Drop for WriteSlotGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        if !self.committed {
+            self.buf.fill(0);
+            *self.meta_len = 0;
+            self.state.store(SLOT_FREE, Ordering::Release);
+        }
+    }
+}
+
 /// Metadata associated with a captured frame buffer slot (`camera_fb_t`
 /// fields).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -200,6 +228,7 @@ impl Deref for FrameGuard<'_> {
 impl Drop for FrameGuard<'_> {
     #[inline]
     fn drop(&mut self) {
+        self.data.fill(0);
         self.state_flag.store(SLOT_FREE, Ordering::Release);
     }
 }
@@ -287,34 +316,41 @@ impl<const COUNT: usize, const BUF_CAP: usize> FramePool<COUNT, BUF_CAP> {
         n
     }
 
-    /// Resets all unleased slots back to [`SLOT_FREE`]
-    /// (`esp_camera_return_all` / `cam_give_all`).
+    /// Resets all slots (including any leaked [`SLOT_LEASED`] slots) back to
+    /// [`SLOT_FREE`] and clears metadata and buffers (`esp_camera_return_all`
+    /// / `cam_give_all`, `M-118`).
+    ///
+    /// Taking `&mut self` statically guarantees no live [`FrameGuard`] borrows
+    /// this pool, so resetting [`SLOT_LEASED`] slots safely recovers from
+    /// `core::mem::forget`.
     pub fn return_all(&mut self) {
         let mut i = 0;
         while i < COUNT {
-            if self.states[i].load(Ordering::Acquire) != SLOT_LEASED {
-                self.states[i].store(SLOT_FREE, Ordering::Release);
-            }
+            self.buffers[i].0.fill(0);
+            self.meta[i].len = 0;
+            self.states[i].store(SLOT_FREE, Ordering::Release);
             i += 1;
         }
     }
 
-    /// Returns a slice to the raw backing buffer of slot `idx`, or `None` if
-    /// out of bounds.
+    /// Returns a slice of the valid captured frame payload in slot `idx`
+    /// (`..meta.len`), or `None` if out of bounds or not in [`SLOT_READY`]
+    /// (`M-197`).
     #[inline]
     pub fn raw_buffer(&self, idx: usize) -> Option<&[u8]> {
-        if idx < COUNT {
-            Some(&self.buffers[idx].0)
+        if idx < COUNT && self.states[idx].load(Ordering::Acquire) == SLOT_READY {
+            let len = self.meta[idx].len.min(BUF_CAP);
+            Some(&self.buffers[idx].0[..len])
         } else {
             None
         }
     }
 
     /// Returns a mutable slice to the raw backing buffer of slot `idx`, or
-    /// `None` if out of bounds or if currently leased (`LOGIC-054`).
+    /// `None` if out of bounds or not in [`SLOT_FREE`] (`LOGIC-054`, `M-197`).
     #[inline]
     pub fn raw_buffer_mut(&mut self, idx: usize) -> Option<&mut [u8]> {
-        if idx < COUNT && self.states[idx].load(Ordering::Acquire) != SLOT_LEASED {
+        if idx < COUNT && self.states[idx].load(Ordering::Acquire) == SLOT_FREE {
             Some(&mut self.buffers[idx].0)
         } else {
             None
@@ -322,22 +358,23 @@ impl<const COUNT: usize, const BUF_CAP: usize> FramePool<COUNT, BUF_CAP> {
     }
 
     /// Finds a target slot index for writing a new frame according to
-    /// `self.grab_mode` (`LOGIC-052`).
+    /// `self.grab_mode` (`LOGIC-052`, `M-118`).
     ///
-    /// Searches starting from
-    /// `self.write_cursor.fetch_add(1, Ordering::Relaxed) % COUNT`
-    /// to prevent slots `2..COUNT` from starving in [`GrabMode::Latest`].
+    /// Starts from `self.write_cursor % COUNT` to prevent slots `2..COUNT`
+    /// from starving in [`GrabMode::Latest`], and only advances `write_cursor`
+    /// when a slot is available (never on [`CameraError::NoMem`]).
     pub fn find_target_slot(&self) -> Result<usize, CameraError> {
         if COUNT == 0 || BUF_CAP == 0 {
             return Err(CameraError::NoMem);
         }
 
-        let start = self.write_cursor.fetch_add(1, Ordering::Relaxed) % COUNT;
+        let start = self.write_cursor.load(Ordering::Relaxed) % COUNT;
 
         // First look for any SLOT_FREE buffer starting from write_cursor
         for offset in 0..COUNT {
             let i = (start + offset) % COUNT;
             if self.states[i].load(Ordering::Acquire) == SLOT_FREE {
+                self.write_cursor.fetch_add(1, Ordering::Relaxed);
                 return Ok(i);
             }
         }
@@ -345,10 +382,8 @@ impl<const COUNT: usize, const BUF_CAP: usize> FramePool<COUNT, BUF_CAP> {
         match self.grab_mode {
             GrabMode::WhenEmpty => Err(CameraError::NoMem),
             GrabMode::Latest => {
-                // In Latest mode, if no slot is free, reclaim ONLY the oldest
-                // ready slot. Existing ready slots are not wiped here; older
-                // ready slots are only drained after write successfully
-                // finishes. Never evict a SLOT_LEASED slot.
+                // In Latest mode, if no slot is free, identify ONLY the oldest
+                // ready slot. Never evict a SLOT_LEASED or SLOT_WRITING slot.
                 let mut oldest: Option<(u64, usize)> = None;
                 for offset in 0..COUNT {
                     let j = (start + offset) % COUNT;
@@ -364,6 +399,7 @@ impl<const COUNT: usize, const BUF_CAP: usize> FramePool<COUNT, BUF_CAP> {
                     }
                 }
                 if let Some((_, idx)) = oldest {
+                    self.write_cursor.fetch_add(1, Ordering::Relaxed);
                     Ok(idx)
                 } else {
                     Err(CameraError::NoMem)
@@ -372,10 +408,84 @@ impl<const COUNT: usize, const BUF_CAP: usize> FramePool<COUNT, BUF_CAP> {
         }
     }
 
-    /// Selects a slot index for writing a new frame according to `self.grab_mode`.
-    #[inline]
-    fn select_write_slot(&mut self) -> Result<usize, CameraError> {
-        self.find_target_slot()
+    /// Atomically reserves a write slot by transitioning it via CAS to
+    /// [`SLOT_WRITING`] without advancing `write_cursor` on
+    /// [`CameraError::NoMem`] (`M-118`).
+    fn reserve_write_slot(&self) -> Result<usize, CameraError> {
+        if COUNT == 0 || BUF_CAP == 0 {
+            return Err(CameraError::NoMem);
+        }
+
+        let start = self.write_cursor.load(Ordering::Relaxed) % COUNT;
+
+        // 1. Atomically claim any SLOT_FREE buffer starting from write_cursor.
+        for offset in 0..COUNT {
+            let i = (start + offset) % COUNT;
+            if self.states[i]
+                .compare_exchange(SLOT_FREE, SLOT_WRITING, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                self.write_cursor.fetch_add(1, Ordering::Relaxed);
+                return Ok(i);
+            }
+        }
+
+        // 2. In Latest mode, atomically reclaim the oldest SLOT_READY slot.
+        match self.grab_mode {
+            GrabMode::WhenEmpty => Err(CameraError::NoMem),
+            GrabMode::Latest => loop {
+                let mut oldest: Option<(u64, usize)> = None;
+                for offset in 0..COUNT {
+                    let j = (start + offset) % COUNT;
+                    if self.states[j].load(Ordering::Acquire) == SLOT_READY {
+                        let seq = self.meta[j].sequence;
+                        match oldest {
+                            None => oldest = Some((seq, j)),
+                            Some((best_seq, _)) if seq < best_seq => {
+                                oldest = Some((seq, j));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                let Some((_, idx)) = oldest else {
+                    return Err(CameraError::NoMem);
+                };
+                if self.states[idx]
+                    .compare_exchange(
+                        SLOT_READY,
+                        SLOT_WRITING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    self.write_cursor.fetch_add(1, Ordering::Relaxed);
+                    return Ok(idx);
+                }
+            },
+        }
+    }
+
+    /// Zeroes and frees all [`SLOT_READY`] slots other than `keep_idx` for
+    /// [`GrabMode::Latest`].
+    fn drain_other_ready_slots(&mut self, keep_idx: usize) {
+        for j in 0..COUNT {
+            if j != keep_idx
+                && self.states[j]
+                    .compare_exchange(
+                        SLOT_READY,
+                        SLOT_WRITING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+            {
+                self.buffers[j].0.fill(0);
+                self.meta[j].len = 0;
+                self.states[j].store(SLOT_FREE, Ordering::Release);
+            }
+        }
     }
 
     /// Pushes a complete frame payload into the pool according to
@@ -391,18 +501,15 @@ impl<const COUNT: usize, const BUF_CAP: usize> FramePool<COUNT, BUF_CAP> {
         if payload.len() > BUF_CAP {
             return Err(CameraError::BufferTooSmall);
         }
-        let idx = self.select_write_slot()?;
+        let idx = self.reserve_write_slot()?;
 
         self.buffers[idx].0[..payload.len()].copy_from_slice(payload);
+        self.buffers[idx].0[payload.len()..].fill(0);
 
         // Only after payload is successfully written, drain older ready slots
         // in GrabMode::Latest
         if self.grab_mode == GrabMode::Latest {
-            for j in 0..COUNT {
-                if j != idx && self.states[j].load(Ordering::Acquire) == SLOT_READY {
-                    self.states[j].store(SLOT_FREE, Ordering::Release);
-                }
-            }
+            self.drain_other_ready_slots(idx);
         }
 
         let seq = self.next_seq;
@@ -434,29 +541,29 @@ impl<const COUNT: usize, const BUF_CAP: usize> FramePool<COUNT, BUF_CAP> {
     where
         F: FnOnce(&mut [u8]) -> Result<usize, CameraError>,
     {
-        let idx = self.select_write_slot()?;
-        let written_len = match writer(&mut self.buffers[idx].0) {
-            Ok(len) => len,
-            Err(e) => {
-                self.meta[idx].len = 0;
-                self.states[idx].store(SLOT_FREE, Ordering::Release);
-                return Err(e);
-            }
+        let idx = self.reserve_write_slot()?;
+
+        // Guard transitions slot back to SLOT_FREE and zeroes the buffer on
+        // error, oversize length, or panic unwind (M-118).
+        let mut write_guard = WriteSlotGuard {
+            state: &self.states[idx],
+            buf: &mut self.buffers[idx].0,
+            meta_len: &mut self.meta[idx].len,
+            committed: false,
         };
+
+        let written_len = writer(write_guard.buf)?;
         if written_len > BUF_CAP {
-            self.meta[idx].len = 0;
-            self.states[idx].store(SLOT_FREE, Ordering::Release);
             return Err(CameraError::BufferTooSmall);
         }
+        write_guard.buf[written_len..].fill(0);
+        write_guard.committed = true;
+        drop(write_guard);
 
         // Only after writer succeeds and validates capacity, drain any older
         // SLOT_READY slots in GrabMode::Latest
         if self.grab_mode == GrabMode::Latest {
-            for j in 0..COUNT {
-                if j != idx && self.states[j].load(Ordering::Acquire) == SLOT_READY {
-                    self.states[j].store(SLOT_FREE, Ordering::Release);
-                }
-            }
+            self.drain_other_ready_slots(idx);
         }
 
         let seq = self.next_seq;
@@ -524,18 +631,16 @@ impl<const COUNT: usize, const BUF_CAP: usize> FramePool<COUNT, BUF_CAP> {
                 }
                 if let Some((_, win)) = newest {
                     chosen_idx = Some(win);
-                    for j in 0..COUNT {
-                        if j != win && self.states[j].load(Ordering::Acquire) == SLOT_READY {
-                            self.states[j].store(SLOT_FREE, Ordering::Release);
-                        }
-                    }
+                    self.drain_other_ready_slots(win);
                 }
             }
         }
 
         let idx = chosen_idx.ok_or(CameraError::Timeout)?;
         let meta = self.meta[idx];
-        self.states[idx].store(SLOT_LEASED, Ordering::Release);
+        self.states[idx]
+            .compare_exchange(SLOT_READY, SLOT_LEASED, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| CameraError::Timeout)?;
 
         Ok(FrameGuard {
             data: &mut self.buffers[idx].0,
@@ -581,7 +686,7 @@ mod tests {
     fn test_frame_pool_backing_buffers_4_byte_aligned() {
         let mut pool: FramePool<3, 17> = FramePool::new(GrabMode::WhenEmpty);
         for i in 0..3 {
-            let buf = pool.raw_buffer(i).expect("slot exists");
+            let buf = pool.raw_buffer_mut(i).expect("free slot exists");
             assert_eq!(
                 (buf.as_ptr() as usize) % 4,
                 0,
@@ -737,6 +842,13 @@ mod tests {
         pool.states[0].store(SLOT_LEASED, Ordering::Release);
         assert!(pool.raw_buffer_mut(0).is_none());
         assert!(pool.raw_buffer_mut(1).is_some());
+
+        // M-197: SLOT_READY and SLOT_WRITING must also reject raw_buffer_mut.
+        pool.states[0].store(SLOT_READY, Ordering::Release);
+        assert!(pool.raw_buffer_mut(0).is_none());
+        pool.states[0].store(SLOT_WRITING, Ordering::Release);
+        assert!(pool.raw_buffer_mut(0).is_none());
+
         pool.states[0].store(SLOT_FREE, Ordering::Release);
         assert!(pool.raw_buffer_mut(0).is_some());
     }
@@ -751,5 +863,123 @@ mod tests {
             .push_frame(&[2], 10, 10, PixelFormat::Grayscale, 2)
             .expect("push_frame");
         assert_ne!(s0, s1);
+    }
+
+    #[test]
+    fn test_m118_return_all_recovers_mem_forget_leased_slot_and_zeroes() {
+        let mut pool: FramePool<2, 16> = FramePool::new(GrabMode::WhenEmpty);
+        pool.push_frame(&[0xAA, 0xBB, 0xCC, 0xDD], 160, 120, PixelFormat::Jpeg, 10)
+            .expect("push frame");
+
+        // Simulate a leaked FrameGuard via core::mem::forget.
+        let leaked = pool.take().expect("take frame");
+        assert_eq!(leaked.slot_index(), 0);
+        core::mem::forget(leaked);
+
+        // Slot 0 is stuck in SLOT_LEASED before return_all().
+        assert_eq!(pool.free_count(), 1);
+        assert_eq!(pool.states[0].load(Ordering::Acquire), SLOT_LEASED);
+
+        // return_all(&mut self) statically proves zero live guards exist and
+        // MUST reclaim SLOT_LEASED slots and zero buffer residue.
+        pool.return_all();
+        assert_eq!(pool.free_count(), 2);
+        assert_eq!(pool.available_frames(), 0);
+        assert_eq!(pool.states[0].load(Ordering::Acquire), SLOT_FREE);
+        assert_eq!(pool.meta[0].len, 0);
+        assert_eq!(pool.buffers[0].0, [0u8; 16]);
+    }
+
+    #[test]
+    fn test_m118_write_slot_guard_drop_clears_slot_on_unwind() {
+        let mut pool: FramePool<1, 16> = FramePool::new(GrabMode::Latest);
+        pool.push_frame(&[0x11, 0x22, 0x33, 0x44], 160, 120, PixelFormat::Jpeg, 10)
+            .expect("push ready frame");
+        assert_eq!(pool.available_frames(), 1);
+
+        // Atomically reserve the only slot (evicting SLOT_READY ->
+        // SLOT_WRITING), simulate partial write, and drop WriteSlotGuard
+        // uncommitted (exact unwind path).
+        let idx = pool.reserve_write_slot().expect("reserve latest slot");
+        assert_eq!(idx, 0);
+        assert_eq!(pool.states[0].load(Ordering::Acquire), SLOT_WRITING);
+        {
+            let guard = WriteSlotGuard {
+                state: &pool.states[0],
+                buf: &mut pool.buffers[0].0,
+                meta_len: &mut pool.meta[0].len,
+                committed: false,
+            };
+            guard.buf[0] = 0xDE;
+            guard.buf[1] = 0xAD;
+            // Drop without setting committed = true.
+        }
+
+        assert_eq!(pool.states[0].load(Ordering::Acquire), SLOT_FREE);
+        assert_eq!(pool.available_frames(), 0);
+        assert_eq!(pool.free_count(), 1);
+        assert_eq!(pool.meta[0].len, 0);
+        assert_eq!(pool.buffers[0].0, [0u8; 16]);
+    }
+
+    #[test]
+    fn test_m118_cas_reservation_and_no_cursor_advance_on_nomem() {
+        let mut pool: FramePool<2, 16> = FramePool::new(GrabMode::WhenEmpty);
+        pool.push_frame(&[1, 2], 10, 10, PixelFormat::Grayscale, 1)
+            .expect("push 0");
+        pool.push_frame(&[3, 4], 10, 10, PixelFormat::Grayscale, 2)
+            .expect("push 1");
+
+        let cursor_before = pool.write_cursor.load(Ordering::Relaxed);
+        assert_eq!(pool.find_target_slot(), Err(CameraError::NoMem));
+        assert_eq!(
+            pool.write_cursor.load(Ordering::Relaxed),
+            cursor_before,
+            "find_target_slot must not advance write_cursor on NoMem"
+        );
+        assert_eq!(
+            pool.push_frame(&[5, 6], 10, 10, PixelFormat::Grayscale, 3),
+            Err(CameraError::NoMem)
+        );
+        assert_eq!(
+            pool.write_cursor.load(Ordering::Relaxed),
+            cursor_before,
+            "push_frame must not advance write_cursor on NoMem"
+        );
+
+        // Verify CAS reservation prevents double-claiming the same slot.
+        pool.return_all();
+        let r0 = pool.reserve_write_slot().expect("first CAS claim");
+        let r1 = pool.reserve_write_slot().expect("second CAS claim");
+        assert_ne!(r0, r1);
+        assert_eq!(pool.reserve_write_slot(), Err(CameraError::NoMem));
+        assert_eq!(pool.states[r0].load(Ordering::Acquire), SLOT_WRITING);
+        assert_eq!(pool.states[r1].load(Ordering::Acquire), SLOT_WRITING);
+        pool.return_all();
+    }
+
+    #[test]
+    fn test_m197_frame_guard_drop_zeroizes_and_raw_buffer_bounds() {
+        let mut pool: FramePool<2, 16> = FramePool::new(GrabMode::WhenEmpty);
+
+        // Free slots must not be exposed by raw_buffer().
+        assert!(pool.raw_buffer(0).is_none());
+
+        let idx = pool
+            .push_frame(&[0xFE, 0xED, 0xFA, 0xCE], 160, 120, PixelFormat::Jpeg, 50)
+            .expect("push frame");
+        assert_eq!(pool.raw_buffer(idx), Some(&[0xFE, 0xED, 0xFA, 0xCE][..]));
+        // Ready slot must reject raw_buffer_mut().
+        assert!(pool.raw_buffer_mut(idx).is_none());
+
+        {
+            let guard = pool.take().expect("lease ready frame");
+            assert_eq!(guard.as_slice(), &[0xFE, 0xED, 0xFA, 0xCE]);
+        }
+
+        // After FrameGuard drops, buffer bytes MUST be zeroed (SEC-051) and
+        // raw_buffer() must return None because slot is SLOT_FREE.
+        assert!(pool.raw_buffer(idx).is_none());
+        assert_eq!(pool.buffers[idx].0, [0u8; 16]);
     }
 }

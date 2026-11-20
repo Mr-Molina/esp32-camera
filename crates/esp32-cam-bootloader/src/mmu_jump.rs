@@ -7,8 +7,21 @@
 // JUSTIFICATION: Hardware Mask ROM and DPORT MMIO registers on Xtensa target
 // require unsafe FFI and volatile pointer operations.
 
+#[cfg(target_arch = "xtensa")]
+use core::sync::atomic::AtomicBool;
+#[cfg(target_arch = "xtensa")]
+use core::sync::atomic::Ordering;
+
+use crate::image_verify::is_valid_app_ram_span;
+use crate::image_verify::is_valid_executable_addr;
 use crate::image_verify::SegmentKind;
 use crate::image_verify::VerifiedImage;
+use crate::image_verify::MAX_SEGMENTS;
+use crate::image_verify::SOC_APP_IRAM_LOW;
+use crate::image_verify::SOC_DROM_HIGH;
+use crate::image_verify::SOC_DROM_LOW;
+use crate::image_verify::SOC_IROM_HIGH;
+use crate::image_verify::SOC_IROM_LOW;
 use crate::rom_boundary::AlignedBounce64;
 use crate::rom_boundary::CacheControl;
 use crate::rom_boundary::FlashError;
@@ -43,6 +56,9 @@ pub const DPORT_CACHE_MASK_FLASH_BITS: u32 = 0x0000_0017;
 /// MMU page granularity in bytes (64 KiB).
 pub const MMU_PAGE_SIZE: u32 = 0x1_0000;
 
+/// Maximum ESP32-WROVER SPI flash size in bytes (4 MiB).
+pub const MAX_MMU_FLASH_BYTES: u64 = 4 * 1024 * 1024;
+
 /// MMU mapping plan calculated for a virtual memory segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MmuMappingPlan {
@@ -54,36 +70,6 @@ pub struct MmuMappingPlan {
     pub page_count: u32,
 }
 
-/// Computes the 64 KiB page-aligned MMU mapping parameters for a segment.
-#[must_use]
-pub const fn compute_mmu_mapping(flash_offset: u32, vaddr: u32, len: u32) -> MmuMappingPlan {
-    let vaddr_aligned = vaddr & !(MMU_PAGE_SIZE - 1);
-    let paddr_aligned = flash_offset & !(MMU_PAGE_SIZE - 1);
-    let offset_in_page = vaddr & (MMU_PAGE_SIZE - 1);
-    let page_count = if len == 0 {
-        0
-    } else {
-        (offset_in_page + len + MMU_PAGE_SIZE - 1) >> 16
-    };
-    MmuMappingPlan {
-        vaddr_aligned,
-        paddr_aligned,
-        page_count,
-    }
-}
-
-/// Abstraction for writing loaded segment bytes to destination RAM.
-pub trait RamSink {
-    /// Writes `bytes` to RAM destination address `addr`.
-    fn write_ram(&mut self, addr: u32, bytes: &[u8]);
-}
-
-/// Abstraction for clearing DPORT flash cache isolation masks.
-pub trait CacheMaskControl {
-    /// Unmasks flash cache bits in DPORT cache control registers.
-    fn unmask_flash_cache(&mut self);
-}
-
 /// Errors occurring during RAM loading, MMU mapping, or boot jump preparation.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +78,12 @@ pub enum BootJumpError {
     Flash(FlashError),
     /// MMU mapping failed via cache controller.
     MmuMapFailed,
+    /// MMU mapping parameters overflow, break page parity, or exceed bounds.
+    MmuMappingInvalid,
+    /// RAM write destination fails alignment, overflow, or SRAM allowlist.
+    InvalidRamWrite,
+    /// Entry point address is zero or outside verified executable segments.
+    InvalidEntryAddress,
 }
 
 impl From<FlashError> for BootJumpError {
@@ -100,8 +92,131 @@ impl From<FlashError> for BootJumpError {
     }
 }
 
+/// Validates a destination RAM write span against 4-byte alignment,
+/// non-null/non-wrap arithmetic, and the ESP32 application SRAM allowlist.
+#[inline]
+pub const fn validate_ram_write_span(addr: u32, len: usize) -> Result<(), BootJumpError> {
+    if len == 0 {
+        return Ok(());
+    }
+    if addr == 0 || (addr & 3) != 0 || (len & 3) != 0 || len > u32::MAX as usize {
+        return Err(BootJumpError::InvalidRamWrite);
+    }
+    let len_u32 = len as u32;
+    if !is_valid_app_ram_span(addr, len_u32) {
+        return Err(BootJumpError::InvalidRamWrite);
+    }
+    Ok(())
+}
+
+/// Computes the 64 KiB page-aligned MMU mapping parameters for a segment.
+///
+/// Enforces `u64` overflow-free arithmetic, 64 KiB intra-page offset parity
+/// between `flash_offset` and `vaddr`, DROM/IROM virtual bounds, and the 4 MiB
+/// physical flash ceiling.
+pub const fn compute_mmu_mapping(
+    flash_offset: u32,
+    vaddr: u32,
+    len: u32,
+) -> Result<MmuMappingPlan, BootJumpError> {
+    let page_mask = MMU_PAGE_SIZE - 1;
+    let offset_in_page = vaddr & page_mask;
+    if offset_in_page != (flash_offset & page_mask) {
+        return Err(BootJumpError::MmuMappingInvalid);
+    }
+
+    let vaddr_u64 = vaddr as u64;
+    let flash_u64 = flash_offset as u64;
+    let len_u64 = len as u64;
+    let v_end = vaddr_u64 + len_u64;
+    let p_end = flash_u64 + len_u64;
+
+    let drom_lo = SOC_DROM_LOW as u64;
+    let drom_hi = SOC_DROM_HIGH as u64;
+    let irom_lo = SOC_IROM_LOW as u64;
+    let irom_hi = SOC_IROM_HIGH as u64;
+
+    let region_hi = if vaddr_u64 >= drom_lo && v_end <= drom_hi && (len > 0 || vaddr_u64 < drom_hi)
+    {
+        drom_hi
+    } else if vaddr_u64 >= irom_lo && v_end <= irom_hi && (len > 0 || vaddr_u64 < irom_hi) {
+        irom_hi
+    } else {
+        return Err(BootJumpError::MmuMappingInvalid);
+    };
+
+    if p_end > MAX_MMU_FLASH_BYTES || (len == 0 && flash_u64 >= MAX_MMU_FLASH_BYTES) {
+        return Err(BootJumpError::MmuMappingInvalid);
+    }
+
+    let vaddr_aligned = vaddr & !page_mask;
+    let paddr_aligned = flash_offset & !page_mask;
+    let page_count_u64 = if len == 0 {
+        0
+    } else {
+        let page_size_u64 = MMU_PAGE_SIZE as u64;
+        ((offset_in_page as u64) + len_u64 + page_size_u64 - 1) >> 16
+    };
+
+    let mapped_bytes = page_count_u64 * (MMU_PAGE_SIZE as u64);
+    if (vaddr_aligned as u64) + mapped_bytes > region_hi
+        || (paddr_aligned as u64) + mapped_bytes > MAX_MMU_FLASH_BYTES
+    {
+        return Err(BootJumpError::MmuMappingInvalid);
+    }
+
+    Ok(MmuMappingPlan {
+        vaddr_aligned,
+        paddr_aligned,
+        page_count: page_count_u64 as u32,
+    })
+}
+
+/// Abstraction for writing loaded segment bytes to destination RAM.
+pub trait RamSink {
+    /// Writes `bytes` to RAM destination address `addr`.
+    fn write_ram(&mut self, addr: u32, bytes: &[u8]) -> Result<(), BootJumpError>;
+}
+
+/// Abstraction for controlling DPORT flash cache isolation and MMU IA clear
+/// registers.
+pub trait CacheMaskControl {
+    /// Sets or clears `DPORT_APP_CACHE_MMU_IA_CLR` around APP MMU reset.
+    fn set_app_mmu_ia_clr(&mut self, enabled: bool);
+
+    /// Unmasks flash cache bits in DPORT cache control registers.
+    fn unmask_flash_cache(&mut self);
+}
+
+fn verify_image_entry_for_load(image: &VerifiedImage) -> Result<(), BootJumpError> {
+    let entry = image.entry_addr();
+    if !is_valid_executable_addr(entry) {
+        return Err(BootJumpError::InvalidEntryAddress);
+    }
+    for seg in image.segments().iter().flatten() {
+        let is_exec = match seg.kind() {
+            SegmentKind::IromMap => true,
+            SegmentKind::RamLoad => seg.load_addr() >= SOC_APP_IRAM_LOW,
+            SegmentKind::DromMap | SegmentKind::RtcSkip => false,
+        };
+        if !is_exec || seg.data_len() == 0 {
+            continue;
+        }
+        if let Some(seg_end) = seg.load_addr().checked_add(seg.data_len()) {
+            if entry >= seg.load_addr() && entry < seg_end {
+                return Ok(());
+            }
+        }
+    }
+    Err(BootJumpError::InvalidEntryAddress)
+}
+
 /// Copies RAM segments to memory, configures MMU mappings for flash segments,
 /// and unmasks the flash cache controller.
+///
+/// Pre-validates entry bounds, RAM write spans, and all MMU plans before
+/// mutating cache, RAM, or MMU state. Disables flash cache prior to SPI flash
+/// reads and flushes APP CPU cache after MMU programming.
 pub fn load_ram_and_map_mmu<F: FlashIo, C: CacheControl, R: RamSink, D: CacheMaskControl>(
     flash: &mut F,
     cache: &mut C,
@@ -109,64 +224,80 @@ pub fn load_ram_and_map_mmu<F: FlashIo, C: CacheControl, R: RamSink, D: CacheMas
     dport: &mut D,
     image: &VerifiedImage,
 ) -> Result<(), BootJumpError> {
-    let mut bounce = AlignedBounce64::new();
-    for seg in image.segments.iter().flatten() {
-        if seg.kind == SegmentKind::RamLoad {
-            let mut remaining = seg.data_len;
-            let mut curr_flash = seg.flash_offset;
-            let mut curr_dst = seg.load_addr;
-            while remaining > 0 {
-                let chunk_len = core::cmp::min(remaining as usize, bounce.bytes.len());
-                flash.read(curr_flash, &mut bounce.bytes[..chunk_len])?;
-                ram.write_ram(curr_dst, &bounce.bytes[..chunk_len]);
-                curr_flash = curr_flash.saturating_add(chunk_len as u32);
-                curr_dst = curr_dst.saturating_add(chunk_len as u32);
-                remaining -= chunk_len as u32;
+    verify_image_entry_for_load(image)?;
+
+    let mut mmu_plans: [Option<MmuMappingPlan>; MAX_SEGMENTS] = [None; MAX_SEGMENTS];
+    let mut plan_count: usize = 0;
+
+    for seg in image.segments().iter().flatten() {
+        match seg.kind() {
+            SegmentKind::RamLoad => {
+                validate_ram_write_span(seg.load_addr(), seg.data_len() as usize)?;
+                let _flash_end = seg
+                    .flash_offset()
+                    .checked_add(seg.data_len())
+                    .ok_or(BootJumpError::InvalidRamWrite)?;
             }
+            SegmentKind::DromMap | SegmentKind::IromMap => {
+                let plan =
+                    compute_mmu_mapping(seg.flash_offset(), seg.load_addr(), seg.data_len())?;
+                if plan.page_count > 0 {
+                    if plan_count >= MAX_SEGMENTS {
+                        return Err(BootJumpError::MmuMappingInvalid);
+                    }
+                    mmu_plans[plan_count] = Some(plan);
+                    plan_count += 1;
+                }
+            }
+            SegmentKind::RtcSkip => {}
         }
     }
 
     cache.disable_and_flush();
 
-    #[cfg(target_arch = "xtensa")]
-    // JUSTIFICATION: Mask ROM MMU initialization requires ROM FFI call and
-    // clearing APP MMU invalid access bit in DPORT_APP_CACHE_CTRL1_REG.
-    // SAFETY: ROM symbol mmu_init is provided by ESP32 ROM for CPUs 0 and 1;
-    // DPORT_APP_CACHE_CTRL1_REG is a valid MMIO register on ESP32.
-    unsafe {
-        mmu_init(0);
-        let app_ctrl1 = DPORT_APP_CACHE_CTRL1_REG as *mut u32;
-        app_ctrl1.write_volatile(app_ctrl1.read_volatile() | DPORT_APP_CACHE_MMU_IA_CLR);
-        mmu_init(1);
-        app_ctrl1.write_volatile(app_ctrl1.read_volatile() & !DPORT_APP_CACHE_MMU_IA_CLR);
-    }
-
-    for seg in image.segments.iter().flatten() {
-        if seg.kind == SegmentKind::DromMap || seg.kind == SegmentKind::IromMap {
-            let plan = compute_mmu_mapping(seg.flash_offset, seg.load_addr, seg.data_len);
-            if plan.page_count > 0 {
-                if !cache.mmu_map_pages(0, plan.vaddr_aligned, plan.paddr_aligned, plan.page_count)
-                {
-                    return Err(BootJumpError::MmuMapFailed);
-                }
-                if !cache.mmu_map_pages(1, plan.vaddr_aligned, plan.paddr_aligned, plan.page_count)
-                {
-                    return Err(BootJumpError::MmuMapFailed);
+    let mut bounce = AlignedBounce64::new();
+    for seg in image.segments().iter().flatten() {
+        if seg.kind() == SegmentKind::RamLoad {
+            let mut remaining = seg.data_len();
+            let mut curr_flash = seg.flash_offset();
+            let mut curr_dst = seg.load_addr();
+            while remaining > 0 {
+                let chunk_len = core::cmp::min(remaining as usize, bounce.bytes.len());
+                flash.read(curr_flash, &mut bounce.bytes[..chunk_len])?;
+                ram.write_ram(curr_dst, &bounce.bytes[..chunk_len])?;
+                remaining -= chunk_len as u32;
+                if remaining > 0 {
+                    curr_flash = curr_flash
+                        .checked_add(chunk_len as u32)
+                        .ok_or(BootJumpError::InvalidRamWrite)?;
+                    curr_dst = curr_dst
+                        .checked_add(chunk_len as u32)
+                        .ok_or(BootJumpError::InvalidRamWrite)?;
                 }
             }
         }
     }
 
+    cache.mmu_init(0);
+    dport.set_app_mmu_ia_clr(true);
+    cache.mmu_init(1);
+    dport.set_app_mmu_ia_clr(false);
+
+    for plan in mmu_plans.iter().take(plan_count).flatten() {
+        if !cache.mmu_map_pages(0, plan.vaddr_aligned, plan.paddr_aligned, plan.page_count) {
+            return Err(BootJumpError::MmuMapFailed);
+        }
+        if !cache.mmu_map_pages(1, plan.vaddr_aligned, plan.paddr_aligned, plan.page_count) {
+            return Err(BootJumpError::MmuMapFailed);
+        }
+    }
+
+    cache.flush_cache(1);
     dport.unmask_flash_cache();
     cache.enable_cache(0);
     cache.flush_uart0();
 
     Ok(())
-}
-
-#[cfg(target_arch = "xtensa")]
-extern "C" {
-    fn mmu_init(cpu: u32);
 }
 
 /// Writes up to `4 - lane_offset` bytes into the 32-bit little-endian word
@@ -254,53 +385,105 @@ pub unsafe fn write_ram_words_32(dst_words: *mut u32, bytes: &[u8]) {
     }
 }
 
-/// RAM sink for Xtensa target that writes verified image bytes to SRAM.
 #[cfg(target_arch = "xtensa")]
-#[derive(Debug, Default, Clone, Copy)]
-pub struct XtensaRamSink;
+static XTENSA_RAM_SINK_TAKEN: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_arch = "xtensa")]
-impl RamSink for XtensaRamSink {
-    fn write_ram(&mut self, addr: u32, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
-        let lane = (addr as usize) & 3;
-        let mut aligned_word = (addr as usize & !3) as *mut u32;
-        let mut remaining_bytes = bytes;
-        if lane != 0 {
-            // JUSTIFICATION: Unaligned leading bytes require 32-bit volatile
-            // read-modify-write at the enclosing word boundary.
-            // SAFETY: Destination addresses are verified against bootloader
-            // SRAM overlap, and aligned_word points to valid writable SRAM.
-            let written = unsafe { write_partial_word_le(aligned_word, lane, remaining_bytes) };
-            // JUSTIFICATION: Advancing word pointer past partially written word.
-            // SAFETY: Pointer is advanced by 1 word within verified SRAM region.
-            aligned_word = unsafe { aligned_word.add(1) };
-            remaining_bytes = &remaining_bytes[written..];
-        }
-        if !remaining_bytes.is_empty() {
-            // JUSTIFICATION: Aligned segment payload writes require 32-bit
-            // volatile store sequences.
-            // SAFETY: Destination addresses are verified against bootloader
-            // SRAM overlap and aligned_word is 4-byte aligned.
-            unsafe {
-                write_ram_words_32(aligned_word, remaining_bytes);
-            }
+static XTENSA_DPORT_MASK_TAKEN: AtomicBool = AtomicBool::new(false);
+
+/// RAM sink singleton for Xtensa target that writes verified bytes to SRAM.
+#[cfg(target_arch = "xtensa")]
+#[derive(Debug)]
+pub struct XtensaRamSink {
+    _private: (),
+}
+
+#[cfg(target_arch = "xtensa")]
+impl XtensaRamSink {
+    /// Claims exclusive ownership of the Xtensa RAM sink singleton.
+    ///
+    /// Returns `None` if the singleton has already been claimed.
+    #[must_use]
+    pub fn take() -> Option<Self> {
+        if XTENSA_RAM_SINK_TAKEN
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            Some(Self { _private: () })
+        } else {
+            None
         }
     }
 }
 
-/// DPORT cache mask controller for Xtensa hardware.
 #[cfg(target_arch = "xtensa")]
-#[derive(Debug, Default, Clone, Copy)]
-pub struct XtensaDportMask;
+impl RamSink for XtensaRamSink {
+    fn write_ram(&mut self, addr: u32, bytes: &[u8]) -> Result<(), BootJumpError> {
+        validate_ram_write_span(addr, bytes.len())?;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let aligned_word = (addr as usize) as *mut u32;
+        // JUSTIFICATION: Aligned segment payload writes require 32-bit
+        // volatile store sequences on Xtensa SRAM.
+        // SAFETY: `validate_ram_write_span` verified `addr != 0`, 4-byte
+        // alignment of both `addr` and `bytes.len()`, no `u32` wrap, and
+        // strict membership in allowlisted application DRAM0/IRAM0.
+        unsafe {
+            write_ram_words_32(aligned_word, bytes);
+        }
+        Ok(())
+    }
+}
+
+/// DPORT cache mask controller singleton for Xtensa hardware.
+#[cfg(target_arch = "xtensa")]
+#[derive(Debug)]
+pub struct XtensaDportMask {
+    _private: (),
+}
+
+#[cfg(target_arch = "xtensa")]
+impl XtensaDportMask {
+    /// Claims exclusive ownership of the Xtensa DPORT mask singleton.
+    ///
+    /// Returns `None` if the singleton has already been claimed.
+    #[must_use]
+    pub fn take() -> Option<Self> {
+        if XTENSA_DPORT_MASK_TAKEN
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            Some(Self { _private: () })
+        } else {
+            None
+        }
+    }
+}
 
 #[cfg(target_arch = "xtensa")]
 impl CacheMaskControl for XtensaDportMask {
+    fn set_app_mmu_ia_clr(&mut self, enabled: bool) {
+        // JUSTIFICATION: Toggling APP MMU invalid-access clear bit in DPORT
+        // hardware MMIO register around `mmu_init(1)`.
+        // SAFETY: `DPORT_APP_CACHE_CTRL1_REG` is a valid 4-byte-aligned
+        // ESP32 MMIO register owned exclusively by this singleton.
+        unsafe {
+            let app_ctrl1 = DPORT_APP_CACHE_CTRL1_REG as *mut u32;
+            let cur = app_ctrl1.read_volatile();
+            let next = if enabled {
+                cur | DPORT_APP_CACHE_MMU_IA_CLR
+            } else {
+                cur & !DPORT_APP_CACHE_MMU_IA_CLR
+            };
+            app_ctrl1.write_volatile(next);
+        }
+    }
+
     fn unmask_flash_cache(&mut self) {
         // JUSTIFICATION: Modifying hardware DPORT MMIO to unmask flash cache.
-        // SAFETY: DPORT cache control register addresses are valid ESP32 MMIO.
+        // SAFETY: DPORT cache control register addresses are valid ESP32 MMIO
+        // owned exclusively by this singleton.
         unsafe {
             let pro_reg = DPORT_PRO_CACHE_CTRL1_REG as *mut u32;
             let app_reg = DPORT_APP_CACHE_CTRL1_REG as *mut u32;
@@ -314,15 +497,23 @@ impl CacheMaskControl for XtensaDportMask {
 ///
 /// # Safety
 ///
-/// The entry address must point to a valid Xtensa Windowed ABI entry point.
+/// The entry address must point to a valid Xtensa Windowed ABI entry point
+/// inside a verified executable segment.
 // JUSTIFICATION: Target handoff requires direct machine jump to entry point.
-// SAFETY: The entry address is validated during image verification.
+// SAFETY: Entry address is validated both during image verification and
+// against `is_valid_executable_addr` immediately before transmuting.
 #[cfg(target_arch = "xtensa")]
+#[allow(clippy::empty_loop)]
 pub unsafe fn jump_to_entry(entry_addr: u32) -> ! {
+    if !is_valid_executable_addr(entry_addr) {
+        let mut wdt = crate::wdt::XtensaWdtMmio;
+        crate::wdt::trigger_sw_reset(&mut wdt);
+        loop {}
+    }
     // JUSTIFICATION: Target handoff requires transmuting the verified entry
     // address into a diverging extern "C" function pointer.
-    // SAFETY: Caller guarantees `entry_addr` points to a validated Xtensa
-    // Windowed ABI entry point inside a verified application segment.
+    // SAFETY: `entry_addr` is verified non-zero and inside executable ESP32
+    // IRAM0/IROM, and caller guarantees valid Xtensa Windowed ABI code there.
     let entry_fn: extern "C" fn() -> ! = unsafe { core::mem::transmute(entry_addr as usize) };
     entry_fn()
 }
@@ -337,20 +528,93 @@ mod tests {
     #[test]
     fn test_compute_mmu_mapping_aligned_and_unaligned() {
         // Aligned 64 KiB page
-        let plan_aligned = compute_mmu_mapping(0x20000, 0x3F40_0000, 0x1_0000);
+        let plan_aligned =
+            compute_mmu_mapping(0x20000, 0x3F40_0000, 0x1_0000).expect("aligned mapping");
         assert_eq!(plan_aligned.vaddr_aligned, 0x3F40_0000);
         assert_eq!(plan_aligned.paddr_aligned, 0x20000);
         assert_eq!(plan_aligned.page_count, 1);
 
         // Unaligned by +0x20 bytes crossing page boundary
-        let plan_unaligned = compute_mmu_mapping(0x20020, 0x3F40_0020, 0x1_0000);
+        let plan_unaligned =
+            compute_mmu_mapping(0x20020, 0x3F40_0020, 0x1_0000).expect("unaligned mapping");
         assert_eq!(plan_unaligned.vaddr_aligned, 0x3F40_0000);
         assert_eq!(plan_unaligned.paddr_aligned, 0x20000);
         assert_eq!(plan_unaligned.page_count, 2);
 
         // Zero length
-        let plan_zero = compute_mmu_mapping(0x20000, 0x3F40_0000, 0);
+        let plan_zero = compute_mmu_mapping(0x20000, 0x3F40_0000, 0).expect("zero-length mapping");
         assert_eq!(plan_zero.page_count, 0);
+
+        // Intra-page parity mismatch rejected
+        assert_eq!(
+            compute_mmu_mapping(0x20020, 0x3F40_0040, 0x1000),
+            Err(BootJumpError::MmuMappingInvalid)
+        );
+
+        // u32 overflow rejected without wrapping
+        assert_eq!(
+            compute_mmu_mapping(0x20000, 0x3F40_0000, u32::MAX),
+            Err(BootJumpError::MmuMappingInvalid)
+        );
+
+        // Exceeds DROM upper bound rejected
+        assert_eq!(
+            compute_mmu_mapping(0x20000, 0x3F7F_0000, 0x2_0000),
+            Err(BootJumpError::MmuMappingInvalid)
+        );
+
+        // Exceeds 4 MiB flash bound rejected
+        assert_eq!(
+            compute_mmu_mapping(0x3F_0000, 0x3F40_0000, 0x2_0000),
+            Err(BootJumpError::MmuMappingInvalid)
+        );
+
+        // Virtual address outside DROM/IROM rejected
+        assert_eq!(
+            compute_mmu_mapping(0x20000, 0x4008_0000, 0x1000),
+            Err(BootJumpError::MmuMappingInvalid)
+        );
+    }
+
+    #[test]
+    fn test_validate_ram_write_span_hardening() {
+        assert_eq!(validate_ram_write_span(0x4008_0000, 64), Ok(()));
+        assert_eq!(validate_ram_write_span(0x3FFB_0000, 64), Ok(()));
+        assert_eq!(validate_ram_write_span(0x4008_0000, 0), Ok(()));
+
+        // Unaligned address or length
+        assert_eq!(
+            validate_ram_write_span(0x4008_0001, 64),
+            Err(BootJumpError::InvalidRamWrite)
+        );
+        assert_eq!(
+            validate_ram_write_span(0x4008_0000, 62),
+            Err(BootJumpError::InvalidRamWrite)
+        );
+
+        // NULL / wrap-to-NULL
+        assert_eq!(
+            validate_ram_write_span(0, 4),
+            Err(BootJumpError::InvalidRamWrite)
+        );
+        assert_eq!(
+            validate_ram_write_span(0xFFFF_FFFC, 8),
+            Err(BootJumpError::InvalidRamWrite)
+        );
+
+        // MMIO & bootloader SRAM rejected
+        assert_eq!(
+            validate_ram_write_span(0x3FF0_0040, 4),
+            Err(BootJumpError::InvalidRamWrite)
+        );
+        assert_eq!(
+            validate_ram_write_span(0x3FFF_0000, 4),
+            Err(BootJumpError::InvalidRamWrite)
+        );
+        assert_eq!(
+            validate_ram_write_span(0x4007_8000, 4),
+            Err(BootJumpError::InvalidRamWrite)
+        );
     }
 
     struct TestRamSink {
@@ -370,7 +634,8 @@ mod tests {
     }
 
     impl RamSink for TestRamSink {
-        fn write_ram(&mut self, addr: u32, bytes: &[u8]) {
+        fn write_ram(&mut self, addr: u32, bytes: &[u8]) -> Result<(), BootJumpError> {
+            validate_ram_write_span(addr, bytes.len())?;
             self.last_addr = addr;
             for &b in bytes {
                 if self.write_len < self.written_bytes.len() {
@@ -378,20 +643,34 @@ mod tests {
                     self.write_len += 1;
                 }
             }
+            Ok(())
         }
     }
 
     struct TestCacheMask {
         unmasked: bool,
+        ia_clr_events: [bool; 4],
+        ia_clr_count: usize,
     }
 
     impl TestCacheMask {
         const fn new() -> Self {
-            Self { unmasked: false }
+            Self {
+                unmasked: false,
+                ia_clr_events: [false; 4],
+                ia_clr_count: 0,
+            }
         }
     }
 
     impl CacheMaskControl for TestCacheMask {
+        fn set_app_mmu_ia_clr(&mut self, enabled: bool) {
+            if self.ia_clr_count < self.ia_clr_events.len() {
+                self.ia_clr_events[self.ia_clr_count] = enabled;
+                self.ia_clr_count += 1;
+            }
+        }
+
         fn unmask_flash_cache(&mut self) {
             self.unmasked = true;
         }
@@ -400,10 +679,14 @@ mod tests {
     #[derive(Default)]
     struct RecordingCache {
         disabled_and_flushed: bool,
+        mmu_inits: [u32; 4],
+        mmu_init_count: usize,
         map_calls: usize,
         mapped_vaddr: [u32; 4],
         mapped_paddr: [u32; 4],
         mapped_pages: [u32; 4],
+        flushed_cpus: [u32; 4],
+        flush_count: usize,
         enabled_cpu: Option<u32>,
         uart_flushed: bool,
     }
@@ -411,6 +694,13 @@ mod tests {
     impl CacheControl for RecordingCache {
         fn disable_and_flush(&mut self) {
             self.disabled_and_flushed = true;
+        }
+
+        fn mmu_init(&mut self, cpu: u32) {
+            if self.mmu_init_count < self.mmu_inits.len() {
+                self.mmu_inits[self.mmu_init_count] = cpu;
+                self.mmu_init_count += 1;
+            }
         }
 
         fn mmu_map_pages(&mut self, _cpu: u32, vaddr: u32, paddr: u32, page_count: u32) -> bool {
@@ -421,6 +711,13 @@ mod tests {
                 self.map_calls += 1;
             }
             true
+        }
+
+        fn flush_cache(&mut self, cpu: u32) {
+            if self.flush_count < self.flushed_cpus.len() {
+                self.flushed_cpus[self.flush_count] = cpu;
+                self.flush_count += 1;
+            }
         }
 
         fn enable_cache(&mut self, cpu: u32) {
@@ -443,25 +740,20 @@ mod tests {
             .expect("write_raw failed");
 
         let mut segments: [Option<VerifiedSegment>; MAX_SEGMENTS] = [None; MAX_SEGMENTS];
-        segments[0] = Some(VerifiedSegment {
-            flash_offset: 0x100,
-            load_addr: 0x4008_0000,
-            data_len: 64,
-            kind: SegmentKind::RamLoad,
-        });
-        segments[1] = Some(VerifiedSegment {
-            flash_offset: 0x20020,
-            load_addr: 0x3F40_0020,
-            data_len: 0x8000,
-            kind: SegmentKind::DromMap,
-        });
+        segments[0] = Some(VerifiedSegment::new_for_test(
+            0x100,
+            0x4008_0000,
+            64,
+            SegmentKind::RamLoad,
+        ));
+        segments[1] = Some(VerifiedSegment::new_for_test(
+            0x20020,
+            0x3F40_0020,
+            0x8000,
+            SegmentKind::DromMap,
+        ));
 
-        let image = VerifiedImage {
-            entry_addr: 0x4008_0000,
-            segment_count: 2,
-            segments,
-            image_end_offset: 0x30000,
-        };
+        let image = VerifiedImage::new_for_test(0x4008_0000, 2, segments, 0x30000);
 
         let mut cache = RecordingCache::default();
         let mut ram = TestRamSink::new();
@@ -474,17 +766,80 @@ mod tests {
         assert_eq!(ram.write_len, 64);
         assert_eq!(&ram.written_bytes[..64], &ram_payload[..]);
 
-        // Verify Cache flush & MMU map
+        // Verify Cache flush, MMU init parity, APP IA clear, and MMU map
         assert!(cache.disabled_and_flushed);
+        assert_eq!(cache.mmu_init_count, 2);
+        assert_eq!(&cache.mmu_inits[..2], &[0, 1]);
+        assert_eq!(dport.ia_clr_count, 2);
+        assert_eq!(&dport.ia_clr_events[..2], &[true, false]);
         assert_eq!(cache.map_calls, 2); // CPU 0 and CPU 1
         assert_eq!(cache.mapped_vaddr[0], 0x3F40_0000);
         assert_eq!(cache.mapped_paddr[0], 0x20000);
         assert_eq!(cache.mapped_pages[0], 1);
+        assert_eq!(cache.flush_count, 1);
+        assert_eq!(cache.flushed_cpus[0], 1);
 
         // Verify DPORT cache unmask and re-enable
         assert!(dport.unmasked);
         assert_eq!(cache.enabled_cpu, Some(0));
         assert!(cache.uart_flushed);
+    }
+
+    #[test]
+    fn test_load_ram_prevalidates_before_mutating_state() {
+        let mut flash = MockFlash::<2>::new();
+        let ram_payload = [0x55u8; 64];
+        flash.write_raw(0x100, &ram_payload).expect("write_raw");
+
+        // Valid RAM segment paired with invalid MMU segment (parity mismatch)
+        let mut segments: [Option<VerifiedSegment>; MAX_SEGMENTS] = [None; MAX_SEGMENTS];
+        segments[0] = Some(VerifiedSegment::new_for_test(
+            0x100,
+            0x4008_0000,
+            64,
+            SegmentKind::RamLoad,
+        ));
+        segments[1] = Some(VerifiedSegment::new_for_test(
+            0x20020,
+            0x3F40_0040,
+            0x8000,
+            SegmentKind::DromMap,
+        ));
+        let image = VerifiedImage::new_for_test(0x4008_0000, 2, segments, 0x30000);
+
+        let mut cache = RecordingCache::default();
+        let mut ram = TestRamSink::new();
+        let mut dport = TestCacheMask::new();
+
+        let err = load_ram_and_map_mmu(&mut flash, &mut cache, &mut ram, &mut dport, &image)
+            .expect_err("must reject invalid MMU plan before mutating RAM");
+        assert_eq!(err, BootJumpError::MmuMappingInvalid);
+        assert_eq!(ram.write_len, 0);
+        assert!(!cache.disabled_and_flushed);
+        assert!(!dport.unmasked);
+    }
+
+    #[test]
+    fn test_load_ram_rejects_zero_entry_addr() {
+        let mut flash = MockFlash::<2>::new();
+        let mut segments: [Option<VerifiedSegment>; MAX_SEGMENTS] = [None; MAX_SEGMENTS];
+        segments[0] = Some(VerifiedSegment::new_for_test(
+            0x100,
+            0x4008_0000,
+            64,
+            SegmentKind::RamLoad,
+        ));
+        let image = VerifiedImage::new_for_test(0, 1, segments, 0x200);
+
+        let mut cache = RecordingCache::default();
+        let mut ram = TestRamSink::new();
+        let mut dport = TestCacheMask::new();
+
+        let err = load_ram_and_map_mmu(&mut flash, &mut cache, &mut ram, &mut dport, &image)
+            .expect_err("must reject zero entry address");
+        assert_eq!(err, BootJumpError::InvalidEntryAddress);
+        assert_eq!(ram.write_len, 0);
+        assert!(!cache.disabled_and_flushed);
     }
 
     #[test]
@@ -561,19 +916,14 @@ mod tests {
             .expect("write_raw failed");
 
         let mut segments: [Option<VerifiedSegment>; MAX_SEGMENTS] = [None; MAX_SEGMENTS];
-        segments[0] = Some(VerifiedSegment {
-            flash_offset: 0x100,
-            load_addr: 0x4008_0000,
-            data_len: 72,
-            kind: SegmentKind::RamLoad,
-        });
+        segments[0] = Some(VerifiedSegment::new_for_test(
+            0x100,
+            0x4008_0000,
+            72,
+            SegmentKind::RamLoad,
+        ));
 
-        let image = VerifiedImage {
-            entry_addr: 0x4008_0000,
-            segment_count: 1,
-            segments,
-            image_end_offset: 0x30000,
-        };
+        let image = VerifiedImage::new_for_test(0x4008_0000, 1, segments, 0x30000);
 
         let mut cache = RecordingCache::default();
         let mut ram = TestRamSink::new();

@@ -124,7 +124,7 @@ where
         };
         if load_ram_and_map_mmu(flash, cache, ram, dport, &verified).is_ok() {
             record_boot_stage(wdt, BOOT_STAGE_IMAGE_LOADED);
-            return Ok(verified.entry_addr);
+            return Ok(verified.entry_addr());
         }
     }
 
@@ -141,12 +141,17 @@ pub fn run_xtensa_boot() -> ! {
     let mut gpio = XtensaGpioMmio;
     let mut wdt = XtensaWdtMmio;
     let mut clk = XtensaClockMmio;
-    let mut flash = RomFlash::new();
-    let mut cache = RomCache::new();
+    let (Some(mut flash), Some(mut cache), Some(mut ram), Some(mut dport)) = (
+        RomFlash::take(),
+        RomCache::take(),
+        XtensaRamSink::take(),
+        XtensaDportMask::take(),
+    ) else {
+        trigger_sw_reset(&mut wdt);
+        loop {}
+    };
     cache.flush_uart0();
     configure_bbpll_240m_apb_80m();
-    let mut ram = XtensaRamSink;
-    let mut dport = XtensaDportMask;
 
     if attach_flash_4mb_dio().is_err() {
         cache.flush_uart0();
@@ -181,6 +186,7 @@ mod tests {
     use crate::image_verify::Sha256;
     use crate::image_verify::ESP_CHECKSUM_MAGIC;
     use crate::image_verify::ESP_IMAGE_HEADER_MAGIC;
+    use crate::mmu_jump::BootJumpError;
     use crate::otadata::OtaImgState;
     use crate::otadata::OtaSelectEntry;
     use crate::partitions::encode_md5_entry;
@@ -193,16 +199,15 @@ mod tests {
     use crate::rom_boundary::AlignedBounce64;
     use crate::rom_boundary::FlashError;
     use crate::rom_boundary::MockCache;
-    use crate::rom_boundary::MockFlash;
     use crate::rom_boundary::FLASH_SECTOR_SIZE;
     use crate::wdt::RTC_CNTL_STORE7_REG;
 
     const OTADATA_OFFSET: u32 = 0x9000;
     const OTADATA_SIZE: u32 = 0x2000;
-    const OTA0_OFFSET: u32 = 0xB000;
-    const OTA0_SIZE: u32 = 0x2000;
-    const OTA1_OFFSET: u32 = 0xD000;
-    const OTA1_SIZE: u32 = 0x2000;
+    const OTA0_OFFSET: u32 = 0x1_0000;
+    const OTA0_SIZE: u32 = 0x1_0000;
+    const OTA1_OFFSET: u32 = 0x2_0000;
+    const OTA1_SIZE: u32 = 0x1_0000;
 
     #[repr(C, align(4))]
     struct AlignedTestImage {
@@ -306,7 +311,7 @@ mod tests {
     }
 
     impl RamSink for MockRamSink {
-        fn write_ram(&mut self, addr: u32, bytes: &[u8]) {
+        fn write_ram(&mut self, addr: u32, bytes: &[u8]) -> Result<(), BootJumpError> {
             self.last_addr = addr;
             for &b in bytes {
                 if self.written_len < self.data.len() {
@@ -314,6 +319,7 @@ mod tests {
                     self.written_len += 1;
                 }
             }
+            Ok(())
         }
     }
 
@@ -328,6 +334,8 @@ mod tests {
     }
 
     impl CacheMaskControl for MockDportMask {
+        fn set_app_mmu_ia_clr(&mut self, _enabled: bool) {}
+
         fn unmask_flash_cache(&mut self) {
             self.unmasked = true;
         }
@@ -343,7 +351,7 @@ mod tests {
         entry
     }
 
-    fn write_standard_partitions(flash: &mut MockFlash<18>) {
+    fn write_standard_partitions<const N: usize>(flash: &mut SparseFlash<N>) {
         let mut raw = [0xFFu8; 128];
         let e_otadata = make_part_entry(
             PART_TYPE_DATA,
@@ -364,16 +372,14 @@ mod tests {
         let md5 = encode_md5_entry(&raw[..96]);
         raw[96..128].copy_from_slice(&md5);
 
-        flash
-            .write_raw(PARTITION_TABLE_OFFSET, &raw)
-            .expect("partition table write");
+        flash.write_raw(PARTITION_TABLE_OFFSET, &raw);
     }
 
     fn build_app_image(entry_addr: u32, ram_fill: u8) -> (AlignedTestImage, usize) {
         let drom_payload = [0x11u8; 32];
         let ram_payload = [ram_fill; 32];
         let segments: [(u32, &[u8]); 2] =
-            [(0x3F40_0020, &drom_payload), (0x4008_0000, &ram_payload)];
+            [(0x3F40_0020, &drom_payload), (entry_addr, &ram_payload)];
 
         let mut img = AlignedTestImage { bytes: [0u8; 512] };
         img.bytes[0] = ESP_IMAGE_HEADER_MAGIC;
@@ -429,22 +435,16 @@ mod tests {
 
     #[test]
     fn valid_ota0_transitions_new_to_pending_verify_and_returns_entry() {
-        let mut flash = MockFlash::<18>::new();
+        let mut flash = SparseFlash::<8>::new();
         write_standard_partitions(&mut flash);
 
         let entry0 = OtaSelectEntry::new(1, OtaImgState::New);
-        flash
-            .write_raw(OTADATA_OFFSET, &entry0.to_bytes())
-            .expect("write otadata0");
+        flash.write_raw(OTADATA_OFFSET, &entry0.to_bytes());
 
         let (img0, len0) = build_app_image(0x4008_1000, 0xA1);
         let (img1, len1) = build_app_image(0x4008_2000, 0xB2);
-        flash
-            .write_raw(OTA0_OFFSET, &img0.bytes[..len0])
-            .expect("write ota0");
-        flash
-            .write_raw(OTA1_OFFSET, &img1.bytes[..len1])
-            .expect("write ota1");
+        flash.write_raw(OTA0_OFFSET, &img0.bytes[..len0]);
+        flash.write_raw(OTA1_OFFSET, &img1.bytes[..len1]);
 
         let mut gpio = MockGpio::new();
         let mut wdt = MockWdt::new();
@@ -472,23 +472,17 @@ mod tests {
 
     #[test]
     fn corrupt_ota0_falls_back_to_valid_ota1() {
-        let mut flash = MockFlash::<18>::new();
+        let mut flash = SparseFlash::<8>::new();
         write_standard_partitions(&mut flash);
 
         let entry0 = OtaSelectEntry::new(1, OtaImgState::Valid);
-        flash
-            .write_raw(OTADATA_OFFSET, &entry0.to_bytes())
-            .expect("write otadata0");
+        flash.write_raw(OTADATA_OFFSET, &entry0.to_bytes());
 
         let (mut img0, len0) = build_app_image(0x4008_1000, 0xA1);
         img0.bytes[40] ^= 0xFF; // corrupt segment payload
         let (img1, len1) = build_app_image(0x4008_2000, 0xB2);
-        flash
-            .write_raw(OTA0_OFFSET, &img0.bytes[..len0])
-            .expect("write ota0");
-        flash
-            .write_raw(OTA1_OFFSET, &img1.bytes[..len1])
-            .expect("write ota1");
+        flash.write_raw(OTA0_OFFSET, &img0.bytes[..len0]);
+        flash.write_raw(OTA1_OFFSET, &img1.bytes[..len1]);
 
         let mut gpio = MockGpio::new();
         let mut wdt = MockWdt::new();
@@ -510,27 +504,19 @@ mod tests {
 
     #[test]
     fn pending_verify_rollback_aborts_ota0_and_selects_ota1() {
-        let mut flash = MockFlash::<18>::new();
+        let mut flash = SparseFlash::<8>::new();
         write_standard_partitions(&mut flash);
 
         // seq=3 maps to ota_0 ((3-1)%2 = 0); seq=2 maps to ota_1 ((2-1)%2 = 1).
         let entry0 = OtaSelectEntry::new(3, OtaImgState::PendingVerify);
         let entry1 = OtaSelectEntry::new(2, OtaImgState::Valid);
-        flash
-            .write_raw(OTADATA_OFFSET, &entry0.to_bytes())
-            .expect("write otadata0");
-        flash
-            .write_raw(OTADATA_OFFSET + 0x1000, &entry1.to_bytes())
-            .expect("write otadata1");
+        flash.write_raw(OTADATA_OFFSET, &entry0.to_bytes());
+        flash.write_raw(OTADATA_OFFSET + 0x1000, &entry1.to_bytes());
 
         let (img0, len0) = build_app_image(0x4008_1000, 0xA1);
         let (img1, len1) = build_app_image(0x4008_2000, 0xB2);
-        flash
-            .write_raw(OTA0_OFFSET, &img0.bytes[..len0])
-            .expect("write ota0");
-        flash
-            .write_raw(OTA1_OFFSET, &img1.bytes[..len1])
-            .expect("write ota1");
+        flash.write_raw(OTA0_OFFSET, &img0.bytes[..len0]);
+        flash.write_raw(OTA1_OFFSET, &img1.bytes[..len1]);
 
         let mut gpio = MockGpio::new();
         let mut wdt = MockWdt::new();
@@ -553,19 +539,15 @@ mod tests {
 
     #[test]
     fn all_candidates_corrupt_returns_no_bootable_image() {
-        let mut flash = MockFlash::<18>::new();
+        let mut flash = SparseFlash::<8>::new();
         write_standard_partitions(&mut flash);
 
         let (mut img0, len0) = build_app_image(0x4008_1000, 0xA1);
         let (mut img1, len1) = build_app_image(0x4008_2000, 0xB2);
         img0.bytes[0] = 0x00;
         img1.bytes[0] = 0x00;
-        flash
-            .write_raw(OTA0_OFFSET, &img0.bytes[..len0])
-            .expect("write ota0");
-        flash
-            .write_raw(OTA1_OFFSET, &img1.bytes[..len1])
-            .expect("write ota1");
+        flash.write_raw(OTA0_OFFSET, &img0.bytes[..len0]);
+        flash.write_raw(OTA1_OFFSET, &img1.bytes[..len1]);
 
         let mut gpio = MockGpio::new();
         let mut wdt = MockWdt::new();

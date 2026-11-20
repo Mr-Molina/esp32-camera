@@ -18,25 +18,26 @@ use crate::frames_80211::parse_auth_resp;
 use crate::frames_80211::parse_beacon_or_probe_resp;
 use crate::frames_80211::parse_deauth_or_disassoc;
 use crate::frames_80211::rx_80211_data_to_eth;
+use crate::frames_80211::volatile_zeroize;
 use crate::frames_80211::FrameError;
 use crate::frames_80211::FrameType;
 use crate::frames_80211::RxDataOutcome;
+use crate::frames_80211::MAX_CCMP_PN;
 use crate::lmac_mmio::LmacError;
 use crate::phy_bridge::PhyBridgeError;
 use crate::rate_ctrl::RateController;
 use crate::regs::WifiPhyRate;
 use core::fmt;
+use esp32_cam_wpa2::crypto::hash::ct_eq;
 use esp32_cam_wpa2::handshake::HandshakeError;
 use esp32_cam_wpa2::handshake::RxEapolAction;
 use esp32_cam_wpa2::handshake::TxDoneAction;
 use esp32_cam_wpa2::handshake::WpaStaStateMachine;
 use esp32_cam_wpa2::handshake::WIFI_WPA_ALG_CCMP;
 use esp32_cam_wpa2::ie::parse_rsn_ie;
-use esp32_cam_wpa2::ie::parse_wpa_ie;
 use esp32_cam_wpa2::ie::WPA_CIPHER_CCMP;
 use esp32_cam_wpa2::ie::WPA_KEY_MGMT_PSK;
 use esp32_cam_wpa2::ie::WPA_PROTO_RSN;
-use esp32_cam_wpa2::ie::WPA_PROTO_WPA;
 use esp32_cam_wpa2::kdf::pbkdf2_hmac_sha1;
 
 /// STA state machine errors.
@@ -253,11 +254,14 @@ pub trait StaTxSink {
     /// Notifies hardware layer of associated BSSID for hardware ACK filtering.
     fn on_associated_bssid(&mut self, bssid: [u8; 6]) -> Result<(), StaError>;
 
-    /// Generates a hardware-backed random 32-bit unsigned integer.
-    fn hw_random_u32(&mut self) -> u32;
+    /// Generates a hardware-backed random 32-bit unsigned integer, returning an
+    /// error if the hardware RNG is uninitialized or fails health checks (`M-015`).
+    fn hw_random_u32(&mut self) -> Result<u32, StaError>;
 }
 
 const MAX_SCAN_CANDIDATES: usize = 16;
+const MAX_FAILED_BSSIDS: usize = 8;
+const FAILED_BSSID_PENALTY: i32 = 200;
 const SCAN_CHANNEL_DWELL_MS: u64 = 90;
 const AUTH_TIMEOUT_MS: u64 = 2000;
 const ASSOC_TIMEOUT_MS: u64 = 2000;
@@ -265,6 +269,16 @@ const FOUR_WAY_TIMEOUT_MS: u64 = 5000;
 const KEEPALIVE_INTERVAL_MS: u64 = 30000;
 const INITIAL_BACKOFF_MS: u64 = 500;
 const MAX_BACKOFF_MS: u64 = 4000;
+
+/// Converts a 6-byte little-endian IEEE 802.11 Key RSC to a 48-bit CCMP PN.
+const fn rsc_to_pn(rsc: [u8; 6]) -> u64 {
+    (rsc[0] as u64)
+        | ((rsc[1] as u64) << 8)
+        | ((rsc[2] as u64) << 16)
+        | ((rsc[3] as u64) << 24)
+        | ((rsc[4] as u64) << 32)
+        | ((rsc[5] as u64) << 40)
+}
 
 /// Pure-Rust IEEE 802.11 STA MAC Core.
 pub struct StaMacCore {
@@ -277,6 +291,9 @@ pub struct StaMacCore {
     seq_num: u16,
     candidates: [ScanCandidate; MAX_SCAN_CANDIDATES],
     candidate_count: usize,
+    failed_bssids: [[u8; 6]; MAX_FAILED_BSSIDS],
+    failed_bssid_counts: [u8; MAX_FAILED_BSSIDS],
+    failed_bssid_len: usize,
     current_scan_channel: u8,
     channel_dwell_start_ms: u64,
     state_entered_ms: u64,
@@ -297,13 +314,20 @@ pub struct StaMacCore {
     assoc_ie_len: usize,
     ptk: Option<[u8; 16]>,
     ptk_tx_pn: u64,
-    unicast_rx_pn: u64,
+    unicast_rx_pn_qos: [u64; 16],
+    unicast_rx_pn_non_qos: u64,
     gtk: [Option<[u8; 16]>; 4],
     gtk_rx_pn: [u64; 4],
     active_gtk_id: Option<u8>,
     tx_buf: [u8; 1600],
     scratch_buf: [u8; 1600],
     eth_buf: [u8; 1600],
+}
+
+impl Drop for StaMacCore {
+    fn drop(&mut self) {
+        self.zeroize_all_secrets();
+    }
 }
 
 impl StaMacCore {
@@ -320,6 +344,9 @@ impl StaMacCore {
             seq_num: 0,
             candidates: [EMPTY_CANDIDATE; MAX_SCAN_CANDIDATES],
             candidate_count: 0,
+            failed_bssids: [[0u8; 6]; MAX_FAILED_BSSIDS],
+            failed_bssid_counts: [0u8; MAX_FAILED_BSSIDS],
+            failed_bssid_len: 0,
             current_scan_channel: 1,
             channel_dwell_start_ms: 0,
             state_entered_ms: 0,
@@ -340,7 +367,8 @@ impl StaMacCore {
             assoc_ie_len: 0,
             ptk: None,
             ptk_tx_pn: 0,
-            unicast_rx_pn: 0,
+            unicast_rx_pn_qos: [0u64; 16],
+            unicast_rx_pn_non_qos: 0,
             gtk: [None; 4],
             gtk_rx_pn: [0u64; 4],
             active_gtk_id: None,
@@ -350,18 +378,33 @@ impl StaMacCore {
         }
     }
 
+    fn zeroize_all_secrets(&mut self) {
+        self.reset_crypto_and_keys();
+        volatile_zeroize(&mut self.cached_pmk);
+        volatile_zeroize(&mut self.cached_pmk_hex);
+        volatile_zeroize(&mut self.pmk_cache_passphrase);
+        volatile_zeroize(&mut self.config.passphrase);
+        volatile_zeroize(&mut self.tx_buf);
+        volatile_zeroize(&mut self.scratch_buf);
+        volatile_zeroize(&mut self.eth_buf);
+    }
+
     /// Resets all internal state, buffers, and cryptographic contexts in place
     /// with the specified MAC address, avoiding large stack allocations.
     pub fn reset_with_mac(&mut self, sta_mac: [u8; 6]) {
+        self.zeroize_all_secrets();
         self.sta_mac = sta_mac;
         self.state = StaState::Idle;
         self.config = StaConnectConfig::new();
         self.rate_ctrl = RateController::new();
-        self.wpa = WpaStaStateMachine::new();
+        self.wpa.reset();
         self.current_channel = 1;
         self.seq_num = 0;
         self.candidates.fill(EMPTY_CANDIDATE);
         self.candidate_count = 0;
+        self.failed_bssids.fill([0u8; 6]);
+        self.failed_bssid_counts.fill(0);
+        self.failed_bssid_len = 0;
         self.current_scan_channel = 1;
         self.channel_dwell_start_ms = 0;
         self.state_entered_ms = 0;
@@ -371,24 +414,12 @@ impl StaMacCore {
         self.selected_candidate = None;
         self.aid = 0;
         self.last_rssi = -127;
-        self.cached_pmk.fill(0);
-        self.cached_pmk_hex.fill(0);
         self.pmk_cached = false;
         self.pmk_cache_ssid.fill(0);
         self.pmk_cache_ssid_len = 0;
-        self.pmk_cache_passphrase.fill(0);
         self.pmk_cache_passphrase_len = 0;
         self.assoc_ie.fill(0);
         self.assoc_ie_len = 0;
-        self.ptk = None;
-        self.ptk_tx_pn = 0;
-        self.unicast_rx_pn = 0;
-        self.gtk.fill(None);
-        self.gtk_rx_pn.fill(0);
-        self.active_gtk_id = None;
-        self.tx_buf.fill(0);
-        self.scratch_buf.fill(0);
-        self.eth_buf.fill(0);
     }
 
     /// Returns the current state machine status.
@@ -455,6 +486,21 @@ impl StaMacCore {
         if config.ssid_len == 0 || config.ssid_len > 32 || config.passphrase_len > 64 {
             return Err(StaError::InvalidConfig);
         }
+        let creds_changed = self.config.ssid_bytes() != config.ssid_bytes()
+            || !ct_eq(self.config.passphrase_bytes(), config.passphrase_bytes());
+        if creds_changed {
+            volatile_zeroize(&mut self.config.passphrase);
+            volatile_zeroize(&mut self.cached_pmk);
+            volatile_zeroize(&mut self.cached_pmk_hex);
+            volatile_zeroize(&mut self.pmk_cache_passphrase);
+            self.pmk_cache_passphrase_len = 0;
+            self.pmk_cache_ssid.fill(0);
+            self.pmk_cache_ssid_len = 0;
+            self.pmk_cached = false;
+            self.failed_bssids.fill([0u8; 6]);
+            self.failed_bssid_counts.fill(0);
+            self.failed_bssid_len = 0;
+        }
         self.config = config;
         self.backoff_ms = INITIAL_BACKOFF_MS;
         self.start_scan(now_ms, sink)
@@ -478,6 +524,7 @@ impl StaMacCore {
                 );
             }
         }
+        self.selected_candidate = None;
         self.reset_crypto_and_keys();
         self.wpa.on_disconnected();
         self.state = StaState::Disconnected;
@@ -604,10 +651,13 @@ impl StaMacCore {
             return Err(StaError::NotConnected);
         }
         let bssid = self.bssid().ok_or(StaError::NotConnected)?;
+        if self.ptk.is_none() {
+            return Err(StaError::NotConnected);
+        }
+        let pn = self.allocate_ptk_tx_pn(now_ms, sink)?;
         let seq = self.next_seq();
         let tk = self.ptk.as_ref().ok_or(StaError::NotConnected)?;
-        self.ptk_tx_pn = self.ptk_tx_pn.saturating_add(1);
-        let tx_key = Some((tk, 0u8, self.ptk_tx_pn));
+        let tx_key = Some((tk, 0u8, pn));
 
         let len = eth_to_80211_data(&mut self.tx_buf, eth_frame, bssid, seq, tx_key)?;
         let rate = self.rate_ctrl.current_data_rate();
@@ -623,6 +673,19 @@ impl StaMacCore {
                 Err(e)
             }
         }
+    }
+
+    fn allocate_ptk_tx_pn(
+        &mut self,
+        now_ms: u64,
+        sink: &mut dyn StaTxSink,
+    ) -> Result<u64, StaError> {
+        if self.ptk_tx_pn >= MAX_CCMP_PN {
+            let _ = self.handle_disconnection(now_ms, sink);
+            return Err(StaError::Frame(FrameError::InvalidPacketNumber));
+        }
+        self.ptk_tx_pn += 1;
+        Ok(self.ptk_tx_pn)
     }
 
     fn start_scan(&mut self, now_ms: u64, sink: &mut dyn StaTxSink) -> Result<(), StaError> {
@@ -675,14 +738,15 @@ impl StaMacCore {
         }
 
         let candidate = self.candidates[best_idx];
-        self.selected_candidate = Some(candidate);
-        self.current_channel = candidate.channel;
-        self.last_rssi = candidate.rssi;
-        sink.on_channel_switch(candidate.channel)?;
-        sink.on_associated_bssid(candidate.bssid)?;
 
-        self.ensure_cached_pmk()?;
-        let (assoc_ie, assoc_ie_len) = self.wpa.start_connect(
+        // Perform fallible PMK derivation, WPA handshake setup, and Auth frame
+        // construction BEFORE mutating FSM candidate state or hardware filters.
+        if let Err(e) = self.ensure_cached_pmk() {
+            let _ = self.handle_disconnection(now_ms, sink);
+            return Err(e);
+        }
+
+        let (assoc_ie, assoc_ie_len) = match self.wpa.start_connect(
             self.sta_mac,
             candidate.bssid,
             self.config.ssid_bytes(),
@@ -694,19 +758,46 @@ impl StaMacCore {
             WPA_KEY_MGMT_PSK,
             0,
             0,
-        )?;
-        self.assoc_ie = assoc_ie;
-        self.assoc_ie_len = assoc_ie_len;
+        ) {
+            Ok(res) => res,
+            Err(e) => {
+                self.record_bssid_failure(candidate.bssid);
+                let _ = self.handle_disconnection(now_ms, sink);
+                return Err(StaError::Handshake(e));
+            }
+        };
 
         let seq = self.next_seq();
-        let len = build_open_auth_req(&mut self.tx_buf, candidate.bssid, self.sta_mac, seq)?;
-        sink.send_mpdu(
-            &self.tx_buf[..len],
-            self.rate_ctrl.mgmt_rate(),
-            true,
-            now_ms,
-        )?;
+        let len = match build_open_auth_req(&mut self.tx_buf, candidate.bssid, self.sta_mac, seq) {
+            Ok(l) => l,
+            Err(e) => {
+                let _ = self.handle_disconnection(now_ms, sink);
+                return Err(StaError::Frame(e));
+            }
+        };
 
+        if let Err(e) = sink
+            .on_channel_switch(candidate.channel)
+            .and_then(|()| sink.on_associated_bssid(candidate.bssid))
+            .and_then(|()| {
+                sink.send_mpdu(
+                    &self.tx_buf[..len],
+                    self.rate_ctrl.mgmt_rate(),
+                    true,
+                    now_ms,
+                )
+            })
+        {
+            self.record_bssid_failure(candidate.bssid);
+            let _ = self.handle_disconnection(now_ms, sink);
+            return Err(e);
+        }
+
+        self.selected_candidate = Some(candidate);
+        self.current_channel = candidate.channel;
+        self.last_rssi = candidate.rssi;
+        self.assoc_ie = assoc_ie;
+        self.assoc_ie_len = assoc_ie_len;
         self.state = StaState::AuthWait;
         self.state_entered_ms = now_ms;
         self.last_tx_or_rx_ms = now_ms;
@@ -728,7 +819,8 @@ impl StaMacCore {
                 }
             }
             11 => {
-                if self.state == StaState::AuthWait {
+                // Auth Response is unicast-only to our STA MAC.
+                if self.state == StaState::AuthWait && parsed.addr1 == self.sta_mac {
                     if let Some(cand) = self.selected_candidate {
                         if parsed.addr2 == cand.bssid {
                             let (seq, status) = parse_auth_resp(raw_mpdu)?;
@@ -760,7 +852,8 @@ impl StaMacCore {
                 }
             }
             1 => {
-                if self.state == StaState::AssocWait {
+                // Assoc Response is unicast-only to our STA MAC.
+                if self.state == StaState::AssocWait && parsed.addr1 == self.sta_mac {
                     if let Some(cand) = self.selected_candidate {
                         if parsed.addr2 == cand.bssid {
                             let (status, aid) = parse_assoc_resp(raw_mpdu)?;
@@ -778,14 +871,26 @@ impl StaMacCore {
                 }
             }
             10 | 12 => {
-                if let Some(cand) = self.selected_candidate {
-                    if parsed.addr2 == cand.bssid {
-                        let _ = parse_deauth_or_disassoc(raw_mpdu);
-                        self.handle_disconnection(now_ms, sink)?;
+                // Ignore Deauth/Disassoc unless actively authenticating,
+                // associating, handshaking, or connected, and only when the
+                // frame parses cleanly.
+                if matches!(
+                    self.state,
+                    StaState::AuthWait
+                        | StaState::AssocWait
+                        | StaState::FourWayWait
+                        | StaState::Connected
+                ) {
+                    if let Some(cand) = self.selected_candidate {
+                        if parsed.addr2 == cand.bssid && parse_deauth_or_disassoc(raw_mpdu).is_ok()
+                        {
+                            self.handle_disconnection(now_ms, sink)?;
+                        }
                     }
                 }
             }
-            13 => {
+            // Action/ADDBA Request is unicast-only and valid only when Connected.
+            13 if self.state == StaState::Connected && parsed.addr1 == self.sta_mac => {
                 if let Ok((dialog_token, tid_param_set, _, _)) = parse_addba_req(raw_mpdu) {
                     if let Some(cand) = self.selected_candidate {
                         if parsed.addr2 == cand.bssid {
@@ -819,6 +924,12 @@ impl StaMacCore {
             Err(_) => return,
         };
 
+        let Some(channel) = info.channel else {
+            return;
+        };
+        if !(1..=13).contains(&channel) {
+            return;
+        }
         if info.ssid != self.config.ssid_bytes() {
             return;
         }
@@ -834,42 +945,45 @@ impl StaMacCore {
             return;
         }
 
-        let mut proto = WPA_PROTO_RSN;
-        let mut group_cipher = WPA_CIPHER_CCMP;
-        let mut ap_ie_buf = [0u8; 128];
-        let mut ap_ie_len = 0;
-
-        if let Some(rie) = info.rsn_ie {
-            if let Ok(data) = parse_rsn_ie(rie) {
-                proto = WPA_PROTO_RSN;
-                group_cipher = data.group_cipher;
-                let copy_len = rie.len().min(ap_ie_buf.len());
-                ap_ie_buf[..copy_len].copy_from_slice(&rie[..copy_len]);
-                ap_ie_len = copy_len;
-            }
-        } else if let Some(wie) = info.wpa_ie {
-            if let Ok(data) = parse_wpa_ie(wie) {
-                proto = WPA_PROTO_WPA;
-                group_cipher = data.group_cipher;
-                let copy_len = wie.len().min(ap_ie_buf.len());
-                ap_ie_buf[..copy_len].copy_from_slice(&wie[..copy_len]);
-                ap_ie_len = copy_len;
-            }
-        } else {
+        // Enforce WPA2-RSN only (reject legacy WPA1 downgrade), cap RSN IE to
+        // 128 bytes, reject malformed RSN IEs without fallthrough, and require
+        // CCMP pairwise + CCMP group + PSK AKM.
+        let Some(rie) = info.rsn_ie else {
+            return;
+        };
+        if rie.len() > 128 {
             return;
         }
+        let Ok(data) = parse_rsn_ie(rie) else {
+            return;
+        };
+        if (data.pairwise_cipher & WPA_CIPHER_CCMP) == 0
+            || (data.key_mgmt & WPA_KEY_MGMT_PSK) == 0
+            || data.group_cipher != WPA_CIPHER_CCMP
+        {
+            return;
+        }
+
+        let proto = WPA_PROTO_RSN;
+        let group_cipher = data.group_cipher;
+        let mut ap_ie_buf = [0u8; 128];
+        ap_ie_buf[..rie.len()].copy_from_slice(rie);
+        let ap_ie_len = rie.len();
 
         let mut score: i32 = i32::from(info.rssi);
         if self.config.target_bssid == Some(info.bssid) {
             score = score.saturating_add(1000);
         }
-        if proto == WPA_PROTO_RSN {
-            score = score.saturating_add(500);
+        score = score.saturating_add(500);
+        let fail_count = self.bssid_failure_count(info.bssid);
+        if fail_count > 0 {
+            let penalty = i32::from(fail_count).saturating_mul(FAILED_BSSID_PENALTY);
+            score = score.saturating_sub(penalty);
         }
 
         let candidate = ScanCandidate {
             bssid: info.bssid,
-            channel: info.channel,
+            channel,
             rssi: info.rssi,
             privacy: info.privacy,
             has_ccmp: info.has_ccmp,
@@ -934,36 +1048,29 @@ impl StaMacCore {
             return Ok(());
         }
 
-        let mut ccmp_pn = 0u64;
-        let mut ccmp_key_id = 0u8;
-        if parsed.is_protected {
+        // Select the GTK slot matching the wire CCMP Key ID (supports GTK
+        // rekey overlap); `rx_80211_data_to_eth` re-verifies the key_id
+        // returned by `ccmp_decrypt_mpdu` after MIC authentication.
+        let is_group = (parsed.addr1[0] & 0x01) != 0;
+        let gtk_arg = if parsed.is_protected && is_group {
             let fc = u16::from_le_bytes([raw_mpdu[0], raw_mpdu[1]]);
-            let mut hdr_len = 24;
-            if parsed.to_ds && parsed.from_ds {
-                hdr_len = 30;
-            }
-            if (parsed.subtype & 0x08) != 0 {
-                hdr_len += 2;
-                if (fc & 0x8000) != 0 {
-                    hdr_len += 4;
-                }
-            }
+            let is_qos = parsed.subtype == 0x08;
+            let has_htc = is_qos && (fc & 0x8000) != 0;
+            let hdr_len = 24 + if is_qos { 2 } else { 0 } + if has_htc { 4 } else { 0 };
             if raw_mpdu.len() < hdr_len + 8 {
                 return Err(StaError::Frame(FrameError::MalformedHeader));
             }
-            let iv = &raw_mpdu[hdr_len..hdr_len + 8];
-            ccmp_key_id = (iv[3] >> 6) & 0x03;
-            ccmp_pn = (iv[0] as u64)
-                | ((iv[1] as u64) << 8)
-                | ((iv[4] as u64) << 16)
-                | ((iv[5] as u64) << 24)
-                | ((iv[6] as u64) << 32)
-                | ((iv[7] as u64) << 40);
-        }
-
-        let gtk_arg = match self.active_gtk_id {
-            Some(id) => self.gtk[id as usize].as_ref().map(|k| (id, k)),
-            None => None,
+            let wire_key_id = (raw_mpdu[hdr_len + 3] >> 6) & 0x03;
+            self.gtk[usize::from(wire_key_id)]
+                .as_ref()
+                .map(|k| (wire_key_id, k))
+        } else {
+            match self.active_gtk_id {
+                Some(id) => self.gtk[usize::from(id & 0x03)]
+                    .as_ref()
+                    .map(|k| (id & 0x03, k)),
+                None => None,
+            }
         };
 
         let outcome = rx_80211_data_to_eth(
@@ -973,30 +1080,56 @@ impl StaMacCore {
             self.ptk.as_ref(),
             gtk_arg,
             &cand.bssid,
+            &self.sta_mac,
+            true,
         )?;
 
-        if parsed.is_protected {
-            let is_group = (raw_mpdu[4] & 0x01) != 0;
+        let ccmp_meta = match outcome {
+            RxDataOutcome::Ethernet { ccmp, .. } | RxDataOutcome::Eapol { ccmp, .. } => ccmp,
+        };
+
+        if let Some(meta) = ccmp_meta {
             if is_group {
-                let idx = (ccmp_key_id & 0x03) as usize;
-                if ccmp_pn <= self.gtk_rx_pn[idx] {
+                let idx = usize::from(meta.key_id & 0x03);
+                if meta.pn <= self.gtk_rx_pn[idx] {
                     return Err(StaError::ReplayDetected);
                 }
-                self.gtk_rx_pn[idx] = ccmp_pn;
+                self.gtk_rx_pn[idx] = meta.pn;
             } else {
-                if ccmp_pn <= self.unicast_rx_pn {
+                let last_pn = match meta.qos_tid {
+                    Some(tid) => &mut self.unicast_rx_pn_qos[usize::from(tid & 0x0F)],
+                    None => &mut self.unicast_rx_pn_non_qos,
+                };
+                if meta.pn <= *last_pn {
                     return Err(StaError::ReplayDetected);
                 }
-                self.unicast_rx_pn = ccmp_pn;
+                *last_pn = meta.pn;
             }
         }
 
         match outcome {
-            RxDataOutcome::Eapol(elen) => {
+            RxDataOutcome::Eapol { len: elen, ccmp } => {
+                // EAPOL must be unicast to sta_mac; once PTK is active or
+                // Connected, EAPOL MUST be CCMP-protected (CVE-2020-26140).
+                if parsed.addr1 != self.sta_mac {
+                    return Err(StaError::Frame(FrameError::MalformedHeader));
+                }
+                if (self.state == StaState::Connected || self.ptk.is_some())
+                    && (!parsed.is_protected || ccmp.is_none())
+                {
+                    return Err(StaError::Frame(FrameError::UnencryptedPayloadRejected));
+                }
+
                 let mut snonce = [0u8; 32];
                 let mut offset = 0;
                 while offset < 32 {
-                    let r = sink.hw_random_u32();
+                    let r = match sink.hw_random_u32() {
+                        Ok(val) => val,
+                        Err(e) => {
+                            volatile_zeroize(&mut snonce);
+                            return Err(e);
+                        }
+                    };
                     let bytes = r.to_le_bytes();
                     let rem = 32 - offset;
                     let to_copy = if rem < 4 { rem } else { 4 };
@@ -1004,9 +1137,11 @@ impl StaMacCore {
                     offset += to_copy;
                 }
 
-                let act = self
+                let act_res = self
                     .wpa
-                    .on_rx_eapol(&cand.bssid, &self.eth_buf[..elen], &snonce)?;
+                    .on_rx_eapol(&cand.bssid, &self.eth_buf[..elen], &snonce);
+                volatile_zeroize(&mut snonce);
+                let act = act_res?;
                 match act {
                     RxEapolAction::Ignore => {}
                     RxEapolAction::SendFrame(txf) => {
@@ -1021,11 +1156,14 @@ impl StaMacCore {
                         eth[14..eth_len].copy_from_slice(&txf.data[..txf.len]);
 
                         let seq = self.next_seq();
-                        let tx_key = if let Some(ref tk) = self.ptk {
-                            self.ptk_tx_pn = self.ptk_tx_pn.saturating_add(1);
-                            Some((tk, 0u8, self.ptk_tx_pn))
+                        let tx_pn = if self.ptk.is_some() {
+                            Some(self.allocate_ptk_tx_pn(now_ms, sink)?)
                         } else {
                             None
+                        };
+                        let tx_key = match (&self.ptk, tx_pn) {
+                            (Some(ref tk), Some(pn)) => Some((tk, 0u8, pn)),
+                            _ => None,
                         };
                         let mpdu_len = eth_to_80211_data(
                             &mut self.tx_buf,
@@ -1042,7 +1180,7 @@ impl StaMacCore {
                         );
                         let tx_failed = send_res.is_err();
                         let done_act = self.wpa.on_eapol_tx_complete(tx_failed);
-                        self.handle_tx_done_action(done_act);
+                        self.handle_tx_done_action(done_act, now_ms, sink)?;
                         send_res?;
                     }
                     RxEapolAction::Deauth(reason) => {
@@ -1064,7 +1202,19 @@ impl StaMacCore {
                     }
                 }
             }
-            RxDataOutcome::Ethernet(total_eth_len) => {
+            RxDataOutcome::Ethernet {
+                len: total_eth_len,
+                ccmp,
+            } => {
+                // IEEE 802.1X controlled-port invariant: drop Ethernet data
+                // unless Connected with active PTK and verified CCMP.
+                if self.state != StaState::Connected
+                    || !parsed.is_protected
+                    || ccmp.is_none()
+                    || self.ptk.is_none()
+                {
+                    return Err(StaError::Frame(FrameError::UnencryptedPayloadRejected));
+                }
                 self.last_tx_or_rx_ms = now_ms;
                 on_eth_rx(&self.eth_buf[..total_eth_len]);
             }
@@ -1072,30 +1222,85 @@ impl StaMacCore {
         Ok(())
     }
 
-    fn handle_tx_done_action(&mut self, action: TxDoneAction) {
+    fn handle_tx_done_action(
+        &mut self,
+        action: TxDoneAction,
+        now_ms: u64,
+        sink: &mut dyn StaTxSink,
+    ) -> Result<(), StaError> {
         match action {
-            TxDoneAction::None | TxDoneAction::TxFailed => {}
+            TxDoneAction::None | TxDoneAction::TxFailed => Ok(()),
             TxDoneAction::InstallAndComplete(install) => {
-                if install.install_ptk && install.ptk_alg == WIFI_WPA_ALG_CCMP {
+                // Reject unsupported key algorithms instead of silently
+                // skipping installation and entering an unkeyed Connected state.
+                if install.install_ptk
+                    && (install.ptk_alg != WIFI_WPA_ALG_CCMP || install.ptk_key_len < 16)
+                {
+                    let _ = self.handle_disconnection(now_ms, sink);
+                    return Err(StaError::Handshake(HandshakeError::BadParam));
+                }
+                if install.gtk_len > 0
+                    && (install.gtk_alg != WIFI_WPA_ALG_CCMP || install.gtk_len < 16)
+                {
+                    let _ = self.handle_disconnection(now_ms, sink);
+                    return Err(StaError::Handshake(HandshakeError::BadParam));
+                }
+
+                if install.install_ptk {
                     let mut tk = [0u8; 16];
                     tk.copy_from_slice(&install.ptk_key[..16]);
-                    self.ptk = Some(tk);
-                    self.ptk_tx_pn = 0;
-                    self.unicast_rx_pn = 0;
+                    // KRACK guard (CVE-2017-13077): never reset TX/RX PNs when
+                    // reinstalling an identical PTK.
+                    let same_ptk = match self.ptk {
+                        Some(ref existing) => ct_eq(existing, &tk),
+                        None => false,
+                    };
+                    if !same_ptk {
+                        if let Some(ref mut old) = self.ptk {
+                            volatile_zeroize(old);
+                        }
+                        self.ptk = Some(tk);
+                        self.ptk_tx_pn = 0;
+                        self.unicast_rx_pn_qos.fill(0);
+                        self.unicast_rx_pn_non_qos = 0;
+                    }
+                    volatile_zeroize(&mut tk);
                 }
-                if install.gtk_len >= 16 && install.gtk_alg == WIFI_WPA_ALG_CCMP {
-                    let idx = (install.gtk_idx & 0x03) as usize;
+
+                if install.gtk_len >= 16 {
+                    let idx = usize::from(install.gtk_idx & 0x03);
                     let mut gtk_key = [0u8; 16];
                     gtk_key.copy_from_slice(&install.gtk[..16]);
-                    self.gtk[idx] = Some(gtk_key);
-                    self.gtk_rx_pn[idx] = 0;
+                    // KRACK guard (CVE-2017-13078): preserve GTK RX PN on
+                    // identical GTK reinstall; seed new GTK PN from Key RSC.
+                    let same_gtk = match self.gtk[idx] {
+                        Some(ref existing) => ct_eq(existing, &gtk_key),
+                        None => false,
+                    };
+                    if !same_gtk {
+                        if let Some(ref mut old) = self.gtk[idx] {
+                            volatile_zeroize(old);
+                        }
+                        self.gtk[idx] = Some(gtk_key);
+                        self.gtk_rx_pn[idx] = rsc_to_pn(install.gtk_rsc);
+                    }
                     self.active_gtk_id = Some(install.gtk_idx & 0x03);
+                    volatile_zeroize(&mut gtk_key);
                 }
+
                 if install.notify_auth_done {
+                    if self.ptk.is_none() {
+                        let _ = self.handle_disconnection(now_ms, sink);
+                        return Err(StaError::Handshake(HandshakeError::BadParam));
+                    }
+                    if let Some(cand) = self.selected_candidate {
+                        self.clear_bssid_failure(cand.bssid);
+                    }
                     self.wpa.on_connected();
                     self.state = StaState::Connected;
                     self.backoff_ms = INITIAL_BACKOFF_MS;
                 }
+                Ok(())
             }
         }
     }
@@ -1105,6 +1310,15 @@ impl StaMacCore {
         now_ms: u64,
         _sink: &mut dyn StaTxSink,
     ) -> Result<(), StaError> {
+        if matches!(
+            self.state,
+            StaState::AuthWait | StaState::AssocWait | StaState::FourWayWait
+        ) {
+            if let Some(cand) = self.selected_candidate {
+                self.record_bssid_failure(cand.bssid);
+            }
+        }
+        self.selected_candidate = None;
         self.reset_crypto_and_keys();
         self.wpa.on_disconnected();
         self.state = StaState::Disconnected;
@@ -1113,12 +1327,78 @@ impl StaMacCore {
         Ok(())
     }
 
+    fn record_bssid_failure(&mut self, bssid: [u8; 6]) {
+        let mut i = 0;
+        while i < self.failed_bssid_len {
+            if self.failed_bssids[i] == bssid {
+                self.failed_bssid_counts[i] = self.failed_bssid_counts[i].saturating_add(1).min(16);
+                return;
+            }
+            i += 1;
+        }
+        if self.failed_bssid_len < MAX_FAILED_BSSIDS {
+            self.failed_bssids[self.failed_bssid_len] = bssid;
+            self.failed_bssid_counts[self.failed_bssid_len] = 1;
+            self.failed_bssid_len += 1;
+        } else {
+            // Evict the entry with the smallest failure count.
+            let mut min_idx = 0;
+            let mut min_cnt = self.failed_bssid_counts[0];
+            let mut j = 1;
+            while j < MAX_FAILED_BSSIDS {
+                if self.failed_bssid_counts[j] < min_cnt {
+                    min_cnt = self.failed_bssid_counts[j];
+                    min_idx = j;
+                }
+                j += 1;
+            }
+            self.failed_bssids[min_idx] = bssid;
+            self.failed_bssid_counts[min_idx] = 1;
+        }
+    }
+
+    fn clear_bssid_failure(&mut self, bssid: [u8; 6]) {
+        let mut i = 0;
+        while i < self.failed_bssid_len {
+            if self.failed_bssids[i] == bssid {
+                let last = self.failed_bssid_len - 1;
+                self.failed_bssids[i] = self.failed_bssids[last];
+                self.failed_bssid_counts[i] = self.failed_bssid_counts[last];
+                self.failed_bssids[last] = [0u8; 6];
+                self.failed_bssid_counts[last] = 0;
+                self.failed_bssid_len = last;
+                return;
+            }
+            i += 1;
+        }
+    }
+
+    fn bssid_failure_count(&self, bssid: [u8; 6]) -> u8 {
+        let mut i = 0;
+        while i < self.failed_bssid_len {
+            if self.failed_bssids[i] == bssid {
+                return self.failed_bssid_counts[i];
+            }
+            i += 1;
+        }
+        0
+    }
+
     fn reset_crypto_and_keys(&mut self) {
+        if let Some(ref mut k) = self.ptk {
+            volatile_zeroize(k);
+        }
         self.ptk = None;
         self.ptk_tx_pn = 0;
-        self.unicast_rx_pn = 0;
-        self.gtk = [None; 4];
-        self.gtk_rx_pn = [0u64; 4];
+        self.unicast_rx_pn_qos.fill(0);
+        self.unicast_rx_pn_non_qos = 0;
+        for slot in &mut self.gtk {
+            if let Some(ref mut k) = slot {
+                volatile_zeroize(k);
+            }
+            *slot = None;
+        }
+        self.gtk_rx_pn.fill(0);
         self.active_gtk_id = None;
         self.aid = 0;
     }
@@ -1136,24 +1416,38 @@ impl StaMacCore {
             && self.pmk_cache_ssid_len == ssid.len()
             && &self.pmk_cache_ssid[..self.pmk_cache_ssid_len] == ssid
             && self.pmk_cache_passphrase_len == pass.len()
-            && &self.pmk_cache_passphrase[..self.pmk_cache_passphrase_len] == pass
+            && ct_eq(
+                &self.pmk_cache_passphrase[..self.pmk_cache_passphrase_len],
+                pass,
+            )
         {
             return Ok(());
         }
 
         let mut pmk = [0u8; 32];
-        if let Some(dec) = decode_hex_pmk(pass) {
-            pmk = dec;
-            encode_hex_pmk(&pmk, &mut self.cached_pmk_hex);
+        let mut hex_buf = [0u8; 64];
+        if decode_hex_pmk(pass, &mut pmk) {
+            encode_hex_pmk(&pmk, &mut hex_buf);
         } else if (8..=63).contains(&pass.len()) {
-            pbkdf2_hmac_sha1(pass, ssid, 4096, &mut pmk)
-                .map_err(|_| StaError::Handshake(HandshakeError::BadParam))?;
-            encode_hex_pmk(&pmk, &mut self.cached_pmk_hex);
+            if pbkdf2_hmac_sha1(pass, ssid, 4096, &mut pmk).is_err() {
+                volatile_zeroize(&mut pmk);
+                return Err(StaError::Handshake(HandshakeError::BadParam));
+            }
+            encode_hex_pmk(&pmk, &mut hex_buf);
         } else {
             return Err(StaError::InvalidConfig);
         }
 
+        volatile_zeroize(&mut self.cached_pmk);
+        volatile_zeroize(&mut self.cached_pmk_hex);
+        volatile_zeroize(&mut self.pmk_cache_passphrase);
+        self.pmk_cache_ssid.fill(0);
+
         self.cached_pmk = pmk;
+        self.cached_pmk_hex = hex_buf;
+        volatile_zeroize(&mut pmk);
+        volatile_zeroize(&mut hex_buf);
+
         self.pmk_cache_ssid[..ssid.len()].copy_from_slice(ssid);
         self.pmk_cache_ssid_len = ssid.len();
         self.pmk_cache_passphrase[..pass.len()].copy_from_slice(pass);
@@ -1163,19 +1457,24 @@ impl StaMacCore {
     }
 }
 
-fn decode_hex_pmk(hex: &[u8]) -> Option<[u8; 32]> {
+fn decode_hex_pmk(hex: &[u8], out: &mut [u8; 32]) -> bool {
     if hex.len() != 64 {
-        return None;
+        return false;
     }
-    let mut out = [0u8; 32];
     let mut i = 0;
     while i < 32 {
-        let hi = hex_nibble(hex[i * 2])?;
-        let lo = hex_nibble(hex[i * 2 + 1])?;
+        let Some(hi) = hex_nibble(hex[i * 2]) else {
+            volatile_zeroize(out);
+            return false;
+        };
+        let Some(lo) = hex_nibble(hex[i * 2 + 1]) else {
+            volatile_zeroize(out);
+            return false;
+        };
         out[i] = (hi << 4) | lo;
         i += 1;
     }
-    Some(out)
+    true
 }
 
 const fn hex_nibble(b: u8) -> Option<u8> {
@@ -1201,6 +1500,11 @@ fn encode_hex_pmk(pmk: &[u8; 32], out: &mut [u8; 64]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use esp32_cam_wpa2::crypto::ccm::ccmp_encrypt_mpdu;
+    use esp32_cam_wpa2::handshake::PendingKeyInstall;
+    use esp32_cam_wpa2::ie::gen_wpa_ie;
+    use esp32_cam_wpa2::ie::WPA_CIPHER_TKIP;
+    use esp32_cam_wpa2::ie::WPA_PROTO_WPA;
 
     struct MockSink {
         sent_frames: usize,
@@ -1209,6 +1513,7 @@ mod tests {
         last_rate: WifiPhyRate,
         associated_bssid: Option<[u8; 6]>,
         random_counter: u32,
+        fail_rng: Option<LmacError>,
     }
 
     impl MockSink {
@@ -1220,6 +1525,7 @@ mod tests {
                 last_rate: WifiPhyRate::Rate1mL,
                 associated_bssid: None,
                 random_counter: 0x1234_5678,
+                fail_rng: None,
             }
         }
     }
@@ -1252,9 +1558,12 @@ mod tests {
             Ok(())
         }
 
-        fn hw_random_u32(&mut self) -> u32 {
+        fn hw_random_u32(&mut self) -> Result<u32, StaError> {
+            if let Some(err) = self.fail_rng {
+                return Err(StaError::Hardware(err));
+            }
             self.random_counter = self.random_counter.wrapping_add(1);
-            self.random_counter
+            Ok(self.random_counter)
         }
     }
 
@@ -1324,6 +1633,7 @@ mod tests {
         let mut fsm = StaMacCore::new(sta_mac);
         let mut sink = MockSink::new();
 
+        fsm.state = StaState::Connected;
         fsm.selected_candidate = Some(ScanCandidate {
             bssid,
             channel: 1,
@@ -1352,6 +1662,288 @@ mod tests {
         let res = fsm.handle_rx_mpdu(&addba_req, -50, 1000, &mut sink, |_| {});
         assert!(res.is_ok());
         assert_eq!(sink.sent_frames, 1);
+
+        // Broadcast ADDBA Request and ADDBA while Disconnected must be ignored.
+        addba_req[4..10].fill(0xFF);
+        let _ = fsm.handle_rx_mpdu(&addba_req, -50, 1001, &mut sink, |_| {});
+        assert_eq!(sink.sent_frames, 1);
+        addba_req[4..10].copy_from_slice(&sta_mac);
+        fsm.state = StaState::Disconnected;
+        let _ = fsm.handle_rx_mpdu(&addba_req, -50, 1002, &mut sink, |_| {});
+        assert_eq!(sink.sent_frames, 1);
+    }
+
+    #[test]
+    fn test_krack_guard_and_gtk_rsc_init() {
+        let sta_mac = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let bssid = [0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB];
+        let mut fsm = StaMacCore::new(sta_mac);
+        let mut sink = MockSink::new();
+        fsm.state = StaState::FourWayWait;
+        fsm.selected_candidate = Some(ScanCandidate {
+            bssid,
+            channel: 6,
+            rssi: -50,
+            privacy: true,
+            has_ccmp: true,
+            has_psk: true,
+            group_cipher: WPA_CIPHER_CCMP,
+            proto: WPA_PROTO_RSN,
+            ap_ie: [0u8; 128],
+            ap_ie_len: 0,
+            score: 0,
+        });
+
+        let mut install = PendingKeyInstall::empty();
+        install.install_ptk = true;
+        install.ptk_alg = WIFI_WPA_ALG_CCMP;
+        install.ptk_key[..16].copy_from_slice(&[0xAAu8; 16]);
+        install.ptk_key_len = 16;
+        install.gtk[..16].copy_from_slice(&[0xBBu8; 16]);
+        install.gtk_len = 16;
+        install.gtk_alg = WIFI_WPA_ALG_CCMP;
+        install.gtk_idx = 1;
+        install.gtk_rsc = [0x2A, 0x00, 0x00, 0x00, 0x00, 0x00]; // PN 42
+        install.notify_auth_done = true;
+
+        let act = TxDoneAction::InstallAndComplete(install.clone());
+        assert!(fsm.handle_tx_done_action(act, 100, &mut sink).is_ok());
+        assert_eq!(fsm.state(), StaState::Connected);
+        assert_eq!(fsm.gtk_rx_pn[1], 42);
+
+        // Advance TX/RX PNs, then reinstall identical PTK/GTK (KRACK):
+        // PNs must not reset.
+        fsm.ptk_tx_pn = 55;
+        fsm.unicast_rx_pn_non_qos = 19;
+        fsm.unicast_rx_pn_qos[3] = 77;
+        fsm.gtk_rx_pn[1] = 100;
+        assert!(fsm
+            .handle_tx_done_action(TxDoneAction::InstallAndComplete(install), 200, &mut sink)
+            .is_ok());
+        assert_eq!(fsm.ptk_tx_pn, 55);
+        assert_eq!(fsm.unicast_rx_pn_non_qos, 19);
+        assert_eq!(fsm.unicast_rx_pn_qos[3], 77);
+        assert_eq!(fsm.gtk_rx_pn[1], 100);
+    }
+
+    #[test]
+    fn test_per_tid_replay_gtk_id_lookup_and_tx_pn_exhaustion() {
+        let sta_mac = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let bssid = [0x02, 0x66, 0x77, 0x88, 0x99, 0xAA];
+        let sa = [0x02, 0xCC, 0xDD, 0xEE, 0xFF, 0x01];
+        let tk = [0x33u8; 16];
+        let gtk1 = [0x44u8; 16];
+        let gtk2 = [0x55u8; 16];
+
+        let mut fsm = StaMacCore::new(sta_mac);
+        let mut sink = MockSink::new();
+        fsm.state = StaState::Connected;
+        fsm.selected_candidate = Some(ScanCandidate {
+            bssid,
+            channel: 6,
+            rssi: -50,
+            privacy: true,
+            has_ccmp: true,
+            has_psk: true,
+            group_cipher: WPA_CIPHER_CCMP,
+            proto: WPA_PROTO_RSN,
+            ap_ie: [0u8; 128],
+            ap_ie_len: 0,
+            score: 0,
+        });
+        fsm.ptk = Some(tk);
+        fsm.gtk[1] = Some(gtk1);
+        fsm.gtk[2] = Some(gtk2);
+        fsm.active_gtk_id = Some(2);
+
+        let pt = [0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00, 0x08, 0x00, 0xDE, 0xAD];
+        let mut enc = [0u8; 128];
+
+        // QoS Data TID 1 with PN 10, then QoS Data TID 2 with PN 5
+        // (must succeed because TIDs maintain independent replay windows).
+        let mut qos_hdr = [0u8; 26];
+        qos_hdr[0] = 0x88;
+        qos_hdr[1] = 0x42;
+        qos_hdr[4..10].copy_from_slice(&sta_mac);
+        qos_hdr[10..16].copy_from_slice(&bssid);
+        qos_hdr[16..22].copy_from_slice(&sa);
+        qos_hdr[24] = 1; // TID 1
+        let n1 = ccmp_encrypt_mpdu(&tk, 0, 10, &qos_hdr, &pt, &mut enc).expect("enc tid1");
+        let mut rx_cnt = 0;
+        assert!(fsm
+            .handle_rx_mpdu(&enc[..n1], -50, 100, &mut sink, |_| rx_cnt += 1)
+            .is_ok());
+        assert_eq!(rx_cnt, 1);
+
+        qos_hdr[24] = 2; // TID 2 with lower PN 5
+        let n2 = ccmp_encrypt_mpdu(&tk, 0, 5, &qos_hdr, &pt, &mut enc).expect("enc tid2");
+        assert!(fsm
+            .handle_rx_mpdu(&enc[..n2], -50, 101, &mut sink, |_| rx_cnt += 1)
+            .is_ok());
+        assert_eq!(rx_cnt, 2);
+
+        // Replay TID 2 PN 5 must fail.
+        assert_eq!(
+            fsm.handle_rx_mpdu(&enc[..n2], -50, 102, &mut sink, |_| rx_cnt += 1),
+            Err(StaError::ReplayDetected)
+        );
+
+        // GTK lookup by wire key_id 1 even while active_gtk_id == Some(2).
+        let mut grp_hdr = [0u8; 24];
+        grp_hdr[0] = 0x08;
+        grp_hdr[1] = 0x42;
+        grp_hdr[4..10].fill(0xFF);
+        grp_hdr[10..16].copy_from_slice(&bssid);
+        grp_hdr[16..22].copy_from_slice(&sa);
+        let ng = ccmp_encrypt_mpdu(&gtk1, 1, 7, &grp_hdr, &pt, &mut enc).expect("enc gtk1");
+        assert!(fsm
+            .handle_rx_mpdu(&enc[..ng], -50, 103, &mut sink, |_| rx_cnt += 1)
+            .is_ok());
+        assert_eq!(rx_cnt, 3);
+
+        // 48-bit TX PN exhaustion forces disconnection and rejects TX.
+        fsm.ptk_tx_pn = MAX_CCMP_PN;
+        let eth = [0u8; 24];
+        assert_eq!(
+            fsm.transmit_eth(&eth, 200, &mut sink),
+            Err(StaError::Frame(FrameError::InvalidPacketNumber))
+        );
+        assert_eq!(fsm.state(), StaState::Disconnected);
+        assert!(fsm.bssid().is_none());
+    }
+
+    #[test]
+    fn test_deauth_clears_candidate_and_ignores_when_disconnected() {
+        let sta_mac = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let bssid = [0x02, 0x66, 0x77, 0x88, 0x99, 0xAA];
+        let mut fsm = StaMacCore::new(sta_mac);
+        let mut sink = MockSink::new();
+        fsm.state = StaState::Connected;
+        fsm.selected_candidate = Some(ScanCandidate {
+            bssid,
+            channel: 6,
+            rssi: -50,
+            privacy: true,
+            has_ccmp: true,
+            has_psk: true,
+            group_cipher: WPA_CIPHER_CCMP,
+            proto: WPA_PROTO_RSN,
+            ap_ie: [0u8; 128],
+            ap_ie_len: 0,
+            score: 0,
+        });
+
+        // Malformed Deauth (Protected bit set without decryption) must be ignored.
+        let mut bad_deauth = [0u8; 26];
+        bad_deauth[0] = 0xC0;
+        bad_deauth[1] = 0x40;
+        bad_deauth[4..10].copy_from_slice(&sta_mac);
+        bad_deauth[10..16].copy_from_slice(&bssid);
+        bad_deauth[16..22].copy_from_slice(&bssid);
+        assert!(fsm
+            .handle_rx_mpdu(&bad_deauth, -50, 1000, &mut sink, |_| {})
+            .is_ok());
+        assert_eq!(fsm.state(), StaState::Connected);
+
+        // Valid Deauth disconnects and clears selected_candidate.
+        bad_deauth[1] = 0x00;
+        assert!(fsm
+            .handle_rx_mpdu(&bad_deauth, -50, 1000, &mut sink, |_| {})
+            .is_ok());
+        assert_eq!(fsm.state(), StaState::Disconnected);
+        assert!(fsm.selected_candidate.is_none());
+        let saved_due = fsm.reconnect_due_ms;
+        let saved_backoff = fsm.backoff_ms;
+
+        // Subsequent spoofed Deauth while Disconnected must not extend backoff.
+        assert!(fsm
+            .handle_rx_mpdu(&bad_deauth, -50, 1400, &mut sink, |_| {})
+            .is_ok());
+        assert_eq!(fsm.reconnect_due_ms, saved_due);
+        assert_eq!(fsm.backoff_ms, saved_backoff);
+    }
+
+    #[test]
+    fn test_reject_wpa1_and_tkip_group_and_penalize_failed_bssid() {
+        let sta_mac = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let bssid_evil = [0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0x01];
+        let bssid_good = [0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0x02];
+        let mut fsm = StaMacCore::new(sta_mac);
+        let mut sink = MockSink::new();
+        let cfg = StaConnectConfig::from_slices(b"CorpNet", b"supersecret", None, -90)
+            .expect("valid cfg");
+        fsm.start_connect(cfg, 0, &mut sink).expect("scan start");
+
+        let make_bcn = |bssid: [u8; 6], ie: &[u8]| -> ([u8; 128], usize) {
+            let mut b = [0u8; 128];
+            b[0] = 0x80;
+            b[4..10].fill(0xFF);
+            b[10..16].copy_from_slice(&bssid);
+            b[16..22].copy_from_slice(&bssid);
+            b[34] = 0x11;
+            let mut p = 36;
+            b[p] = 0;
+            b[p + 1] = 7;
+            b[p + 2..p + 9].copy_from_slice(b"CorpNet");
+            p += 9;
+            b[p..p + 3].copy_from_slice(&[3, 1, 6]);
+            p += 3;
+            b[p..p + ie.len()].copy_from_slice(ie);
+            p += ie.len();
+            (b, p)
+        };
+
+        // WPA1 IE must be rejected.
+        let mut wpa1_ie = [0u8; 32];
+        let wpa1_len = gen_wpa_ie(
+            WPA_PROTO_WPA,
+            WPA_CIPHER_CCMP,
+            WPA_CIPHER_CCMP,
+            WPA_KEY_MGMT_PSK,
+            0,
+            0,
+            &mut wpa1_ie,
+        )
+        .expect("wpa1 ie");
+        let (b1, l1) = make_bcn(bssid_evil, &wpa1_ie[..wpa1_len]);
+        fsm.record_scan_beacon(&b1[..l1], -40);
+        assert_eq!(fsm.scan_candidates().len(), 0);
+
+        // RSN with TKIP group cipher must be rejected.
+        let mut tkip_rsn = [0u8; 32];
+        let tkip_len = gen_wpa_ie(
+            WPA_PROTO_RSN,
+            WPA_CIPHER_CCMP,
+            WPA_CIPHER_TKIP,
+            WPA_KEY_MGMT_PSK,
+            0,
+            0,
+            &mut tkip_rsn,
+        )
+        .expect("tkip rsn");
+        let (b2, l2) = make_bcn(bssid_evil, &tkip_rsn[..tkip_len]);
+        fsm.record_scan_beacon(&b2[..l2], -40);
+        assert_eq!(fsm.scan_candidates().len(), 0);
+
+        // Valid RSN CCMP/CCMP: failed BSSID gets penalized below good BSSID.
+        let mut rsn = [0u8; 32];
+        let rsn_len = gen_wpa_ie(
+            WPA_PROTO_RSN,
+            WPA_CIPHER_CCMP,
+            WPA_CIPHER_CCMP,
+            WPA_KEY_MGMT_PSK,
+            0,
+            0,
+            &mut rsn,
+        )
+        .expect("rsn");
+        fsm.record_bssid_failure(bssid_evil);
+        let (be, le) = make_bcn(bssid_evil, &rsn[..rsn_len]);
+        let (bg, lg) = make_bcn(bssid_good, &rsn[..rsn_len]);
+        fsm.record_scan_beacon(&be[..le], -45);
+        fsm.record_scan_beacon(&bg[..lg], -60);
+        assert_eq!(fsm.scan_candidates().len(), 2);
+        assert!(fsm.scan_candidates()[1].score > fsm.scan_candidates()[0].score);
     }
 
     #[test]
@@ -1392,5 +1984,83 @@ mod tests {
         fsm.reset_with_mac(new_mac);
         assert_eq!(fsm.sta_mac(), new_mac);
         assert_eq!(fsm.state(), StaState::Idle);
+    }
+
+    #[test]
+    fn test_m1_aborts_on_rng_failure_without_sending_m2() {
+        let sta_mac = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let bssid = [0x02, 0x66, 0x77, 0x88, 0x99, 0xAA];
+        let mut fsm = StaMacCore::new(sta_mac);
+        let mut sink = MockSink::new();
+        sink.fail_rng = Some(LmacError::RngHealthCheckFailed);
+
+        let mut rsn_ie = [0u8; 32];
+        let rsn_len = gen_wpa_ie(
+            WPA_PROTO_RSN,
+            WPA_CIPHER_CCMP,
+            WPA_CIPHER_CCMP,
+            WPA_KEY_MGMT_PSK,
+            0,
+            0,
+            &mut rsn_ie,
+        )
+        .expect("rsn ie");
+        let hex_psk = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        fsm.wpa
+            .start_connect(
+                sta_mac,
+                bssid,
+                b"RngNet",
+                hex_psk,
+                &rsn_ie[..rsn_len],
+                WPA_PROTO_RSN,
+                WPA_CIPHER_CCMP,
+                WPA_CIPHER_CCMP,
+                WPA_KEY_MGMT_PSK,
+                0,
+                0,
+            )
+            .expect("wpa start");
+        fsm.state = StaState::FourWayWait;
+        fsm.selected_candidate = Some(ScanCandidate {
+            bssid,
+            channel: 6,
+            rssi: -50,
+            privacy: true,
+            has_ccmp: true,
+            has_psk: true,
+            group_cipher: WPA_CIPHER_CCMP,
+            proto: WPA_PROTO_RSN,
+            ap_ie: [0u8; 128],
+            ap_ie_len: 0,
+            score: 0,
+        });
+
+        // Construct valid FromDS EAPOL-Key M1 frame.
+        let mut mpdu = [0u8; 32 + 99];
+        mpdu[0] = 0x08;
+        mpdu[1] = 0x02;
+        mpdu[4..10].copy_from_slice(&sta_mac);
+        mpdu[10..16].copy_from_slice(&bssid);
+        mpdu[16..22].copy_from_slice(&bssid);
+        mpdu[24..32].copy_from_slice(&[0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00, 0x88, 0x8E]);
+        let eapol = &mut mpdu[32..];
+        eapol[0] = 0x02;
+        eapol[1] = 0x03;
+        eapol[2..4].copy_from_slice(&95u16.to_be_bytes());
+        eapol[4] = 0x02;
+        eapol[5..7].copy_from_slice(&0x008Au16.to_be_bytes());
+        eapol[7..9].copy_from_slice(&16u16.to_be_bytes());
+        eapol[16] = 1;
+        eapol[17..49].fill(0xAB);
+
+        // M-015: RNG failure MUST abort M1 and never transmit M2 with zero SNonce.
+        let res = fsm.handle_rx_mpdu(&mpdu, -50, 1000, &mut sink, |_| {});
+        assert_eq!(
+            res,
+            Err(StaError::Hardware(LmacError::RngHealthCheckFailed))
+        );
+        assert_eq!(sink.sent_frames, 0);
+        assert_eq!(fsm.state(), StaState::FourWayWait);
     }
 }
