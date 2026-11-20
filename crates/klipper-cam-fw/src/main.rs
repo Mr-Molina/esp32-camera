@@ -59,11 +59,15 @@ use esp32_cam_wifi_mac::phy_bridge::XtensaPhySession;
 #[cfg(target_arch = "xtensa")]
 use esp32_cam_wifi_mac::ApConfig;
 #[cfg(target_arch = "xtensa")]
+use esp32_cam_wifi_mac::DriverError;
+#[cfg(target_arch = "xtensa")]
 use esp32_cam_wifi_mac::Esp32StaWifiDriver;
 #[cfg(target_arch = "xtensa")]
 use esp32_cam_wifi_mac::HardwareWifiMmioBus;
 #[cfg(target_arch = "xtensa")]
 use esp32_cam_wifi_mac::StaConnectConfig;
+#[cfg(target_arch = "xtensa")]
+use esp32_cam_wifi_mac::StaError;
 #[cfg(target_arch = "xtensa")]
 use esp32_cam_wifi_mac::StaState;
 #[cfg(target_arch = "xtensa")]
@@ -2699,7 +2703,17 @@ fn connect_strongest_ap(
     let delay = Delay::new();
     phy_set_max_tx_power_qdbm(WIFI_MAX_TX_POWER_QDBM);
 
+    let mut prev_state = net_device.state();
     let sta_cfg = build_sta_config(ssid_str, pass_str, None);
+    feed_rtc_wdt();
+    if let Err(e) = net_device.warm_pmk_cache(&sta_cfg) {
+        println!(
+            "[KLIPPER-CAM-RS] [WIFI] warm_pmk_cache('{}') error: {:?}",
+            ssid_str, e
+        );
+        return None;
+    }
+    feed_rtc_wdt();
     if let Err(e) = net_device.connect(sta_cfg, now_millis()) {
         println!(
             "[KLIPPER-CAM-RS] [WIFI] connect('{}') start error: {:?}",
@@ -2710,10 +2724,41 @@ fn connect_strongest_ap(
 
     let start_ms = now_millis();
     let mut candidates_logged = false;
+    let mut last_poll_err: Option<DriverError> = None;
+    let mut last_sta_err: Option<StaError> = None;
     loop {
         feed_rtc_wdt();
         let cur_ms = now_millis();
-        let _ = net_device.poll(cur_ms);
+        if let Err(e) = net_device.poll(cur_ms) {
+            if last_poll_err != Some(e) {
+                println!(
+                    "[KLIPPER-CAM-RS] [WIFI] poll error (+{}ms): {:?}",
+                    cur_ms.saturating_sub(start_ms),
+                    e
+                );
+                last_poll_err = Some(e);
+            }
+        }
+        if let Some(err) = net_device.take_last_sta_error() {
+            if last_sta_err != Some(err) {
+                println!(
+                    "[KLIPPER-CAM-RS] [WIFI] sta error (+{}ms): {:?}",
+                    cur_ms.saturating_sub(start_ms),
+                    err
+                );
+                last_sta_err = Some(err);
+            }
+        }
+        let cur_state = net_device.state();
+        if cur_state != prev_state {
+            println!(
+                "[KLIPPER-CAM-RS] [WIFI] state {:?} -> {:?} (+{}ms)",
+                prev_state,
+                cur_state,
+                cur_ms.saturating_sub(start_ms)
+            );
+            prev_state = cur_state;
+        }
         if !candidates_logged
             && !net_device.scan_candidates().is_empty()
             && net_device.state() != StaState::Scanning
@@ -2765,8 +2810,10 @@ fn connect_strongest_ap(
         }
         if cur_ms.saturating_sub(start_ms) >= wait_ms {
             println!(
-                "[KLIPPER-CAM-RS] [WIFI] connect('{}') timed out ({} ms)",
-                ssid_str, wait_ms
+                "[KLIPPER-CAM-RS] [WIFI] connect('{}') timed out ({} ms) state={:?}",
+                ssid_str,
+                wait_ms,
+                net_device.state()
             );
             let _ = net_device.disconnect(3, cur_ms);
             delay.delay_millis(200);
@@ -4855,10 +4902,10 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
     );
     let _ = FIRMWARE_RUNTIME.with_mut(FirmwareRuntime::on_wifi_sta_start);
 
-    let mut boot_connected = connect_strongest_ap(&mut *net_device, ssid, pass, 15_000);
+    let mut boot_connected = connect_strongest_ap(&mut *net_device, ssid, pass, 25_000);
     if boot_connected.is_none() {
         delay.delay_millis(250);
-        boot_connected = connect_strongest_ap(&mut *net_device, ssid, pass, 15_000);
+        boot_connected = connect_strongest_ap(&mut *net_device, ssid, pass, 25_000);
     }
     if boot_connected.is_none() && cfg!(feature = "provisioning-ap") {
         record_boot_breadcrumb_post_wifi(7, 0, 0);
@@ -5028,6 +5075,7 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
     let mut last_rollback_retry_ms: u64 = 0;
     let mut connect_ms: u64 = now_millis();
     let mut last_ip_acquired_ms: u64 = connect_ms;
+    let mut last_dhcp_wait_diag_ms: u64 = connect_ms;
     let mut last_wifi_connected_ms: u64 = connect_ms;
     let mut last_reconnect_attempt_ms: u64 = connect_ms;
     let mut last_heartbeat_ms: u64 = connect_ms;
@@ -5319,16 +5367,47 @@ fn run_post_wifi_server_loop<B: klipper_cam_fw::SccbBus>(
             }
             if ip_configured {
                 last_ip_acquired_ms = now_u64;
-            } else if net_device.is_connected()
-                && now_u64.saturating_sub(last_ip_acquired_ms) >= 90_000
-                && ota_accum_owner.is_none()
-                && !runtime.server.is_reboot_scheduled()
-            {
-                println!(concat!(
-                    "[KLIPPER-CAM-RS] [WATCHDOG] DHCP lease not acquired within 90s; ",
-                    "deasserting PSRAM CS# and rebooting..."
-                ));
-                quiesce_psram_and_software_reset();
+                last_dhcp_wait_diag_ms = now_u64;
+            } else if net_device.is_connected() {
+                if now_u64.saturating_sub(last_dhcp_wait_diag_ms) >= 5_000 {
+                    last_dhcp_wait_diag_ms = now_u64;
+                    let (rx_pop, rx_ctrl, rx_next, head_w0, eof_mask, non_bcn, tx_ok, malf) =
+                        net_device.take_rx_diag_snapshot();
+                    let (pri_ok, fb_ok, rx_prot, prot_info) = net_device.extra_diag_counts();
+                    println!(
+                        concat!(
+                            "[KLIPPER-CAM-RS] [DHCP-WAIT] tx_ok={} tx_fail={} sta_err={:?} ",
+                            "last_data_rx={:?} rx_pop={} malf={} rx_ctrl=0x{:08x} rx_next=0x{:08x} ",
+                            "head_w0=0x{:08x} eof=0x{:02x} non_bcn={:?} ",
+                            "pri_ok={} fb_ok={} rx_prot={} prot={:?}"
+                        ),
+                        tx_ok,
+                        net_device.pending_eth_tx_failures(),
+                        net_device.take_last_sta_error(),
+                        net_device.take_last_connected_rx_info(),
+                        rx_pop,
+                        malf,
+                        rx_ctrl,
+                        rx_next,
+                        head_w0,
+                        eof_mask,
+                        non_bcn,
+                        pri_ok,
+                        fb_ok,
+                        rx_prot,
+                        prot_info
+                    );
+                }
+                if now_u64.saturating_sub(last_ip_acquired_ms) >= 90_000
+                    && ota_accum_owner.is_none()
+                    && !runtime.server.is_reboot_scheduled()
+                {
+                    println!(concat!(
+                        "[KLIPPER-CAM-RS] [WATCHDOG] DHCP lease not acquired within 90s; ",
+                        "deasserting PSRAM CS# and rebooting..."
+                    ));
+                    quiesce_psram_and_software_reset();
+                }
             }
         } else if !ip_configured {
             if let IpMode::Static(static_cfg) = ip_mode {

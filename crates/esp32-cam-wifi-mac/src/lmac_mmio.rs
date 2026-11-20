@@ -292,6 +292,8 @@ pub struct MockWifiMmioBus {
     pub rx_ctrl_reload_count: usize,
     /// Last `TX_PLCP0_TRIG_REG` value written with trigger bits asserted.
     pub last_tx_plcp0_triggered: u32,
+    /// Value of `HW_CRYPTO_DISABLE_START` observed when `TX_PLCP0_TRIG_REG` was triggered.
+    pub crypto_ctrl_at_tx_trigger: u32,
     /// Count of `mem_barrier` calls recorded by the mock bus.
     pub barrier_count: usize,
     /// Total microseconds passed to `delay_us`.
@@ -321,6 +323,7 @@ impl MockWifiMmioBus {
             write_count: 0,
             rx_ctrl_reload_count: 0,
             last_tx_plcp0_triggered: 0,
+            crypto_ctrl_at_tx_trigger: 0,
             barrier_count: 0,
             delay_us_total: 0,
         }
@@ -427,6 +430,7 @@ impl WifiMmioBus for MockWifiMmioBus {
             && (val & regs::TX_PLCP0_TRIGGER_BITS) == regs::TX_PLCP0_TRIGGER_BITS
         {
             self.last_tx_plcp0_triggered = val;
+            self.crypto_ctrl_at_tx_trigger = self.reg(regs::HW_CRYPTO_DISABLE_START);
         }
 
         // Emulate hardware W1C / self-clearing side effects on registers.
@@ -646,6 +650,7 @@ fn sha256_compress_pool(state: &mut [u32; 8], input: &[u32; 16]) {
 pub struct LmacHal<B: WifiMmioBus> {
     bus: B,
     mac_initialized: bool,
+    vif0_crypto_ctrl: u32,
     rng_pool: [u32; 8],
     rng_counter: u64,
     last_raw_rng: u32,
@@ -658,6 +663,7 @@ impl<B: WifiMmioBus> LmacHal<B> {
         Self {
             bus,
             mac_initialized: false,
+            vif0_crypto_ctrl: 0x0003_0000,
             rng_pool: SHA256_IV,
             rng_counter: 0,
             last_raw_rng: 0,
@@ -670,6 +676,13 @@ impl<B: WifiMmioBus> LmacHal<B> {
     #[must_use]
     pub const fn is_initialized(&self) -> bool {
         self.mac_initialized
+    }
+
+    /// Returns `true` if hardware CCMP RX decryption is enabled for STA VIF 0.
+    #[inline]
+    #[must_use]
+    pub const fn is_sta_hw_crypto_enabled(&self) -> bool {
+        self.vif0_crypto_ctrl != 0x0003_0000
     }
 
     /// Returns an immutable reference to the underlying bus.
@@ -698,6 +711,7 @@ impl<B: WifiMmioBus> LmacHal<B> {
         validate_dma_desc_addr(rx_ring_base_addr)?;
 
         self.mac_initialized = false;
+        self.vif0_crypto_ctrl = 0x0003_0000;
 
         // 1. hal_mac_init: un-gate MAC clocks
         let r_clk = self.bus.read_reg(regs::MAC_CLK_RST_REG);
@@ -892,10 +906,10 @@ impl<B: WifiMmioBus> LmacHal<B> {
             .write_reg(regs::MAC_RX_REG_3284, (r3284 & !0x07) | 0x20);
 
         // 6. hal_crypto_init (pure-Rust CCMP passthrough: 0x30000 bypass on
-        // 0x3FF7_3800..=0x3FF7_380C; 0 on 0x3FF7_3810..=0x3FF7_3814)
+        // 0x3FF7_3800..=0x3FF7_3804; 0 on 0x3FF7_3808..=0x3FF7_3814)
         let mut crypto_addr = regs::HW_CRYPTO_DISABLE_START;
         while crypto_addr <= regs::HW_CRYPTO_DISABLE_END {
-            let val = if crypto_addr <= regs::HW_CRYPTO_DISABLE_START + 12 {
+            let val = if crypto_addr <= regs::HW_CRYPTO_DISABLE_START + 4 {
                 0x0003_0000
             } else {
                 0
@@ -1044,6 +1058,7 @@ impl<B: WifiMmioBus> LmacHal<B> {
         self.bus.mem_barrier();
 
         self.mac_initialized = false;
+        self.vif0_crypto_ctrl = 0x0003_0000;
     }
 
     /// Configures RX policy for passive scanning (promiscuous BSSID bypass).
@@ -1084,6 +1099,79 @@ impl<B: WifiMmioBus> LmacHal<B> {
         let pol = self.bus.read_reg(pol_reg);
         self.bus
             .write_reg(pol_reg, pol & !regs::RX_POLICY_PROMISC_BYPASS);
+    }
+
+    /// Programs a hardware CCMP key into MAC key table `slot` (`0..=3` for GTK,
+    /// `4` for STA PTK) and enables STA VIF 0 hardware CCMP RX decryption.
+    pub fn install_sta_ccmp_key(&mut self, slot: u8, key_idx: u8, bssid: [u8; 6], key: &[u8; 16]) {
+        if usize::from(slot) >= regs::KEY_SLOT_COUNT {
+            return;
+        }
+        let slot_base = regs::KEY_TABLE_BASE_REG + u32::from(slot) * regs::KEY_SLOT_STRIDE;
+        let word0 = u32::from_le_bytes([bssid[0], bssid[1], bssid[2], bssid[3]]);
+        let mac_hi = u32::from(u16::from_le_bytes([bssid[4], bssid[5]]));
+        let alg_bits = 3u32 << 18;
+        let mode_bits = if slot < 4 { 6u32 << 21 } else { 3u32 << 21 };
+        let key_id_bits = u32::from(key_idx & 0x03) << 30;
+        let word1 = mac_hi | alg_bits | mode_bits | key_id_bits;
+
+        self.bus.write_reg(slot_base, word0);
+        self.bus.write_reg(slot_base + 4, word1);
+
+        let slot_mask = self.bus.read_reg(regs::HW_CRYPTO_DISABLE_END);
+        self.bus.write_reg(
+            regs::HW_CRYPTO_DISABLE_END,
+            slot_mask | (1u32 << u32::from(slot)),
+        );
+
+        let mut w = 0usize;
+        while w < 4 {
+            let base = w * 4;
+            let key_word =
+                u32::from_le_bytes([key[base], key[base + 1], key[base + 2], key[base + 3]]);
+            self.bus.write_reg(slot_base + 8 + (w as u32) * 4, key_word);
+            w += 1;
+        }
+
+        let mut offset = 24u32;
+        while offset < 40 {
+            self.bus.write_reg(slot_base + offset, 0);
+            offset += 4;
+        }
+
+        let r3810_addr = regs::HW_CRYPTO_DISABLE_START + 0x10;
+        let r3810 = self.bus.read_reg(r3810_addr);
+        self.bus.write_reg(r3810_addr, r3810 & 0xFF00_00FF);
+
+        self.vif0_crypto_ctrl = 0x0003_0103;
+        self.bus
+            .write_reg(regs::HW_CRYPTO_DISABLE_START, self.vif0_crypto_ctrl);
+        self.bus.mem_barrier();
+    }
+
+    /// Clears STA VIF 0 hardware CCMP key slots (`0..=4`) and restores
+    /// software-crypto passthrough (`0x0003_0000`).
+    pub fn clear_sta_ccmp_keys(&mut self) {
+        self.vif0_crypto_ctrl = 0x0003_0000;
+        self.bus
+            .write_reg(regs::HW_CRYPTO_DISABLE_START, 0x0003_0000);
+
+        let slot_mask = self.bus.read_reg(regs::HW_CRYPTO_DISABLE_END);
+        self.bus
+            .write_reg(regs::HW_CRYPTO_DISABLE_END, slot_mask & !0x0000_001F);
+
+        let mut slot = 0u32;
+        while slot <= 4 {
+            let slot_base = regs::KEY_TABLE_BASE_REG + slot * regs::KEY_SLOT_STRIDE;
+            let mut word_idx = 0u32;
+            while word_idx < 10 {
+                self.bus.write_reg(slot_base + word_idx * 4, 0);
+                word_idx += 1;
+            }
+            slot += 1;
+        }
+
+        self.bus.mem_barrier();
     }
 
     /// Reads and validates the factory MAC address from ESP32 eFuse Block 0,
@@ -1410,6 +1498,15 @@ impl<B: WifiMmioBus> LmacHal<B> {
         };
         let base = (desc_addr & 0x000F_FFFF) | mode | ack;
 
+        // Temporarily bypass STA HW crypto during TX (frames are encrypted in SW)
+        // and unconditionally restore `vif0_crypto_ctrl` on every return path.
+        let restore_crypto = self.vif0_crypto_ctrl != 0x0003_0000;
+        if restore_crypto {
+            self.bus
+                .write_reg(regs::HW_CRYPTO_DISABLE_START, 0x0003_0000);
+            self.bus.mem_barrier();
+        }
+
         // Write descriptor base address, barrier, then assert trigger bits
         self.bus.write_reg(regs::TX_PLCP0_TRIG_REG, base);
         self.bus.mem_barrier();
@@ -1418,6 +1515,18 @@ impl<B: WifiMmioBus> LmacHal<B> {
         self.bus.mem_barrier();
 
         // 8. Poll for completion, error, or loop exhaustion
+        let tx_res = self.poll_tx_completion(max_polls);
+
+        if restore_crypto {
+            self.bus
+                .write_reg(regs::HW_CRYPTO_DISABLE_START, self.vif0_crypto_ctrl);
+            self.bus.mem_barrier();
+        }
+
+        tx_res
+    }
+
+    fn poll_tx_completion(&mut self, max_polls: u32) -> Result<(), LmacError> {
         let mut poll = 0;
         while poll < max_polls {
             let err_status = self.bus.read_reg(regs::TX_ERR_STATUS_REG);
@@ -1493,8 +1602,8 @@ mod tests {
 
         assert_eq!(bus.reg(regs::HW_CRYPTO_DISABLE_START), 0x0003_0000);
         assert_eq!(bus.reg(regs::HW_CRYPTO_DISABLE_START + 4), 0x0003_0000);
-        assert_eq!(bus.reg(regs::HW_CRYPTO_DISABLE_START + 8), 0x0003_0000);
-        assert_eq!(bus.reg(regs::HW_CRYPTO_DISABLE_START + 12), 0x0003_0000);
+        assert_eq!(bus.reg(regs::HW_CRYPTO_DISABLE_START + 8), 0);
+        assert_eq!(bus.reg(regs::HW_CRYPTO_DISABLE_START + 12), 0);
         assert_eq!(bus.reg(regs::HW_CRYPTO_DISABLE_START + 16), 0);
         assert_eq!(bus.reg(regs::HW_CRYPTO_DISABLE_END), 0);
         assert_eq!(bus.reg(regs::KEY_TABLE_BASE_REG), 0);
@@ -1920,11 +2029,150 @@ mod tests {
 
         assert_eq!(hal.init_mac([0x02; 6], 0x3FFE_0000), Ok(()));
 
-        let expected = [0x0003_0000u32, 0x0003_0000, 0x0003_0000, 0x0003_0000, 0, 0];
+        let expected = [0x0003_0000u32, 0x0003_0000, 0, 0, 0, 0];
         for (idx, &exp) in expected.iter().enumerate() {
             let addr = regs::HW_CRYPTO_DISABLE_START + (idx as u32) * 4;
             assert_eq!(hal.bus().reg(addr), exp);
         }
+    }
+
+    #[test]
+    fn test_install_and_clear_sta_ccmp_keys() {
+        let mut mock = MockWifiMmioBus::new();
+        mock.auto_init_3d24 = true;
+        mock.set_reg(regs::HW_CRYPTO_DISABLE_START + 0x10, 0xA5FF_FF5A);
+        let mut hal = LmacHal::new(mock);
+        assert!(!hal.is_sta_hw_crypto_enabled());
+
+        let bssid = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        let ptk = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+            0x0F, 0x10,
+        ];
+        let gtk = [
+            0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE,
+            0xAF, 0xB0,
+        ];
+
+        // Install PTK in slot 4 (key_idx 0 -> mode_bits = 3 << 21).
+        hal.install_sta_ccmp_key(4, 0, bssid, &ptk);
+        assert!(hal.is_sta_hw_crypto_enabled());
+        let ptk_base = regs::KEY_TABLE_BASE_REG + 4 * regs::KEY_SLOT_STRIDE;
+        assert_eq!(hal.bus().reg(ptk_base), 0x4433_2211);
+        assert_eq!(
+            hal.bus().reg(ptk_base + 4),
+            0x6655 | (3u32 << 18) | (3u32 << 21)
+        );
+        assert_eq!(hal.bus().reg(ptk_base + 8), 0x0403_0201);
+        assert_eq!(hal.bus().reg(ptk_base + 12), 0x0807_0605);
+        assert_eq!(hal.bus().reg(ptk_base + 16), 0x0C0B_0A09);
+        assert_eq!(hal.bus().reg(ptk_base + 20), 0x100F_0E0D);
+        for off in [24u32, 28, 32, 36] {
+            assert_eq!(hal.bus().reg(ptk_base + off), 0);
+        }
+        assert_eq!(
+            hal.bus().reg(regs::HW_CRYPTO_DISABLE_START + 0x10),
+            0xA500_005A
+        );
+        assert_eq!(hal.bus().reg(regs::HW_CRYPTO_DISABLE_START), 0x0003_0103);
+        assert_eq!(
+            hal.bus().reg(regs::HW_CRYPTO_DISABLE_END) & (1 << 4),
+            1 << 4
+        );
+
+        // Install GTK in slot 1 (key_idx 1 -> mode_bits = 6 << 21, key_id_bits = 1 << 30).
+        hal.install_sta_ccmp_key(1, 1, bssid, &gtk);
+        let gtk_base = regs::KEY_TABLE_BASE_REG + regs::KEY_SLOT_STRIDE;
+        assert_eq!(hal.bus().reg(gtk_base), 0x4433_2211);
+        assert_eq!(
+            hal.bus().reg(gtk_base + 4),
+            0x6655 | (3u32 << 18) | (6u32 << 21) | (1u32 << 30)
+        );
+        assert_eq!(hal.bus().reg(gtk_base + 8), 0xA4A3_A2A1);
+        assert_eq!(
+            hal.bus().reg(regs::HW_CRYPTO_DISABLE_END) & ((1 << 4) | (1 << 1)),
+            (1 << 4) | (1 << 1)
+        );
+
+        // Out-of-range slot is safely ignored.
+        let writes_before = hal.bus().write_count;
+        hal.install_sta_ccmp_key(regs::KEY_SLOT_COUNT as u8, 0, bssid, &ptk);
+        assert_eq!(hal.bus().write_count, writes_before);
+
+        // Preserve unrelated upper slot mask bit when clearing STA slots 0..=4.
+        hal.bus_mut()
+            .set_reg(regs::HW_CRYPTO_DISABLE_END, (1 << 5) | (1 << 4) | (1 << 1));
+        hal.clear_sta_ccmp_keys();
+        assert!(!hal.is_sta_hw_crypto_enabled());
+        assert_eq!(hal.bus().reg(regs::HW_CRYPTO_DISABLE_START), 0x0003_0000);
+        assert_eq!(hal.bus().reg(regs::HW_CRYPTO_DISABLE_END), 1 << 5);
+        for slot in 0..=4u32 {
+            let base = regs::KEY_TABLE_BASE_REG + slot * regs::KEY_SLOT_STRIDE;
+            for word_idx in 0..10u32 {
+                assert_eq!(hal.bus().reg(base + word_idx * 4), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn test_submit_and_poll_tx_bypasses_and_restores_hw_crypto_on_ok_and_err() {
+        let bssid = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let key = [0x55u8; 16];
+
+        // Case 1: Ok(()) path bypasses to 0x0003_0000 at trigger and restores 0x0003_0103.
+        let mut mock_ok = MockWifiMmioBus::new();
+        mock_ok.auto_tx_done = true;
+        mock_ok.auto_tx_status = 0;
+        let mut hal_ok = LmacHal::new(mock_ok);
+        hal_ok.install_sta_ccmp_key(4, 0, bssid, &key);
+        assert_eq!(
+            hal_ok.submit_and_poll_tx(0x3FFE_1000, 64, WifiPhyRate::Rate6m, 40, true, 100),
+            Ok(())
+        );
+        assert_eq!(hal_ok.bus().crypto_ctrl_at_tx_trigger, 0x0003_0000);
+        assert_eq!(hal_ok.bus().reg(regs::HW_CRYPTO_DISABLE_START), 0x0003_0103);
+
+        // Case 2: TxAckFailed error path restores 0x0003_0103.
+        let mut mock_ack_err = MockWifiMmioBus::new();
+        mock_ack_err.auto_tx_done = true;
+        mock_ack_err.auto_tx_status = 3;
+        let mut hal_ack_err = LmacHal::new(mock_ack_err);
+        hal_ack_err.install_sta_ccmp_key(4, 0, bssid, &key);
+        assert_eq!(
+            hal_ack_err.submit_and_poll_tx(0x3FFE_1000, 64, WifiPhyRate::Rate6m, 40, true, 100),
+            Err(LmacError::TxAckFailed(3))
+        );
+        assert_eq!(hal_ack_err.bus().crypto_ctrl_at_tx_trigger, 0x0003_0000);
+        assert_eq!(
+            hal_ack_err.bus().reg(regs::HW_CRYPTO_DISABLE_START),
+            0x0003_0103
+        );
+
+        // Case 3: TxHardwareError path restores 0x0003_0103.
+        let mut mock_hw_err = MockWifiMmioBus::new();
+        mock_hw_err.auto_tx_err = 1;
+        let mut hal_hw_err = LmacHal::new(mock_hw_err);
+        hal_hw_err.install_sta_ccmp_key(4, 0, bssid, &key);
+        assert_eq!(
+            hal_hw_err.submit_and_poll_tx(0x3FFE_1000, 64, WifiPhyRate::Rate6m, 40, true, 100),
+            Err(LmacError::TxHardwareError)
+        );
+        assert_eq!(
+            hal_hw_err.bus().reg(regs::HW_CRYPTO_DISABLE_START),
+            0x0003_0103
+        );
+
+        // Case 4: TxTimeout path restores 0x0003_0103.
+        let mut mock_to = MockWifiMmioBus::new();
+        mock_to.set_reg(regs::MAC_CLK_RST_REG, regs::MAC_CLK_RST_BIT_TX_ACTIVE);
+        mock_to.auto_clear_tx_active_on_abort_reset = true;
+        let mut hal_to = LmacHal::new(mock_to);
+        hal_to.install_sta_ccmp_key(4, 0, bssid, &key);
+        assert_eq!(
+            hal_to.submit_and_poll_tx(0x3FFE_1000, 64, WifiPhyRate::Rate6m, 40, false, 5),
+            Err(LmacError::TxTimeout)
+        );
+        assert_eq!(hal_to.bus().reg(regs::HW_CRYPTO_DISABLE_START), 0x0003_0103);
     }
 
     #[test]

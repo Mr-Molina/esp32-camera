@@ -17,7 +17,7 @@ use crate::frames_80211::parse_assoc_resp;
 use crate::frames_80211::parse_auth_resp;
 use crate::frames_80211::parse_beacon_or_probe_resp;
 use crate::frames_80211::parse_deauth_or_disassoc;
-use crate::frames_80211::rx_80211_data_to_eth;
+use crate::frames_80211::rx_80211_data_to_eth_ext;
 use crate::frames_80211::volatile_zeroize;
 use crate::frames_80211::FrameError;
 use crate::frames_80211::FrameType;
@@ -257,6 +257,23 @@ pub trait StaTxSink {
     /// Generates a hardware-backed random 32-bit unsigned integer, returning an
     /// error if the hardware RNG is uninitialized or fails health checks (`M-015`).
     fn hw_random_u32(&mut self) -> Result<u32, StaError>;
+
+    /// Installs a hardware CCMP key into the specified key slot (`0..=3` GTK,
+    /// `4` PTK).
+    fn on_install_ccmp_key(
+        &mut self,
+        _slot: u8,
+        _key_idx: u8,
+        _bssid: [u8; 6],
+        _key: &[u8; 16],
+    ) -> Result<(), StaError> {
+        Ok(())
+    }
+
+    /// Clears all STA hardware CCMP keys and restores software-crypto passthrough.
+    fn on_clear_crypto_keys(&mut self) -> Result<(), StaError> {
+        Ok(())
+    }
 }
 
 const MAX_SCAN_CANDIDATES: usize = 16;
@@ -322,6 +339,8 @@ pub struct StaMacCore {
     tx_buf: [u8; 1600],
     scratch_buf: [u8; 1600],
     eth_buf: [u8; 1600],
+    data_tx_primary_ok: u32,
+    data_tx_fallback_ok: u32,
 }
 
 impl Drop for StaMacCore {
@@ -375,6 +394,8 @@ impl StaMacCore {
             tx_buf: [0u8; 1600],
             scratch_buf: [0u8; 1600],
             eth_buf: [0u8; 1600],
+            data_tx_primary_ok: 0,
+            data_tx_fallback_ok: 0,
         }
     }
 
@@ -420,6 +441,14 @@ impl StaMacCore {
         self.pmk_cache_passphrase_len = 0;
         self.assoc_ie.fill(0);
         self.assoc_ie_len = 0;
+        self.data_tx_primary_ok = 0;
+        self.data_tx_fallback_ok = 0;
+    }
+
+    /// Returns `(data_tx_primary_ok, data_tx_fallback_ok)` counters.
+    #[must_use]
+    pub const fn data_tx_counts(&self) -> (u32, u32) {
+        (self.data_tx_primary_ok, self.data_tx_fallback_ok)
     }
 
     /// Returns the current state machine status.
@@ -476,13 +505,7 @@ impl StaMacCore {
         &self.candidates[..self.candidate_count]
     }
 
-    /// Initiates connection sequence to a Wi-Fi network.
-    pub fn start_connect(
-        &mut self,
-        config: StaConnectConfig,
-        now_ms: u64,
-        sink: &mut dyn StaTxSink,
-    ) -> Result<(), StaError> {
+    fn apply_connect_config(&mut self, config: StaConnectConfig) -> Result<(), StaError> {
         if config.ssid_len == 0 || config.ssid_len > 32 || config.passphrase_len > 64 {
             return Err(StaError::InvalidConfig);
         }
@@ -502,7 +525,27 @@ impl StaMacCore {
             self.failed_bssid_len = 0;
         }
         self.config = config;
+        Ok(())
+    }
+
+    /// Precomputes and caches the WPA2 PMK for `config` ahead of
+    /// [`Self::start_connect`] so `start_connect` sees unchanged credentials
+    /// and a populated PMK cache.
+    pub fn precompute_pmk(&mut self, config: &StaConnectConfig) -> Result<(), StaError> {
+        self.apply_connect_config(*config)?;
+        self.ensure_cached_pmk()
+    }
+
+    /// Initiates connection sequence to a Wi-Fi network.
+    pub fn start_connect(
+        &mut self,
+        config: StaConnectConfig,
+        now_ms: u64,
+        sink: &mut dyn StaTxSink,
+    ) -> Result<(), StaError> {
+        self.apply_connect_config(config)?;
         self.backoff_ms = INITIAL_BACKOFF_MS;
+        let _ = sink.on_clear_crypto_keys();
         self.start_scan(now_ms, sink)
     }
 
@@ -526,6 +569,7 @@ impl StaMacCore {
         }
         self.selected_candidate = None;
         self.reset_crypto_and_keys();
+        let _ = sink.on_clear_crypto_keys();
         self.wpa.on_disconnected();
         self.state = StaState::Disconnected;
         self.reconnect_due_ms = now_ms.saturating_add(self.backoff_ms);
@@ -612,6 +656,20 @@ impl StaMacCore {
         rssi: i8,
         now_ms: u64,
         sink: &mut dyn StaTxSink,
+        on_eth_rx: F,
+    ) -> Result<(), StaError> {
+        self.handle_rx_mpdu_ext(raw_mpdu, rssi, false, now_ms, sink, on_eth_rx)
+    }
+
+    /// Processes an incoming raw MPDU from the hardware RX ring, optionally
+    /// accepting hardware-decrypted CCMP payloads (`hw_ccmp_decrypted`).
+    pub fn handle_rx_mpdu_ext<F: FnMut(&[u8])>(
+        &mut self,
+        raw_mpdu: &[u8],
+        rssi: i8,
+        hw_ccmp_decrypted: bool,
+        now_ms: u64,
+        sink: &mut dyn StaTxSink,
         mut on_eth_rx: F,
     ) -> Result<(), StaError> {
         let parsed = match parse_80211_header(raw_mpdu) {
@@ -633,9 +691,14 @@ impl StaMacCore {
 
         match parsed.frame_type {
             FrameType::Mgmt => self.handle_mgmt_frame(raw_mpdu, &parsed, rssi, now_ms, sink),
-            FrameType::Data => {
-                self.handle_data_frame(raw_mpdu, &parsed, now_ms, sink, &mut on_eth_rx)
-            }
+            FrameType::Data => self.handle_data_frame(
+                raw_mpdu,
+                &parsed,
+                hw_ccmp_decrypted,
+                now_ms,
+                sink,
+                &mut on_eth_rx,
+            ),
             _ => Ok(()),
         }
     }
@@ -660,10 +723,31 @@ impl StaMacCore {
         let tx_key = Some((tk, 0u8, pn));
 
         let len = eth_to_80211_data(&mut self.tx_buf, eth_frame, bssid, seq, tx_key)?;
-        let rate = self.rate_ctrl.current_data_rate();
-        let res = sink.send_mpdu(&self.tx_buf[..len], rate, true, now_ms);
+        let mut used_fallback = false;
+        let res = match sink.send_mpdu(&self.tx_buf[..len], WifiPhyRate::Rate11mS, true, now_ms) {
+            Ok(()) => Ok(()),
+            Err(e @ StaError::Hardware(LmacError::TxDrainFailed)) => Err(e),
+            Err(_) => {
+                // Set 802.11 Retry bit (FC1 bit 3) on fallback retransmission;
+                // FC Retry is masked in CCMP AAD so the MIC remains valid.
+                self.tx_buf[1] |= 0x08;
+                used_fallback = true;
+                match sink.send_mpdu(&self.tx_buf[..len], WifiPhyRate::Rate6m, true, now_ms) {
+                    Ok(()) => Ok(()),
+                    Err(e @ StaError::Hardware(LmacError::TxDrainFailed)) => Err(e),
+                    Err(_) => {
+                        sink.send_mpdu(&self.tx_buf[..len], WifiPhyRate::Rate1mL, true, now_ms)
+                    }
+                }
+            }
+        };
         match res {
             Ok(()) => {
+                if used_fallback {
+                    self.data_tx_fallback_ok = self.data_tx_fallback_ok.saturating_add(1);
+                } else {
+                    self.data_tx_primary_ok = self.data_tx_primary_ok.saturating_add(1);
+                }
                 self.rate_ctrl.on_tx_success();
                 self.last_tx_or_rx_ms = now_ms;
                 Ok(())
@@ -1033,6 +1117,7 @@ impl StaMacCore {
         &mut self,
         raw_mpdu: &[u8],
         parsed: &crate::frames_80211::ParsedFrame<'_>,
+        hw_ccmp_decrypted: bool,
         now_ms: u64,
         sink: &mut dyn StaTxSink,
         on_eth_rx: &mut F,
@@ -1073,7 +1158,7 @@ impl StaMacCore {
             }
         };
 
-        let outcome = rx_80211_data_to_eth(
+        let outcome = rx_80211_data_to_eth_ext(
             raw_mpdu,
             &mut self.scratch_buf,
             &mut self.eth_buf,
@@ -1082,6 +1167,7 @@ impl StaMacCore {
             &cand.bssid,
             &self.sta_mac,
             true,
+            hw_ccmp_decrypted,
         )?;
 
         let ccmp_meta = match outcome {
@@ -1264,6 +1350,9 @@ impl StaMacCore {
                         self.unicast_rx_pn_qos.fill(0);
                         self.unicast_rx_pn_non_qos = 0;
                     }
+                    if let Some(cand) = self.selected_candidate {
+                        sink.on_install_ccmp_key(4, 0, cand.bssid, &tk)?;
+                    }
                     volatile_zeroize(&mut tk);
                 }
 
@@ -1285,6 +1374,15 @@ impl StaMacCore {
                         self.gtk_rx_pn[idx] = rsc_to_pn(install.gtk_rsc);
                     }
                     self.active_gtk_id = Some(install.gtk_idx & 0x03);
+                    let gtk_kid = install.gtk_idx & 0x03;
+                    let gtk_slot = match gtk_kid {
+                        1 => 0,
+                        2 | 0 => 1,
+                        _ => 2,
+                    };
+                    if let Some(cand) = self.selected_candidate {
+                        sink.on_install_ccmp_key(gtk_slot, gtk_kid, cand.bssid, &gtk_key)?;
+                    }
                     volatile_zeroize(&mut gtk_key);
                 }
 
@@ -1308,7 +1406,7 @@ impl StaMacCore {
     fn handle_disconnection(
         &mut self,
         now_ms: u64,
-        _sink: &mut dyn StaTxSink,
+        sink: &mut dyn StaTxSink,
     ) -> Result<(), StaError> {
         if matches!(
             self.state,
@@ -1320,6 +1418,7 @@ impl StaMacCore {
         }
         self.selected_candidate = None;
         self.reset_crypto_and_keys();
+        let _ = sink.on_clear_crypto_keys();
         self.wpa.on_disconnected();
         self.state = StaState::Disconnected;
         self.reconnect_due_ms = now_ms.saturating_add(self.backoff_ms);
@@ -1500,7 +1599,7 @@ fn encode_hex_pmk(pmk: &[u8; 32], out: &mut [u8; 64]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use esp32_cam_wpa2::crypto::ccm::ccmp_encrypt_mpdu;
+    use esp32_cam_wpa2::crypto::ccm::{ccmp_decrypt_mpdu, ccmp_encrypt_mpdu};
     use esp32_cam_wpa2::handshake::PendingKeyInstall;
     use esp32_cam_wpa2::ie::gen_wpa_ie;
     use esp32_cam_wpa2::ie::WPA_CIPHER_TKIP;
@@ -2062,5 +2161,203 @@ mod tests {
         );
         assert_eq!(sink.sent_frames, 0);
         assert_eq!(fsm.state(), StaState::FourWayWait);
+    }
+
+    #[test]
+    fn test_transmit_eth_rate6m_with_rate1ml_retry_preserves_valid_ccmp() {
+        struct RetryRecordingSink {
+            calls: [(WifiPhyRate, usize, [u8; 128]); 4],
+            call_count: usize,
+            errs: [Option<StaError>; 4],
+        }
+
+        impl RetryRecordingSink {
+            fn new(errs: [Option<StaError>; 4]) -> Self {
+                Self {
+                    calls: [(WifiPhyRate::Rate1mL, 0, [0u8; 128]); 4],
+                    call_count: 0,
+                    errs,
+                }
+            }
+        }
+
+        impl StaTxSink for RetryRecordingSink {
+            fn send_mpdu(
+                &mut self,
+                mpdu: &[u8],
+                rate: WifiPhyRate,
+                _wait_ack: bool,
+                _now_ms: u64,
+            ) -> Result<(), StaError> {
+                let idx = self.call_count;
+                self.call_count += 1;
+                if idx < self.calls.len() {
+                    let copy_len = mpdu.len().min(self.calls[idx].2.len());
+                    self.calls[idx].0 = rate;
+                    self.calls[idx].1 = copy_len;
+                    self.calls[idx].2[..copy_len].copy_from_slice(&mpdu[..copy_len]);
+                    if let Some(err) = self.errs[idx].take() {
+                        return Err(err);
+                    }
+                }
+                Ok(())
+            }
+
+            fn on_channel_switch(&mut self, _channel: u8) -> Result<(), StaError> {
+                Ok(())
+            }
+
+            fn on_scan_rx_policy(&mut self) -> Result<(), StaError> {
+                Ok(())
+            }
+
+            fn on_associated_bssid(&mut self, _bssid: [u8; 6]) -> Result<(), StaError> {
+                Ok(())
+            }
+
+            fn hw_random_u32(&mut self) -> Result<u32, StaError> {
+                Ok(0x1234_5678)
+            }
+        }
+
+        let sta_mac = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let bssid = [0x02, 0x66, 0x77, 0x88, 0x99, 0xAA];
+        let tk = [0x42u8; 16];
+
+        let mut fsm = StaMacCore::new(sta_mac);
+        fsm.state = StaState::Connected;
+        fsm.ptk = Some(tk);
+        fsm.selected_candidate = Some(ScanCandidate {
+            bssid,
+            channel: 6,
+            rssi: -50,
+            privacy: true,
+            has_ccmp: true,
+            has_psk: true,
+            group_cipher: WPA_CIPHER_CCMP,
+            proto: WPA_PROTO_RSN,
+            ap_ie: [0u8; 128],
+            ap_ie_len: 0,
+            score: 0,
+        });
+
+        let mut eth_frame = [0u8; 24];
+        eth_frame[0..6].copy_from_slice(&[0xFF; 6]);
+        eth_frame[6..12].copy_from_slice(&sta_mac);
+        eth_frame[12..14].copy_from_slice(&[0x08, 0x00]);
+        eth_frame[14..24].copy_from_slice(b"DHCP-DISCO");
+
+        // Fallback chain: Rate11mS -> Rate6m -> Rate1mL.
+        let mut sink = RetryRecordingSink::new([
+            Some(StaError::Hardware(LmacError::TxTimeout)),
+            Some(StaError::Hardware(LmacError::TxTimeout)),
+            None,
+            None,
+        ]);
+        fsm.transmit_eth(&eth_frame, 4_200, &mut sink)
+            .expect("Rate11mS and Rate6m failures should retry at Rate1mL");
+
+        assert_eq!(sink.call_count, 3);
+        assert_eq!(sink.calls[0].0, WifiPhyRate::Rate11mS);
+        assert_eq!(sink.calls[1].0, WifiPhyRate::Rate6m);
+        assert_eq!(sink.calls[2].0, WifiPhyRate::Rate1mL);
+        assert_eq!(fsm.data_tx_counts(), (0, 1));
+
+        let len0 = sink.calls[0].1;
+        let len1 = sink.calls[1].1;
+        let len2 = sink.calls[2].1;
+        assert_eq!(len0, len1);
+        assert_eq!(len0, len2);
+        assert_eq!(sink.calls[0].2[1] & 0x08, 0);
+        assert_eq!(sink.calls[1].2[1] & 0x08, 0x08);
+        assert_eq!(sink.calls[2].2[1] & 0x08, 0x08);
+        assert_eq!(sink.calls[0].2[2..len0], sink.calls[1].2[2..len1]);
+        assert_eq!(sink.calls[0].2[2..len0], sink.calls[2].2[2..len2]);
+        assert_eq!(fsm.last_tx_or_rx_ms, 4_200);
+
+        let mut plain = [0u8; 128];
+        let (pt_len, key_id, pn) = ccmp_decrypt_mpdu(&tk, &sink.calls[2].2[..len2], &mut plain)
+            .expect("retried MPDU with Retry bit must preserve valid CCMP MIC");
+        assert_eq!(key_id, 0);
+        assert_eq!(pn, 1);
+        assert_eq!(&plain[6..8], &[0x08, 0x00]);
+        assert_eq!(&plain[8..pt_len], b"DHCP-DISCO");
+
+        // Primary Rate11mS success increments data_tx_primary_ok.
+        let mut ok_sink = RetryRecordingSink::new([None, None, None, None]);
+        fsm.transmit_eth(&eth_frame, 4_250, &mut ok_sink)
+            .expect("primary Rate11mS should succeed");
+        assert_eq!(ok_sink.call_count, 1);
+        assert_eq!(ok_sink.calls[0].0, WifiPhyRate::Rate11mS);
+        assert_eq!(fsm.data_tx_counts(), (1, 1));
+
+        // TxDrainFailed on Rate11mS must not retry at Rate6m or Rate1mL.
+        let mut drain_sink = RetryRecordingSink::new([
+            Some(StaError::Hardware(LmacError::TxDrainFailed)),
+            None,
+            None,
+            None,
+        ]);
+        let drain_res = fsm.transmit_eth(&eth_frame, 4_300, &mut drain_sink);
+        assert_eq!(drain_res, Err(StaError::Hardware(LmacError::TxDrainFailed)));
+        assert_eq!(drain_sink.call_count, 1);
+        assert_eq!(drain_sink.calls[0].0, WifiPhyRate::Rate11mS);
+        assert_eq!(fsm.data_tx_counts(), (1, 1));
+
+        // TxDrainFailed on Rate6m must not retry at Rate1mL.
+        let mut drain6m_sink = RetryRecordingSink::new([
+            Some(StaError::Hardware(LmacError::TxTimeout)),
+            Some(StaError::Hardware(LmacError::TxDrainFailed)),
+            None,
+            None,
+        ]);
+        let drain6m_res = fsm.transmit_eth(&eth_frame, 4_400, &mut drain6m_sink);
+        assert_eq!(
+            drain6m_res,
+            Err(StaError::Hardware(LmacError::TxDrainFailed))
+        );
+        assert_eq!(drain6m_sink.call_count, 2);
+        assert_eq!(drain6m_sink.calls[0].0, WifiPhyRate::Rate11mS);
+        assert_eq!(drain6m_sink.calls[1].0, WifiPhyRate::Rate6m);
+        assert_eq!(fsm.data_tx_counts(), (1, 1));
+    }
+
+    #[test]
+    fn test_precompute_pmk_avoids_recompute_on_start_connect() {
+        let sta_mac = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let mut fsm = StaMacCore::new(sta_mac);
+        let cfg = StaConnectConfig::from_slices(b"WarmNet", b"supersecret", None, -90)
+            .expect("valid cfg");
+        assert!(!fsm.pmk_cached);
+
+        fsm.precompute_pmk(&cfg).expect("precompute_pmk");
+        assert!(fsm.pmk_cached);
+        let cached_pmk = fsm.cached_pmk;
+        let cached_hex = fsm.cached_pmk_hex;
+        assert_eq!(fsm.config.ssid_bytes(), cfg.ssid_bytes());
+        assert_eq!(fsm.config.passphrase_bytes(), cfg.passphrase_bytes());
+
+        // Mark a BSSID as failed; if `start_connect` saw `creds_changed == true`,
+        // it would wipe `pmk_cached` and `failed_bssid_len`.
+        fsm.record_bssid_failure([0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE]);
+        assert_eq!(fsm.failed_bssid_len, 1);
+
+        let mut sink = MockSink::new();
+        fsm.start_connect(cfg, 1_000, &mut sink)
+            .expect("start_connect");
+        assert!(fsm.pmk_cached);
+        assert_eq!(fsm.cached_pmk, cached_pmk);
+        assert_eq!(fsm.cached_pmk_hex, cached_hex);
+        assert_eq!(fsm.failed_bssid_len, 1);
+
+        fsm.ensure_cached_pmk().expect("ensure_cached_pmk");
+        assert_eq!(fsm.cached_pmk, cached_pmk);
+
+        let cfg2 = StaConnectConfig::from_slices(b"OtherNet", b"othersecret", None, -90)
+            .expect("valid cfg2");
+        fsm.precompute_pmk(&cfg2).expect("precompute_pmk 2");
+        assert!(fsm.pmk_cached);
+        assert_ne!(fsm.cached_pmk, cached_pmk);
+        assert_eq!(fsm.failed_bssid_len, 0);
     }
 }

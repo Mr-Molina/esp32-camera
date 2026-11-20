@@ -851,6 +851,33 @@ pub fn rx_80211_data_to_eth(
     sta_mac: &[u8; 6],
     bss_protected: bool,
 ) -> Result<RxDataOutcome, FrameError> {
+    rx_80211_data_to_eth_ext(
+        raw_mpdu,
+        scratch_plain,
+        out_eth,
+        ptk,
+        gtk,
+        expected_bssid,
+        sta_mac,
+        bss_protected,
+        false,
+    )
+}
+
+/// Decapsulates an 802.11 Data MPDU into an Ethernet-II frame or EAPOL packet,
+/// optionally accepting hardware-decrypted CCMP payloads (`hw_ccmp_decrypted`).
+#[allow(clippy::too_many_arguments)]
+pub fn rx_80211_data_to_eth_ext(
+    raw_mpdu: &[u8],
+    scratch_plain: &mut [u8],
+    out_eth: &mut [u8],
+    ptk: Option<&[u8; 16]>,
+    gtk: Option<(u8, &[u8; 16])>,
+    expected_bssid: &[u8; 6],
+    sta_mac: &[u8; 6],
+    bss_protected: bool,
+    hw_ccmp_decrypted: bool,
+) -> Result<RxDataOutcome, FrameError> {
     if raw_mpdu.len() < 24 {
         return Err(FrameError::MalformedHeader);
     }
@@ -913,25 +940,63 @@ pub fn rx_80211_data_to_eth(
             (ptk.ok_or(FrameError::MissingKey)?, 0u8)
         };
 
-        let (pt_len, key_id, pn) =
-            ccmp_decrypt_mpdu(key, raw_mpdu, scratch_plain).map_err(|_| FrameError::CryptoError)?;
-        if key_id != expected_key_id {
-            return Err(FrameError::KeyIdMismatch);
+        if hw_ccmp_decrypted
+            && raw_mpdu.len() >= hdr_len + 16
+            && raw_mpdu[hdr_len + 8..].len() >= 8
+            && raw_mpdu[hdr_len + 8..hdr_len + 14] == [0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00]
+        {
+            let iv = &raw_mpdu[hdr_len..hdr_len + 8];
+            if iv[2] != 0 || (iv[3] & 0x20) == 0 || (iv[3] & 0x1F) != 0 {
+                return Err(FrameError::CryptoError);
+            }
+            let key_id = (iv[3] >> 6) & 0x03;
+            if key_id != expected_key_id {
+                return Err(FrameError::KeyIdMismatch);
+            }
+            let pn = u64::from(iv[0])
+                | (u64::from(iv[1]) << 8)
+                | (u64::from(iv[4]) << 16)
+                | (u64::from(iv[5]) << 24)
+                | (u64::from(iv[6]) << 32)
+                | (u64::from(iv[7]) << 40);
+            if pn == 0 || pn > MAX_CCMP_PN {
+                return Err(FrameError::InvalidPacketNumber);
+            }
+            let pt_src = &raw_mpdu[hdr_len + 8..raw_mpdu.len() - 8];
+            let pt_len = pt_src.len();
+            let pt_dst = scratch_plain
+                .get_mut(..pt_len)
+                .ok_or(FrameError::BufferTooSmall)?;
+            pt_dst.copy_from_slice(pt_src);
+            (
+                &*pt_dst,
+                Some(CcmpRxMeta {
+                    pn,
+                    key_id,
+                    qos_tid,
+                }),
+            )
+        } else {
+            let (pt_len, key_id, pn) = ccmp_decrypt_mpdu(key, raw_mpdu, scratch_plain)
+                .map_err(|_| FrameError::CryptoError)?;
+            if key_id != expected_key_id {
+                return Err(FrameError::KeyIdMismatch);
+            }
+            if pn == 0 || pn > MAX_CCMP_PN {
+                return Err(FrameError::InvalidPacketNumber);
+            }
+            let pt = scratch_plain
+                .get(..pt_len)
+                .ok_or(FrameError::BufferTooSmall)?;
+            (
+                pt,
+                Some(CcmpRxMeta {
+                    pn,
+                    key_id,
+                    qos_tid,
+                }),
+            )
         }
-        if pn == 0 || pn > MAX_CCMP_PN {
-            return Err(FrameError::InvalidPacketNumber);
-        }
-        let pt = scratch_plain
-            .get(..pt_len)
-            .ok_or(FrameError::BufferTooSmall)?;
-        (
-            pt,
-            Some(CcmpRxMeta {
-                pn,
-                key_id,
-                qos_tid,
-            }),
-        )
     } else {
         // FragAttacks (CVE-2020-26140): once PTK is installed, reject ALL
         // unencrypted frames, including EAPOL.
@@ -2347,6 +2412,169 @@ mod tests {
         assert_eq!(
             ap_rx_80211_data_to_eth(&mpdu[..up_len], &bssid, &sta, &mut small_eth),
             Err(FrameError::BufferTooSmall)
+        );
+    }
+
+    #[test]
+    fn test_rx_80211_data_to_eth_ext_hw_ccmp_decrypted() {
+        let bssid = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let sta_mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let sa = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC];
+        let tk = [0x11u8; 16];
+        let gtk = [0x77u8; 16];
+        let mut scratch = [0u8; 256];
+        let mut out = [0u8; 256];
+
+        // Helper closure-like builder for a Protected=1 FromDS=1 MPDU with
+        // plaintext LLC/SNAP (simulating ESP32 hardware CCMP decryption).
+        let build_hw_decrypted_mpdu =
+            |da: [u8; 6], qos_tid: Option<u8>, key_id: u8, pn: u64, ext_iv: bool| {
+                let hdr_len = if qos_tid.is_some() { 26 } else { 24 };
+                let mut mpdu = [0u8; 64];
+                mpdu[0] = if qos_tid.is_some() { 0x88 } else { 0x08 };
+                mpdu[1] = 0x42; // FromDS=1, Protected=1
+                mpdu[4..10].copy_from_slice(&da);
+                mpdu[10..16].copy_from_slice(&bssid);
+                mpdu[16..22].copy_from_slice(&sa);
+                if let Some(tid) = qos_tid {
+                    mpdu[24] = tid & 0x0F;
+                }
+                // CCMP 8-byte IV
+                mpdu[hdr_len] = (pn & 0xFF) as u8;
+                mpdu[hdr_len + 1] = ((pn >> 8) & 0xFF) as u8;
+                mpdu[hdr_len + 2] = 0;
+                mpdu[hdr_len + 3] = ((key_id & 0x03) << 6) | if ext_iv { 0x20 } else { 0x00 };
+                mpdu[hdr_len + 4] = ((pn >> 16) & 0xFF) as u8;
+                mpdu[hdr_len + 5] = ((pn >> 24) & 0xFF) as u8;
+                mpdu[hdr_len + 6] = ((pn >> 32) & 0xFF) as u8;
+                mpdu[hdr_len + 7] = ((pn >> 40) & 0xFF) as u8;
+                // Decrypted LLC/SNAP + EtherType 0x0800 + 6-byte payload + 8-byte trailing MIC
+                let snap_off = hdr_len + 8;
+                mpdu[snap_off..snap_off + 8]
+                    .copy_from_slice(&[0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00, 0x08, 0x00]);
+                mpdu[snap_off + 8..snap_off + 14].copy_from_slice(b"HWCCMP");
+                let total_len = snap_off + 14 + 8;
+                (mpdu, total_len)
+            };
+
+        // 1. Valid unicast QoS decap with hw_ccmp_decrypted = true
+        let pn_uni = 0x0001_0203_0405u64;
+        let (uni_mpdu, uni_len) = build_hw_decrypted_mpdu(sta_mac, Some(3), 0, pn_uni, true);
+        assert_eq!(
+            rx_80211_data_to_eth_ext(
+                &uni_mpdu[..uni_len],
+                &mut scratch,
+                &mut out,
+                Some(&tk),
+                None,
+                &bssid,
+                &sta_mac,
+                true,
+                true,
+            ),
+            Ok(RxDataOutcome::Ethernet {
+                len: 14 + 6,
+                ccmp: Some(CcmpRxMeta {
+                    pn: pn_uni,
+                    key_id: 0,
+                    qos_tid: Some(3),
+                }),
+            })
+        );
+        assert_eq!(&out[0..6], &sta_mac);
+        assert_eq!(&out[6..12], &sa);
+        assert_eq!(&out[12..14], &[0x08, 0x00]);
+        assert_eq!(&out[14..20], b"HWCCMP");
+
+        // 2. Valid group (GTK key_id = 1) decap with hw_ccmp_decrypted = true
+        let (grp_mpdu, grp_len) = build_hw_decrypted_mpdu([0xFF; 6], None, 1, 42, true);
+        assert_eq!(
+            rx_80211_data_to_eth_ext(
+                &grp_mpdu[..grp_len],
+                &mut scratch,
+                &mut out,
+                Some(&tk),
+                Some((1, &gtk)),
+                &bssid,
+                &sta_mac,
+                true,
+                true,
+            ),
+            Ok(RxDataOutcome::Ethernet {
+                len: 14 + 6,
+                ccmp: Some(CcmpRxMeta {
+                    pn: 42,
+                    key_id: 1,
+                    qos_tid: None,
+                }),
+            })
+        );
+
+        // 3. Bad KeyID rejected
+        let (bad_kid_mpdu, bad_kid_len) = build_hw_decrypted_mpdu([0xFF; 6], None, 2, 42, true);
+        assert_eq!(
+            rx_80211_data_to_eth_ext(
+                &bad_kid_mpdu[..bad_kid_len],
+                &mut scratch,
+                &mut out,
+                Some(&tk),
+                Some((1, &gtk)),
+                &bssid,
+                &sta_mac,
+                true,
+                true,
+            ),
+            Err(FrameError::KeyIdMismatch)
+        );
+
+        // 4. pn == 0 rejected
+        let (zero_pn_mpdu, zero_pn_len) = build_hw_decrypted_mpdu(sta_mac, None, 0, 0, true);
+        assert_eq!(
+            rx_80211_data_to_eth_ext(
+                &zero_pn_mpdu[..zero_pn_len],
+                &mut scratch,
+                &mut out,
+                Some(&tk),
+                None,
+                &bssid,
+                &sta_mac,
+                true,
+                true,
+            ),
+            Err(FrameError::InvalidPacketNumber)
+        );
+
+        // 5. Missing ExtIV bit rejected
+        let (no_extiv_mpdu, no_extiv_len) = build_hw_decrypted_mpdu(sta_mac, None, 0, 7, false);
+        assert_eq!(
+            rx_80211_data_to_eth_ext(
+                &no_extiv_mpdu[..no_extiv_len],
+                &mut scratch,
+                &mut out,
+                Some(&tk),
+                None,
+                &bssid,
+                &sta_mac,
+                true,
+                true,
+            ),
+            Err(FrameError::CryptoError)
+        );
+
+        // 6. hw_ccmp_decrypted = false rejects unencrypted payload inside Protected=1
+        assert_eq!(
+            rx_80211_data_to_eth_ext(
+                &uni_mpdu[..uni_len],
+                &mut scratch,
+                &mut out,
+                Some(&tk),
+                None,
+                &bssid,
+                &sta_mac,
+                true,
+                false,
+            ),
+            Err(FrameError::CryptoError)
         );
     }
 }

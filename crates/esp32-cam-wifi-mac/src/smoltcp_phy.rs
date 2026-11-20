@@ -109,6 +109,10 @@ impl smoltcp::phy::RxToken for StaRxToken {
 /// to prevent remote frame-flood WDT starvation.
 pub const MAX_RX_PER_POLL: usize = 16;
 
+/// Hardware `rx_state` (`-0x0b` in `wdev.o`: `wDev_ProcessRxSucData`) emitted
+/// when an encrypted MPDU passes through for software crypto decryption.
+const RX_STATE_SW_CRYPTO_PASSTHROUGH: u8 = 0xF5;
+
 /// smoltcp TX token providing a staging buffer for an outgoing Ethernet frame.
 pub struct StaTxToken<'a, B: WifiMmioBus> {
     driver: &'a mut Esp32StaWifiDriver<B>,
@@ -184,6 +188,22 @@ impl<'a, B: WifiMmioBus> StaTxSink for DriverTxSink<'a, B> {
     fn hw_random_u32(&mut self) -> Result<u32, StaError> {
         self.lmac.try_hw_random_u32().map_err(StaError::Hardware)
     }
+
+    fn on_install_ccmp_key(
+        &mut self,
+        slot: u8,
+        key_idx: u8,
+        bssid: [u8; 6],
+        key: &[u8; 16],
+    ) -> Result<(), StaError> {
+        self.lmac.install_sta_ccmp_key(slot, key_idx, bssid, key);
+        Ok(())
+    }
+
+    fn on_clear_crypto_keys(&mut self) -> Result<(), StaError> {
+        self.lmac.clear_sta_ccmp_keys();
+        Ok(())
+    }
 }
 
 /// Bridge adapter fulfilling [`ApTxSink`] via the driver's LMAC and TX slot.
@@ -241,7 +261,15 @@ pub struct Esp32StaWifiDriver<B: WifiMmioBus> {
     now_ms: u64,
     initialized: bool,
     pending_eth_tx_failures: u32,
+    eth_tx_ok: u32,
     rx_dropped_overflow: u32,
+    last_sta_error: Option<StaError>,
+    last_connected_rx_info: Option<(u8, u8, u16)>,
+    rx_popped_total: u32,
+    rx_malformed_total: u32,
+    last_non_beacon_rx: Option<(u8, u8, u8, u16)>,
+    rx_protected_total: u32,
+    last_protected_rx_info: Option<(u8, u8)>,
     _pin: PhantomPinned,
 }
 
@@ -264,7 +292,15 @@ impl<B: WifiMmioBus> Esp32StaWifiDriver<B> {
             now_ms: 0,
             initialized: false,
             pending_eth_tx_failures: 0,
+            eth_tx_ok: 0,
             rx_dropped_overflow: 0,
+            last_sta_error: None,
+            last_connected_rx_info: None,
+            rx_popped_total: 0,
+            rx_malformed_total: 0,
+            last_non_beacon_rx: None,
+            rx_protected_total: 0,
+            last_protected_rx_info: None,
             _pin: PhantomPinned,
         }
     }
@@ -338,11 +374,19 @@ impl<B: WifiMmioBus> Esp32StaWifiDriver<B> {
         Ok(mac)
     }
 
+    /// Precomputes and caches the WPA2 PMK for `config` ahead of [`Self::connect`].
+    pub fn warm_pmk_cache(&mut self, config: &StaConnectConfig) -> Result<(), DriverError> {
+        self.sta.precompute_pmk(config).map_err(DriverError::Sta)
+    }
+
     /// Initiates association to an access point with the given configuration.
     pub fn connect(&mut self, config: StaConnectConfig, now_ms: u64) -> Result<(), DriverError> {
         if !self.initialized {
             return Err(DriverError::NotInitialized);
         }
+        self.last_sta_error = None;
+        self.last_connected_rx_info = None;
+        self.last_non_beacon_rx = None;
         self.now_ms = now_ms;
         let mut sink = DriverTxSink {
             lmac: &mut self.lmac,
@@ -461,6 +505,7 @@ impl<B: WifiMmioBus> Esp32StaWifiDriver<B> {
                     // (e.g., multi-descriptor jumbo frames or DMA runts) so a
                     // single bad descriptor can never wedge the RX ring head.
                     processed += 1;
+                    self.rx_malformed_total = self.rx_malformed_total.saturating_add(1);
                     let _ = self.rx_ring.recycle_current();
                     self.lmac.reload_rx_dma();
                     continue;
@@ -468,16 +513,37 @@ impl<B: WifiMmioBus> Esp32StaWifiDriver<B> {
                 RxPop::Frame(ctrl, mpdu) => (ctrl, mpdu),
             };
             processed += 1;
+            self.rx_popped_total = self.rx_popped_total.saturating_add(1);
 
             let sig_len = usize::from(ctrl.sig_len);
             let mpdu_len = mpdu.len();
+            if mpdu_len >= 2 && (mpdu[1] & 0x40) != 0 {
+                self.rx_protected_total = self.rx_protected_total.saturating_add(1);
+                self.last_protected_rx_info = Some((ctrl.rx_state, mpdu[0]));
+            }
+            if self.sta.is_connected() && mpdu_len >= 10 && mpdu[0] != 0x80 {
+                self.last_non_beacon_rx = Some((ctrl.rx_state, mpdu[0], mpdu[4], ctrl.sig_len));
+            }
+            if self.sta.is_connected()
+                && mpdu_len >= 10
+                && (mpdu[4..10] == self.sta.sta_mac()
+                    || ((mpdu[4] & 1) != 0 && ((mpdu[0] >> 2) & 0x03) == 2))
+            {
+                self.last_connected_rx_info = Some((ctrl.rx_state, mpdu[0], ctrl.sig_len));
+            }
             let payload_no_fcs_len = sig_len.saturating_sub(4);
             // Accept both silicon RX DMA buffers (which strip the 4-byte FCS
             // and 4-byte-pad the payload, so `sig_len - 4 <= mpdu_len < sig_len`)
             // and mock buffers that retain the 4-byte FCS (`mpdu_len == sig_len`).
-            // Drop RX errors, sig_len == 0 fallbacks, runts (<= 4 B), and
-            // oversized MPDUs (> scratch capacity).
-            let valid_frame = ctrl.rx_state == 0
+            // Also accept `RX_STATE_SW_CRYPTO_PASSTHROUGH` (0xF5) when the
+            // 802.11 Protected bit (`mpdu[1] & 0x40`) is set so SW-decrypted
+            // MPDUs are not dropped. Drop other RX errors, sig_len == 0
+            // fallbacks, runts (<= 4 B), and oversized MPDUs (> scratch capacity).
+            let rx_state_ok = ctrl.rx_state == 0
+                || (ctrl.rx_state == RX_STATE_SW_CRYPTO_PASSTHROUGH
+                    && mpdu_len >= 2
+                    && (mpdu[1] & 0x40) != 0);
+            let valid_frame = rx_state_ok
                 && sig_len > 4
                 && payload_no_fcs_len <= mpdu_len
                 && mpdu_len <= sig_len + 3
@@ -518,13 +584,18 @@ impl<B: WifiMmioBus> Esp32StaWifiDriver<B> {
                     }
                 }
             } else {
+                let hw_ccmp_decrypted = ctrl.rx_state == 0 && self.lmac.is_sta_hw_crypto_enabled();
                 let mut sink = DriverTxSink {
                     lmac: &mut self.lmac,
                     tx_slot: &mut self.tx_slot,
                 };
-                let _ = self
-                    .sta
-                    .handle_rx_mpdu(mpdu_no_fcs, ctrl.rssi, now_ms, &mut sink, |eth| {
+                if let Err(err) = self.sta.handle_rx_mpdu_ext(
+                    mpdu_no_fcs,
+                    ctrl.rssi,
+                    hw_ccmp_decrypted,
+                    now_ms,
+                    &mut sink,
+                    |eth| {
                         if eth.len() > 1536 {
                             self.rx_dropped_overflow = self.rx_dropped_overflow.saturating_add(1);
                             return;
@@ -538,7 +609,10 @@ impl<B: WifiMmioBus> Esp32StaWifiDriver<B> {
                         } else {
                             self.rx_dropped_overflow = self.rx_dropped_overflow.saturating_add(1);
                         }
-                    });
+                    },
+                ) {
+                    self.last_sta_error = Some(err);
+                }
             }
         }
 
@@ -553,7 +627,10 @@ impl<B: WifiMmioBus> Esp32StaWifiDriver<B> {
                 lmac: &mut self.lmac,
                 tx_slot: &mut self.tx_slot,
             };
-            self.sta.poll_tick(now_ms, &mut sink)?;
+            if let Err(err) = self.sta.poll_tick(now_ms, &mut sink) {
+                self.last_sta_error = Some(err);
+                return Err(DriverError::Sta(err));
+            }
         }
 
         Ok(())
@@ -577,12 +654,21 @@ impl<B: WifiMmioBus> Esp32StaWifiDriver<B> {
                 lmac: &mut self.lmac,
                 tx_slot: &mut self.tx_slot,
             };
-            self.sta
+            match self
+                .sta
                 .transmit_eth(&self.smol_tx_buf[..len], self.now_ms, &mut sink)
-                .is_err()
+            {
+                Ok(()) => false,
+                Err(e) => {
+                    self.last_sta_error = Some(e);
+                    true
+                }
+            }
         };
         if tx_failed {
             self.pending_eth_tx_failures = self.pending_eth_tx_failures.saturating_add(1);
+        } else {
+            self.eth_tx_ok = self.eth_tx_ok.saturating_add(1);
         }
     }
 
@@ -719,6 +805,61 @@ impl<B: WifiMmioBus> Esp32StaWifiDriver<B> {
         self.rx_dropped_overflow
     }
 
+    /// Returns and clears the most recent [`StaError`] captured during `poll()`.
+    pub fn take_last_sta_error(&mut self) -> Option<StaError> {
+        self.last_sta_error.take()
+    }
+
+    /// Returns and clears `(rx_state, mpdu_fc0, sig_len)` for the most recent
+    /// unicast or broadcast/multicast Data RX frame seen while connected.
+    pub fn take_last_connected_rx_info(&mut self) -> Option<(u8, u8, u16)> {
+        self.last_connected_rx_info.take()
+    }
+
+    /// Returns a diagnostic snapshot of RX ring & LMAC DMA state and clears
+    /// `last_non_beacon_rx`:
+    /// `(rx_popped_total, rx_ctrl_reg, rx_next_dscr_reg, head_word0, eof_mask, last_non_beacon_rx, eth_tx_ok, rx_malformed_total)`.
+    #[allow(clippy::type_complexity)]
+    pub fn take_rx_diag_snapshot(
+        &mut self,
+    ) -> (u32, u32, u32, u32, u8, Option<(u8, u8, u8, u16)>, u32, u32) {
+        let rx_ctrl_reg = self.lmac.bus().read_reg(crate::regs::RX_CTRL_REG);
+        let rx_next_dscr_reg = self.lmac.bus().read_reg(crate::regs::RX_NEXT_DSCR_REG);
+        let head_word0 = self.rx_ring.current_desc().map_or(0, |d| d.word0);
+        let mut eof_mask = 0u8;
+        for idx in 0..8 {
+            if self
+                .rx_ring
+                .desc(idx)
+                .is_some_and(|d| (d.word0 & crate::dma_ring::WifiRxDmaDesc::EOF_BIT) != 0)
+            {
+                eof_mask |= 1u8 << idx;
+            }
+        }
+        (
+            self.rx_popped_total,
+            rx_ctrl_reg,
+            rx_next_dscr_reg,
+            head_word0,
+            eof_mask,
+            self.last_non_beacon_rx.take(),
+            self.eth_tx_ok,
+            self.rx_malformed_total,
+        )
+    }
+
+    /// Returns `(data_tx_primary_ok, data_tx_fallback_ok, rx_protected_total, last_protected_rx_info)`.
+    #[must_use]
+    pub const fn extra_diag_counts(&self) -> (u32, u32, u32, Option<(u8, u8)>) {
+        let (pri_ok, fb_ok) = self.sta.data_tx_counts();
+        (
+            pri_ok,
+            fb_ok,
+            self.rx_protected_total,
+            self.last_protected_rx_info,
+        )
+    }
+
     /// Shuts down the Wi-Fi baseband and resets hardware MAC state.
     ///
     /// Idempotent: returns immediately when the driver is not initialized.
@@ -730,6 +871,8 @@ impl<B: WifiMmioBus> Esp32StaWifiDriver<B> {
         crate::phy_bridge::phy_arm_bb_wdt(false);
         self.lmac.deinit_mac();
         self.ap = None;
+        self.last_connected_rx_info = None;
+        self.last_non_beacon_rx = None;
         self.initialized = false;
     }
 }
@@ -1734,5 +1877,394 @@ mod tests {
         });
         assert_eq!(seen_len2, 38);
         assert_eq!(&seen2[..38], &eth_mock[..]);
+    }
+
+    #[test]
+    fn test_take_last_sta_error_captures_and_clears() {
+        let _guard = crate::phy_bridge::test_sync::lock_host_phy();
+        crate::phy_bridge::host_mock_reset();
+        crate::phy_bridge::host_mock_set_phy_enabled(true);
+
+        let mut bus = MockWifiMmioBus::new();
+        bus.auto_init_3d24 = true;
+        bus.auto_tx_done = true;
+        let mut driver = core::pin::pin!(Esp32StaWifiDriver::new(bus));
+        driver
+            .as_mut()
+            .init_pinned(Some([0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc]))
+            .expect("init_pinned");
+
+        // JUSTIFICATION: Driving `poll()` / `connect()` on the stack-pinned
+        // driver without relocating it.
+        // SAFETY: `driver` remains pinned for the entire test lifetime.
+        let drv = unsafe { driver.as_mut().get_unchecked_mut() };
+        assert_eq!(drv.take_last_sta_error(), None);
+
+        let cfg =
+            StaConnectConfig::from_slices(b"MissingAp", b"password123", None, -90).expect("cfg");
+        let mut now_ms = 1_000u64;
+        drv.connect(cfg, now_ms).expect("connect");
+
+        for _ in 1..13 {
+            now_ms += 95;
+            drv.poll(now_ms).expect("scan dwell poll");
+        }
+        now_ms += 95;
+        let res = drv.poll(now_ms);
+        assert_eq!(res, Err(DriverError::Sta(StaError::NoSuitableAp)));
+        assert_eq!(drv.take_last_sta_error(), Some(StaError::NoSuitableAp));
+        assert_eq!(drv.take_last_sta_error(), None);
+
+        // Re-trigger via scan sweep and verify `connect()` clears `last_sta_error`.
+        now_ms += 2_000;
+        drv.connect(cfg, now_ms).expect("reconnect");
+        for _ in 1..13 {
+            now_ms += 95;
+            drv.poll(now_ms).expect("scan dwell poll 2");
+        }
+        now_ms += 95;
+        assert_eq!(
+            drv.poll(now_ms),
+            Err(DriverError::Sta(StaError::NoSuitableAp))
+        );
+        now_ms += 2_000;
+        drv.connect(cfg, now_ms).expect("connect clears last error");
+        assert_eq!(drv.take_last_sta_error(), None);
+    }
+
+    #[test]
+    fn test_poll_rx_state_sw_crypto_passthrough_requires_protected_bit() {
+        let _guard = crate::phy_bridge::test_sync::lock_host_phy();
+        crate::phy_bridge::host_mock_reset();
+        crate::phy_bridge::host_mock_set_phy_enabled(true);
+
+        let sta_mac = [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc];
+        let bssid = [0x02, 0xCC, 0x00, 0x00, 0x00, 0x01];
+
+        let mut bus = MockWifiMmioBus::new();
+        bus.auto_init_3d24 = true;
+        bus.auto_tx_done = true;
+        let mut driver = core::pin::pin!(Esp32StaWifiDriver::new(bus));
+        driver
+            .as_mut()
+            .init_pinned(Some(sta_mac))
+            .expect("init_pinned");
+
+        // JUSTIFICATION: Driving `connect()` and `poll()` on the stack-pinned
+        // driver without relocating it.
+        // SAFETY: `driver` remains pinned for the entire test lifetime.
+        let drv = unsafe { driver.as_mut().get_unchecked_mut() };
+
+        let cfg =
+            StaConnectConfig::from_slices(b"Passthrough", b"password123", None, -90).expect("cfg");
+        let mut now_ms = 1_000u64;
+        drv.connect(cfg, now_ms).expect("connect");
+        assert_eq!(drv.state(), StaState::Scanning);
+
+        let (mut beacon, beacon_len) = build_valid_rsn_beacon(bssid, b"Passthrough", 1);
+        beacon[beacon_len..beacon_len + 4].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        sim_hw_rx_slot(
+            drv,
+            0,
+            0xC4,
+            0x00,
+            (beacon_len + 4) as u16,
+            beacon_len + 4,
+            &beacon[..beacon_len + 4],
+        );
+        now_ms += 10;
+        drv.poll(now_ms).expect("beacon poll");
+        assert_eq!(drv.scan_candidates().len(), 1);
+
+        // Advance through remaining channels (2..=13) to enter AuthWait.
+        for _ in 1..=13 {
+            now_ms += 95;
+            drv.poll(now_ms).expect("scan dwell");
+        }
+        assert_eq!(drv.state(), StaState::AuthWait);
+
+        // Slot 1: Open Auth Response (seq=2, status=0) -> AssocWait.
+        let mut auth_resp = [0u8; 34];
+        auth_resp[0] = 0xB0;
+        auth_resp[4..10].copy_from_slice(&sta_mac);
+        auth_resp[10..16].copy_from_slice(&bssid);
+        auth_resp[16..22].copy_from_slice(&bssid);
+        auth_resp[26..28].copy_from_slice(&2u16.to_le_bytes());
+        sim_hw_rx_slot(drv, 1, 0xC4, 0x00, 34, 34, &auth_resp);
+        now_ms += 10;
+        drv.poll(now_ms).expect("auth resp poll");
+        assert_eq!(drv.state(), StaState::AssocWait);
+
+        // Slot 2: Assoc Response (status=0, aid=0xC001) -> FourWayWait.
+        let mut assoc_resp = [0u8; 34];
+        assoc_resp[0] = 0x10;
+        assoc_resp[4..10].copy_from_slice(&sta_mac);
+        assoc_resp[10..16].copy_from_slice(&bssid);
+        assoc_resp[16..22].copy_from_slice(&bssid);
+        assoc_resp[24..26].copy_from_slice(&0x0011u16.to_le_bytes());
+        assoc_resp[28..30].copy_from_slice(&0xC001u16.to_le_bytes());
+        sim_hw_rx_slot(drv, 2, 0xC4, 0x00, 34, 34, &assoc_resp);
+        now_ms += 10;
+        drv.poll(now_ms).expect("assoc resp poll");
+        assert_eq!(drv.state(), StaState::FourWayWait);
+        assert_eq!(drv.take_last_sta_error(), None);
+
+        // Construct a Data MPDU addressed to `sta_mac` from `bssid`.
+        let mut data_mpdu = [0u8; 52];
+        data_mpdu[0] = 0x08;
+        data_mpdu[4..10].copy_from_slice(&sta_mac);
+        data_mpdu[10..16].copy_from_slice(&bssid);
+        data_mpdu[16..22].copy_from_slice(&bssid);
+
+        // 1. rx_state == 0xF5 with Protected=1 -> MUST pass `valid_frame` and reach STA FSM.
+        data_mpdu[1] = 0x42; // FromDS=1 | Protected=1
+        sim_hw_rx_slot(
+            drv,
+            3,
+            0xC4,
+            RX_STATE_SW_CRYPTO_PASSTHROUGH,
+            52,
+            52,
+            &data_mpdu,
+        );
+        now_ms += 10;
+        drv.poll(now_ms).expect("passthrough protected=1 poll");
+        assert!(drv.take_last_sta_error().is_some());
+
+        // 2. rx_state == 0xF5 with Protected=0 -> MUST be dropped before STA FSM.
+        data_mpdu[1] = 0x02; // FromDS=1 | Protected=0
+        sim_hw_rx_slot(
+            drv,
+            4,
+            0xC4,
+            RX_STATE_SW_CRYPTO_PASSTHROUGH,
+            52,
+            52,
+            &data_mpdu,
+        );
+        now_ms += 10;
+        drv.poll(now_ms).expect("passthrough protected=0 poll");
+        assert_eq!(drv.take_last_sta_error(), None);
+
+        // 3. rx_state == 0x01 with Protected=1 -> MUST be dropped before STA FSM.
+        data_mpdu[1] = 0x42; // FromDS=1 | Protected=1
+        sim_hw_rx_slot(drv, 5, 0xC4, 0x01, 52, 52, &data_mpdu);
+        now_ms += 10;
+        drv.poll(now_ms).expect("rx_state 0x01 poll");
+        assert_eq!(drv.take_last_sta_error(), None);
+    }
+
+    #[test]
+    fn test_poll_accepts_hw_ccmp_decrypted_protected_data_mpdu() {
+        let _guard = crate::phy_bridge::test_sync::lock_host_phy();
+        crate::phy_bridge::host_mock_reset();
+        crate::phy_bridge::host_mock_set_phy_enabled(true);
+
+        let sta_mac = [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc];
+        let bssid = [0x02, 0xCC, 0x00, 0x00, 0x00, 0x01];
+        let sa = [0x02, 0xDD, 0xEE, 0xFF, 0x00, 0x02];
+        let hex_psk = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let pmk = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+            0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67,
+            0x89, 0xab, 0xcd, 0xef,
+        ];
+
+        let mut bus = MockWifiMmioBus::new();
+        bus.auto_init_3d24 = true;
+        bus.auto_tx_done = true;
+        let mut driver = core::pin::pin!(Esp32StaWifiDriver::new(bus));
+        driver
+            .as_mut()
+            .init_pinned(Some(sta_mac))
+            .expect("init_pinned");
+
+        // JUSTIFICATION: Driving `connect()` and `poll()` on the stack-pinned
+        // driver without relocating it.
+        // SAFETY: `driver` remains pinned for the entire test lifetime.
+        let drv = unsafe { driver.as_mut().get_unchecked_mut() };
+        assert!(!drv.lmac().is_sta_hw_crypto_enabled());
+
+        let cfg = StaConnectConfig::from_slices(b"HwCrypto", hex_psk, None, -90).expect("cfg");
+        let mut now_ms = 1_000u64;
+        drv.connect(cfg, now_ms).expect("connect");
+
+        let (mut beacon, beacon_len) = build_valid_rsn_beacon(bssid, b"HwCrypto", 1);
+        beacon[beacon_len..beacon_len + 4].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        sim_hw_rx_slot(
+            drv,
+            0,
+            0xC4,
+            0x00,
+            (beacon_len + 4) as u16,
+            beacon_len + 4,
+            &beacon[..beacon_len + 4],
+        );
+        now_ms += 10;
+        drv.poll(now_ms).expect("beacon poll");
+
+        for _ in 1..=13 {
+            now_ms += 95;
+            drv.poll(now_ms).expect("scan dwell");
+        }
+        assert_eq!(drv.state(), StaState::AuthWait);
+
+        let mut auth_resp = [0u8; 34];
+        auth_resp[0] = 0xB0;
+        auth_resp[4..10].copy_from_slice(&sta_mac);
+        auth_resp[10..16].copy_from_slice(&bssid);
+        auth_resp[16..22].copy_from_slice(&bssid);
+        auth_resp[26..28].copy_from_slice(&2u16.to_le_bytes());
+        sim_hw_rx_slot(drv, 1, 0xC4, 0x00, 34, 34, &auth_resp);
+        now_ms += 10;
+        drv.poll(now_ms).expect("auth resp poll");
+        assert_eq!(drv.state(), StaState::AssocWait);
+
+        let mut assoc_resp = [0u8; 34];
+        assoc_resp[0] = 0x10;
+        assoc_resp[4..10].copy_from_slice(&sta_mac);
+        assoc_resp[10..16].copy_from_slice(&bssid);
+        assoc_resp[16..22].copy_from_slice(&bssid);
+        assoc_resp[24..26].copy_from_slice(&0x0011u16.to_le_bytes());
+        assoc_resp[28..30].copy_from_slice(&0xC001u16.to_le_bytes());
+        sim_hw_rx_slot(drv, 2, 0xC4, 0x00, 34, 34, &assoc_resp);
+        now_ms += 10;
+        drv.poll(now_ms).expect("assoc resp poll");
+        assert_eq!(drv.state(), StaState::FourWayWait);
+
+        // Slot 3: EAPOL M1 (FromDS=1, unencrypted).
+        let anonce = [0x11u8; 32];
+        let mut m1 = [0u8; 32 + 99 + 4];
+        m1[0] = 0x08;
+        m1[1] = 0x02;
+        m1[4..10].copy_from_slice(&sta_mac);
+        m1[10..16].copy_from_slice(&bssid);
+        m1[16..22].copy_from_slice(&bssid);
+        m1[24..32].copy_from_slice(&[0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00, 0x88, 0x8E]);
+        {
+            let eapol = &mut m1[32..32 + 99];
+            eapol[0] = 0x02;
+            eapol[1] = 0x03;
+            eapol[2..4].copy_from_slice(&95u16.to_be_bytes());
+            eapol[4] = 0x02;
+            eapol[5..7].copy_from_slice(&0x008Au16.to_be_bytes());
+            eapol[7..9].copy_from_slice(&16u16.to_be_bytes());
+            eapol[16] = 1;
+            eapol[17..49].copy_from_slice(&anonce);
+        }
+        sim_hw_rx_slot(drv, 3, 0xC4, 0x00, m1.len() as u16, m1.len(), &m1);
+        now_ms += 10;
+        drv.poll(now_ms).expect("M1 poll");
+
+        let mut snonce = [0u8; 32];
+        snonce.copy_from_slice(&drv.tx_slot().buffer_slice()[32 + 17..32 + 49]);
+        let ptk = esp32_cam_wpa2::kdf::wpa_pmk_to_ptk(
+            &pmk,
+            b"Pairwise key expansion",
+            &bssid,
+            &sta_mac,
+            &anonce,
+            &snonce,
+            false,
+        );
+
+        // Slot 4: EAPOL M3 with wrapped RSN IE + GTK KDE (key_id=1).
+        let mut ap_rsn = [0u8; 32];
+        let ap_rsn_len = gen_wpa_ie(
+            WPA_PROTO_RSN,
+            WPA_CIPHER_CCMP,
+            WPA_CIPHER_CCMP,
+            WPA_KEY_MGMT_PSK,
+            0,
+            0,
+            &mut ap_rsn,
+        )
+        .expect("ap rsn");
+        assert_eq!(ap_rsn_len, 22);
+        let gtk = [0x99u8; 16];
+        let mut plain_kd = [0u8; 48];
+        plain_kd[..22].copy_from_slice(&ap_rsn[..22]);
+        plain_kd[22] = 0xDD;
+        plain_kd[23] = 22;
+        plain_kd[24..27].copy_from_slice(&[0x00, 0x0F, 0xAC]);
+        plain_kd[27] = 0x01;
+        plain_kd[28] = 1; // GTK key_id = 1
+        plain_kd[30..46].copy_from_slice(&gtk);
+        plain_kd[46] = 0xDD;
+        let mut wrapped_kd = [0u8; 56];
+        esp32_cam_wpa2::crypto::aes_wrap(&ptk.kek, &plain_kd, &mut wrapped_kd).expect("aes_wrap");
+
+        let mut m3 = [0u8; 32 + 99 + 56 + 4];
+        m3[0] = 0x08;
+        m3[1] = 0x02;
+        m3[4..10].copy_from_slice(&sta_mac);
+        m3[10..16].copy_from_slice(&bssid);
+        m3[16..22].copy_from_slice(&bssid);
+        m3[24..32].copy_from_slice(&[0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00, 0x88, 0x8E]);
+        {
+            let eapol = &mut m3[32..32 + 99 + 56];
+            eapol[0] = 0x02;
+            eapol[1] = 0x03;
+            eapol[2..4].copy_from_slice(&((95 + 56) as u16).to_be_bytes());
+            eapol[4] = 0x02;
+            eapol[5..7].copy_from_slice(&0x13CAu16.to_be_bytes());
+            eapol[7..9].copy_from_slice(&16u16.to_be_bytes());
+            eapol[16] = 2;
+            eapol[17..49].copy_from_slice(&anonce);
+            eapol[97..99].copy_from_slice(&(56u16).to_be_bytes());
+            eapol[99..99 + 56].copy_from_slice(&wrapped_kd);
+            let mic = esp32_cam_wpa2::crypto::hmac_sha1_vector(&ptk.kck, &[&eapol[..]]);
+            eapol[81..97].copy_from_slice(&mic[..16]);
+        }
+        sim_hw_rx_slot(drv, 4, 0xC4, 0x00, m3.len() as u16, m3.len(), &m3);
+        now_ms += 10;
+        drv.poll(now_ms).expect("M3 poll");
+
+        assert_eq!(drv.state(), StaState::Connected);
+        assert!(drv.lmac().is_sta_hw_crypto_enabled());
+        assert_eq!(drv.take_last_sta_error(), None);
+
+        // Slot 5: Hardware-decrypted Protected=1 FromDS=1 Data MPDU (`rx_state == 0`).
+        // 24B HDR + 8B CCMP IV (PN=1, ExtIV=1, KeyID=0) + 8B LLC/SNAP + 6B payload + 8B MIC = 54B.
+        let mut hw_mpdu = [0u8; 54 + 4];
+        hw_mpdu[0] = 0x08;
+        hw_mpdu[1] = 0x42; // FromDS=1 | Protected=1
+        hw_mpdu[4..10].copy_from_slice(&sta_mac);
+        hw_mpdu[10..16].copy_from_slice(&bssid);
+        hw_mpdu[16..22].copy_from_slice(&sa);
+        hw_mpdu[24] = 1; // PN0 = 1
+        hw_mpdu[27] = 0x20; // ExtIV=1, KeyID=0
+        hw_mpdu[32..40].copy_from_slice(&[0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00, 0x08, 0x00]);
+        hw_mpdu[40..46].copy_from_slice(b"HWCCMP");
+        sim_hw_rx_slot(
+            drv,
+            5,
+            0xC4,
+            0x00,
+            hw_mpdu.len() as u16,
+            hw_mpdu.len(),
+            &hw_mpdu,
+        );
+        now_ms += 10;
+        drv.poll(now_ms).expect("hw-decrypted data poll");
+        assert_eq!(drv.take_last_sta_error(), None);
+        assert_eq!(drv.rx_queue_len(), 1);
+
+        let (rx_tok, _) = drv
+            .receive(Instant::from_millis(now_ms as i64))
+            .expect("smoltcp rx token");
+        let mut seen = [0u8; 32];
+        let seen_len = smoltcp::phy::RxToken::consume(rx_tok, |buf| {
+            seen[..buf.len()].copy_from_slice(buf);
+            buf.len()
+        });
+        assert_eq!(seen_len, 20);
+        assert_eq!(&seen[0..6], &sta_mac);
+        assert_eq!(&seen[6..12], &sa);
+        assert_eq!(&seen[12..14], &[0x08, 0x00]);
+        assert_eq!(&seen[14..20], b"HWCCMP");
+
+        drv.disconnect(3, now_ms + 10).expect("disconnect");
+        assert!(!drv.lmac().is_sta_hw_crypto_enabled());
     }
 }
